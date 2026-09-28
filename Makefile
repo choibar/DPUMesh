@@ -103,7 +103,7 @@ $(TESTDIR)/service_resolve_test: tests/service_resolve_test.c src/core/service_r
 
 examples: lib $(addprefix $(BINDIR)/,$(EXAMPLES))
 
-$(BINDIR)/hello_dpumesh $(BINDIR)/hello_dpumesh_server: $(BINDIR)/%: examples/native/%.c | $(BINDIR)
+$(BINDIR)/hello_dpumesh $(BINDIR)/hello_dpumesh_server: $(BINDIR)/%: examples/native/%.c $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) | $(BINDIR)
 	$(CC) $(HOST_CFLAGS) $< -L$(LIBDIR) -ldpumesh -Wl,-rpath,$(abspath $(LIBDIR)) -lpthread -o $@
 
 $(BINDIR)/tcp_echo $(BINDIR)/tcp_client: $(BINDIR)/%: examples/preload/%.c | $(BINDIR)
