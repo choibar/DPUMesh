@@ -24,9 +24,9 @@ TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c co
     comch_consumer.c comch_producer.c comch_msgq.c dpa.c ring.c) \
     $(addprefix $(TRANSPORT)/host/,comch_client.c channel.c host_stubs.c)
 TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h)
-LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_registry.c \
+LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
-HOST_TESTS := carrier_logic_test service_registry_test native_writable_test native_core_transport_test \
+HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
     channel_session_test session_server_test dma_cleanup_test dpa_cleanup_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
@@ -95,11 +95,11 @@ $(TESTDIR)/preload_api_contract_test: tests/preload_api_contract_test.c src/faca
 $(TESTDIR)/native_writable_test: tests/native_writable_test.c src/core/dmesh_core.c src/core/native_transport.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread -o $@
 
-$(TESTDIR)/native_core_transport_test: tests/native_core_transport_test.c tests/support/native_memory_transport.c src/core/dmesh_core.c src/facade/dmesh_api.c src/core/native_transport.h | $(TESTDIR)
+$(TESTDIR)/native_core_transport_test: tests/native_core_transport_test.c tests/support/native_memory_transport.c src/core/dmesh_core.c src/core/service_resolve.c src/facade/dmesh_api.c src/core/native_transport.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) $(filter %.c,$^) -pthread -o $@
 
-$(TESTDIR)/service_registry_test: tests/service_registry_test.c src/core/service_registry.c src/core/service_registry.h | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) $(filter %.c,$^) -o $@
+$(TESTDIR)/service_resolve_test: tests/service_resolve_test.c src/core/service_resolve.c src/core/service_resolve.h | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -DDMESH_RESOLVE_TEST $(filter %.c,$^) -pthread -o $@
 
 examples: lib $(addprefix $(BINDIR)/,$(EXAMPLES))
 

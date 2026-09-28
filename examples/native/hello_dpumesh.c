@@ -55,14 +55,14 @@ static int drain(dmesh_channel_t *channel, dmesh_eq_t *eq, dmesh_qp_t *qp,
 
 int main(int argc, char **argv)
 {
-    const char *service = argc > 1 ? argv[1] : "echo-dpumesh";
+    const char *service = argc > 1 ? argv[1] : "echo-dpumesh:9095";
     const char *message = argc > 2 ? argv[2] : "hello from DPUmesh\n";
     size_t message_len = strlen(message), reply_len = 0;
     char reply[REPLY_MAX];
     int rc = 1;
 
     if (getenv("DPUMESH_SERVICE") || message_len == 0 || message_len > REPLY_MAX) {
-        fprintf(stderr, "usage: env -u DPUMESH_SERVICE %s [service] [message]\n", argv[0]);
+        fprintf(stderr, "usage: env -u DPUMESH_SERVICE %s [host:port] [message]\n", argv[0]);
         return 2;
     }
 

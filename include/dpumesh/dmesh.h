@@ -119,8 +119,11 @@ int64_t dmesh_eq_next_deadline_ns(dmesh_eq_t *eq);
 
 /* ===== Connection setup (rdma_cm) ===== */
 
-/* Create a client QP for a registered service name. Returns EINVAL, ENOENT
- * (not meshed), EAGAIN (no generation held — retry), or ENOMEM. */
+/* Create a client QP for a "<host>:<port>" service target: host is a Service
+ * DNS name ("name" in this Pod's namespace, "name.namespace", or a full name)
+ * or an IPv4 literal, port the Service port. Returns EINVAL (malformed target),
+ * ENOENT (no such name), EAGAIN (DNS temporarily unavailable — retry), ENOSPC,
+ * or ENOMEM. */
 dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *service_name);
 
 /* Flush, send FIN, release RX credit, and destroy the QP. The pointer is invalid

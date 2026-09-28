@@ -24,6 +24,27 @@ QP destruction. `user_data` belongs to the application.
 | Events | `dmesh_poll_eq`, `dmesh_release_rx_buffer` |
 | Statistics | `dmesh_get_tx_stats` |
 
+## Naming
+
+A service target is `"<host>:<port>"`: host is a Service DNS name (`"name"` in
+the calling Pod's namespace, `"name.namespace"`, or a full name) or an IPv4
+literal, and port is the Service port. The cluster DNS answers every name; the
+library stores no address. `dmesh_create_qp(eq, target)` connects to a
+target, and a server's `DPUMESH_SERVICE` is the target it serves.
+
+- `dmesh_create_qp` fails with `EINVAL` for a malformed target, `ENOENT` for a
+  name without an IPv4 address, `EAGAIN` while DNS gives no answer, and
+  `ENOSPC` once the process has used 1024 distinct addresses.
+- Answers are cached per target for five seconds, the default record TTL of
+  CoreDNS. A QP keeps the address it opened with.
+- A server resolves `DPUMESH_SERVICE` once, when its channel is created; every
+  backend flow it offers the DPU carries that address.
+- The preload shim carries a `connect()` over DPUmesh when its destination is
+  the current address of a target in `DPUMESH_TARGETS` (separated by commas or
+  spaces); other destinations use kernel TCP, logged. A listed target on the
+  dialed port without a DNS answer, or a malformed list, fails the connect with
+  `EHOSTUNREACH`.
+
 ## Transmit and receive
 
 `dmesh_alloc` acquires the QP's transmit gate and reserves contiguous memory;

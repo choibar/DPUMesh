@@ -32,8 +32,8 @@ exports rcv_ring + tx_staging instead of pushing).
 
 | API | Carrier |
 |---|---|
-| `dmesh_create_channel` | Opens the PCI device and one Comch client/PE, completes HELLO, registers one TX pool and one RX region (32 windows of 1 MiB), loads the registry. A server channel (`DPUMESH_SERVICE`) keeps `DPUMESH_BACKEND_POOL` unclaimed BACKEND flows open, each under a fresh upstream port, up to `DPUMESH_BACKEND_MAX` flows in total; a flow is replaced as soon as a stream claims it, so the DPU connector always finds a ready backend. |
-| `dmesh_create_qp` | Sends flow-tagged OPEN on the channel session and waits for READY. Opens an `INGRESS_PUSH` flow: source `DPUMESH_POD_IP` and the QP port, destination the registry address of the service, `DPUMESH_WORKLOAD` as identity label. |
+| `dmesh_create_channel` | Opens the PCI device and one Comch client/PE, completes HELLO, registers one TX pool and one RX region (32 windows of 1 MiB). A server channel resolves its `DPUMESH_SERVICE` target once and keeps `DPUMESH_BACKEND_POOL` unclaimed BACKEND flows open, each under a fresh upstream port, up to `DPUMESH_BACKEND_MAX` flows in total; a flow is replaced as soon as a stream claims it, so the DPU connector always finds a ready backend. |
+| `dmesh_create_qp` | Sends flow-tagged OPEN on the channel session and waits for READY. Opens an `INGRESS_PUSH` flow: source `DPUMESH_POD_IP` and the QP port, destination the address DNS gives for the `<host>:<port>` target ([naming](API.md#naming)), `DPUMESH_WORKLOAD` as identity label. |
 | inbound stream | The first push batch on a BACKEND flow enters the core's accept queue under that flow's upstream port. After the stream closes, the flow reopens under a new port. |
 | `dmesh_post_send` | The descriptor's TX-pool range is posted to the flow's forward ring as one or two DPUMesh descriptors (a multiple of 128 bytes plus a remainder of at most 128 bytes, each at most 8064 bytes). |
 | custody ACK | The DPA's `consumer_head` passing a descriptor's ticket. |
@@ -181,10 +181,11 @@ in the proxy's notification handling, not in this library.
 ## Configuration
 
 All values come from the environment; `.env.example` lists them with
-placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`), `DPUMESH_CONFIG`
-(registry, default `/etc/dpumesh/registry`), `DPUMESH_POD_IP`,
-`DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0), `DPUMESH_SERVICE` for a
-server, `DPUMESH_BACKEND_POOL` (spare flows, default 8), `DPUMESH_BACKEND_MAX`
+placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`),
+`DPUMESH_POD_IP`, `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
+`DPUMESH_SERVICE` (the `<host>:<port>` target a server serves),
+`DPUMESH_TARGETS` (the targets the preload shim carries),
+`DPUMESH_BACKEND_POOL` (spare flows, default 8), `DPUMESH_BACKEND_MAX`
 (default 16). `DPUMESH_SPIN_US` is the empty-poll window before an EQ arms
 its doorbells and `DPUMESH_TICK_US` the fallback poll period while doorbell-less
 traffic is outstanding. `DPUMESH_CARRIER_TRACE` and `DPUMESH_CORE_TRACE` print flow,

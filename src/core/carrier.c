@@ -13,7 +13,7 @@
 #define _GNU_SOURCE
 #endif
 #include "native_transport.h"
-#include "service_registry.h"
+#include "service_resolve.h"
 #include "channel.h"
 #include "carrier_logic.h"
 #include <arpa/inet.h>
@@ -53,7 +53,6 @@ struct slot {
 struct dmesh_native_transport {
     struct channel_dev *dev;
     struct channel_mem *tx, *rx;
-    struct dmesh_service_registry registry;
     char server[64], workload[64];
     uint32_t pod_ip;
     int pod_id, service_id, backend_pool, backend_max;
@@ -76,14 +75,14 @@ static int slot_index(const struct dmesh_native_transport *t, const struct slot 
 static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t mode,
                      uint16_t port, int service_id)
 {
-    const struct dmesh_service *svc = dmesh_registry_id(&t->registry, service_id);
-    if (!svc) { errno = ENOENT; return -1; }
+    uint32_t dst_ip; uint16_t dst_port;
+    if (dmesh_target_addr(service_id, &dst_ip, &dst_port) != 0) return -1;
     /* host-dpa reverse path: the same roles on the export flow modes */
     if (channel_dev_host_dpa(t->dev))
         mode = mode == CHANNEL_MODE_BACKEND_DPU_DMA ? CHANNEL_MODE_BACKEND_HOST_DPA : CHANNEL_MODE_CLIENT_HOST_DPA;
     struct channel_conn_config cfg = {
         .flow_id = (uint32_t)slot_index(t, s) + 1, .workload = t->workload,
-        .src_ip = t->pod_ip, .dst_ip = svc->ipv4, .src_port = port, .dst_port = svc->port,
+        .src_ip = t->pod_ip, .dst_ip = dst_ip, .src_port = port, .dst_port = dst_port,
         .mode = mode, .tx = t->tx, .rx = t->rx,
         .rx_offset = (size_t)slot_index(t, s) * CHANNEL_WINDOW,
     };
@@ -171,9 +170,6 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     pthread_mutex_init(&t->lock, NULL);
     for (int i = 0; i < SLOTS; ++i) { pthread_mutex_init(&t->slots[i].lock, NULL); t->slots[i].epfd = -1; }
     for (int i = 0; i < SLOTS; ++i) if ((t->slots[i].epfd = epoll_create1(EPOLL_CLOEXEC)) < 0) goto fail;
-    const char *registry = getenv("DPUMESH_CONFIG");
-    if (!registry) registry = "/etc/dpumesh/registry";
-    if (dmesh_registry_load(&t->registry, registry) != 0) goto fail;
     const char *pci = getenv("DPUMESH_PCI_ADDR"), *server = getenv("DPUMESH_SERVER");
     const char *pod_ip = getenv("DPUMESH_POD_IP"), *workload = getenv("DPUMESH_WORKLOAD");
     if (!pci || !*pci || !pod_ip || inet_pton(AF_INET, pod_ip, &t->pod_ip) != 1) { errno = EINVAL; goto fail; }
@@ -184,10 +180,15 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     t->backend_max = env_int("DPUMESH_BACKEND_MAX", BACKEND_MAX_DEFAULT, t->backend_pool, SLOTS);
     t->next_uport = UPORT_BASE;
     t->service_id = DMESH_SVC_NONE;
+    /* The served address is resolved once: every BACKEND flow carries it. */
     if (cfg->service_name && *cfg->service_name) {
-        const struct dmesh_service *svc = dmesh_registry_name(&t->registry, cfg->service_name);
-        if (!svc) { errno = ENOENT; goto fail; }
-        t->service_id = svc->id;
+        t->service_id = dmesh_target_resolve(cfg->service_name);
+        if (t->service_id < 0) {
+            int saved = errno;
+            fprintf(stderr, "dpumesh: DPUMESH_SERVICE '%s' did not resolve (%s)\n", cfg->service_name, strerror(saved));
+            errno = saved;
+            goto fail;
+        }
     }
     if (channel_dev_open(pci, &t->dev) != 0) goto fail;
     if (channel_session_open(t->dev, t->server) != 0) goto fail;
@@ -409,8 +410,6 @@ void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe)
 }
 int dmesh_native_resolve(struct dmesh_native_transport *t, const char *name, uint32_t addr, uint16_t port)
 {
-    const struct dmesh_service *e = name ? dmesh_registry_name(&t->registry, name)
-                                         : dmesh_registry_addr(&t->registry, addr, port);
-    if (!e) { errno = ENOENT; return -1; }
-    return e->id;
+    (void)t;
+    return name ? dmesh_target_resolve(name) : dmesh_target_member(addr, port);
 }

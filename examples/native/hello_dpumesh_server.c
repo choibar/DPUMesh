@@ -37,7 +37,7 @@ static void close_later(dmesh_qp_t **list, int *count, dmesh_qp_t *qp)
 int main(void)
 {
     if (!getenv("DPUMESH_SERVICE")) {
-        fprintf(stderr, "DPUMESH_SERVICE must name this server's Kubernetes Service\n");
+        fprintf(stderr, "DPUMESH_SERVICE must be this server's Service target (host:port)\n");
         return 2;
     }
     dmesh_channel_t *channel = dmesh_create_channel();
