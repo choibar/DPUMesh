@@ -124,7 +124,7 @@ int64_t dmesh_eq_next_deadline_ns(dmesh_eq_t *eq);
  * or an IPv4 literal, port the Service port. Returns EINVAL (malformed target),
  * ENOENT (no such name), EAGAIN (DNS temporarily unavailable — retry), ENOSPC,
  * or ENOMEM. */
-dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *service_name);
+dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *target);
 
 /* Flush, send FIN, release RX credit, and destroy the QP. The pointer is invalid
  * on return. Defer destruction until the current EQ batch is fully dispatched. */

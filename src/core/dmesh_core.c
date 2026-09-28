@@ -2645,13 +2645,13 @@ dmesh_qp_t *dmesh_qp_open(dmesh_eq_t *eq, int dst_service_id) {
 /* Resolve the "<host>:<port>" target through DNS and open the public QP.
  * "name" resolves in this Pod's own namespace; "name.namespace" is the DNS
  * convention for a cross-namespace peer. */
-dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *service_name) {
-    if (!eq || !service_name) { errno = EINVAL; return NULL; }
-    int svc = dmesh_resolve_name_via(eq->ch->ctx, service_name);
+dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *target) {
+    if (!eq || !target) { errno = EINVAL; return NULL; }
+    int svc = dmesh_resolve_name_via(eq->ch->ctx, target);
     if (svc < 0) {
         int saved = errno;
         DOCA_LOG_WARN("dmesh_create_qp: '%s' did not resolve (%s)",
-                      service_name, strerror(saved));
+                      target, strerror(saved));
         errno = saved;
         return NULL;                          /* errno from the resolver */
     }

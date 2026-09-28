@@ -500,8 +500,8 @@ static int dispatcher_drain_eq(pfd_t *self, int max_batches) {
                 efd_signal(e);
                 pthread_mutex_unlock(&e->mu);
                 /* A connection error outlives the cached answer that routed
-                 * it here; the next connect() asks the DPU again. paddr is
-                 * set only on the connect() side, where the cache entry is. */
+                 * it here; the next connect() asks DNS again. paddr is set
+                 * only on the connect() side, where the cache entry is. */
                 if (e->paddr != 0)
                     dmesh_resolve_invalidate(e->paddr, e->pport);
             }
