@@ -68,7 +68,7 @@ doca_error_t doca_comch_server_disconnect(struct doca_comch_server *server,
 static char cleanup_order[64];
 static unsigned cleanup_count, release_count, mmap_calls;
 static char failed_phase;
-static unsigned failed_mmap;
+static unsigned failed_mmap, quiesce_pending;
 
 static doca_error_t cleanup_phase(char phase)
 {
@@ -78,10 +78,21 @@ static doca_error_t cleanup_phase(char phase)
     return failed_phase == phase ? DOCA_ERROR_IO_FAILED : DOCA_SUCCESS;
 }
 
-doca_error_t dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn)
+doca_error_t dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn)
 {
     assert(conn->dma_closing);
-    return cleanup_phase('Q');
+    doca_error_t result = cleanup_phase('Q');
+    if (result == DOCA_SUCCESS && quiesce_pending != 0) {
+        --quiesce_pending;
+        return DOCA_ERROR_AGAIN;
+    }
+    return result;
+}
+
+bool dmesh_doca_dpa_failed(struct doca_dpa *dpa)
+{
+    (void)dpa;
+    return false;
 }
 
 doca_error_t cleanup_dma_tasks(struct dmesh_conn *conn)
@@ -132,7 +143,7 @@ static void reset_cleanup(void)
     cleanup_count = release_count = mmap_calls = 0;
     cleanup_order[0] = 0;
     failed_phase = 0;
-    failed_mmap = 0;
+    failed_mmap = quiesce_pending = 0;
 }
 
 static void deliver(struct doca_comch_connection *peer, uint16_t type,
@@ -434,6 +445,15 @@ static void checked_close_test(void)
         assert(memcmp(cleanup_order, phases, i + 1) == 0);
         assert(sibling->state == DMESH_CONN_RUNNING && !s->closing);
     }
+    /* A DPA kernel that has not stopped yet keeps the flow closing; each
+     * pass rechecks it and nothing past the fence runs. */
+    reset_cleanup();
+    quiesce_pending = 2;
+    conn->state = DMESH_CONN_CLOSING;
+    dmesh_flow_close_advance(conn);
+    dmesh_flow_close_advance(conn);
+    assert(conn->state == DMESH_CONN_CLOSING && strcmp(cleanup_order, "QQ") == 0);
+    assert(conn->ring_mmap && conn->dpa_thread && release_count == 0);
     /* An mmap failure preserves its remaining mappings and pool reservation;
      * a retry skips already destroyed mappings and frees once. */
     reset_cleanup();

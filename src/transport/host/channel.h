@@ -92,7 +92,8 @@ uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t by
 uint64_t channel_conn_consumed(const struct channel_conn *conn);
 
 /* Reverse path: next landed batch, pos/len relative to the window's data ring.
- * Returns 1 with a batch, 0 when none, -1 on a malformed batch */
+ * Returns 1 with a batch, 0 when none, -1 at end of stream (a zero-length
+ * batch) or on a malformed batch */
 int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len);
 /* Publishes the consumption cursor: every batch up to `seq` is released */
 void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes);

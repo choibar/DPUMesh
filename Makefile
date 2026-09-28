@@ -78,7 +78,7 @@ $(TESTDIR)/dma_cleanup_test: tests/dma_cleanup_test.c $(TRANSPORT)/dpu/dma.c $(T
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/dpa_cleanup_test: tests/dpa_cleanup_test.c $(TRANSPORT)/common/dpa.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
+	$(CC) $(HOST_CFLAGS) -DDMESH_DPA_QUIESCE_TIMEOUT_MS=20 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/carrier_logic_test: tests/carrier_logic_test.c src/core/carrier.c src/core/carrier_logic.h $(TRANSPORT)/host/channel.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread -o $@

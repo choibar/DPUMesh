@@ -329,7 +329,7 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
                 }
             }
             else if (r < 0 && !s->peer_gone_reported) {
-                s->peer_gone_reported = 1; fill_rx(t, s, e, 0, 0); n = 1;   /* malformed batch: fail the stream */
+                s->peer_gone_reported = 1; fill_rx(t, s, e, 0, 0); n = 1;   /* end of stream or malformed batch */
             }
         }
     } else {

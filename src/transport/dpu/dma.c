@@ -686,6 +686,8 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
         return -(int)DOCA_ERROR_BAD_STATE;
     if (conn->tx_staging == NULL || conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL)
         return -(int)DOCA_ERROR_BAD_STATE;
+    if (conn->push_fin_requested)
+        return -(int)DOCA_ERROR_BAD_STATE; /* no bytes after end of stream */
     if (conn->push_state != 0)
         return 0;                       /* previous batch still in flight */
     if (len == 0)
@@ -817,6 +819,29 @@ dmesh_dma_push_desc_done(struct dmesh_conn *conn)
     /* Keep the host cursor reasonably fresh (also probes legacy hosts). */
     if ((conn->push_seq & 0xf) == 0 || conn->push_seq < 4)
         dmesh_dma_pull_cursor(conn);
+    (void)dmesh_dma_push_fin(conn);
+}
+
+int
+dmesh_dma_push_fin(struct dmesh_conn *conn)
+{
+    if (conn == NULL)
+        return -(int)DOCA_ERROR_INVALID_VALUE;
+    if (!conn->push_fin_requested || conn->push_fin_sent)
+        return 0;
+    if (dma_admission_closed(conn))
+        return -(int)DOCA_ERROR_BAD_STATE;
+    /* Due once the push channel exists and no batch is in flight. The data
+     * gate leaves two descriptor slots free, so the FIN never overwrites a
+     * descriptor the host has not read. */
+    if (conn->tx_staging == NULL || conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL ||
+        conn->push_state != 0)
+        return 0;
+    conn->push_len = 0;
+    dmesh_dma_push_submit_desc(conn);
+    if (conn->push_state == 2)
+        conn->push_fin_sent = true;
+    return 0;
 }
 
 doca_error_t
