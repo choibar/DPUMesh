@@ -1,6 +1,6 @@
-/* LD_PRELOAD POSIX-socket facade. Registry-matched TCP endpoints use DPUmesh; all
- * other descriptors remain kernel-backed. A dispatcher translates native
- * events into socket readiness. */
+/* LD_PRELOAD POSIX-socket facade. TCP connections to the addresses of
+ * $DPUMESH_TARGETS use DPUmesh; all other descriptors remain kernel-backed. A
+ * dispatcher translates native events into socket readiness. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
@@ -90,11 +90,11 @@ static void preload_atfork_child(void);
 
 #define DBG(...) do { if (g_debug) { fprintf(stderr, "[dmesh_preload] " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
-/* Identity ($DPUMESH_SERVICE) is a Kubernetes Service name and routing is
- * answered by the DPU from the held topology generation
- * (src/core/dmesh_resolve.c) — the shim types no integer and carries no
- * registry file. connect() keys on IP:port; listen() converts the port named
- * by $DPUMESH_PORT (dmesh_config_listen_port). */
+/* Identity ($DPUMESH_SERVICE) and the meshed destinations ($DPUMESH_TARGETS)
+ * are "<host>:<port>" targets answered through DNS (src/core/service_resolve.c)
+ * — the shim types no integer and stores no address. connect() keys on
+ * IP:port; listen() converts the port named by $DPUMESH_PORT
+ * (dmesh_config_listen_port). */
 #ifndef DMESH_PRELOAD_TEST
 __attribute__((constructor))
 static void preload_ctor(void) {
@@ -500,8 +500,8 @@ static int dispatcher_drain_eq(pfd_t *self, int max_batches) {
                 efd_signal(e);
                 pthread_mutex_unlock(&e->mu);
                 /* A connection error outlives the cached answer that routed
-                 * it here; the next connect() asks the DPU again. paddr is
-                 * set only on the connect() side, where the cache entry is. */
+                 * it here; the next connect() asks DNS again. paddr is set
+                 * only on the connect() side, where the cache entry is. */
                 if (e->paddr != 0)
                     dmesh_resolve_invalidate(e->paddr, e->pport);
             }
@@ -671,9 +671,9 @@ static void preload_atfork_child(void) {
 /* Create the channel + dispatcher. Called under g_ch_mu; leaves g_ch NULL on
  * failure, so a later mapped socket operation retries the registration. */
 static void channel_init(void) {
-    /* dmesh_create_channel() requests the PodSpec's $DPUMESH_SERVICE or opens
-     * a pure client when unset; the controller authorizes the request. The
-     * process has one channel, created on its first mapped socket operation. */
+    /* dmesh_create_channel() serves the PodSpec's $DPUMESH_SERVICE target or
+     * opens a pure client when unset. The process has one channel, created on
+     * its first mapped socket operation. */
     dmesh_channel_t *ch = dmesh_create_channel();
     if (!ch) { DBG("dmesh_create_channel() FAILED (will retry)"); return; }
     dmesh_eq_t *eq = dmesh_create_eq(ch);
@@ -1031,10 +1031,9 @@ int connect(int fd, const struct sockaddr *addr, socklen_t alen) {
         if (real_getsockopt(fd, SOL_SOCKET, SO_TYPE, &so_type, &tl) < 0 ||
             so_type != SOCK_STREAM)
             return real_connect(fd, addr, alen);
-        /* The DPU answers whether this destination is meshed, so the channel
-         * comes first. A meshed Pod has no path around the mesh: a channel
-         * that cannot come up refuses the connect, and the backoff only paces
-         * bring-up attempts, never a bypass. */
+        /* A meshed Pod has no path around the mesh, so the channel comes
+         * first: a channel that cannot come up refuses the connect, and the
+         * backoff only paces bring-up attempts, never a bypass. */
         static _Atomic long g_channel_retry_after;
         struct timespec mono;
         clock_gettime(CLOCK_MONOTONIC, &mono);
@@ -1057,22 +1056,23 @@ int connect(int fd, const struct sockaddr *addr, socklen_t alen) {
         int svc = dmesh_resolve_addr_via(g_ch->ctx, sin->sin_addr.s_addr,
                                          ntohs(sin->sin_port));
         if (svc < 0 && errno == ENOENT) {
-            /* The DPU itself answered not-meshed: this destination lives
-             * outside the mesh, and kernel TCP is its ordinary path rather
-             * than a fallback. Leaving is still an explicit, logged decision. */
+            /* No listed target resolves to this address: it lives outside
+             * the mesh, and kernel TCP is its ordinary path rather than a
+             * fallback. Leaving is still an explicit, logged decision. */
             fprintf(stderr, "[dmesh_preload] %s:%d is not meshed; kernel TCP\n",
                     inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
             return real_connect(fd, addr, alen);
         }
         if (svc < 0) {
-            /* No answer is not "not meshed": the round trip failed or no
-             * generation is held yet, so whether this destination is
-             * protected is unknown. Guessing kernel TCP here would route a
-             * protected Service around its policy exactly when the mesh is
-             * least healthy. */
-            fprintf(stderr, "[dmesh_preload] %s:%d unresolvable "
-                    "(no generation held); refusing\n",
-                    inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
+            /* No answer is not "not meshed": a listed target on this port has
+             * no DNS answer, or the list is malformed, so whether this
+             * destination is meshed is unknown. Guessing kernel TCP here would
+             * route a meshed Service around the mesh exactly when name
+             * resolution is least healthy. */
+            fprintf(stderr, "[dmesh_preload] %s:%d unresolvable (%s); refusing\n",
+                    inet_ntoa(sin->sin_addr), ntohs(sin->sin_port),
+                    errno == EINVAL ? "DPUMESH_TARGETS is malformed"
+                                    : "a listed target has no DNS answer");
             errno = EHOSTUNREACH;
             return -1;
         }

@@ -1,12 +1,11 @@
 // gRPC echo (health) server listening ON THE DMA CHANNEL: it registers itself
-// with the DPU proxy as the backend for the echo service key, and serves h2
-// connections the proxy opens through the channel.
+// with the DPU proxy as the backend for its DPUMESH_SERVICE target, and serves
+// h2 connections the proxy opens through the channel.
 package main
 
 import (
 	"log"
 	"os"
-	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -18,11 +17,11 @@ import (
 
 func main() {
 
-	lis, err := dmeshgo.ListenAddress(serviceIP(), servicePort())
+	lis, err := dmeshgo.ListenService()
 	if err != nil {
 		log.Fatalf("dmesh listen: %v", err)
 	}
-	log.Printf("echo-server: backend channel registered for %s:%d (configured DPUMESH_SERVER)", serviceIP(), servicePort())
+	log.Printf("echo-server: backend channel registered for %s (configured DPUMESH_SERVER)", os.Getenv("DPUMESH_SERVICE"))
 
 	s := grpc.NewServer(grpc.ConnectionTimeout(24 * time.Hour))
 	h := health.NewServer()
@@ -32,20 +31,4 @@ func main() {
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
-}
-
-// The service address is the registry row the DPU routes to this process.
-func serviceIP() string {
-	v := os.Getenv("DPUMESH_SERVICE_IP")
-	if v == "" {
-		log.Fatal("DPUMESH_SERVICE_IP is not set")
-	}
-	return v
-}
-func servicePort() int {
-	p, err := strconv.Atoi(os.Getenv("DPUMESH_SERVICE_PORT"))
-	if err != nil || p <= 0 {
-		log.Fatal("DPUMESH_SERVICE_PORT is not set")
-	}
-	return p
 }

@@ -1,7 +1,7 @@
 /* Minimal gRPC server on DPUmesh. The service and its handler are stock gRPC
  * C++; only bootstrap differs — connections arrive from the transport through
- * a PassiveListener instead of a bound port. The process registers as
- * $DPUMESH_SERVICE. */
+ * a PassiveListener instead of a bound port. The process serves the
+ * $DPUMESH_SERVICE "<host>:<port>" target. */
 #include <cstdio>
 #include <memory>
 

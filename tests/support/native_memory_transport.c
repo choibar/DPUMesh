@@ -79,7 +79,7 @@ int dmesh_native_close(struct dmesh_native_transport *t) {
 }
 int dmesh_native_resolve(struct dmesh_native_transport *t, const char *name, uint32_t ip, uint16_t port) {
     (void)t; (void)ip; (void)port;
-    if (name && strcmp(name, "echo")) { errno = ENOENT; return -1; }
+    if (name && strcmp(name, "echo:80")) { errno = ENOENT; return -1; }
     return 1;
 }
 int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t *d) {

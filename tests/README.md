@@ -10,7 +10,7 @@
 | `native_core_transport_test` | Channel, EQ, QP, reservation, custody ACK, held RX buffers, FIN and teardown over the memory carrier in `support/` |
 | `native_writable_test` | Writable-buffer accounting of the core |
 | `carrier_logic_test` | Forward chunking to the DPUMesh copy rule and the in-order release window of the carrier |
-| `service_registry_test` | Registry validation and transactional reload |
+| `service_resolve_test` | Service target grammar, DNS answer caching and invalidation, address ids, fail-closed `DPUMESH_TARGETS` membership |
 | `topology_test` | Topology header |
 | `session_protocol_test` | Versioned Comch envelopes, malformed frames, unaligned input and flow identities |
 | `session_flow_test` | Shared-session flow lookup, generation checks, independent DPA pool ownership and disconnect fan-out |

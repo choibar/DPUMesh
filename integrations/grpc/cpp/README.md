@@ -7,14 +7,16 @@ Generated messages, stubs, handlers and RPC deadlines stay unchanged.
 auto runtime = dpumesh::grpc::DmeshRuntime::Create(
     dpumesh::grpc::MakeNativeDmeshApiOps());
 auto channel = dpumesh::grpc::CreateDmeshChannel(
-    *runtime, "hello-dpumesh", grpc::InsecureChannelCredentials());
+    *runtime, "hello-dpumesh:50051", grpc::InsecureChannelCredentials());
 ```
 
 Check each returned status before using the value. The complete
 [client](../../../examples/grpc/hello_grpc_client.cc) and
 [server](../../../examples/grpc/hello_grpc_server.cc) show bootstrap,
-error handling and an ordinary generated service. The server registers
-`DPUMESH_SERVICE` and attaches its gRPC passive listener to the runtime.
+error handling and an ordinary generated service. The channel target is a
+`<host>:<port>` [service target](../../../design/API.md#naming); the server
+serves its `DPUMESH_SERVICE` target and attaches its gRPC passive listener to
+the runtime.
 
 Build the native library, then configure against the exact gRPC source tree:
 

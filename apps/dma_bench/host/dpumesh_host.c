@@ -27,7 +27,8 @@
  *   BENCH_DURATION  seconds      (10)
  *   BENCH_MODE      sink | echo  (sink)
  *   BENCH_WINDOW    echo: bytes in flight per thread (262144)
- *   BENCH_SERVICE   registry service name (dma-echo)
+ *   BENCH_SERVICE   service target <host>:<port> (192.0.2.1:9000; dpumesh_dpu
+ *                   serves every flow, whatever its address)
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -412,7 +413,7 @@ static int config_read(struct config *cfg)
     cfg->duration = atof(env_or("BENCH_DURATION", "10"));
     cfg->mode = strcmp(env_or("BENCH_MODE", "sink"), "echo") == 0 ? MODE_ECHO : MODE_SINK;
     cfg->window = (uint32_t)atoi(env_or("BENCH_WINDOW", "262144"));
-    cfg->service = env_or("BENCH_SERVICE", "dma-echo");
+    cfg->service = env_or("BENCH_SERVICE", "192.0.2.1:9000");
     if (cfg->threads < 1 || cfg->threads > MAX_THREADS || cfg->size < STAMP_LEN || cfg->duration <= 0) {
         fprintf(stderr, "usage: BENCH_THREADS=1..%d BENCH_SIZE>=%d BENCH_DURATION>0 BENCH_MODE=sink|echo dpumesh_host\n",
                 MAX_THREADS, STAMP_LEN);

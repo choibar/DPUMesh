@@ -6,6 +6,7 @@
 #endif
 #include "dmesh_core.h"
 #include "native_transport.h"
+#include "service_resolve.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1336,8 +1337,8 @@ static void init_config(dpumesh_ctx_t *ctx, const dpumesh_config_t *config,
     if (hh > mb) hh = mb;
     ctx->recycle_reserve = hh;
 
-    /* The advertised Service is a name; the compact id is the DPU's answer at
-     * registration (interned from the held generation), never a host input. */
+    /* The advertised Service is a "<host>:<port>" target; the transport
+     * resolves it and reports the id its address was interned to. */
     snprintf(ctx->service_name, sizeof(ctx->service_name), "%s",
              service_name != NULL ? service_name : "");
     ctx->service_id = DMESH_SVC_NONE;
@@ -2385,8 +2386,9 @@ int dmesh_resolve_addr_via(dpumesh_ctx_t *ctx, uint32_t addr, uint16_t port) {
     if (!ctx) { errno = EINVAL; return -1; }
     return dmesh_native_resolve(ctx->transport, NULL, addr, port);
 }
+/* DNS answers are process-wide, so invalidation needs no channel. */
 void dmesh_resolve_invalidate(uint32_t addr, uint16_t port) {
-    (void)addr; (void)port; /* immutable static provider has no stale cache */
+    dmesh_target_invalidate(addr, port);
 }
 int dmesh_config_listen_port(void) {
     const char *value = getenv("DPUMESH_PORT");
@@ -2640,16 +2642,17 @@ dmesh_qp_t *dmesh_qp_open(dmesh_eq_t *eq, int dst_service_id) {
     return c;
 }
 
-/* Resolve the Kubernetes Service name through the DPU and open the public QP.
+/* Resolve the "<host>:<port>" target through DNS and open the public QP.
  * "name" resolves in this Pod's own namespace; "name.namespace" is the DNS
  * convention for a cross-namespace peer. */
-dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *service_name) {
-    if (!eq || !service_name) { errno = EINVAL; return NULL; }
-    int svc = dmesh_resolve_name_via(eq->ch->ctx, service_name);
+dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *target) {
+    if (!eq || !target) { errno = EINVAL; return NULL; }
+    int svc = dmesh_resolve_name_via(eq->ch->ctx, target);
     if (svc < 0) {
+        int saved = errno;
         DOCA_LOG_WARN("dmesh_create_qp: '%s' did not resolve (%s)",
-                      service_name,
-                      errno == ENOENT ? "not meshed" : "no generation held");
+                      target, strerror(saved));
+        errno = saved;
         return NULL;                          /* errno from the resolver */
     }
     return dmesh_qp_open(eq, svc);

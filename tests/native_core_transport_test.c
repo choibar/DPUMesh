@@ -22,14 +22,14 @@ static dmesh_event_t receive(dmesh_eq_t *eq, dmesh_event_type_t type) {
     assert(!"event deadline exceeded"); return ev;
 }
 int main(void) {
-    setenv("DPUMESH_SERVICE", "echo", 1);
+    setenv("DPUMESH_SERVICE", "echo:80", 1);
     dmesh_channel_t *server = dmesh_create_channel(); assert(server);
     unsetenv("DPUMESH_SERVICE");
     dmesh_channel_t *client = dmesh_create_channel(); assert(client);
     dmesh_eq_t *se = dmesh_create_eq(server), *ce = dmesh_create_eq(client);
     assert(se && ce);
     assert(dmesh_destroy_channel(client) == -1 && errno == EBUSY);
-    dmesh_qp_t *cq = dmesh_create_qp(ce, "echo"); assert(cq);
+    dmesh_qp_t *cq = dmesh_create_qp(ce, "echo:80"); assert(cq);
     assert(dmesh_destroy_eq(ce) == -1 && errno == EBUSY);
     test_native_hold_acks(1);
     unsigned char *tx = dmesh_alloc(cq, 16385); assert(tx);

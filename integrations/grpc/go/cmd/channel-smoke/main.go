@@ -293,8 +293,8 @@ func runClient(ctx context.Context, ip string, port, rounds int, rpcLimit time.D
 	return nil
 }
 
-func runServer(ctx context.Context, ip string, port int) error {
-	listener, err := dmeshgo.ListenAddress(ip, port)
+func runServer(ctx context.Context) error {
+	listener, err := dmeshgo.ListenService()
 	if err != nil {
 		return err
 	}
@@ -302,7 +302,7 @@ func runServer(ctx context.Context, ip string, port int) error {
 	s.RegisterService(&service, echoServer{})
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(listener) }()
-	log.Printf("CHANNEL_SMOKE_SERVER_READY address=%s:%d", ip, port)
+	log.Printf("CHANNEL_SMOKE_SERVER_READY service=%s", os.Getenv("DPUMESH_SERVICE"))
 	select {
 	case err = <-done:
 	case <-ctx.Done():
@@ -326,14 +326,16 @@ func main() {
 	flag.Parse()
 	ip := os.Getenv("DPUMESH_SERVICE_IP")
 	port, err := strconv.Atoi(os.Getenv("DPUMESH_SERVICE_PORT"))
-	if err != nil || ip == "" || port < 1 || port > 65535 || *rounds < 1 || *timeout <= 0 || *rpcLimit <= 0 {
-		log.Fatal("set DPUMESH_SERVICE_IP/PORT and positive rounds/timeouts")
+	// Only the client dials an address; the server serves DPUMESH_SERVICE.
+	if *mode == "client" && (err != nil || ip == "" || port < 1 || port > 65535) ||
+		*rounds < 1 || *timeout <= 0 || *rpcLimit <= 0 {
+		log.Fatal("set DPUMESH_SERVICE_IP/PORT for the client and positive rounds/timeouts")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	switch *mode {
 	case "server":
-		err = runServer(ctx, ip, port)
+		err = runServer(ctx)
 	case "client":
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, *timeout)

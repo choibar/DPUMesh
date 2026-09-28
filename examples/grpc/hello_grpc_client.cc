@@ -1,6 +1,6 @@
 /* Minimal gRPC client on DPUmesh. Stubs, RPC semantics, metadata and
  * deadlines are stock gRPC C++; only bootstrap differs — the channel target
- * is a Kubernetes Service name, not an address. */
+ * is a Service "<host>:<port>" that the transport resolves through DNS. */
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -13,7 +13,7 @@
 #include "echo.grpc.pb.h"
 
 int main(int argc, char** argv) {
-  const std::string service = argc > 1 ? argv[1] : "echo-grpc-dpumesh";
+  const std::string service = argc > 1 ? argv[1] : "echo-grpc-dpumesh:50051";
   const std::string text = argc > 2 ? argv[2] : "hello";
 
   auto runtime = dpumesh::grpc::DmeshRuntime::Create(

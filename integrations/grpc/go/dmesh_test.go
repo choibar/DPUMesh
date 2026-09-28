@@ -154,3 +154,43 @@ func TestCloseTransportBusyKeepsConnectionUsable(t *testing.T) {
 		t.Fatalf("connection after busy close: %v", err)
 	}
 }
+func TestListenerAddressMatchesServiceTarget(t *testing.T) {
+	for _, c := range []struct {
+		target, ip string
+		port       int
+		ok         bool
+	}{
+		{"10.96.0.15:9095", "10.96.0.15", 9095, true},
+		{"localhost:9095", "127.0.0.1", 9095, true},
+		{"10.96.0.15:9095", "10.96.0.16", 9095, false},
+		{"10.96.0.15:9095", "10.96.0.15", 9096, false},
+		{"echo", "10.96.0.15", 9095, false},
+		{"", "10.96.0.15", 9095, false},
+	} {
+		t.Setenv("DPUMESH_SERVICE", c.target)
+		if err := servesAt(c.ip, c.port); (err == nil) != c.ok {
+			t.Errorf("servesAt(%s, %d) with DPUMESH_SERVICE=%q: %v", c.ip, c.port, c.target, err)
+		}
+	}
+}
+func TestServiceListenerNeedsNoAddress(t *testing.T) {
+	for _, c := range []struct {
+		target, addr string
+		ok           bool
+	}{
+		{"echo:9095", ":9095", true},
+		{"echo.prod.svc.cluster.local:9095", ":9095", true},
+		{"10.96.0.15:9095", "10.96.0.15:9095", true},
+		{"echo", "", false},
+		{":9095", "", false},
+		{"echo:0", "", false},
+		{"echo:http", "", false},
+		{"", "", false},
+	} {
+		t.Setenv("DPUMESH_SERVICE", c.target)
+		addr, err := serviceAddr()
+		if (err == nil) != c.ok || err == nil && addr.String() != c.addr {
+			t.Errorf("serviceAddr() with DPUMESH_SERVICE=%q: %v, %v", c.target, addr, err)
+		}
+	}
+}

@@ -1,8 +1,9 @@
 # Examples
 
-Each program uses the host library over a running DPUMesh proxy. Both sides
-read the same `DPUMESH_CONFIG` registry; a server process sets
-`DPUMESH_SERVICE`, a client leaves it unset. `.env.example` at the repository
+Each program uses the host library over a running DPUMesh proxy. Services are
+named by `<host>:<port>` targets that resolve through DNS
+([naming](../design/API.md#naming)); a server process sets `DPUMESH_SERVICE`
+to its target, a client leaves it unset. `.env.example` at the repository
 root lists every variable; see [configuration](../design/HOST.md#configuration).
 
 ## Native C
@@ -12,19 +13,20 @@ root lists every variable; see [configuration](../design/HOST.md#configuration).
 
 ```sh
 make examples
-DPUMESH_SERVICE=hello-dpumesh build/bin/hello_dpumesh_server
-build/bin/hello_dpumesh hello-dpumesh hello      # another configured process
+DPUMESH_SERVICE=hello-dpumesh:9095 build/bin/hello_dpumesh_server
+build/bin/hello_dpumesh hello-dpumesh:9095 hello      # another configured process
 ```
 
 ## POSIX preload
 
 `preload/tcp_echo.c` and `preload/tcp_client.c` are ordinary socket programs.
-Under `LD_PRELOAD` the shim carries their connections over the transport; the
-server also sets `DPUMESH_PORT` to its listening port.
+Under `LD_PRELOAD` the shim carries the client's connections to the targets in
+`DPUMESH_TARGETS` over the transport; the server also sets `DPUMESH_PORT` to
+its listening port.
 
 ```sh
-LD_PRELOAD=build/lib/libdpumesh_preload.so DPUMESH_SERVICE=hello-dpumesh DPUMESH_PORT=9095 build/bin/tcp_echo 9095
-printf 'RUN 100 64 1\nQUIT\n' | LD_PRELOAD=build/lib/libdpumesh_preload.so build/bin/tcp_client <service-ip> 9095
+LD_PRELOAD=build/lib/libdpumesh_preload.so DPUMESH_SERVICE=hello-dpumesh:9095 DPUMESH_PORT=9095 build/bin/tcp_echo 9095
+printf 'RUN 100 64 1\nQUIT\n' | LD_PRELOAD=build/lib/libdpumesh_preload.so DPUMESH_TARGETS=hello-dpumesh:9095 build/bin/tcp_client <service-ip> 9095
 ```
 
 ## C++ gRPC
@@ -36,5 +38,6 @@ runtime; `grpc/hello_grpc_client.cc` calls it. Both build with the
 ## Go gRPC
 
 `integrations/grpc/go/cmd/echo-server` and `cmd/echo-client` run the gRPC
-health RPC over `net.Conn`. Both read the service address from
-`DPUMESH_SERVICE_IP` and `DPUMESH_SERVICE_PORT`; see the [Go adapter](../integrations/grpc/go/README.md).
+health RPC over `net.Conn`. The server serves its `DPUMESH_SERVICE` target;
+the client dials `DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT`. See the
+[Go adapter](../integrations/grpc/go/README.md).

@@ -141,10 +141,12 @@ int  dpumesh_init(dpumesh_ctx_t **ctx, const char *service_name,
                   const dpumesh_config_t *config);
 void dpumesh_destroy(dpumesh_ctx_t *ctx);
 
-/* Service lookup contract shared by native and preload facades. Returns a
- * transport-local service id, ENOENT for an unregistered destination, or EAGAIN
- * when resolution is temporarily unavailable. No topology/control provider is
- * installed by this header. */
+/* Service lookup contract shared by native and preload facades. resolve_name
+ * takes a "<host>:<port>" target and answers through DNS; resolve_addr answers
+ * whether an address belongs to a target in $DPUMESH_TARGETS. Both return a
+ * process-local service id, ENOENT for a destination outside the mesh, or
+ * EAGAIN when resolution is temporarily unavailable. invalidate drops the
+ * cached answers for an address after a connection error. */
 int dmesh_config_listen_port(void);               /* $DPUMESH_PORT, -1 = not a server */
 int dmesh_resolve_name_via(dpumesh_ctx_t *ctx, const char *name);
 int dmesh_resolve_addr_via(dpumesh_ctx_t *ctx, uint32_t ip_net, uint16_t port_host);
