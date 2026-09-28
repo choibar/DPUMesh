@@ -972,7 +972,7 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     if (getenv("DMESH_NO_TEARDOWN") != NULL && flow_has_resources(conn))
         return DOCA_ERROR_NOT_SUPPORTED;
     conn->dma_closing = true;
-    result = dmesh_doca_dpa_quiesce_checked(conn);
+    result = dmesh_doca_dpa_quiesce_step(conn);
     if (result != DOCA_SUCCESS)
         return result;
     result = cleanup_dma_tasks(conn);
@@ -1047,13 +1047,15 @@ static void dmesh_flow_close_advance(struct dmesh_conn *conn)
         conn->dma_closing = true;
         /* Stop this DPU's reader as far as possible, but its completion is
          * not evidence that the remote host reader released our exports. */
-        (void)dmesh_doca_dpa_quiesce_checked(conn);
+        (void)dmesh_doca_dpa_quiesce_step(conn);
         conn->error_status = ECONNRESET;
         conn->error_sent = true;
         conn->state = DMESH_CONN_ERROR;
         return;
     }
     doca_error_t result = dmesh_flow_teardown_checked(conn);
+    if (result == DOCA_ERROR_AGAIN)
+        return; /* the DPA kernel has not stopped yet; retry on the next pass */
     if (result != DOCA_SUCCESS) {
         conn->error_status = flow_close_errno(result);
         conn->error_sent = true; /* report this attempt as CLOSED(error) */
@@ -1290,6 +1292,8 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
         if (conn->multiplexed && conn->reverse_exported && !conn->ready_sent &&
             server_send_flow_msg(conn, DMESH_SESSION_READY, NULL, 0, 0) == DOCA_SUCCESS)
             conn->ready_sent = true;
+        if (conn->push_fin_requested && !conn->push_fin_sent)
+            (void)dmesh_dma_push_fin(conn);
 		break;
 
 	case DMESH_CONN_CLOSING:
@@ -1380,6 +1384,8 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 	return;
 
 error:
+	if (objs->dpa_pool != NULL)
+		(void)dmesh_doca_dpa_failed(objs->dpa_pool->dpa);
 	conn->state = DMESH_CONN_ERROR;
 }
 

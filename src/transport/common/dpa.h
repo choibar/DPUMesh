@@ -25,6 +25,10 @@ struct dmesh_doca_dpa_thread {
     struct doca_dpa *dpa;           /* DOCA DPA */
     struct doca_dpa_thread *thread; /* DPA thread */
     bool running, quiesced;        /* run attempted; explicit DMA close fence completed */
+    /* Stop handshake of the current run, advanced by dmesh_doca_dpa_quiesce_step(). */
+    bool stop_sent, submitted_known;
+    uint64_t submitted;             /* DMA copies the kernel issued before it stopped */
+    uint64_t quiesce_deadline_ns;   /* CLOCK_MONOTONIC; the handshake fails after it */
     doca_dpa_dev_uintptr_t arg;     /* argument to be used by DPA thread */
     doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */
 	doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
@@ -119,10 +123,25 @@ struct dmesh_conn;
 doca_error_t
 dmesh_doca_dpa_comch_create(struct dmesh_conn *conn);
 
+/* Upper bound on one stop handshake. A kernel that has not stopped by then is
+ * treated as stuck: its flow keeps its objects instead of releasing them. */
+#ifndef DMESH_DPA_QUIESCE_TIMEOUT_MS
+#define DMESH_DPA_QUIESCE_TIMEOUT_MS 1000
+#endif
+
 /* Checked native-flow teardown. Quiesce verifies both kernel exit and receipt
  * of every issued DMA completion before any mapping can be released. Each
- * destroy preserves failed objects for retry; none releases a pool slot. */
+ * destroy preserves failed objects for retry; none releases a pool slot.
+ * quiesce_step advances the handshake by one read and returns DOCA_ERROR_AGAIN
+ * while it is pending, so an event loop never waits in it; quiesce_checked
+ * repeats it until it settles. Both return DOCA_ERROR_TIME_OUT once
+ * DMESH_DPA_QUIESCE_TIMEOUT_MS has passed and DOCA_ERROR_BAD_STATE when the DPA
+ * context has failed. */
+doca_error_t dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn);
 doca_error_t dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn);
+/* True once the DPA context reports a device-side error, after which its
+ * threads no longer run; the first detection in a process is logged. */
+bool dmesh_doca_dpa_failed(struct doca_dpa *dpa);
 doca_error_t dmesh_doca_dpa_comch_destroy_checked(struct dmesh_conn *conn);
 doca_error_t dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *thread);
 

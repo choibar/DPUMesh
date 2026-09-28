@@ -171,6 +171,9 @@ struct dmesh_conn {
     uint32_t push_pos;                        /* data-ring write offset (host side) */
     uint32_t push_len;                        /* in-flight batch length */
     int push_state;                           /* 0 idle, 1 data in flight, 2 desc in flight */
+    /* The proxy finished sending: a zero-length descriptor follows the last
+     * batch and the host reads it as end of stream (dmesh_dma_push_fin). */
+    bool push_fin_requested, push_fin_sent;
     struct dmesh_push_desc *push_shadow;      /* in tx_staging's reserved tail */
 
     /* Push flow control (see struct dmesh_push_cursor). The cursor shadow

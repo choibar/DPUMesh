@@ -36,7 +36,7 @@ struct fixture {
     struct fake_recv recv;
     enum operation fail;
     void *fail_handle;
-    bool hold_contexts;
+    bool hold_contexts, dpa_fatal;
     unsigned deliveries, progress_calls, stop_writes, reads, reposts, task_frees;
     unsigned thread_destroy_calls, arg_free_calls;
     bool thread_destroyed, arg_freed;
@@ -88,6 +88,11 @@ doca_error_t doca_dpa_h2d_memcpy(struct doca_dpa *dpa, doca_dpa_dev_uintptr_t ds
     if (fails(OP_WRITE_STOP, NULL)) return DOCA_ERROR_DRIVER;
     memcpy((void *)(uintptr_t)dst, src, size);
     return DOCA_SUCCESS;
+}
+doca_error_t doca_dpa_peek_at_last_error(const struct doca_dpa *dpa)
+{
+    assert(dpa == (void *)f);
+    return f->dpa_fatal ? DOCA_ERROR_BAD_STATE : DOCA_SUCCESS;
 }
 doca_error_t doca_dpa_d2h_memcpy(struct doca_dpa *dpa, void *dst,
                                 doca_dpa_dev_uintptr_t src, size_t size)
@@ -321,6 +326,44 @@ static void test_quiesce_faults(void)
     release_fixture();
 }
 
+static void test_quiesce_step_never_waits(void)
+{
+    create_fixture();
+    f->args.stopped = 0;
+    assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_AGAIN);
+    assert(f->stop_writes == 1 && f->reads == 1 && f->progress_calls == 1);
+    assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_AGAIN);
+    assert(f->stop_writes == 1 && f->reads == 2);
+    f->args.stopped = 1;
+    f->args.dma_submitted = 1;
+    assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_AGAIN);
+    assert(f->reads == 4 && !f->thread.quiesced);
+    f->deliveries = 1;
+    assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_SUCCESS);
+    assert(f->thread.quiesced && f->stop_writes == 1 && f->reads == 4);
+    release_fixture();
+
+    create_fixture();
+    f->args.stopped = 0;
+    assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_AGAIN);
+    f->thread.quiesce_deadline_ns = 0;
+    assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_TIME_OUT);
+    assert(!f->thread.quiesced && f->stop_writes == 1);
+    release_fixture();
+}
+
+static void test_failed_dpa_is_not_polled(void)
+{
+    create_fixture();
+    f->dpa_fatal = true;
+    assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_BAD_STATE);
+    assert(dmesh_doca_dpa_quiesce_checked(conn()) == DOCA_ERROR_BAD_STATE);
+    assert(f->stop_writes == 0 && f->reads == 0 && !f->thread.quiesced);
+    f->dpa_fatal = false;
+    assert(dmesh_doca_dpa_quiesce_checked(conn()) == DOCA_SUCCESS);
+    release_fixture();
+}
+
 static void test_never_run_needs_no_fence(void)
 {
     create_fixture();
@@ -467,6 +510,8 @@ int main(void)
 {
     test_quiesce_requires_copy_completion();
     test_quiesce_faults();
+    test_quiesce_step_never_waits();
+    test_failed_dpa_is_not_polled();
     test_never_run_needs_no_fence();
     test_recv_counter_and_shutdown();
     test_malformed_completion_cannot_satisfy_fence();

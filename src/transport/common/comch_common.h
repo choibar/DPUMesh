@@ -69,7 +69,7 @@ struct dmesh_flow_id {
 struct dmesh_push_desc {
     volatile uint64_t seq;      /* 1-based batch sequence; 0 = empty slot */
     volatile uint32_t pos;      /* batch offset within the data ring */
-    volatile uint32_t len;      /* batch length in bytes */
+    volatile uint32_t len;      /* batch length in bytes; 0 = end of stream */
 };
 #define DMESH_PUSH_DESC_N    128u
 #define DMESH_PUSH_DATA_OFF  4096u

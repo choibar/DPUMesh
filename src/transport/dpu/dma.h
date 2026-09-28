@@ -52,6 +52,14 @@ submit_dma_task_kind(struct dmesh_conn *conn, const struct doca_buf *src, struct
 int
 dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len);
 
+/* End a push stream once push_fin_requested is set: after the last batch is
+ * visible, publish one zero-length descriptor, which the host reads as end of
+ * stream. Returns 0 (sent, or not due yet: the call is repeated from the
+ * descriptor completion and the flow's advance) or a negative doca_error_t
+ * when the flow no longer admits DMA. */
+int
+dmesh_dma_push_fin(struct dmesh_conn *conn);
+
 doca_error_t
 enqueue_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 

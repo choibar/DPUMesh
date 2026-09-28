@@ -763,57 +763,109 @@ dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
     return DOCA_SUCCESS;
 }
 
-/* Checked native-flow close. The kernel publishes its copy count before the
- * stopped flag. DMA-copy immediate messages arrive only after the copy (DOCA
- * producer_dma_copy contract), so every submitted copy must be observed here
- * before any local or exported mapping can be released. Keep receive tasks
- * posted until that fence; otherwise a credit-starved kernel cannot stop. */
+static uint64_t
+monotonic_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t
+quiesce_deadline_ns(void)
+{
+    return monotonic_ns() + (uint64_t)DMESH_DPA_QUIESCE_TIMEOUT_MS * 1000000ull;
+}
+
+/* A new run starts a new stop handshake. */
+static void
+dpa_thread_run_reset(struct dmesh_doca_dpa_thread *thread)
+{
+    thread->quiesced = false;
+    thread->stop_sent = false;
+    thread->submitted_known = false;
+    thread->submitted = 0;
+    thread->quiesce_deadline_ns = 0;
+}
+
+bool
+dmesh_doca_dpa_failed(struct doca_dpa *dpa)
+{
+    static bool reported;
+
+    if (dpa == NULL || doca_dpa_peek_at_last_error(dpa) != DOCA_ERROR_BAD_STATE)
+        return false;
+    if (!__atomic_exchange_n(&reported, true, __ATOMIC_RELAXED))
+        DOCA_LOG_ERR("DPA context reported a device-side error; its threads no longer run and new flows fail until the process restarts");
+    return true;
+}
+
+/* One step of the checked native-flow close. The kernel publishes its copy
+ * count before the stopped flag. DMA-copy immediate messages arrive only after
+ * the copy (DOCA producer_dma_copy contract), so every submitted copy must be
+ * observed here before any local or exported mapping can be released. Keep
+ * receive tasks posted until that fence; otherwise a credit-starved kernel
+ * cannot stop. */
 doca_error_t
-dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn)
+dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn)
 {
     struct dmesh_doca_dpa_thread *thread;
     struct dmesh_doca_dpa_comch *comch;
     doca_error_t result;
     uint32_t one = 1, stopped = 0;
-    uint64_t submitted = 0;
-    unsigned spins;
 
     if (conn == NULL || (thread = conn->dpa_thread) == NULL || !thread->running || thread->quiesced)
         return DOCA_SUCCESS;
     comch = conn->dpa_comch;
     if (thread->arg == 0 || thread->thread == NULL || comch == NULL)
         return DOCA_ERROR_BAD_STATE;
-    result = doca_dpa_h2d_memcpy(thread->dpa,
-        thread->arg + offsetof(struct dpa_thread_arg, stop), &one, sizeof(one));
-    if (result != DOCA_SUCCESS)
-        return result;
-    for (spins = 0; spins < 100000; ++spins) {
-        if (conn->objs != NULL && conn->objs->consumer_pe != NULL)
-            (void)doca_pe_progress(conn->objs->consumer_pe);
+    if (dmesh_doca_dpa_failed(thread->dpa))
+        return DOCA_ERROR_BAD_STATE;
+    if (!thread->stop_sent) {
+        result = doca_dpa_h2d_memcpy(thread->dpa,
+            thread->arg + offsetof(struct dpa_thread_arg, stop), &one, sizeof(one));
+        if (result != DOCA_SUCCESS)
+            return result;
+        thread->stop_sent = true;
+        thread->quiesce_deadline_ns = quiesce_deadline_ns();
+    }
+    if (conn->objs != NULL && conn->objs->consumer_pe != NULL)
+        (void)doca_pe_progress(conn->objs->consumer_pe);
+    if (!thread->submitted_known) {
         result = doca_dpa_d2h_memcpy(thread->dpa, &stopped,
             thread->arg + offsetof(struct dpa_thread_arg, stopped), sizeof(stopped));
         if (result != DOCA_SUCCESS)
             return result;
-        if (stopped != 0)
-            break;
+        if (stopped == 0)
+            return monotonic_ns() >= thread->quiesce_deadline_ns ? DOCA_ERROR_TIME_OUT
+                                                                 : DOCA_ERROR_AGAIN;
+        result = doca_dpa_d2h_memcpy(thread->dpa, &thread->submitted,
+            thread->arg + offsetof(struct dpa_thread_arg, dma_submitted), sizeof(thread->submitted));
+        if (result != DOCA_SUCCESS)
+            return result;
+        thread->submitted_known = true;
     }
-    if (stopped == 0)
-        return DOCA_ERROR_TIME_OUT;
-    result = doca_dpa_d2h_memcpy(thread->dpa, &submitted,
-        thread->arg + offsetof(struct dpa_thread_arg, dma_submitted), sizeof(submitted));
-    if (result != DOCA_SUCCESS)
-        return result;
-    for (spins = 0; spins < 100000; ++spins) {
-        if (comch->completion_error || comch->dma_completed > submitted)
-            return DOCA_ERROR_IO_FAILED;
-        if (comch->dma_completed == submitted) {
-            thread->quiesced = true;
-            return DOCA_SUCCESS;
-        }
-        if (conn->objs != NULL && conn->objs->consumer_pe != NULL)
-            (void)doca_pe_progress(conn->objs->consumer_pe);
+    if (comch->completion_error || comch->dma_completed > thread->submitted)
+        return DOCA_ERROR_IO_FAILED;
+    if (comch->dma_completed == thread->submitted) {
+        thread->quiesced = true;
+        return DOCA_SUCCESS;
     }
-    return DOCA_ERROR_TIME_OUT;
+    return monotonic_ns() >= thread->quiesce_deadline_ns ? DOCA_ERROR_TIME_OUT : DOCA_ERROR_AGAIN;
+}
+
+doca_error_t
+dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn)
+{
+    doca_error_t result;
+
+    /* Each blocking call waits a full window, including a retried close. */
+    if (conn != NULL && conn->dpa_thread != NULL && conn->dpa_thread->stop_sent)
+        conn->dpa_thread->quiesce_deadline_ns = quiesce_deadline_ns();
+    while ((result = dmesh_doca_dpa_quiesce_step(conn)) == DOCA_ERROR_AGAIN)
+        ;
+    return result;
 }
 
 static doca_error_t
@@ -946,7 +998,7 @@ dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *thread)
             return result;
         thread->arg = 0;
     }
-    thread->quiesced = false;
+    dpa_thread_run_reset(thread);
     return DOCA_SUCCESS;
 }
 
@@ -1316,7 +1368,7 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
 	}
 
     dpa_thread->running = true;
-    dpa_thread->quiesced = false;
+    dpa_thread_run_reset(dpa_thread);
     result = doca_dpa_thread_run(dpa_thread->thread);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to run DPA thread - %s",
