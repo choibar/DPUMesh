@@ -20,7 +20,7 @@ func main() {
 	ip := os.Getenv("DPUMESH_SERVICE_IP")
 	port, _ := strconv.Atoi(os.Getenv("DPUMESH_SERVICE_PORT"))
 	if ip == "" || port == 0 {
-		log.Fatal("DPUMESH_SERVICE_IP and DPUMESH_SERVICE_PORT select the registry service")
+		log.Fatal("DPUMESH_SERVICE_IP and DPUMESH_SERVICE_PORT select the service address")
 	}
 	lis, err := dmeshgo.ListenAddress(ip, port)
 	if err != nil {

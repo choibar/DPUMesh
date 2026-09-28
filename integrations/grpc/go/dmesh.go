@@ -1,7 +1,7 @@
 // Package dmeshgo adapts the native channel/EQ/QP API to net.Conn and
 // net.Listener. One process owns one channel and one polling goroutine.
-// Configure DPUMESH_PCI_ADDR, DPUMESH_SERVER, DPUMESH_POD_IP,
-// DPUMESH_CONFIG and, for a listener, DPUMESH_SERVICE before starting Go.
+// Configure DPUMESH_PCI_ADDR, DPUMESH_SERVER, DPUMESH_POD_IP and, for a
+// listener, the DPUMESH_SERVICE "<host>:<port>" target before starting Go.
 package dmeshgo
 
 /*
@@ -32,14 +32,13 @@ static void dmesh_go_wait_fd(int fd, int64_t timeout_ns) {
 import "C"
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"strings"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -538,25 +537,25 @@ func (c *Conn) SetWriteDeadline(d time.Time) error {
 	return nil
 }
 
-func serviceAt(ip string, port int) (string, error) {
-	path := envOr("DPUMESH_CONFIG", "/etc/dpumesh/registry")
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
+// servesAt checks that the process's DPUMESH_SERVICE target resolves to
+// ip:port, the address the native library serves once the channel is open.
+func servesAt(ip string, port int) error {
+	target := os.Getenv("DPUMESH_SERVICE")
+	host, p, err := net.SplitHostPort(target)
+	if err != nil || p != strconv.Itoa(port) {
+		return fmt.Errorf("dmesh: DPUMESH_SERVICE %q is not a target on port %d", target, port)
 	}
-	defer f.Close()
-	addr := net.JoinHostPort(ip, fmt.Sprint(port))
-	scan := bufio.NewScanner(f)
-	for scan.Scan() {
-		fields := strings.Fields(strings.SplitN(scan.Text(), "#", 2)[0])
-		if len(fields) == 3 && fields[0] == addr {
-			return fields[1], nil
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return fmt.Errorf("dmesh: DPUMESH_SERVICE %q: %w", target, err)
+	}
+	want := net.ParseIP(ip)
+	for _, a := range addrs {
+		if net.ParseIP(a).Equal(want) {
+			return nil
 		}
 	}
-	if err := scan.Err(); err != nil {
-		return "", err
-	}
-	return "", fmt.Errorf("dmesh: %s is absent from %s", addr, path)
+	return fmt.Errorf("dmesh: DPUMESH_SERVICE %q does not resolve to %s", target, net.JoinHostPort(ip, p))
 }
 func checkConfig(server, pod, workload string) error {
 	for _, value := range [][3]string{{"DPUMESH_SERVER", server, "DPUMesh0"}, {"DPUMESH_POD_IP", pod, ""},
@@ -571,15 +570,11 @@ func Dial(server, srcIP string, srcPort int, dstIP string, dstPort int, workload
 	if err := checkConfig(server, srcIP, workload); err != nil {
 		return nil, err
 	}
-	service, err := serviceAt(dstIP, dstPort)
-	if err != nil {
-		return nil, err
-	}
 	t, err := openTransport()
 	if err != nil {
 		return nil, err
 	}
-	name := C.CString(service)
+	name := C.CString(net.JoinHostPort(dstIP, strconv.Itoa(dstPort)))
 	defer C.free(unsafe.Pointer(name))
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -610,12 +605,8 @@ func Listen(server, svcIP string, svcPort int, workload string) (*Listener, erro
 	if err := checkConfig(server, "", workload); err != nil {
 		return nil, err
 	}
-	service, err := serviceAt(svcIP, svcPort)
-	if err != nil {
+	if err := servesAt(svcIP, svcPort); err != nil {
 		return nil, err
-	}
-	if os.Getenv("DPUMESH_SERVICE") != service {
-		return nil, fmt.Errorf("dmesh: DPUMESH_SERVICE must be %q", service)
 	}
 	t, err := openTransport()
 	if err != nil {

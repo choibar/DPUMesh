@@ -42,7 +42,7 @@ func main() {
 	ip := os.Getenv("DPUMESH_SERVICE_IP")
 	port := envInt("DPUMESH_SERVICE_PORT", 0)
 	if ip == "" || port == 0 {
-		log.Fatal("DPUMESH_SERVICE_IP and DPUMESH_SERVICE_PORT select the registry service")
+		log.Fatal("DPUMESH_SERVICE_IP and DPUMESH_SERVICE_PORT select the service address")
 	}
 	req := bytes.Repeat([]byte{0xAB}, payload)
 

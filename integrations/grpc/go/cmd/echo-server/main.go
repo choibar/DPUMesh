@@ -34,7 +34,7 @@ func main() {
 	}
 }
 
-// The service address is the registry row the DPU routes to this process.
+// The service address is the ClusterIP:port the DPU routes on.
 func serviceIP() string {
 	v := os.Getenv("DPUMESH_SERVICE_IP")
 	if v == "" {

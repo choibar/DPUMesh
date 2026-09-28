@@ -1,4 +1,4 @@
-// Transport-level echo benchmark over dmeshgo: P connections to the registry
+// Transport-level echo benchmark over dmeshgo: P connections to the
 // service at DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT, each streaming fixed-size
 // messages with a bounded number in flight while a reader consumes the echoes.
 // The peer is apps/dma_bench/dpu/dpumesh_dpu in DMESH_MODE=echo, so the
@@ -110,7 +110,7 @@ func main() {
 	ip := os.Getenv("DPUMESH_SERVICE_IP")
 	port := envInt("DPUMESH_SERVICE_PORT", 0)
 	if ip == "" || port == 0 {
-		log.Fatal("DPUMESH_SERVICE_IP and DPUMESH_SERVICE_PORT select the registry service")
+		log.Fatal("DPUMESH_SERVICE_IP and DPUMESH_SERVICE_PORT select the service address")
 	}
 	if window < size {
 		window = size

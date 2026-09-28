@@ -25,16 +25,16 @@ also be rebuilt: the session control protocol is incompatible with the old
 per-flow Comch implementation, although the public C ABI remains version 5.
 The unit tests open no DOCA device.
 
-Configure `DPUMESH_PCI_ADDR`, `DPUMESH_POD_IP`, `DPUMESH_SERVER` and the shared
-`DPUMESH_CONFIG` registry before opening a connection. A server additionally
-sets `DPUMESH_SERVICE`. [Root configuration](../../../README.md#configuration)
-defines these values. The older `Dial`/`Listen` signatures accept only labels
+Configure `DPUMESH_PCI_ADDR`, `DPUMESH_POD_IP` and `DPUMESH_SERVER` before
+opening a connection. A server additionally sets `DPUMESH_SERVICE` to a
+`<host>:<port>` target that resolves to its listen address.
+[Root configuration](../../../README.md#configuration) defines these values. The older `Dial`/`Listen` signatures accept only labels
 that agree with this process configuration; they do not create separate
 physical registrations.
 
 Use `DialContext(ctx, serviceIP, port)` in `grpc.WithContextDialer` and
 `ListenAddress(serviceIP, port)` with `grpc.Server.Serve`. A service address
-identifies a registry entry; the DPU chooses its native backend. The examples
+is a Service ClusterIP and port; the DPU chooses its native backend. The examples
 in `cmd/echo-client` and `cmd/echo-server` run the standard gRPC health RPC
 against `DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT`.
 Close all connections and listeners before calling `CloseTransport`. It returns
