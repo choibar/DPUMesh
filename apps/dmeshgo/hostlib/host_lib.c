@@ -33,25 +33,6 @@
 
 DOCA_LOG_REGISTER(HOST_LIB);
 
-/*
- * DPU-side symbols referenced by shared translation units but never reached on
- * the host path; stubbed so the shared library links without the DPU objects.
- */
-struct doca_comch_connection;
-doca_error_t
-server_send_msg_conn(struct objects *objs, struct doca_comch_connection *connection,
-		     const char *msg, size_t len)
-{
-    (void)objs; (void)connection; (void)msg; (void)len;
-    return DOCA_ERROR_NOT_SUPPORTED;
-}
-
-void
-cleanup_dma_tasks(struct dmesh_conn *conn)
-{
-    (void)conn;
-}
-
 #define DMESH_LIB_PENDING_SIZE (8 * 1024 * 1024)
 
 struct dmesh_chan {

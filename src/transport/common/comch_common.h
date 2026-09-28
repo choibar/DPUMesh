@@ -158,6 +158,13 @@ struct dmesh_comch_msg {
 struct dmesh_conn;
 
 /* Build metadata without sending it; channel sessions add the flow envelope. */
+struct dma_ring;
+struct dmesh_buffer;
+doca_error_t dmesh_build_dma_metadata(struct doca_dev *dev, const struct dma_ring *ring,
+    const struct dmesh_buffer *sndbuf, const struct dmesh_buffer *rcvbuf,
+    const struct dmesh_flow_id *flow, struct dmesh_export_metadata_msg *msg);
+doca_error_t dmesh_validate_reverse_metadata(const struct dmesh_export_rcv_ring_msg *msg);
+
 doca_error_t
 build_dma_metadata(struct objects *objs, struct dmesh_export_metadata_msg *msg);
 doca_error_t

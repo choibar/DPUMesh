@@ -56,6 +56,7 @@ dpu_srcs = files(
 )
 host_srcs = files(
   'host/comch_client.c',
+  'host/comch_client_legacy.c',
 )
 # The host library's channel layer. host_stubs.c stubs the two server-side
 # symbols the shared sources reference, so this archive must never be linked

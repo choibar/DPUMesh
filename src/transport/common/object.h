@@ -11,6 +11,8 @@
 #include "buffer.h"
 #include "comch_server.h"
 #include "comch_common.h"
+#include "comch_client.h"
+#include "dpa.h"
 
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
@@ -81,15 +83,6 @@ struct dma_pending_copy {
     uint32_t length;
 };
 #define DMA_PENDING_MAX 8192
-
-/* A completed recv segment: bytes the DPA DMA-copied into the connection's
- * staging buffer at [pos, pos+len). Consumed zero-copy by the Rust side, which
- * reads directly from the mapped staging region. */
-struct dmesh_recv_seg {
-    uint32_t pos;
-    uint32_t len;
-};
-#define DMESH_RECV_SEG_MAX 8192
 
 /* All DPU-side state owned by one host connection. The shared infrastructure
  * (device, PEs, comch server, DPA instance/pool, DMA engine) stays in
@@ -200,6 +193,7 @@ struct dmesh_doca_objects {
 };
 
 struct objects {
+    struct dmesh_comch_client legacy_client; /* compatibility adapter, not used by native channels */
     int worker_idx;                 /* index of the owning worker thread */
     struct doca_dev *dev;
     struct doca_dev_rep *rep_dev;

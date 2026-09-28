@@ -10,7 +10,7 @@ project('dmesh-hostlib', 'c',
 # — the push channel as a byte stream. It has no host DPA, so it compiles the
 # DPA-free transport sources directly instead of linking libdmesh_common.a
 # (whose dpa.c would drag in the non-PIC dpa_kernel.a); the DPU-side symbols
-# the shared sources reference are stubbed in host_lib.c. Keep this list in
+# the shared sources reference are stubbed in host/host_stubs.c. Keep this list in
 # step with common_nodpa_srcs in src/transport/meson.build.
 add_project_arguments('-D DOCA_ALLOW_EXPERIMENTAL_API', language : 'c')
 
@@ -24,6 +24,8 @@ srcs = files(
   transport / 'common' / 'comch_consumer.c',
   transport / 'common' / 'comch_producer.c',
   transport / 'host' / 'comch_client.c',
+  transport / 'host' / 'comch_client_legacy.c',
+  transport / 'host' / 'host_stubs.c',
   'host_lib.c',
 )
 inc_dirs = include_directories('/opt/mellanox/doca/include/', '.',

@@ -61,6 +61,9 @@ struct dmesh_doca_dpa_msgq {
 };
 
 struct dmesh_doca_dpa_comch {
+    void *owner;
+    void (*received)(void *owner, uint32_t pos, uint32_t len, uint32_t count);
+    void (*sent)(void *owner);
     uint64_t dma_completed;         /* one immediate message after each DMA copy */
     bool completion_error, stopping;
     bool producer_comp_started, consumer_comp_started;
@@ -69,6 +72,29 @@ struct dmesh_doca_dpa_comch {
 	struct dmesh_doca_dpa_msgq recv;			      /**< MsgQ used to receive message DPA */
 	struct doca_comch_consumer_completion *consumer_comp; /**< The consumer completion context used by DPA */
 };
+
+/* Small execution endpoint shared by host reverse DMA and DPU helpers.
+ * PE/thread/completions must retire before the owner or its mappings. */
+#define DMESH_RECV_SEG_MAX 8192
+struct dmesh_recv_seg { uint32_t pos, len; };
+struct dmesh_dpa_endpoint {
+    struct doca_pe *pe;
+    struct dmesh_doca_dpa_thread *dpa_thread;
+    struct dmesh_doca_dpa_comch *dpa_comch;
+    struct doca_buf_arr *buf_arr;
+    struct dmesh_recv_seg *recv_segs;
+    int recv_seg_head, recv_seg_cnt;
+    long recv_seg_dropped;
+};
+
+doca_error_t dmesh_dpa_comch_create(struct dmesh_doca_dpa_thread *thread,
+                                   struct dmesh_doca_dpa_comch **out);
+doca_error_t dmesh_dpa_quiesce_step(struct dmesh_doca_dpa_thread *thread,
+                                   struct dmesh_doca_dpa_comch *comch, struct doca_pe *pe);
+doca_error_t dmesh_dpa_quiesce_checked(struct dmesh_doca_dpa_thread *thread,
+                                      struct dmesh_doca_dpa_comch *comch, struct doca_pe *pe);
+doca_error_t dmesh_dpa_comch_destroy_checked(struct dmesh_doca_dpa_thread *thread,
+                                            struct dmesh_doca_dpa_comch **comch, struct doca_pe *pe);
 
 struct dmesh_doca_dpa_msgq_create_attr {
 	struct doca_dev *dev; /**< A doca device representing the emulation manager */

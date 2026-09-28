@@ -22,13 +22,13 @@ HOST_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -DDOCA_ALLOW_EXPERI
 # channel layer. Keep in step with src/transport/meson.build.
 TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c comch_common.c \
     comch_consumer.c comch_producer.c comch_msgq.c dpa.c ring.c) \
-    $(addprefix $(TRANSPORT)/host/,comch_client.c channel.c host_stubs.c)
+    $(addprefix $(TRANSPORT)/host/,comch_client.c comch_client_legacy.c channel.c host_stubs.c)
 TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
 HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
-    channel_session_test session_server_test dma_cleanup_test dpa_cleanup_test
+    channel_session_test comch_client_test session_server_test dma_cleanup_test dpa_cleanup_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
 .PHONY: all lib test test-native-headers test-abi examples clean
@@ -71,14 +71,18 @@ $(TESTDIR)/session_flow_test: tests/session_flow_test.c $(TRANSPORT)/common/obje
 $(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
+$(TESTDIR)/comch_client_test: tests/comch_client_test.c $(TRANSPORT)/host/comch_client.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
+
 $(TESTDIR)/session_server_test: tests/session_server_test.c $(TRANSPORT)/common/object.c $(TRANSPORT)/dpu/comch_server.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/common/object.c -Wl,--gc-sections $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/dma_cleanup_test: tests/dma_cleanup_test.c $(TRANSPORT)/dpu/dma.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
 
-$(TESTDIR)/dpa_cleanup_test: tests/dpa_cleanup_test.c $(TRANSPORT)/common/dpa.c $(TRANSPORT_HDRS) | $(TESTDIR)
+$(TESTDIR)/dpa_cleanup_test: tests/dpa_cleanup_test.c $(TRANSPORT)/common/dpa.c $(TRANSPORT)/common/comch_msgq.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -DDMESH_DPA_QUIESCE_TIMEOUT_MS=20 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
+
 
 $(TESTDIR)/carrier_logic_test: tests/carrier_logic_test.c src/core/carrier.c src/core/carrier_logic.h $(TRANSPORT)/host/channel.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread -o $@

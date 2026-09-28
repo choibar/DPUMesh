@@ -6,6 +6,7 @@
 /* Test real fences, receive callbacks and destruction order. SDK substitutes
  * below only model device state/failures; no DPA/device is created or run. */
 #include "../src/transport/common/dpa.c"
+#include "../src/transport/common/comch_msgq.c"
 
 enum operation {
     OP_NONE, OP_WRITE_STOP, OP_READ_STOPPED, OP_READ_COUNT, OP_CTX_QUERY,
@@ -136,7 +137,7 @@ uint8_t doca_pe_progress(struct doca_pe *pe)
         --f->deliveries;
         f->recv.submitted = false;
         dmesh_doca_dpa_msgq_recv_cb((void *)&f->recv, (union doca_data){0},
-                                   (union doca_data){.ptr = conn()});
+                                   (union doca_data){.ptr = conn()->dpa_comch});
         return 1;
     }
     return 0;
@@ -228,6 +229,9 @@ static void create_fixture(void)
     conn()->dpa_thread = &f->thread;
     conn()->dpa_comch = calloc(1, sizeof(*conn()->dpa_comch));
     assert(conn()->dpa_comch);
+    conn()->dpa_comch->owner = conn();
+    conn()->dpa_comch->received = conn_received;
+    conn()->dpa_comch->sent = conn_sent;
     f->objs.consumer_pe = (void *)&f->objs;
     f->thread.dpa = (void *)f;
     f->thread.thread = (void *)&f->thread;
@@ -386,32 +390,32 @@ static void test_recv_counter_and_shutdown(void)
     create_fixture();
     f->recv.message.count = 9;
     dmesh_doca_dpa_msgq_recv_cb((void *)&f->recv, (union doca_data){0},
-                               (union doca_data){.ptr = conn()});
+                               (union doca_data){.ptr = conn()->dpa_comch});
     assert(conn()->dpa_comch->dma_completed == 1 && f->objs.recv_msg_cnt == 9);
     assert(f->reposts == 1 && f->task_frees == 0);
     f->recv.submitted = false;
     f->recv.message.type = (enum comch_msg_type)UINT16_MAX;
     dmesh_doca_dpa_msgq_recv_cb((void *)&f->recv, (union doca_data){0},
-                               (union doca_data){.ptr = conn()});
+                               (union doca_data){.ptr = conn()->dpa_comch});
     assert(conn()->dpa_comch->dma_completed == 1 && f->objs.recv_msg_cnt == 9);
     assert(f->reposts == 2 && conn()->dpa_comch->completion_error);
     conn()->dpa_comch->stopping = true;
     f->recv.submitted = false;
     dmesh_doca_dpa_msgq_recv_cb((void *)&f->recv, (union doca_data){0},
-                               (union doca_data){.ptr = conn()});
+                               (union doca_data){.ptr = conn()->dpa_comch});
     assert(f->reposts == 2 && f->task_frees == 1);
     release_fixture();
 
     create_fixture();
     dmesh_doca_dpa_msgq_recv_error_cb((void *)&f->recv, (union doca_data){0},
-                                     (union doca_data){.ptr = conn()});
+                                     (union doca_data){.ptr = conn()->dpa_comch});
     assert(conn()->dpa_comch->completion_error && f->task_frees == 1);
     assert(dmesh_doca_dpa_quiesce_checked(conn()) == DOCA_ERROR_IO_FAILED);
     release_fixture();
     create_fixture();
     conn()->dpa_comch->stopping = true;
     dmesh_doca_dpa_msgq_recv_error_cb((void *)&f->recv, (union doca_data){0},
-                                     (union doca_data){.ptr = conn()});
+                                     (union doca_data){.ptr = conn()->dpa_comch});
     assert(!conn()->dpa_comch->completion_error && f->task_frees == 1);
     release_fixture();
 }
@@ -425,7 +429,7 @@ static void test_malformed_completion_cannot_satisfy_fence(void)
         create_fixture();
         f->recv.length = lengths[i];
         dmesh_doca_dpa_msgq_recv_cb((void *)&f->recv, (union doca_data){0},
-                                   (union doca_data){.ptr = conn()});
+                                   (union doca_data){.ptr = conn()->dpa_comch});
         assert(conn()->dpa_comch->completion_error);
         assert(conn()->dpa_comch->dma_completed == 0 && f->objs.recv_msg_cnt == 0);
         assert(dmesh_doca_dpa_quiesce_checked(conn()) == DOCA_ERROR_IO_FAILED);
@@ -506,8 +510,43 @@ static void test_thread_destroy_retry(void)
     release_fixture();
 }
 
+/* Native host completion delivery has no objects/dmesh_conn owner. Exercise
+ * the same SDK callback and close fence with the small endpoint as its sink. */
+static void test_host_endpoint_completion(void)
+{
+    create_fixture();
+    struct dmesh_dpa_endpoint ep = {
+        .pe = (void *)&f->objs, .dpa_thread = &f->thread,
+        .dpa_comch = conn()->dpa_comch, .recv_seg_head = DMESH_RECV_SEG_MAX - 1,
+        .recv_segs = calloc(DMESH_RECV_SEG_MAX, sizeof(struct dmesh_recv_seg)),
+    };
+    assert(ep.recv_segs);
+    ep.dpa_comch->owner = &ep;
+    ep.dpa_comch->received = endpoint_received;
+    ep.dpa_comch->sent = NULL;
+    for (unsigned i = 0; i < 2; ++i) {
+        f->recv.submitted = false;
+        f->recv.message.pos = i * 32;
+        dmesh_doca_dpa_msgq_recv_cb((void *)&f->recv, (union doca_data){0},
+                                   (union doca_data){.ptr = ep.dpa_comch});
+    }
+    assert(ep.recv_seg_cnt == 2 && ep.recv_segs[DMESH_RECV_SEG_MAX - 1].pos == 0);
+    assert(ep.recv_segs[0].pos == 32 && ep.recv_segs[0].len == 32);
+    assert(ep.dpa_comch->dma_completed == 2 && f->objs.recv_msg_cnt == 0);
+    /* Queue pressure must not overwrite a segment still held by the host. */
+    ep.recv_seg_cnt = DMESH_RECV_SEG_MAX;
+    endpoint_received(&ep, 999, 32, 1);
+    assert(ep.recv_seg_dropped == 1 && ep.recv_segs[0].pos == 32);
+    f->args.dma_submitted = 2;
+    assert(dmesh_dpa_quiesce_checked(ep.dpa_thread, ep.dpa_comch, ep.pe) == DOCA_SUCCESS);
+    assert(ep.dpa_thread->quiesced);
+    free(ep.recv_segs);
+    release_fixture();
+}
+
 int main(void)
 {
+    test_host_endpoint_completion();
     test_quiesce_requires_copy_completion();
     test_quiesce_faults();
     test_quiesce_step_never_waits();

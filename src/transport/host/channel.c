@@ -19,12 +19,10 @@
 #include "comch_client.h"
 #include "comch_common.h"
 #include "comch_msgq.h"
-#include "comch_producer.h"
 #include "common.h"
 #include "dma.h"
 #include "dpa.h"
 #include "dpa_common.h"
-#include "object.h"
 #include "ring.h"
 #include "session_protocol.h"
 
@@ -73,16 +71,16 @@ struct channel_dev {
 	 * No shared control fd is registered in competing EQs; the existing carrier
 	 * fallback tick drives control progress from whichever EQ is awake. */
 	pthread_mutex_t session_lock;
-	struct objects *control;
+	struct dmesh_comch_client *control;
 	struct channel_conn *flows[33];
 	uint32_t generations[33];
 	int hello_ready;
 	int session_error;
 	int host_dpa;                       /* Nonzero: the host-dpa reverse path */
-	struct objects *rev;                /* Pull: the DPA device (rev->dev, rev->dpa_pool->dpa) */
-	struct dmesh_dpa_thread_pool *rev_pool;
-	struct doca_dev *base_dev;          /* Pull: the PF that hosts the DPA process */
-	struct doca_dpa *base_dpa;          /* == rev_pool->dpa unless extended to an SF */
+    struct doca_dev *reverse_dev;       /* base PF or optional SF */
+    struct doca_dpa *reverse_dpa;       /* base context or SF extension */
+    struct doca_dev *base_dev;
+    struct doca_dpa *base_dpa;
 };
 
 struct channel_mem {
@@ -94,8 +92,10 @@ struct channel_mem {
 };
 
 struct channel_conn {
-	struct objects *objs;
-	struct channel_dev *dev;
+    struct channel_dev *dev;
+    struct dma_ring *forward_ring;
+    struct dmesh_export_rcv_ring_msg reverse_metadata;
+    bool reverse_ready;
 	doca_dpa_dev_mmap_t tx_dpa;
 	volatile struct dmesh_push_desc *descs;
 	volatile struct dmesh_push_cursor *cursor;
@@ -104,9 +104,7 @@ struct channel_conn {
 	uint32_t flow_id, generation;
 	int open_sent, ready, peer_closed, error, close_sent, close_error;
 	/* host-dpa reverse path */
-	struct dmesh_conn *rc;              /* The reverse connection on the DPA device */
-	struct objects *ro;                 /* rc's objects: the shared DPA device + this connection's own PE
-	                                     * (a progress engine is single-owner; each slot polls its own) */
+    struct dmesh_dpa_endpoint *reverse;
 	struct doca_mmap *tx_mmap;          /* Imported DPU tx_staging */
 	struct doca_mmap *ring_mmap;        /* Imported DPU rcv_ring */
 	uint64_t rx_seq;                    /* Segments delivered to the carrier */
@@ -199,9 +197,9 @@ int channel_dev_host_dpa(const struct channel_dev *dev)
 
 /* Called only from the control PE while session_lock is held. A flow id is
  * reusable only after CLOSED; generation checks discard delayed old replies. */
-static void session_message(struct objects *objs, const uint8_t *data, size_t len)
+static void session_message(void *owner, const uint8_t *data, size_t len)
 {
-	struct channel_dev *dev = objs->control_message_data;
+	struct channel_dev *dev = owner;
 	struct dmesh_session_header h;
 	const uint8_t *payload;
 	if (dmesh_session_decode(data, len, &h, &payload) != 0) {
@@ -226,15 +224,19 @@ static void session_message(struct objects *objs, const uint8_t *data, size_t le
 		else conn->ready = 1;
 		break;
 	case DMESH_SESSION_REVERSE_EXPORT:
-		if (h.status || h.payload_len != sizeof(conn->objs->rev_msg)) {
+		if (h.status || h.payload_len != sizeof(conn->reverse_metadata)) {
 			conn->error = h.status ? h.status : EPROTO;
 			break;
 		}
-		if (conn->objs->reverse_ready) break;
+		if (conn->reverse_ready) break;
 		struct dmesh_export_rcv_ring_msg export;
 		memcpy(&export, payload, sizeof(export));
-		if (process_export_rcv_ring_msg(conn->objs, &export) != DOCA_SUCCESS)
-			conn->error = EPROTO;
+		if (dmesh_validate_reverse_metadata(&export) != DOCA_SUCCESS)
+            conn->error = EPROTO;
+        else {
+            conn->reverse_metadata = export;
+            conn->reverse_ready = true;
+        }
 		break;
 	case DMESH_SESSION_CLOSED:
 		if (h.status) conn->close_error = h.status;
@@ -273,7 +275,7 @@ static int session_send_locked(struct channel_dev *dev, uint16_t type,
 	uint8_t frame[DMESH_SESSION_MAX_FRAME];
 	size_t len = dmesh_session_encode(frame, sizeof(frame), type, id, generation, 0, payload, bytes);
 	if (!len) { errno = EINVAL; return -1; }
-	doca_error_t result = client_send_msg(dev->control, (const char *)frame, len);
+	doca_error_t result = dmesh_comch_client_send(dev->control, (const char *)frame, len);
 	if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
 	return 0;
 }
@@ -292,7 +294,7 @@ static int session_wait_locked(struct channel_dev *dev, struct channel_conn *con
 			if (conn->close_error) { errno = conn->close_error; return -1; }
 		} else {
 			if (conn->error || conn->peer_closed) { errno = conn->error ? conn->error : ECONNRESET; return -1; }
-			if (conn->ready && (!dev->host_dpa || conn->objs->reverse_ready)) return 0;
+			if (conn->ready && (!dev->host_dpa || conn->reverse_ready)) return 0;
 		}
 		if (channel_now_ms() >= deadline) { errno = ETIMEDOUT; return -1; }
 		/* The wait owns only this flow; another EQ may progress the shared
@@ -311,9 +313,9 @@ int channel_session_open(struct channel_dev *dev, const char *server)
 	dev->control = calloc(1, sizeof(*dev->control));
 	if (!dev->control) { pthread_mutex_unlock(&dev->session_lock); return -1; }
 	dev->control->dev = dev->dev;
-	dev->control->control_message_cb = session_message;
-	dev->control->control_message_data = dev;
-	doca_error_t result = init_comch_ctrl_path_client(server, dev->control, false);
+	dev->control->message = session_message;
+	dev->control->owner = dev;
+	doca_error_t result = dmesh_comch_client_open(server, dev->control);
 	int rc = -1;
 	if (result != DOCA_SUCCESS) errno = error_number(result);
 	else if (session_send_locked(dev, DMESH_SESSION_HELLO, 0, 0, NULL, 0) == 0)
@@ -329,19 +331,19 @@ int channel_session_close(struct channel_dev *dev)
 	for (int i = 1; i <= 32; ++i)
 		if (dev->flows[i] && channel_conn_close(dev->flows[i]) != 0) return -1;
 	pthread_mutex_lock(&dev->session_lock);
-	struct objects *objs = dev->control;
-	if (objs && objs->cc_client) {
-		struct doca_ctx *ctx = doca_comch_client_as_ctx(objs->cc_client);
+	struct dmesh_comch_client *control = dev->control;
+	if (control && control->cc_client) {
+		struct doca_ctx *ctx = doca_comch_client_as_ctx(control->cc_client);
 		(void)doca_ctx_stop(ctx);
-		if (wait_ctx_idle(ctx, objs->pe) != 0 || doca_comch_client_destroy(objs->cc_client) != DOCA_SUCCESS) {
+		if (wait_ctx_idle(ctx, control->pe) != 0 || doca_comch_client_destroy(control->cc_client) != DOCA_SUCCESS) {
 			pthread_mutex_unlock(&dev->session_lock); errno = EIO; return -1;
 		}
-		objs->cc_client = NULL;
+		control->cc_client = NULL;
 	}
-	if (objs && objs->pe && doca_pe_destroy(objs->pe) != DOCA_SUCCESS) {
+	if (control && control->pe && doca_pe_destroy(control->pe) != DOCA_SUCCESS) {
 		pthread_mutex_unlock(&dev->session_lock); errno = EIO; return -1;
 	}
-	free(objs);
+	free(control);
 	dev->control = NULL;
 	pthread_mutex_unlock(&dev->session_lock);
 	return 0;
@@ -379,11 +381,6 @@ static doca_error_t open_pull_dpa(struct channel_dev *dev, const char *pci)
 	if (rev_pci == NULL || *rev_pci == '\0')
 		rev_pci = CHANNEL_DEFAULT_REV_PCI;
 
-	dev->rev = calloc(1, sizeof(*dev->rev));
-	dev->rev_pool = calloc(1, sizeof(*dev->rev_pool));
-	if (dev->rev == NULL || dev->rev_pool == NULL)
-		return DOCA_ERROR_NO_MEMORY;
-	dev->rev->dpa_pool = dev->rev_pool;
 
 	result = open_doca_device_with_pci(rev_pci, NULL, &dev->base_dev);
 	if (result != DOCA_SUCCESS) {
@@ -402,15 +399,15 @@ static doca_error_t open_pull_dpa(struct channel_dev *dev, const char *pci)
 	}
 
 	if (rev_dev == NULL || *rev_dev == '\0') {
-		dev->rev->dev = dev->base_dev;
-		dev->rev_pool->dpa = dev->base_dpa;
+		dev->reverse_dev = dev->base_dev;
+		dev->reverse_dpa = dev->base_dpa;
 		DOCA_LOG_INFO("host-dpa reverse path: host DPA on %s, Comch on %s", rev_pci, pci);
 		return DOCA_SUCCESS;
 	}
 
-	result = open_doca_device_with_ibdev_name((const uint8_t *)rev_dev, strlen(rev_dev), NULL, &dev->rev->dev);
+	result = open_doca_device_with_ibdev_name((const uint8_t *)rev_dev, strlen(rev_dev), NULL, &dev->reverse_dev);
 	if (result == DOCA_SUCCESS)
-		result = doca_dpa_device_extend(dev->base_dpa, dev->rev->dev, &dev->rev_pool->dpa);
+		result = doca_dpa_device_extend(dev->base_dpa, dev->reverse_dev, &dev->reverse_dpa);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to extend the DPA process on %s to %s with error = %s", rev_pci, rev_dev,
 			     doca_error_get_name(result));
@@ -464,20 +461,16 @@ void channel_dev_close(struct channel_dev *dev)
 		return;
 
 	if (channel_session_close(dev) != 0) return;
-	if (dev->rev != NULL) {
-		/* an extended context goes before its base */
-		if (dev->rev_pool != NULL && dev->rev_pool->dpa != NULL && dev->rev_pool->dpa != dev->base_dpa)
-			(void)doca_dpa_destroy(dev->rev_pool->dpa);
-		if (dev->base_dpa != NULL)
-			(void)doca_dpa_destroy(dev->base_dpa);
-		if (dev->rev->dev != NULL && dev->rev->dev != dev->base_dev)
-			(void)doca_dev_close(dev->rev->dev);
-		if (dev->base_dev != NULL)
-			(void)doca_dev_close(dev->base_dev);
-		free(dev->rev_pool);
-		free(dev->rev->dpa_comch);
-		free(dev->rev);
-	}
+    /* An extended context owns SF resources and retires before its base. */
+    if (dev->reverse_dpa != NULL && dev->reverse_dpa != dev->base_dpa)
+        (void)doca_dpa_destroy(dev->reverse_dpa);
+    if (dev->base_dpa != NULL)
+        (void)doca_dpa_destroy(dev->base_dpa);
+    if (dev->reverse_dev != NULL && dev->reverse_dev != dev->base_dev)
+        (void)doca_dev_close(dev->reverse_dev);
+    if (dev->base_dev != NULL) {
+        (void)doca_dev_close(dev->base_dev);
+    }
 	if (dev->dev != NULL)
 		(void)doca_dev_close(dev->dev);
 	pthread_mutex_destroy(&dev->session_lock);
@@ -572,7 +565,7 @@ out:
 int channel_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem **out)
 {
 	struct channel_mem *mem;
-	struct doca_dev *dev2 = dev->host_dpa ? dev->rev->dev : NULL;
+	struct doca_dev *dev2 = dev->host_dpa ? dev->reverse_dev : NULL;
 	doca_error_t result;
 
 	mem = calloc(1, sizeof(*mem));
@@ -636,13 +629,13 @@ void channel_mem_free(struct channel_mem *mem)
  */
 static int host_dpa_teardown(struct channel_conn *conn)
 {
-	struct dmesh_conn *rc = conn->rc;
+	struct dmesh_dpa_endpoint *rc = conn->reverse;
 	doca_error_t result;
 
 	if (rc != NULL) {
-		result = dmesh_doca_dpa_quiesce_checked(rc);
+		result = dmesh_dpa_quiesce_checked(rc->dpa_thread, rc->dpa_comch, rc->pe);
 		if (result != DOCA_SUCCESS) goto fail;
-		result = dmesh_doca_dpa_comch_destroy_checked(rc);
+		result = dmesh_dpa_comch_destroy_checked(rc->dpa_thread, &rc->dpa_comch, rc->pe);
 		if (result != DOCA_SUCCESS) goto fail;
 		if (rc->buf_arr != NULL) {
 			result = doca_buf_arr_destroy(rc->buf_arr);
@@ -656,10 +649,10 @@ static int host_dpa_teardown(struct channel_conn *conn)
 			rc->dpa_thread = NULL;
 		}
 	}
-	if (conn->ro != NULL && conn->ro->consumer_pe != NULL) {
-		result = doca_pe_destroy(conn->ro->consumer_pe);
+	if (conn->reverse != NULL && conn->reverse->pe != NULL) {
+		result = doca_pe_destroy(conn->reverse->pe);
 		if (result != DOCA_SUCCESS) goto fail;
-		conn->ro->consumer_pe = NULL;
+		conn->reverse->pe = NULL;
 	}
 	/* Imported mmaps cannot be explicitly stopped; destroy implicitly stops.
 	 * All their DMA users and buffer arrays have retired before this point. */
@@ -676,10 +669,8 @@ static int host_dpa_teardown(struct channel_conn *conn)
 	if (rc != NULL) {
 		free(rc->recv_segs);
 		free(rc);
-		conn->rc = NULL;
+		conn->reverse = NULL;
 	}
-	free(conn->ro);
-	conn->ro = NULL;
 	return 0;
 fail:
 	errno = error_number(result);
@@ -699,14 +690,13 @@ fail:
  */
 static doca_error_t host_dpa_import_exports(struct channel_conn *conn)
 {
-	struct objects *objs = conn->objs;
 	struct channel_dev *dev = conn->dev;
 	doca_error_t result;
 
-	result = doca_mmap_create_from_export(NULL, objs->rev_msg.tx_desc, objs->rev_msg.tx_desc_len,
-					      dev->rev->dev, &conn->tx_mmap);
+	result = doca_mmap_create_from_export(NULL, conn->reverse_metadata.tx_desc, conn->reverse_metadata.tx_desc_len,
+					      dev->reverse_dev, &conn->tx_mmap);
 	if (result == DOCA_SUCCESS)
-		result = doca_mmap_create_from_export(NULL, objs->rev_msg.ring_desc, objs->rev_msg.ring_desc_len,
+		result = doca_mmap_create_from_export(NULL, conn->reverse_metadata.ring_desc, conn->reverse_metadata.ring_desc_len,
 						      dev->base_dev, &conn->ring_mmap);
 	if (result != DOCA_SUCCESS)
 		DOCA_LOG_ERR("Failed to import the DPU exports with error = %s", doca_error_get_name(result));
@@ -722,38 +712,26 @@ static doca_error_t host_dpa_import_exports(struct channel_conn *conn)
 static doca_error_t host_dpa_create_thread(struct channel_conn *conn)
 {
 	struct channel_dev *dev = conn->dev;
-	struct dmesh_conn *rc;
+	struct dmesh_dpa_endpoint *rc;
 	doca_error_t result;
 
-	/* rc's objects: the shared DPA device with this connection's own PE */
-	conn->ro = calloc(1, sizeof(*conn->ro));
-	if (conn->ro == NULL)
-		return DOCA_ERROR_NO_MEMORY;
-	conn->ro->dev = dev->rev->dev;
-	conn->ro->dpa_pool = dev->rev->dpa_pool;
-	conn->ro->dpa_comch = dev->rev->dpa_comch;
-	result = doca_pe_create(&conn->ro->consumer_pe);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to create PE with error = %s", doca_error_get_name(result));
-		return result;
-	}
+    rc = calloc(1, sizeof(*rc));
+    if (rc == NULL) return DOCA_ERROR_NO_MEMORY;
+    conn->reverse = rc;
+    result = doca_pe_create(&rc->pe);
+    if (result != DOCA_SUCCESS) return result;
 
-	rc = calloc(1, sizeof(*rc));
-	if (rc == NULL)
-		return DOCA_ERROR_NO_MEMORY;
-	conn->rc = rc;
-	rc->objs = conn->ro;
 	rc->dpa_thread = calloc(1, sizeof(*rc->dpa_thread));
 	if (rc->dpa_thread == NULL)
 		return DOCA_ERROR_NO_MEMORY;
-	rc->dpa_thread->dpa = dev->rev->dpa_pool->dpa;
+	rc->dpa_thread->dpa = dev->reverse_dpa;
 
 	result = dmesh_doca_dpa_thread_create(rc->dpa_thread);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to create DPA thread with error = %s", doca_error_get_name(result));
 		return result;
 	}
-	result = init_comch_dpa_msgq(rc, conn->ro->consumer_pe);
+	result = dmesh_dpa_endpoint_init_comch(rc, dev->reverse_dev);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init DPA msgqs with error = %s", doca_error_get_name(result));
 		return result;
@@ -790,7 +768,7 @@ static doca_error_t host_dpa_create_thread(struct channel_conn *conn)
 static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct channel_conn_config *cfg)
 {
 	struct channel_dev *dev = conn->dev;
-	struct dmesh_conn *rc = conn->rc;
+	struct dmesh_dpa_endpoint *rc = conn->reverse;
 	struct dpa_thread_arg arg;
 	doca_dpa_dev_comch_consumer_completion_t consumer_comp;
 	doca_dpa_dev_completion_t producer_comp;
@@ -815,9 +793,9 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 	if (result == DOCA_SUCCESS)
 		result = doca_buf_arr_get_dpa_handle(rc->buf_arr, &buf_arr);
 	if (result == DOCA_SUCCESS)
-		result = doca_mmap_dev_get_dpa_handle(conn->tx_mmap, dev->rev->dev, &src_mmap);
-	if (result == DOCA_SUCCESS && dev->rev->dpa_pool->dpa != dev->base_dpa)
-		result = doca_dpa_get_dpa_handle(dev->rev->dpa_pool->dpa, &dpa_dev); /* extended: the kernel switches device */
+		result = doca_mmap_dev_get_dpa_handle(conn->tx_mmap, dev->reverse_dev, &src_mmap);
+	if (result == DOCA_SUCCESS && dev->reverse_dpa != dev->base_dpa)
+		result = doca_dpa_get_dpa_handle(dev->reverse_dpa, &dpa_dev); /* extended: the kernel switches device */
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to get DPA handles with error = %s", doca_error_get_name(result));
 		return result;
@@ -898,17 +876,15 @@ static doca_error_t host_dpa_setup(struct channel_conn *conn, const struct chann
  */
 static int conn_teardown(struct channel_conn *conn)
 {
-	struct objects *objs = conn->objs;
 	/* Only reached before OPEN or after confirmed CLOSED and reverse quiescence. */
-	if (objs->dma_ring != NULL) {
-		if (objs->dma_ring->mmap != NULL) {
-			doca_error_t result = destroy_mmap_and_free_buffer(objs->dma_ring->mmap, objs->dma_ring->buffer);
+	if (conn->forward_ring != NULL) {
+		if (conn->forward_ring->mmap != NULL) {
+			doca_error_t result = destroy_mmap_and_free_buffer(conn->forward_ring->mmap, conn->forward_ring->buffer);
 			if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
 		}
-		free(objs->dma_ring);
+		free(conn->forward_ring);
 	}
 	/* All other memory and the control PE belong to the channel. */
-	free(objs);
 	free(conn);
 	return 0;
 }
@@ -916,23 +892,17 @@ static int conn_teardown(struct channel_conn *conn)
 int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
 {
 	struct channel_conn *conn;
-	struct objects *objs;
 	doca_error_t result;
 	if (!dev || !cfg || !out || !cfg->flow_id || cfg->flow_id > 32 || !cfg->tx || !cfg->rx ||
 	    cfg->rx_offset > cfg->rx->bytes || CHANNEL_WINDOW > cfg->rx->bytes - cfg->rx_offset) { errno = EINVAL; return -1; }
 	*out = NULL;
 
 	conn = calloc(1, sizeof(*conn));
-	objs = conn != NULL ? calloc(1, sizeof(*objs)) : NULL;
-	if (conn == NULL || objs == NULL) {
-		free(conn);
-		free(objs);
+    if (conn == NULL) {
 		errno = ENOMEM;
 		return -1;
 	}
-	conn->objs = objs;
 	conn->dev = dev;
-	objs->dev = dev->dev;
 
 	/* Install the flow before OPEN, so any completion is routed by id+generation. */
 	pthread_mutex_lock(&dev->session_lock);
@@ -950,29 +920,31 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 	dev->flows[conn->flow_id] = conn;
 	pthread_mutex_unlock(&dev->session_lock);
 
+	struct dmesh_flow_id flow = {0};
+    struct dmesh_buffer sndbuf = {0}, rcvbuf = {0};
 	/* flow identity */
-	objs->flow.src_ip = cfg->src_ip;
-	objs->flow.dst_ip = cfg->dst_ip;
-	objs->flow.src_port = cfg->src_port;
-	objs->flow.dst_port = cfg->dst_port;
-	objs->flow.mode = cfg->mode;
-	snprintf(objs->flow.src_workload, sizeof(objs->flow.src_workload), "%s",
+	flow.src_ip = cfg->src_ip;
+	flow.dst_ip = cfg->dst_ip;
+	flow.src_port = cfg->src_port;
+	flow.dst_port = cfg->dst_port;
+	flow.mode = cfg->mode;
+	snprintf(flow.src_workload, sizeof(flow.src_workload), "%s",
 		 cfg->workload != NULL ? cfg->workload : "");
 
 	/* forward ring and the shared regions as this connection's sndbuf/rcvbuf */
-	result = alloc_dma_ring(&objs->dma_ring, dev->dev, CHANNEL_RING_SIZE);
+	result = alloc_dma_ring(&conn->forward_ring, dev->dev, CHANNEL_RING_SIZE);
 	if (result != DOCA_SUCCESS) goto fail;
-	objs->sndbuf.mmap = cfg->tx->mmap;
-	objs->sndbuf.buf = cfg->tx->buf;
-	objs->sndbuf.size = cfg->tx->bytes;
-	objs->rcvbuf.mmap = cfg->rx->mmap;
-	objs->rcvbuf.buf = (char *)cfg->rx->buf + cfg->rx_offset;
-	objs->rcvbuf.size = CHANNEL_WINDOW;
+	sndbuf.mmap = cfg->tx->mmap;
+	sndbuf.buf = cfg->tx->buf;
+	sndbuf.size = cfg->tx->bytes;
+	rcvbuf.mmap = cfg->rx->mmap;
+	rcvbuf.buf = (char *)cfg->rx->buf + cfg->rx_offset;
+	rcvbuf.size = CHANNEL_WINDOW;
 
 	/* push layout of the window: slot ring, cursor, data ring */
-	memset(objs->rcvbuf.buf, 0, DMESH_PUSH_DATA_OFF);
-	conn->descs = (volatile struct dmesh_push_desc *)objs->rcvbuf.buf;
-	conn->cursor = (volatile struct dmesh_push_cursor *)((char *)objs->rcvbuf.buf + DMESH_PUSH_CURSOR_OFF);
+	memset(rcvbuf.buf, 0, DMESH_PUSH_DATA_OFF);
+	conn->descs = (volatile struct dmesh_push_desc *)rcvbuf.buf;
+	conn->cursor = (volatile struct dmesh_push_cursor *)((char *)rcvbuf.buf + DMESH_PUSH_CURSOR_OFF);
 	conn->cursor->consumed_seq = 0;
 	conn->cursor->consumed_bytes = 0;
 	conn->cursor->magic = DMESH_PUSH_FC_MAGIC;
@@ -982,7 +954,7 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 
 	pthread_mutex_lock(&dev->session_lock);
 	struct dmesh_export_metadata_msg metadata;
-	result = build_dma_metadata(objs, &metadata);
+	result = dmesh_build_dma_metadata(dev->dev, conn->forward_ring, &sndbuf, &rcvbuf, &flow, &metadata);
 	int rc = -1;
 	if (result != DOCA_SUCCESS) errno = error_number(result);
 	else if (session_send_locked(dev, DMESH_SESSION_OPEN, conn->flow_id, conn->generation,
@@ -1048,8 +1020,8 @@ int channel_conn_progress(struct channel_conn *conn)
 	int saved = rc != 0 ? errno : conn->error;
 	int gone = conn->peer_closed;
 	pthread_mutex_unlock(&dev->session_lock);
-	if (conn->ro != NULL && conn->ro->consumer_pe != NULL)
-		(void)doca_pe_progress(conn->ro->consumer_pe);
+	if (conn->reverse != NULL && conn->reverse->pe != NULL)
+		(void)doca_pe_progress(conn->reverse->pe);
 	if (saved) { errno = saved; return -1; }
 	return gone;
 }
@@ -1071,8 +1043,8 @@ static int conn_engines(struct channel_conn *conn, struct doca_pe **pes)
 {
 	int n = 0;
 
-	if (conn->ro != NULL && conn->ro->consumer_pe != NULL)
-		pes[n++] = conn->ro->consumer_pe;
+	if (conn->reverse != NULL && conn->reverse->pe != NULL)
+		pes[n++] = conn->reverse->pe;
 	return n;
 }
 
@@ -1134,7 +1106,7 @@ void channel_conn_clear(struct channel_conn *conn, int fd)
 
 uint32_t channel_conn_ring_free(const struct channel_conn *conn)
 {
-	struct dma_ring *ring = conn->objs->dma_ring;
+	struct dma_ring *ring = conn->forward_ring;
 	uint64_t used = ring->head - ring->ctrl->consumer_head;
 
 	return used >= ring->size ? 0 : (uint32_t)(ring->size - used);
@@ -1142,7 +1114,7 @@ uint32_t channel_conn_ring_free(const struct channel_conn *conn)
 
 uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t bytes)
 {
-	struct dma_ring *ring = conn->objs->dma_ring;
+	struct dma_ring *ring = conn->forward_ring;
 	struct dma_desc *desc = get_next_dma_desc(ring); /* the caller checked ring_free */
 
 	desc->mmap = conn->tx_dpa;
@@ -1154,7 +1126,7 @@ uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t by
 
 uint64_t channel_conn_consumed(const struct channel_conn *conn)
 {
-	return conn->objs->dma_ring->ctrl->consumer_head;
+	return conn->forward_ring->ctrl->consumer_head;
 }
 
 /*
@@ -1177,7 +1149,7 @@ uint64_t channel_conn_consumed(const struct channel_conn *conn)
  */
 static int host_dpa_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len)
 {
-	struct dmesh_conn *rc = conn->rc;
+	struct dmesh_dpa_endpoint *rc = conn->reverse;
 	struct dmesh_recv_seg *seg;
 	uint32_t p, n;
 
@@ -1206,7 +1178,7 @@ int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos
 	uint32_t p, n;
 
 	if (conn->dev->host_dpa)
-		return conn->rc != NULL ? host_dpa_rx_next(conn, seq, pos, len) : 0;
+		return conn->reverse != NULL ? host_dpa_rx_next(conn, seq, pos, len) : 0;
 
 	/* push: the next slot the DPU's DMA engine filled */
 	desc = &conn->descs[conn->expected % DMESH_PUSH_DESC_N];
@@ -1249,8 +1221,8 @@ static void host_dpa_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64
 		return;
 	conn->rd_published_bytes = bytes;
 	conn->rd_published_seq = seq;
-	(void)doca_dpa_h2d_memcpy(conn->rc->dpa_thread->dpa,
-				  conn->rc->dpa_thread->arg + offsetof(struct dpa_thread_arg, rd_pos),
+	(void)doca_dpa_h2d_memcpy(conn->reverse->dpa_thread->dpa,
+				  conn->reverse->dpa_thread->arg + offsetof(struct dpa_thread_arg, rd_pos),
 				  &conn->rd_pos, sizeof(conn->rd_pos));
 }
 
@@ -1259,8 +1231,8 @@ void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t 
 	if (conn->dev->host_dpa) {
 		/* RX credits may outlive a failed close. A completed DMA fence or a
 		 * partially destroyed thread no longer needs a device watermark. */
-		if (conn->rc != NULL && conn->rc->dpa_thread != NULL &&
-		    conn->rc->dpa_thread->running && !conn->rc->dpa_thread->quiesced)
+		if (conn->reverse != NULL && conn->reverse->dpa_thread != NULL &&
+		    conn->reverse->dpa_thread->running && !conn->reverse->dpa_thread->quiesced)
 			host_dpa_rx_consumed(conn, seq, bytes);
 		return;
 	}

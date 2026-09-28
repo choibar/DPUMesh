@@ -45,110 +45,27 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
 {
 	(void)task_user_data;
 
-	doca_error_t result;
-    struct comch_msg *msg;
-
-	struct dmesh_conn *conn = ctx_user_data.ptr;
-	struct objects *objs = conn->objs;
-	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
-    
-    msg = (struct comch_msg *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
-    uint32_t imm_len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
-    if (msg == NULL || imm_len < sizeof(enum comch_msg_type) ||
-        msg->type != COMCH_MSG_TYPE_DMA_COMPLETED || imm_len != sizeof(struct comch_dma_comp_msg)) {
-        if (conn->dpa_comch != NULL) conn->dpa_comch->completion_error = true;
-        goto repost;
+    struct dmesh_doca_dpa_comch *comch = ctx_user_data.ptr;
+    struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
+    const struct comch_dma_comp_msg *msg = (const void *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
+    uint32_t len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
+    if (msg == NULL || len != sizeof(*msg) || msg->type != COMCH_MSG_TYPE_DMA_COMPLETED ||
+        comch->dma_completed == UINT64_MAX) {
+        comch->completion_error = true;
+    } else {
+        ++comch->dma_completed;
+        if (comch->received) comch->received(comch->owner, msg->pos, msg->length, msg->count);
     }
-
-    switch (msg->type) {
-        case COMCH_MSG_TYPE_DMA_COMPLETED:
-            if (conn->dpa_comch != NULL) {
-                if (conn->dpa_comch->dma_completed == UINT64_MAX)
-                    conn->dpa_comch->completion_error = true;
-                else
-                    conn->dpa_comch->dma_completed++;
-            }
-            // struct comch_dma_comp_msg *comp_msg = (struct comch_dma_comp_msg *)msg;
-            // void *mmap_addr = NULL;
-            // size_t mmap_len = 0;
-            // const size_t dst_offset = 10000;
-            // doca_error_t result;
-
-            // // DOCA_LOG_INFO("Received DMA completed message from DPA, pos=%u, length=%u",
-            // //               comp_msg->pos, comp_msg->length);
-
-            // result = doca_mmap_get_memrange(conn->local_mmap, &mmap_addr, &mmap_len);
-            // if (result != DOCA_SUCCESS) {
-            //     DOCA_LOG_ERR("Failed to get local mmap range: %s", doca_error_get_descr(result));
-            //     break;
-            // }
-            // if (comp_msg->length == 0 ||
-            //     comp_msg->pos > mmap_len ||
-            //     comp_msg->length > mmap_len - comp_msg->pos ||
-            //     dst_offset > mmap_len ||
-            //     comp_msg->length > mmap_len - dst_offset) {
-            //     DOCA_LOG_ERR("Invalid DMA copy range: pos=%u, dst_offset=%zu, length=%u, mmap_len=%zu",
-            //                  comp_msg->pos, dst_offset, comp_msg->length, mmap_len);
-            //     break;
-            // }
-            
-            // objs->recv_bytes += comp_msg->length;
-
-            // result = dmesh_dma_copy_to_rcvbuf(conn, comp_msg->pos, comp_msg->length);
-            // if (result == DOCA_ERROR_AGAIN) {
-            //     /* All DMA tasks are in flight (inflow from multiple connections
-            //      * exceeds DMA completion rate): defer the copy; it is retried
-            //      * from the DMA completion callback as tasks free up. */
-            //     dmesh_dma_defer_copy(conn, comp_msg->pos, comp_msg->length);
-            // } else if (result != DOCA_SUCCESS) {
-            //     DOCA_LOG_ERR("Failed to submit DMA copy for completed message: %s",
-            //                  doca_error_get_descr(result));
-            // }
-
-            /* Enqueue the completed segment for zero-copy delivery to the Rust
-             * side, which reads directly from conn->dma_buffer + pos. One
-             * message covers a batch of `count` descriptors ([pos, pos+length)
-             * is contiguous in the staging buffer by construction). */
-            {
-                struct comch_dma_comp_msg *cm = (struct comch_dma_comp_msg *)msg;
-
-                objs->recv_bytes += cm->length;
-                if (cm->count > 1)
-                    objs->recv_msg_cnt += cm->count - 1; /* +1 more below */
-
-                /* recv_segs is NULL for byte-accounting-only consumers (the host
-                 * DPA bench), so guard it: only real datapath conns (DPU proxy
-                 * and the host reverse path) allocate the ring and want segments. */
-                if (conn->recv_segs == NULL) {
-                    /* byte accounting only */
-                } else if (conn->recv_seg_cnt < DMESH_RECV_SEG_MAX) {
-                    int tail = (conn->recv_seg_head + conn->recv_seg_cnt) % DMESH_RECV_SEG_MAX;
-                    conn->recv_segs[tail].pos = cm->pos;
-                    conn->recv_segs[tail].len = cm->length;
-                    conn->recv_seg_cnt++;
-                } else {
-                    conn->recv_seg_dropped++;
-                }
-            }
-            break;
-        default:
-            DOCA_LOG_ERR("Received unknown message type: %u", msg->type);
-            break;
-    }
-
-    objs->recv_msg_cnt++;
-
-repost:
-    if (conn->dpa_comch != NULL && conn->dpa_comch->stopping) {
+    if (comch->stopping) {
         doca_task_free(task);
         return;
     }
-	result = doca_task_submit(task);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("DPA MsgQ receive callback failed: Failed to resubmit receive task - %s",
-			     doca_error_get_name(result));
-		doca_task_free(task);
-	}
+    doca_error_t result = doca_task_submit(task);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("DPA MsgQ receive callback failed: Failed to resubmit receive task - %s",
+                     doca_error_get_name(result));
+        doca_task_free(task);
+    }
 }
 
 /*
@@ -163,10 +80,8 @@ static void dmesh_doca_dpa_msgq_recv_error_cb(struct doca_comch_consumer_task_po
 					     union doca_data ctx_user_data)
 {
 	(void)task_user_data;
-    struct dmesh_conn *conn = ctx_user_data.ptr;
-    if (conn != NULL && conn->dpa_comch != NULL && !conn->dpa_comch->stopping) {
-        conn->dpa_comch->completion_error = true;
-    }
+    struct dmesh_doca_dpa_comch *comch = ctx_user_data.ptr;
+    if (comch != NULL && !comch->stopping) comch->completion_error = true;
 
 	struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
 
@@ -187,8 +102,8 @@ static void dmesh_doca_dpa_msgq_send_cb(struct doca_comch_producer_task_send *se
 	(void)task_user_data;
 	
     
-    struct dmesh_conn *conn = (struct dmesh_conn *)ctx_user_data.ptr;
-    conn->objs->sent_msg_cnt++;
+    struct dmesh_doca_dpa_comch *comch = ctx_user_data.ptr;
+    if (comch->sent) comch->sent(comch->owner);
     
     // DOCA_LOG_INFO("Sent msg to DPA successfully, cnt: %d", objs->sent_msg_cnt);
     doca_comch_producer_task_send_set_imm_data(send_task, (uint8_t *)&msg, sizeof(struct comch_msg));
@@ -680,22 +595,14 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
 }
 
 doca_error_t
-dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
+dmesh_dpa_comch_create(struct dmesh_doca_dpa_thread *dpa_thread,
+                       struct dmesh_doca_dpa_comch **out)
 {
-    struct dmesh_doca_dpa_comch *comch;
-    struct dmesh_doca_dpa_thread *dpa_thread = conn->dpa_thread;
+    if (*out != NULL) return DOCA_ERROR_BAD_STATE;
+    struct dmesh_doca_dpa_comch *comch = calloc(1, sizeof(*comch));
+    if (comch == NULL) return DOCA_ERROR_NO_MEMORY;
+    *out = comch; /* Retain partial setup for checked cleanup. */
     doca_error_t result;
-
-    if (conn->dpa_comch == NULL) {
-        conn->dpa_comch = malloc(sizeof(struct dmesh_doca_dpa_comch));
-        if (conn->dpa_comch == NULL) {
-            DOCA_LOG_ERR("Failed to allocate memory for connection dpa_comch");
-            return DOCA_ERROR_NO_MEMORY;
-        }
-    }
-    comch = conn->dpa_comch;
-
-    memset(comch, 0, sizeof(*comch));
 
     /* The DPA completion goes first: on an extended DPA context (a host PF
      * process extended to an SF) a thread whose first attached completion is
@@ -808,16 +715,14 @@ dmesh_doca_dpa_failed(struct doca_dpa *dpa)
  * receive tasks posted until that fence; otherwise a credit-starved kernel
  * cannot stop. */
 doca_error_t
-dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn)
+dmesh_dpa_quiesce_step(struct dmesh_doca_dpa_thread *thread,
+                       struct dmesh_doca_dpa_comch *comch, struct doca_pe *pe)
 {
-    struct dmesh_doca_dpa_thread *thread;
-    struct dmesh_doca_dpa_comch *comch;
     doca_error_t result;
     uint32_t one = 1, stopped = 0;
 
-    if (conn == NULL || (thread = conn->dpa_thread) == NULL || !thread->running || thread->quiesced)
+    if (thread == NULL || !thread->running || thread->quiesced)
         return DOCA_SUCCESS;
-    comch = conn->dpa_comch;
     if (thread->arg == 0 || thread->thread == NULL || comch == NULL)
         return DOCA_ERROR_BAD_STATE;
     if (dmesh_doca_dpa_failed(thread->dpa))
@@ -830,8 +735,8 @@ dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn)
         thread->stop_sent = true;
         thread->quiesce_deadline_ns = quiesce_deadline_ns();
     }
-    if (conn->objs != NULL && conn->objs->consumer_pe != NULL)
-        (void)doca_pe_progress(conn->objs->consumer_pe);
+    if (pe != NULL)
+        (void)doca_pe_progress(pe);
     if (!thread->submitted_known) {
         result = doca_dpa_d2h_memcpy(thread->dpa, &stopped,
             thread->arg + offsetof(struct dpa_thread_arg, stopped), sizeof(stopped));
@@ -856,14 +761,15 @@ dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn)
 }
 
 doca_error_t
-dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn)
+dmesh_dpa_quiesce_checked(struct dmesh_doca_dpa_thread *thread,
+                          struct dmesh_doca_dpa_comch *comch, struct doca_pe *pe)
 {
     doca_error_t result;
 
     /* Each blocking call waits a full window, including a retried close. */
-    if (conn != NULL && conn->dpa_thread != NULL && conn->dpa_thread->stop_sent)
-        conn->dpa_thread->quiesce_deadline_ns = quiesce_deadline_ns();
-    while ((result = dmesh_doca_dpa_quiesce_step(conn)) == DOCA_ERROR_AGAIN)
+    if (thread != NULL && thread->stop_sent)
+        thread->quiesce_deadline_ns = quiesce_deadline_ns();
+    while ((result = dmesh_dpa_quiesce_step(thread, comch, pe)) == DOCA_ERROR_AGAIN)
         ;
     return result;
 }
@@ -931,16 +837,15 @@ msgq_destroy_checked(struct dmesh_doca_dpa_msgq *msgq, struct doca_pe *pe)
 }
 
 doca_error_t
-dmesh_doca_dpa_comch_destroy_checked(struct dmesh_conn *conn)
+dmesh_dpa_comch_destroy_checked(struct dmesh_doca_dpa_thread *thread,
+                                struct dmesh_doca_dpa_comch **handle, struct doca_pe *pe)
 {
     struct dmesh_doca_dpa_comch *comch;
-    struct doca_pe *pe;
     doca_error_t result;
-    if (conn == NULL || (comch = conn->dpa_comch) == NULL)
+    if (handle == NULL || (comch = *handle) == NULL)
         return DOCA_SUCCESS;
-    if (conn->dpa_thread != NULL && conn->dpa_thread->running && !conn->dpa_thread->quiesced)
+    if (thread != NULL && thread->running && !thread->quiesced)
         return DOCA_ERROR_BAD_STATE;
-    pe = conn->objs != NULL ? conn->objs->consumer_pe : NULL;
     comch->stopping = true;
     result = msgq_destroy_checked(&comch->send, pe);
     if (result != DOCA_SUCCESS)
@@ -973,7 +878,7 @@ dmesh_doca_dpa_comch_destroy_checked(struct dmesh_conn *conn)
         comch->producer_comp = NULL;
     }
     free(comch);
-    conn->dpa_comch = NULL;
+    *handle = NULL;
     return DOCA_SUCCESS;
 }
 
@@ -1494,4 +1399,45 @@ destroy_buf_arr:
     doca_buf_arr_destroy(conn->buf_arr);
     conn->buf_arr = NULL;
     return result;
+}
+
+/* DPU/legacy adapters: the SDK callbacks themselves only see a Comch endpoint. */
+static void conn_received(void *owner, uint32_t pos, uint32_t len, uint32_t count)
+{
+    struct dmesh_conn *conn = owner;
+    conn->objs->recv_bytes += len;
+    conn->objs->recv_msg_cnt += count > 1 ? count : 1;
+    if (!conn->recv_segs) return;
+    if (conn->recv_seg_cnt == DMESH_RECV_SEG_MAX) { ++conn->recv_seg_dropped; return; }
+    int tail = (conn->recv_seg_head + conn->recv_seg_cnt) % DMESH_RECV_SEG_MAX;
+    conn->recv_segs[tail] = (struct dmesh_recv_seg){pos, len};
+    ++conn->recv_seg_cnt;
+}
+static void conn_sent(void *owner) { ++((struct dmesh_conn *)owner)->objs->sent_msg_cnt; }
+
+doca_error_t dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
+{
+    doca_error_t result = dmesh_dpa_comch_create(conn->dpa_thread, &conn->dpa_comch);
+    if (conn->dpa_comch) {
+        conn->dpa_comch->owner = conn;
+        conn->dpa_comch->received = conn_received;
+        conn->dpa_comch->sent = conn_sent;
+    }
+    return result;
+}
+doca_error_t dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn)
+{
+    return conn ? dmesh_dpa_quiesce_checked(conn->dpa_thread, conn->dpa_comch,
+                                          conn->objs ? conn->objs->consumer_pe : NULL) : DOCA_SUCCESS;
+}
+doca_error_t dmesh_doca_dpa_comch_destroy_checked(struct dmesh_conn *conn)
+{
+    return conn ? dmesh_dpa_comch_destroy_checked(conn->dpa_thread, &conn->dpa_comch,
+                                               conn->objs ? conn->objs->consumer_pe : NULL) : DOCA_SUCCESS;
+}
+
+doca_error_t dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn)
+{
+    return conn ? dmesh_dpa_quiesce_step(conn->dpa_thread, conn->dpa_comch,
+                                       conn->objs ? conn->objs->consumer_pe : NULL) : DOCA_SUCCESS;
 }

@@ -5,7 +5,9 @@
 #include <doca_error.h>
 #include <doca_comch_msgq.h>
 
-struct objects;
+struct doca_dev;
+struct dmesh_dpa_endpoint;
+doca_error_t dmesh_dpa_endpoint_init_comch(struct dmesh_dpa_endpoint *ep, struct doca_dev *dev);
 struct dmesh_conn;
 struct doca_pe;
 

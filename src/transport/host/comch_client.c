@@ -1,18 +1,15 @@
 #include "comch_client.h"
 
 #include <time.h>
-#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <doca_comch.h>
 #include <doca_ctx.h>
+#include <doca_pe.h>
 #include <doca_error.h>
 #include <doca_log.h>
 
-#include "comch_consumer.h"
-#include "object.h"
-#include "comch_common.h"
 
 DOCA_LOG_REGISTER(COMCH_CLIENT);
 
@@ -31,10 +28,7 @@ static void client_send_task_completion_callback(struct doca_comch_task_send *ta
 						 union doca_data task_user_data,
 						 union doca_data ctx_user_data)
 {
-	struct objects *objs;
-
-	objs = (struct objects *)(ctx_user_data.ptr);
-	(void)objs;
+	(void)ctx_user_data;
 
 	DOCA_LOG_INFO("Client task sent successfully");
 	doca_task_free(doca_comch_task_send_as_task(task));
@@ -52,10 +46,11 @@ static void client_send_task_completion_err_callback(struct doca_comch_task_send
 						     union doca_data task_user_data,
 						     union doca_data ctx_user_data)
 {
-	struct objects *objs;
+	struct dmesh_comch_client *control;
 
-	objs = (struct objects *)(ctx_user_data.ptr);
-	objs->peer_gone = 1;
+	control = (struct dmesh_comch_client *)(ctx_user_data.ptr);
+	control->peer_gone = 1;
+    if (control->disconnected) control->disconnected(control->owner);
 	{
 		doca_error_t st = doca_task_get_status(doca_comch_task_send_as_task(task));
 
@@ -67,7 +62,7 @@ static void client_send_task_completion_err_callback(struct doca_comch_task_send
 	}
 	doca_task_free(doca_comch_task_send_as_task(task));
 	free(task_user_data.ptr);
-	(void)doca_ctx_stop(doca_comch_client_as_ctx(objs->cc_client));
+	(void)doca_ctx_stop(doca_comch_client_as_ctx(control->cc_client));
 }
 
 /*
@@ -83,17 +78,18 @@ static void client_state_changed_callback(const union doca_data user_data,
                                           enum doca_ctx_states prev_state,
                                           enum doca_ctx_states next_state)
 {
-    struct objects *objs = (struct objects *)user_data.ptr;
+    struct dmesh_comch_client *control = (struct dmesh_comch_client *)user_data.ptr;
 
     (void)ctx;
-    if (objs == NULL)
+    if (control == NULL)
         return;
     if (prev_state == DOCA_CTX_STATE_RUNNING &&
         (next_state == DOCA_CTX_STATE_STOPPING || next_state == DOCA_CTX_STATE_IDLE)) {
-        if (!objs->peer_gone)
+        if (!control->peer_gone)
             DOCA_LOG_INFO("comch client: peer disconnected (ctx %s)",
                           next_state == DOCA_CTX_STATE_IDLE ? "idle" : "stopping");
-        objs->peer_gone = 1;
+        control->peer_gone = 1;
+        if (control->disconnected) control->disconnected(control->owner);
     }
 }
 
@@ -113,8 +109,7 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 	union doca_data user_data;
 	struct doca_comch_client *comch_client;
 	doca_error_t result;
-	struct dmesh_comch_msg *comch_msg;
-	struct objects *objs;
+	struct dmesh_comch_client *control;
 
 	(void)event;
 
@@ -126,52 +121,20 @@ static void client_message_recv_callback(struct doca_comch_event_msg_recv *event
 		return;
 	}
 
-	objs = (struct objects *)user_data.ptr;
-	if (objs->control_message_cb != NULL) {
-		objs->control_message_cb(objs, recv_buffer, msg_len);
-		return;
-	}
-	if (msg_len < sizeof(comch_msg->type)) return;
-
-	comch_msg = (struct dmesh_comch_msg *)recv_buffer;
-	switch (comch_msg->type)
-	{
-	case DMESH_MSG_EXPORT_METADATA:
-		/* The DPU never exports DMA metadata to the host in the current flow */
-		DOCA_LOG_WARN("Ignoring unexpected METADATA message from server");
-		break;
-	case DMESH_MSG_EXPORT_DPA_COMP:
-		DOCA_LOG_INFO("Received DPA completion handles from server");
-		struct dmesh_dpa_comp_msg *dpa_comp_msg = (struct dmesh_dpa_comp_msg *)recv_buffer;
-		result = process_dpa_comp_msg(objs, dpa_comp_msg);
-
-		break;
-
-	case DMESH_MSG_EXPORT_RCV_RING: {
-		DOCA_LOG_INFO("Received reverse rcv_ring metadata from server");
-		struct dmesh_export_rcv_ring_msg *rr = (struct dmesh_export_rcv_ring_msg *)recv_buffer;
-		result = process_export_rcv_ring_msg(objs, rr);
-		if (result != DOCA_SUCCESS)
-			DOCA_LOG_ERR("Failed to process reverse rcv_ring metadata: %s",
-				     doca_error_get_name(result));
-		break;
-	}
-
-	default:
-		DOCA_LOG_INFO("Received unknown message type from server: %u", comch_msg->type);
-		break;
-	}
+    control = user_data.ptr;
+    if (control->message != NULL)
+        control->message(control->owner, recv_buffer, msg_len);
 }
 
 /**
  * Client sends a message to server
  *
- * @sample_objects [in]: The sample object to use
+ * @control [in]: Channel control endpoint
  * @msg [in]: The msg to send
  * @len [in]: The msg length
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
+doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *control, const char *msg, size_t len)
 {
 	doca_error_t result;
 	struct doca_comch_task_send *task;
@@ -182,8 +145,8 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 	data.ptr = malloc(len);
 	if (data.ptr == NULL) return DOCA_ERROR_NO_MEMORY;
 	memcpy(data.ptr, msg, len);
-	result = doca_comch_client_task_send_alloc_init(objs->cc_client,
-		objs->connection, data.ptr, len, &task);
+	result = doca_comch_client_task_send_alloc_init(control->cc_client,
+		control->connection, data.ptr, len, &task);
 	if (result != DOCA_SUCCESS) { free(data.ptr); return result; }
 	doca_task_set_user_data(doca_comch_task_send_as_task(task), data);
 	result = doca_task_submit(doca_comch_task_send_as_task(task));
@@ -194,8 +157,25 @@ doca_error_t client_send_msg(struct objects *objs, const char *msg, size_t len)
 	return result;
 }
 
-doca_error_t init_comch_ctrl_path_client(const char *server_name,
-                    struct objects *objs, bool is_fast_path)
+static void client_consumer_arrived(struct doca_comch_event_consumer *event,
+                                    struct doca_comch_connection *connection, uint32_t id)
+{
+    (void)event;
+    union doca_data data;
+    struct doca_comch_client *client = doca_comch_client_get_client_ctx(connection);
+    if (doca_ctx_get_user_data(doca_comch_client_as_ctx(client), &data) != DOCA_SUCCESS) return;
+    struct dmesh_comch_client *control = data.ptr;
+    if (control->consumer_arrived) control->consumer_arrived(control->owner, id);
+}
+
+static void client_consumer_expired(struct doca_comch_event_consumer *event,
+                                    struct doca_comch_connection *connection, uint32_t id)
+{
+    (void)event; (void)connection; (void)id;
+}
+
+doca_error_t dmesh_comch_client_open(const char *server_name,
+                    struct dmesh_comch_client *control)
 {
     doca_error_t result;
 	struct doca_ctx *ctx;
@@ -206,22 +186,21 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 		.tv_nsec = SLEEP_IN_NANOS,
 	};
 
-    result = doca_pe_create(&(objs->pe));
+    result = doca_pe_create(&(control->pe));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
         return result;
     }
 
-    result = doca_comch_client_create(objs->dev, server_name, &(objs->cc_client));
+    result = doca_comch_client_create(control->dev, server_name, &(control->cc_client));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to create client with error = %s", doca_error_get_name(result));
         goto destroy_pe;
     }
-    objs->is_server = false;
 
-    ctx = doca_comch_client_as_ctx(objs->cc_client);
+    ctx = doca_comch_client_as_ctx(control->cc_client);
 
-    result = doca_pe_connect_ctx(objs->pe, ctx);
+    result = doca_pe_connect_ctx(control->pe, ctx);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed adding pe context to client with error = %s", doca_error_get_name(result));
         goto destroy_client;
@@ -233,26 +212,26 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
         goto destroy_client;
     }
 
-    result = doca_comch_client_task_send_set_conf(objs->cc_client,
+    result = doca_comch_client_task_send_set_conf(control->cc_client,
                                                   client_send_task_completion_callback,
                                                   client_send_task_completion_err_callback,
                                                   CC_SEND_TASK_NUM);
-    if (result != DOCA_SUCCESS) {   
+    if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed setting send task cbs with error = %s", doca_error_get_name(result));
         goto destroy_client;
     }
 
-    result = doca_comch_client_event_msg_recv_register(objs->cc_client, 
+    result = doca_comch_client_event_msg_recv_register(control->cc_client,
                                                     client_message_recv_callback);
-    if (result != DOCA_SUCCESS) {   
+    if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed adding message recv event cb with error = %s", doca_error_get_name(result));
         goto destroy_client;
     }
 
 	/* register event callback for new comsumer and expired consumer */
-	if (is_fast_path) {
-		result = doca_comch_client_event_consumer_register(objs->cc_client,
-									client_new_consumer_callback, expired_consumer_callback);
+	if (control->consumer_arrived != NULL) {
+		result = doca_comch_client_event_consumer_register(control->cc_client,
+									client_consumer_arrived, client_consumer_expired);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed adding consumer event cb with error = %s", doca_error_get_name(result));
 			goto destroy_client;
@@ -260,13 +239,13 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 	}
 
     /* Set client properties */
-	result = doca_comch_cap_get_max_msg_size(doca_dev_as_devinfo(objs->dev), &max_msg_size);
+	result = doca_comch_cap_get_max_msg_size(doca_dev_as_devinfo(control->dev), &max_msg_size);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to get max message size with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
-     result = doca_comch_cap_get_max_recv_queue_size(doca_dev_as_devinfo(objs->dev), &max_rq_size);
+     result = doca_comch_cap_get_max_recv_queue_size(doca_dev_as_devinfo(control->dev), &max_rq_size);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get max recv queue size with error = %s", doca_error_get_name(result));
         goto destroy_client;
@@ -274,19 +253,19 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 
     DOCA_LOG_INFO("CC client max msg size: %u B, max rq size: %u", max_msg_size, max_rq_size);
 
-	result = doca_comch_client_set_max_msg_size(objs->cc_client, max_msg_size);
+	result = doca_comch_client_set_max_msg_size(control->cc_client, max_msg_size);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to set msg size property with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
-	result = doca_comch_client_set_recv_queue_size(objs->cc_client, CC_RECV_QUEUE_SIZE);
+	result = doca_comch_client_set_recv_queue_size(control->cc_client, CC_RECV_QUEUE_SIZE);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to set msg size property with error = %s", doca_error_get_name(result));
 		goto destroy_client;
 	}
 
-	user_data.ptr = (void *)objs;
+	user_data.ptr = (void *)control;
 	result = doca_ctx_set_user_data(ctx, user_data);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to set ctx user data with error = %s", doca_error_get_name(result));
@@ -304,36 +283,36 @@ doca_error_t init_comch_ctrl_path_client(const char *server_name,
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	(void)doca_ctx_get_state(ctx, &state);
 	while (state != DOCA_CTX_STATE_RUNNING) {
-		(void)doca_pe_progress(objs->pe);
+		(void)doca_pe_progress(control->pe);
 		nanosleep(&ts, &ts);
 		(void)doca_ctx_get_state(ctx, &state);
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (objs->peer_gone || now.tv_sec - start.tv_sec >= 5) {
-			result = objs->peer_gone ? DOCA_ERROR_CONNECTION_ABORTED : DOCA_ERROR_TIME_OUT;
+		if (control->peer_gone || now.tv_sec - start.tv_sec >= 5) {
+			result = control->peer_gone ? DOCA_ERROR_CONNECTION_ABORTED : DOCA_ERROR_TIME_OUT;
 			goto destroy_client;
 		}
 	}
 
-	(void)doca_comch_client_get_connection(objs->cc_client, &objs->connection);
-	doca_comch_connection_set_user_data(objs->connection, user_data);
+	(void)doca_comch_client_get_connection(control->cc_client, &control->connection);
+	doca_comch_connection_set_user_data(control->connection, user_data);
 	DOCA_LOG_INFO("CC client connection established successfully");
 
     return DOCA_SUCCESS;
 
 destroy_client:
-    (void)doca_ctx_stop(doca_comch_client_as_ctx(objs->cc_client));
+    (void)doca_ctx_stop(doca_comch_client_as_ctx(control->cc_client));
     for (int i = 0; i < 100000; ++i) {
-        if (doca_ctx_get_state(doca_comch_client_as_ctx(objs->cc_client), &state) != DOCA_SUCCESS ||
+        if (doca_ctx_get_state(doca_comch_client_as_ctx(control->cc_client), &state) != DOCA_SUCCESS ||
             state == DOCA_CTX_STATE_IDLE) break;
-        (void)doca_pe_progress(objs->pe);
+        (void)doca_pe_progress(control->pe);
     }
     /* A still-running context must retain its callback objects and PE. */
-    if (doca_ctx_get_state(doca_comch_client_as_ctx(objs->cc_client), &state) != DOCA_SUCCESS ||
+    if (doca_ctx_get_state(doca_comch_client_as_ctx(control->cc_client), &state) != DOCA_SUCCESS ||
         state != DOCA_CTX_STATE_IDLE) return result;
-    doca_comch_client_destroy(objs->cc_client);
-    objs->cc_client = NULL;    
+    doca_comch_client_destroy(control->cc_client);
+    control->cc_client = NULL;
 destroy_pe:
-    doca_pe_destroy(objs->pe);
-    objs->pe = NULL;
+    doca_pe_destroy(control->pe);
+    control->pe = NULL;
     return result;
 }

@@ -43,28 +43,37 @@ copy_export(struct doca_mmap *mmap, struct doca_dev *dev,
 }
 
 doca_error_t
-build_dma_metadata(struct objects *objs, struct dmesh_export_metadata_msg *msg)
+dmesh_build_dma_metadata(struct doca_dev *dev, const struct dma_ring *ring,
+                         const struct dmesh_buffer *sndbuf, const struct dmesh_buffer *rcvbuf,
+                         const struct dmesh_flow_id *flow, struct dmesh_export_metadata_msg *msg)
 {
-    if (!objs || !msg || !objs->dma_ring)
+    if (!dev || !msg || !ring || !sndbuf || !rcvbuf || !flow)
         return DOCA_ERROR_INVALID_VALUE;
     memset(msg, 0, sizeof(*msg));
     msg->type = DMESH_MSG_EXPORT_METADATA;
-    msg->flow = objs->flow;
-    msg->ring_buf = objs->dma_ring->buffer;
-    msg->ring_buf_len = sizeof(struct dma_ring_ctrl) + objs->dma_ring->size * sizeof(struct dma_desc);
-    msg->sndbuf = objs->sndbuf.buf;
-    msg->sndbuf_len = objs->sndbuf.size;
-    msg->rcvbuf = objs->rcvbuf.buf;
-    msg->rcvbuf_len = objs->rcvbuf.size;
-    doca_error_t result = copy_export(objs->dma_ring->mmap, objs->dev,
+    msg->flow = *flow;
+    msg->ring_buf = ring->buffer;
+    msg->ring_buf_len = sizeof(struct dma_ring_ctrl) + ring->size * sizeof(struct dma_desc);
+    msg->sndbuf = sndbuf->buf;
+    msg->sndbuf_len = sndbuf->size;
+    msg->rcvbuf = rcvbuf->buf;
+    msg->rcvbuf_len = rcvbuf->size;
+    doca_error_t result = copy_export(ring->mmap, dev,
                                      msg->ring_desc, sizeof(msg->ring_desc), &msg->ring_desc_len);
     if (result == DOCA_SUCCESS)
-        result = copy_export(objs->sndbuf.mmap, objs->dev,
+        result = copy_export(sndbuf->mmap, dev,
                              msg->snd_desc, sizeof(msg->snd_desc), &msg->snd_desc_len);
     if (result == DOCA_SUCCESS)
-        result = copy_export(objs->rcvbuf.mmap, objs->dev,
+        result = copy_export(rcvbuf->mmap, dev,
                              msg->rcv_desc, sizeof(msg->rcv_desc), &msg->rcv_desc_len);
     return result;
+}
+
+doca_error_t
+build_dma_metadata(struct objects *objs, struct dmesh_export_metadata_msg *msg)
+{
+    if (!objs) return DOCA_ERROR_INVALID_VALUE;
+    return dmesh_build_dma_metadata(objs->dev, objs->dma_ring, &objs->sndbuf, &objs->rcvbuf, &objs->flow, msg);
 }
 
 doca_error_t
@@ -277,6 +286,17 @@ export_rcv_ring_metadata(struct dmesh_conn *conn)
 doca_error_t
 process_export_rcv_ring_msg(struct objects *objs, struct dmesh_export_rcv_ring_msg *msg)
 {
+    doca_error_t result = dmesh_validate_reverse_metadata(msg);
+    if (result != DOCA_SUCCESS) return result;
+    objs->rev_msg = *msg;
+    objs->reverse_ready = true;
+    DOCA_LOG_INFO("Stashed reverse rcv_ring (%p, %zu) + tx_staging (%p, %zu) export from DPU",
+                  msg->ring_buf, msg->ring_buf_len, msg->tx_staging, msg->tx_staging_len);
+    return DOCA_SUCCESS;
+}
+
+doca_error_t dmesh_validate_reverse_metadata(const struct dmesh_export_rcv_ring_msg *msg)
+{
     if (!msg || msg->type != DMESH_MSG_EXPORT_RCV_RING ||
         msg->ring_desc_len == 0 || msg->ring_desc_len > sizeof(msg->ring_desc) ||
         msg->tx_desc_len == 0 || msg->tx_desc_len > sizeof(msg->tx_desc) ||
@@ -284,9 +304,5 @@ process_export_rcv_ring_msg(struct objects *objs, struct dmesh_export_rcv_ring_m
         msg->ring_buf_len != sizeof(struct dma_ring_ctrl) + DMA_RING_SIZE * sizeof(struct dma_desc) ||
         msg->tx_staging_len != BUFFER_SIZE)
         return DOCA_ERROR_INVALID_VALUE;
-    objs->rev_msg = *msg;
-    objs->reverse_ready = true;
-    DOCA_LOG_INFO("Stashed reverse rcv_ring (%p, %zu) + tx_staging (%p, %zu) export from DPU",
-                  msg->ring_buf, msg->ring_buf_len, msg->tx_staging, msg->tx_staging_len);
     return DOCA_SUCCESS;
 }
