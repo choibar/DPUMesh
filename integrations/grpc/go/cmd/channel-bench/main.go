@@ -499,8 +499,8 @@ func runClient(ctx context.Context, ip string, port int, c config) (r result, ru
 	return r, runErr
 }
 
-func runServer(ctx context.Context, ip string, port int) error {
-	listener, err := dmeshgo.ListenAddress(ip, port)
+func runServer(ctx context.Context) error {
+	listener, err := dmeshgo.ListenService()
 	if err != nil {
 		return err
 	}
@@ -509,7 +509,7 @@ func runServer(ctx context.Context, ip string, port int) error {
 	s.RegisterService(&service, echoServer{})
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(observedListener{Listener: listener, tracker: tracker}) }()
-	log.Printf("CHANNEL_BENCH_SERVER_READY address=%s:%d", ip, port)
+	log.Printf("CHANNEL_BENCH_SERVER_READY service=%s", os.Getenv("DPUMESH_SERVICE"))
 	select {
 	case err = <-done:
 	case <-ctx.Done():
@@ -545,15 +545,16 @@ func main() {
 	flag.Parse()
 	ip := os.Getenv("DPUMESH_SERVICE_IP")
 	port, err := strconv.Atoi(os.Getenv("DPUMESH_SERVICE_PORT"))
-	if err != nil || ip == "" || port < 1 || port > 65535 || c.connections < 1 || c.connections > 4 ||
+	// Only the client dials an address; the server serves DPUMESH_SERVICE.
+	if *mode == "client" && (err != nil || ip == "" || port < 1 || port > 65535) || c.connections < 1 || c.connections > 4 ||
 		c.concurrency < c.connections || c.warmup < 0 || c.duration <= 0 || c.rpcTimeout <= 0 || *timeout <= 0 {
-		log.Fatal("set DPUMESH_SERVICE_IP/PORT, connections 1..4, concurrency >= connections, and valid durations")
+		log.Fatal("set DPUMESH_SERVICE_IP/PORT for the client, connections 1..4, concurrency >= connections, and valid durations")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	switch *mode {
 	case "server":
-		err = runServer(ctx, ip, port)
+		err = runServer(ctx)
 		if err == nil {
 			log.Printf("CHANNEL_BENCH_SERVER_CLOSED")
 		}

@@ -1,7 +1,8 @@
 // Package dmeshgo adapts the native channel/EQ/QP API to net.Conn and
 // net.Listener. One process owns one channel and one polling goroutine.
 // Configure DPUMESH_PCI_ADDR, DPUMESH_SERVER, DPUMESH_POD_IP and, for a
-// listener, the DPUMESH_SERVICE "<host>:<port>" target before starting Go.
+// listener (ListenService), the DPUMESH_SERVICE "<host>:<port>" target before
+// starting Go.
 package dmeshgo
 
 /*
@@ -608,6 +609,33 @@ func Listen(server, svcIP string, svcPort int, workload string) (*Listener, erro
 	if err := servesAt(svcIP, svcPort); err != nil {
 		return nil, err
 	}
+	return listen(&net.TCPAddr{IP: net.ParseIP(svcIP), Port: svcPort})
+}
+
+// serviceAddr is the listener address of the DPUMESH_SERVICE target: the
+// Service port, and the IP only when the target is an IPv4 literal.
+func serviceAddr() (*net.TCPAddr, error) {
+	target := os.Getenv("DPUMESH_SERVICE")
+	host, p, err := net.SplitHostPort(target)
+	port, perr := strconv.Atoi(p)
+	if err != nil || host == "" || perr != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("dmesh: DPUMESH_SERVICE %q is not a \"<host>:<port>\" target", target)
+	}
+	return &net.TCPAddr{IP: net.ParseIP(host).To4(), Port: port}, nil
+}
+
+// ListenService serves the process's DPUMESH_SERVICE target. The native
+// library resolves the target when it opens the channel, so the caller names
+// no address, as a server behind a sidecar binds only its own port.
+func ListenService() (*Listener, error) {
+	addr, err := serviceAddr()
+	if err != nil {
+		return nil, err
+	}
+	return listen(addr)
+}
+
+func listen(addr net.Addr) (*Listener, error) {
 	t, err := openTransport()
 	if err != nil {
 		return nil, err
@@ -620,7 +648,7 @@ func Listen(server, svcIP string, svcPort int, workload string) (*Listener, erro
 	if t.listener != nil {
 		return nil, syscall.EADDRINUSE
 	}
-	l := &Listener{t: t, addr: &net.TCPAddr{IP: net.ParseIP(svcIP), Port: svcPort}}
+	l := &Listener{t: t, addr: addr}
 	t.listener = l
 	return l, nil
 }
@@ -687,7 +715,10 @@ func DialContext(ctx context.Context, ip string, port int) (net.Conn, error) {
 	return c, nil
 }
 
-// ListenAddress serves the process's DPUMESH_SERVICE identity.
+// ListenAddress serves the process's DPUMESH_SERVICE target after checking
+// that it resolves to ip:port.
+//
+// Deprecated: use ListenService, which needs no ClusterIP.
 func ListenAddress(ip string, port int) (*Listener, error) {
 	return Listen("", ip, port, "")
 }

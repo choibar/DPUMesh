@@ -38,6 +38,6 @@ runtime; `grpc/hello_grpc_client.cc` calls it. Both build with the
 ## Go gRPC
 
 `integrations/grpc/go/cmd/echo-server` and `cmd/echo-client` run the gRPC
-health RPC over `net.Conn`. Both read the service address from
-`DPUMESH_SERVICE_IP` and `DPUMESH_SERVICE_PORT`; the server's `DPUMESH_SERVICE`
-must resolve to that address. See the [Go adapter](../integrations/grpc/go/README.md).
+health RPC over `net.Conn`. The server serves its `DPUMESH_SERVICE` target;
+the client dials `DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT`. See the
+[Go adapter](../integrations/grpc/go/README.md).

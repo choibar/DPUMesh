@@ -26,17 +26,21 @@ per-flow Comch implementation, although the public C ABI remains version 5.
 The unit tests open no DOCA device.
 
 Configure `DPUMESH_PCI_ADDR`, `DPUMESH_POD_IP` and `DPUMESH_SERVER` before
-opening a connection. A server additionally sets `DPUMESH_SERVICE` to a
-`<host>:<port>` target that resolves to its listen address.
+opening a connection. A server additionally sets `DPUMESH_SERVICE` to its
+`<host>:<port>` [service target](../../../design/API.md#naming).
 [Root configuration](../../../README.md#configuration) defines these values. The older `Dial`/`Listen` signatures accept only labels
 that agree with this process configuration; they do not create separate
 physical registrations.
 
 Use `DialContext(ctx, serviceIP, port)` in `grpc.WithContextDialer` and
-`ListenAddress(serviceIP, port)` with `grpc.Server.Serve`. A service address
-is a Service ClusterIP and port; the DPU chooses its native backend. The examples
-in `cmd/echo-client` and `cmd/echo-server` run the standard gRPC health RPC
-against `DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT`.
+`ListenService()` with `grpc.Server.Serve`. A service address is a Service
+ClusterIP and port; the DPU chooses its native backend. `ListenService` serves
+`DPUMESH_SERVICE`, which the native library resolves when it opens the channel,
+so a server names no ClusterIP; its `Addr` is the Service port, with the IP only
+when the target is an IPv4 literal. `ListenAddress(serviceIP, port)` is
+deprecated: it also checks that the target resolves to that address. The
+examples in `cmd/echo-client` and `cmd/echo-server` run the standard gRPC
+health RPC; the client dials `DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT`.
 Close all connections and listeners before calling `CloseTransport`. It returns
 `EBUSY` without invalidating active objects. If native channel teardown fails,
 the Go wrapper retains the channel and `CloseTransport` can be retried; new
