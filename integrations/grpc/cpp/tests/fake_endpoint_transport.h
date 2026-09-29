@@ -45,7 +45,7 @@ class FakeEndpointTransport final : public EndpointTransport {
   explicit FakeEndpointTransport(std::shared_ptr<FakeTransportState> state)
       : state_(std::move(state)) {}
 
-  void BindDriver(std::weak_ptr<DmeshEndpointDriver> driver) override;
+  void BindSink(std::weak_ptr<ConnectionSink> sink) override;
   size_t MaxPostSize() const override;
   PostResult Post(size_t length,
                   absl::FunctionRef<void(Reservation)> fill) override;

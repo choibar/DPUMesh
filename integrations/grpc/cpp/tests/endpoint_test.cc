@@ -117,6 +117,32 @@ void TestQueuedReadCompletesSynchronously() {
   CHECK_EQ(fixture.callbacks.Size(), size_t{0});
 }
 
+void TestIncomingBufferIsAdoptedWithoutCopy() {
+  Fixture fixture;
+  static int released = 0;
+  released = 0;
+  const std::string payload = "adopted bytes";
+  auto* bytes = static_cast<uint8_t*>(std::malloc(payload.size()));
+  std::memcpy(bytes, payload.data(), payload.size());
+  CHECK_TRUE(fixture.driver
+                 ->OnIncomingBuffer(bytes, payload.size(),
+                                    [](void* arg) {
+                                      std::free(arg);
+                                      ++released;
+                                    },
+                                    bytes)
+                 .status.ok());
+  {
+    SliceBuffer buffer;
+    CHECK_TRUE(fixture.endpoint->Read([](absl::Status) {}, &buffer,
+                                      EventEngine::Endpoint::ReadArgs()));
+    CHECK_EQ(Flatten(buffer), payload);
+    CHECK_TRUE(buffer[0].data() == bytes);
+    CHECK_EQ(released, 0);
+  }
+  CHECK_EQ(released, 1);
+}
+
 void TestPendingReadCompletesOnDelivery() {
   Fixture fixture;
   SliceBuffer buffer;
@@ -501,6 +527,8 @@ int main() {
   const TestCase tests[] = {
       {"queued read completes synchronously",
        TestQueuedReadCompletesSynchronously},
+      {"incoming buffer is adopted without a copy",
+       TestIncomingBufferIsAdoptedWithoutCopy},
       {"pending read completes on delivery",
        TestPendingReadCompletesOnDelivery},
       {"remote EOF fails reads", TestRemoteEofFailsPendingAndFutureReads},

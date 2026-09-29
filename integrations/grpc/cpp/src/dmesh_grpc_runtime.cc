@@ -110,8 +110,8 @@ class LeasedEndpointTransport final : public EndpointTransport {
     if (on_destroy_) on_destroy_();
   }
 
-  void BindDriver(std::weak_ptr<DmeshEndpointDriver> driver) override {
-    delegate_->BindDriver(std::move(driver));
+  void BindSink(std::weak_ptr<ConnectionSink> sink) override {
+    delegate_->BindSink(std::move(sink));
   }
   size_t MaxPostSize() const override { return delegate_->MaxPostSize(); }
   PostResult Post(size_t length,
