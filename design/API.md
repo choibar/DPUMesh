@@ -79,7 +79,7 @@ no tail needs service). Poll one EQ from one thread.
 
 - `dmesh_create_channel` establishes one shared Comch session. `dmesh_create_qp`
   opens a logical flow on it and synchronously waits for READY; it fails with
-  `ENOSPC` when the DPU worker's 32 flows are in use. Closing one flow keeps
+  `ENOSPC` when the DPU worker's 64 flows are in use. Closing one flow keeps
   sibling flows and the channel's Comch session alive.
 - `dmesh_destroy_qp` and `dmesh_abort_qp` end that connection; the peer's
   close arrives as `RECV_FIN`.

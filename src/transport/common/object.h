@@ -46,7 +46,7 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 /* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection.
  * This is the per-worker-thread limit; total = num_threads x this. */
-#define DMESH_MAX_CONNECTIONS 32
+#define DMESH_MAX_CONNECTIONS 64
 #define DMESH_MAX_SESSIONS 64
 
 /* A Comch peer is a channel, independently of its logical data flows. */

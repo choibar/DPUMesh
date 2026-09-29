@@ -123,7 +123,7 @@ moves the DPA objects onto the pod's SF without a code change.
 
 ## Limits
 
-A DPU worker serves 32 flows (one DPA thread each), shared by client QPs and
+A DPU worker serves 64 flows (one DPA thread each), shared by client QPs and
 the backend pool. The channel establishes Comch once; opening a QP still waits
 synchronously for its own DMA setup and READY, bounded by a five-second control
 timeout. `dmesh_msg_max` is 8192; a descriptor larger than 8064 bytes is
