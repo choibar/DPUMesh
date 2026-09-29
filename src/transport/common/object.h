@@ -116,6 +116,7 @@ struct dmesh_conn {
     struct doca_buf_arr *buf_arr;
     struct doca_mmap *local_mmap;             /* local DMA staging buffer */
     void *dma_buffer;
+    uint32_t rx_wm_published;                 /* staging read watermark the DPA thread last got */
 
     /* Per-connection DMA engine: own doca_dma ctx (own QP) + task pool +
      * buf inventory, so connections cannot starve each other's copies. */

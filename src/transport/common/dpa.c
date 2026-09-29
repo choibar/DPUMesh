@@ -1194,6 +1194,9 @@ dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
         .rd_fc = (uint32_t)dmesh_staging_fc,
 #endif
     };
+#ifdef DOCA_ARCH_DPU
+    conn->rx_wm_published = 0;
+#endif
 
 #ifdef DOCA_ARCH_DPU
     /* producer_dma_copy microbenchmark: DMESH_DPA_BENCH_MODE=1 (throughput) or
