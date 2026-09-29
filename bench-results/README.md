@@ -29,6 +29,12 @@ connection당 동시 RPC 64개이며 backend pool도 K개다. Mode 비교는 EU 
 다른 실험 사이의 참조 비교다. Busy polling에 의한 CPU 100%만으로 ARM 연산
 병목을 확정하지 않는다. 상세 조건·정상 종료 여부·artifact SHA는 각 보고서에 있다.
 
+## 2026-09-29: Go 어댑터 재구성 전후
+
+| 보고서 | 조건 | 상태와 해석 |
+| --- | --- | --- |
+| [Go 어댑터 재구성 전후](2026-09-29_grpc-go-adapter-rework.md) | rapids4, `dpu-dma`, gRPC 64B 동시 1/64, raw 109B echo | 동시 64 처리량 약 +20%, 분리 goroutine raw echo p50 약 −45%; 단일 goroutine p50은 동일. 장비 smoke와 race 테스트 PASS |
+
 ## 자료 보존
 
 보고서의 상대 링크는 Git에 포함된 파일을 가리킨다. 아래 원본 파일은 이 작업에서
