@@ -172,7 +172,8 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     for (int i = 0; i < SLOTS; ++i) if ((t->slots[i].epfd = epoll_create1(EPOLL_CLOEXEC)) < 0) goto fail;
     const char *pci = getenv("DPUMESH_PCI_ADDR"), *server = getenv("DPUMESH_SERVER");
     const char *pod_ip = getenv("DPUMESH_POD_IP"), *workload = getenv("DPUMESH_WORKLOAD");
-    if (!pci || !*pci || !pod_ip || inet_pton(AF_INET, pod_ip, &t->pod_ip) != 1) { errno = EINVAL; goto fail; }
+    /* The PCI address is the broker's; only the in-process host-dpa path reads it. */
+    if (!pod_ip || inet_pton(AF_INET, pod_ip, &t->pod_ip) != 1) { errno = EINVAL; goto fail; }
     snprintf(t->server, sizeof(t->server), "%s", server && *server ? server : "DPUMesh0");
     snprintf(t->workload, sizeof(t->workload), "%s", workload ? workload : "");
     t->pod_id = env_int("DPUMESH_POD_ID", 0, 0, 126);

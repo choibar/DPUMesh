@@ -25,8 +25,10 @@ also be rebuilt: the session control protocol is incompatible with the old
 per-flow Comch implementation, although the public C ABI remains version 5.
 The unit tests open no DOCA device.
 
-Configure `DPUMESH_PCI_ADDR`, `DPUMESH_POD_IP` and `DPUMESH_SERVER` before
-opening a connection. A server additionally sets `DPUMESH_SERVICE` to its
+Configure `DPUMESH_POD_IP` and `DPUMESH_SERVER` before opening a connection,
+and run `dpumesh_broker` (the process that owns the DOCA device) with
+`DPUMESH_BROKER` pointing at its socket; `DPUMESH_PCI_ADDR` is needed here only
+on the host-dpa path. A server additionally sets `DPUMESH_SERVICE` to its
 `<host>:<port>` [service target](../../../design/API.md#naming).
 [Root configuration](../../../README.md#configuration) defines these values. The older `Dial`/`Listen` signatures accept only labels
 that agree with this process configuration; they do not create separate

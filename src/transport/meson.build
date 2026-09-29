@@ -62,7 +62,9 @@ host_srcs = files(
 # symbols the shared sources reference, so this archive must never be linked
 # together with dmesh_dpu.
 channel_srcs = files(
+  'host/broker_ipc.c',
   'host/channel.c',
+  'host/channel_broker.c',
   'host/host_stubs.c',
 )
 
