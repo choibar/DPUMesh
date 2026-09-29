@@ -54,6 +54,13 @@ opening a connection. A server additionally sets `DPUMESH_SERVICE` to its
 that agree with this process configuration; they do not create separate
 physical registrations.
 
+The `dmeshgo/dmeshgrpc` package switches a program by configuration alone:
+with `DPUMESH_ENABLE=1`, `dmeshgrpc.Listen(tcpAddr)` serves `DPUMESH_SERVICE`
+and `dmeshgrpc.DialOptions()` routes `"<ip>:<port>"` targets over DPUMesh;
+otherwise they return a TCP listener and no options. `cmd/health-bench` loads
+any server's standard gRPC health `Check` over DPUMesh and reports calls/s and
+latency per target.
+
 Use `DialContext(ctx, serviceIP, port)` in `grpc.WithContextDialer` and
 `ListenService()` with `grpc.Server.Serve`. A service address is a Service
 ClusterIP and port; the DPU chooses its native backend. `ListenService` serves
