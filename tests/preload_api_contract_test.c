@@ -224,6 +224,42 @@ static void test_native_chunking_delegates_batching(void) {
     test_pfd_free(e);
 }
 
+/* A gather write fills each reservation across iovec boundaries: [3,5,2]
+ * bytes with a 4-byte post limit are 4+4+2, not one post per element. */
+static void test_writev_gathers_across_iovecs(void) {
+    fake_reset();
+    pfd_t *e = test_pfd();
+    struct iovec iov[] = {
+        { (void *)"abc", 3 }, { (void *)"", 0 }, { (void *)"defgh", 5 }, { (void *)"ij", 2 },
+    };
+    assert(shim_send_iov(e, iov, 4, 0) == 10);
+    assert(atomic_load(&fake_alloc_calls) == 3);
+    assert(atomic_load(&fake_post_calls) == 3);
+    assert(fake_posted_len == 10);
+    assert(memcmp(fake_posted, "abcdefghij", 10) == 0);
+    test_pfd_free(e);
+}
+
+/* A reservation refused with EAGAIN consumes no iovec bytes: the retry after
+ * TX_READY sends the whole stream exactly once, in order. */
+static void test_writev_eagain_keeps_cursor(void) {
+    fake_reset();
+    pfd_t *e = test_pfd();
+    struct iovec iov[] = { { (void *)"head", 4 }, { (void *)"payload", 7 } };
+    atomic_store(&fake_fail_allocs, 1);
+    errno = 0;
+    assert(shim_send_iov(e, iov, 2, MSG_DONTWAIT) == -1);
+    assert(errno == EAGAIN);
+    assert(fake_posted_len == 0);
+    g_eq = (dmesh_eq_t *)(uintptr_t)1;
+    fake_emit_event(DMESH_EVENT_TX_READY, &fake_qp);
+    dispatcher_drain_eq(NULL, 0);
+    assert(shim_send_iov(e, iov, 2, MSG_DONTWAIT) == 11);
+    assert(fake_posted_len == 11);
+    assert(memcmp(fake_posted, "headpayload", 11) == 0);
+    test_pfd_free(e);
+}
+
 static void test_nonblocking_eagain_and_pollout_edge(void) {
     fake_reset();
     pfd_t *e = test_pfd();
@@ -748,6 +784,8 @@ int main(void) {
     ENSURE_REAL();
     test_preload_tx_stats();
     test_native_chunking_delegates_batching();
+    test_writev_gathers_across_iovecs();
+    test_writev_eagain_keeps_cursor();
     test_nonblocking_eagain_and_pollout_edge();
     test_blocking_send_waits_for_event();
     test_send_timeout_does_not_poll_native();

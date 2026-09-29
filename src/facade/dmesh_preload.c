@@ -910,16 +910,20 @@ static ssize_t shim_recv(pfd_t *e, void *buf, size_t len, int flags) {
     }
 }
 
-/* Copy as much as native admission currently accepts. Caller holds e->mu. A return
- * shorter than len with errno=EAGAIN means native alloc armed one TX_READY and this
- * function made the app fd honestly non-writable. */
-static ssize_t stream_write_locked(pfd_t *e, const void *buf, size_t len) {
+/* Copy as much of the iovec, from its cursor, as native admission currently
+ * accepts. One reservation spans iovec boundaries: a gather write (an HTTP/2
+ * frame header and its payload, say) becomes one transport write rather than
+ * one per element, whose later pieces the library would otherwise hold as a
+ * busy tail. The cursor advances only over posted bytes. Caller holds e->mu.
+ * A return shorter than len with errno=EAGAIN means native alloc armed one
+ * TX_READY and this function made the app fd honestly non-writable. */
+static ssize_t stream_writev_locked(pfd_t *e, const struct iovec *iov,
+                                    int *idx, size_t *off, size_t len) {
     dmesh_qp_t *c = e->conn;
     if (!c || e->wr_closed || e->io_error) {
         errno = e->io_error ? e->io_error : EPIPE;
         return -1;
     }
-    const uint8_t *p = (const uint8_t *)buf;
     uint32_t cap = (uint32_t)c->ep->block_size;   /* one reserve <= block_size (contiguous) */
     size_t done = 0;
     while (done < len) {
@@ -936,7 +940,14 @@ static ssize_t stream_write_locked(pfd_t *e, const void *buf, size_t len) {
         /* A successful opportunistic retry cancels a stale native TX_READY. Mirror
          * that cancellation in the kernel readiness fd as well. */
         fd_unblock_tx_locked(e);
-        memcpy(dst, p + done, chunk);
+        for (uint32_t filled = 0; filled < chunk;) {
+            size_t left = iov[*idx].iov_len - *off;
+            if (left == 0) { (*idx)++; *off = 0; continue; }
+            size_t take = chunk - filled < left ? chunk - filled : left;
+            memcpy(dst + filled, (const uint8_t *)iov[*idx].iov_base + *off, take);
+            filled += (uint32_t)take;
+            *off += take;
+        }
         if (dmesh_post_send(c, dst, chunk) != 0) {
             e->io_error = errno ? errno : EIO;
             return done ? (ssize_t)done : -1;
@@ -965,46 +976,43 @@ static ssize_t shim_send_iov(pfd_t *e, const struct iovec *iov, int cnt, int fla
     long deadline = (block && e->snd_timeout_ms > 0) ? now_ms() + e->snd_timeout_ms : 0;
     pthread_mutex_unlock(&e->mu);
     size_t sent = 0;
-    for (int i = 0; i < cnt; i++) {
-        const char *p = (const char *)iov[i].iov_base;
-        size_t len = iov[i].iov_len, done = 0;
-        while (done < len) {
-            size_t remaining = len - done;
-            pthread_mutex_lock(&e->mu);
-            errno = 0;
-            ssize_t w = stream_write_locked(e, p + done, remaining);
-            int saved_errno = errno;
-            pthread_mutex_unlock(&e->mu);
-            if (w > 0) {
-                done += (size_t)w;
-                sent += (size_t)w;
-                if ((size_t)w == remaining) continue;
-            }
-            if (saved_errno != EAGAIN) {
-                pthread_mutex_unlock(&e->tx_mu);
-                errno = saved_errno ? saved_errno : ECONNRESET;
-                return sent ? (ssize_t)sent : -1;
-            }
-            if (!block) {
+    int idx = 0;
+    size_t off = 0;
+    while (sent < total) {
+        size_t remaining = total - sent;
+        pthread_mutex_lock(&e->mu);
+        errno = 0;
+        ssize_t w = stream_writev_locked(e, iov, &idx, &off, remaining);
+        int saved_errno = errno;
+        pthread_mutex_unlock(&e->mu);
+        if (w > 0) {
+            sent += (size_t)w;
+            if ((size_t)w == remaining) continue;
+        }
+        if (saved_errno != EAGAIN) {
+            pthread_mutex_unlock(&e->tx_mu);
+            errno = saved_errno ? saved_errno : ECONNRESET;
+            return sent ? (ssize_t)sent : -1;
+        }
+        if (!block) {
+            pthread_mutex_unlock(&e->tx_mu);
+            errno = EAGAIN;
+            return sent ? (ssize_t)sent : -1;
+        }
+        long left = 0;
+        if (deadline) {
+            left = deadline - now_ms();
+            if (left <= 0) {
                 pthread_mutex_unlock(&e->tx_mu);
                 errno = EAGAIN;
                 return sent ? (ssize_t)sent : -1;
             }
-            long left = 0;
-            if (deadline) {
-                left = deadline - now_ms();
-                if (left <= 0) {
-                    pthread_mutex_unlock(&e->tx_mu);
-                    errno = EAGAIN;
-                    return sent ? (ssize_t)sent : -1;
-                }
-            }
-            if (wait_writable(e, left) != 0) {
-                int wait_errno = errno;
-                pthread_mutex_unlock(&e->tx_mu);
-                errno = wait_errno;
-                return sent ? (ssize_t)sent : -1;
-            }
+        }
+        if (wait_writable(e, left) != 0) {
+            int wait_errno = errno;
+            pthread_mutex_unlock(&e->tx_mu);
+            errno = wait_errno;
+            return sent ? (ssize_t)sent : -1;
         }
     }
 
