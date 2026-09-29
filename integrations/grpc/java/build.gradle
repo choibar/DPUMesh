@@ -1,0 +1,70 @@
+// gRPC-java over DPUMesh. Builds with any Gradle 8, for example the wrapper of
+// the service that uses it: `sh <service>/gradlew -p integrations/grpc/java jar`.
+// The JNI library is compiled with the host C++ compiler and packed into the
+// jar; tests run over build/grpc/libdpumesh_stream_loopback.so.
+plugins {
+    id 'java-library'
+}
+
+group = 'io.dpumesh'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+def grpcVersion = '1.84.0'
+
+dependencies {
+    compileOnly "io.grpc:grpc-api:${grpcVersion}"
+    compileOnly "io.grpc:grpc-netty:${grpcVersion}"
+
+    testImplementation "io.grpc:grpc-netty:${grpcVersion}"
+    testImplementation "io.grpc:grpc-stub:${grpcVersion}"
+    testImplementation platform('org.junit:junit-bom:5.13.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 11
+    options.compilerArgs << '-Xlint:all,-options,-deprecation,-serial'
+}
+
+def jniOutput = layout.buildDirectory.dir('native/native/linux-x86_64')
+
+def compileJni = tasks.register('compileJni', Exec) {
+    def source = file('src/main/native/dpumesh_jni.cc')
+    def header = file('../cpp/include/dpumesh_stream.h')
+    inputs.files(source, header)
+    outputs.dir(jniOutput)
+    doFirst { jniOutput.get().asFile.mkdirs() }
+    def jdk = System.getProperty('java.home')
+    commandLine 'g++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-shared', '-fPIC',
+        "-I${jdk}/include", "-I${jdk}/include/linux", "-I${file('../cpp/include')}",
+        source.absolutePath, '-ldl', '-lpthread',
+        '-o', "${jniOutput.get().asFile}/libdpumesh_jni.so"
+}
+
+sourceSets.main.resources.srcDir(layout.buildDirectory.dir('native'))
+tasks.named('processResources') { dependsOn compileJni }
+
+jar {
+    archiveFileName = 'dpumesh-grpc.jar'
+}
+
+def findLoopback() {
+    for (def dir = projectDir; dir != null; dir = dir.parentFile) {
+        def candidate = new File(dir, 'build/grpc/libdpumesh_stream_loopback.so')
+        if (candidate.exists()) return candidate.absolutePath
+    }
+    return ''
+}
+
+test {
+    useJUnitPlatform()
+    environment 'DPUMESH_STREAM_LIBRARY', System.getenv('DPUMESH_STREAM_LIBRARY') ?: findLoopback()
+    environment 'DPUMESH_SERVICE', 'echo.test:50051'
+    environment 'DPUMESH_ENABLE', '1'
+    testLogging { events 'failed'; exceptionFormat 'full' }
+}
