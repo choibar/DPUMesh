@@ -29,6 +29,7 @@ bench-results/*
 !bench-results/2026-09-26_grpc-go-64b-host-dpa-pf01.md
 !bench-results/2026-09-26_grpc-go-64b-w16-k4-no-eu-partitions.csv
 !bench-results/2026-09-26_grpc-go-64b-w16-k4-no-eu-partitions.md
+!bench-results/2026-09-29_grpc-go-adapter-rework.md
 !bench-results/2026-09-29_preload-gather-write.md
 
 # local test binary
