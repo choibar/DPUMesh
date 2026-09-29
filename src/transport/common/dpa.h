@@ -13,7 +13,7 @@
 
 /* Number of DPA threads pre-created per DPU worker thread and handed out per
  * connection (each worker owns a private pool - shared-nothing design) */
-#define DPA_THREAD_POOL_SIZE 32
+#define DPA_THREAD_POOL_SIZE 64
 
 struct objects;
 struct doca_comch_connection;
