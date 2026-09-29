@@ -19,6 +19,7 @@
  *                   process to an SF (ibdev name) that then owns the DPA objects
  */
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -50,7 +51,11 @@ struct channel_conn_config {
 	size_t rx_offset;       /* This connection's window inside rx */
 };
 
-/* Device: opens the Comch device (and, on the host-dpa reverse path, the DPA process) */
+/* Device. A dpu-dma channel is a broker client when DPUMESH_BROKER names the
+ * broker's socket, or when it is unset and /run/dpumesh/broker.sock exists;
+ * the broker owns the device and `pci` is unused. Otherwise (DPUMESH_BROKER=off,
+ * no broker socket, or the host-dpa reverse path) this process opens the Comch
+ * device, and on host-dpa the DPA process, at `pci`: the direct path. */
 int channel_dev_open(const char *pci, struct channel_dev **out);
 void channel_dev_close(struct channel_dev *dev);
 /* One serialized control connection per device/channel. */
@@ -111,5 +116,11 @@ uint64_t channel_conn_consumed(const struct channel_conn *conn);
 int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len);
 /* Publishes the consumption cursor: every batch up to `seq` is released */
 void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes);
+
+/* Broker: serves one client connection (dpumesh_broker's per-client child)
+ * with the device at `pci`, until the client disconnects or SIGTERM/SIGINT;
+ * `unblock` (may be NULL) is unblocked once those handlers are installed.
+ * Closing the connection closes every flow the client left open. */
+int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock);
 
 #endif // CHANNEL_H

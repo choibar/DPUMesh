@@ -22,17 +22,18 @@ HOST_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -DDOCA_ALLOW_EXPERI
 # channel layer. Keep in step with src/transport/meson.build.
 TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c comch_common.c \
     comch_consumer.c comch_producer.c comch_msgq.c dpa.c ring.c) \
-    $(addprefix $(TRANSPORT)/host/,comch_client.c comch_client_legacy.c channel.c host_stubs.c)
+    $(addprefix $(TRANSPORT)/host/,comch_client.c comch_client_legacy.c channel.c channel_broker.c broker_ipc.c \
+    host_stubs.c)
 TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
 HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
-    channel_session_test comch_client_test session_server_test dma_cleanup_test dpa_cleanup_test rx_watermark_test tx_staging_custody_test
+    channel_session_test comch_client_test session_server_test dma_cleanup_test dpa_cleanup_test rx_watermark_test tx_staging_custody_test broker_ipc_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
-.PHONY: all lib test test-native-headers test-abi examples clean
-all: lib
+.PHONY: all lib broker test test-native-headers test-abi examples clean
+all: lib broker
 
 lib: $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so
 
@@ -49,6 +50,12 @@ $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/
 	$(CC) $(HOST_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \
 	    $(LIB_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
 	ln -sfn libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh.so
+
+# The host broker: owns the DOCA device for applications (docs/2026-09-29_host-broker-plan.md).
+broker: $(BINDIR)/dpumesh_broker
+
+$(BINDIR)/dpumesh_broker: src/broker/dpumesh_broker.c $(TRANSPORT_SRCS) $(DPA_KERNEL) $(TRANSPORT_HDRS) | $(BINDIR)
+	$(CC) $(HOST_CFLAGS) $< $(TRANSPORT_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
 
 $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR)
 	$(CC) $(HOST_CFLAGS) -U_FILE_OFFSET_BITS -fPIC -shared $< -L$(LIBDIR) -ldpumesh -ldl -pthread -o $@
@@ -68,8 +75,11 @@ $(TESTDIR)/session_protocol_test: tests/session_protocol_test.c $(TRANSPORT)/com
 $(TESTDIR)/session_flow_test: tests/session_flow_test.c $(TRANSPORT)/common/object.c $(TRANSPORT)/common/dpa.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
-$(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+$(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT)/host/channel_broker.c $(TRANSPORT)/host/broker_ipc.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/host/channel_broker.c $(TRANSPORT)/host/broker_ipc.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+
+$(TESTDIR)/broker_ipc_test: tests/broker_ipc_test.c $(TRANSPORT)/host/broker_ipc.c $(TRANSPORT)/host/broker_ipc.h | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) $< $(TRANSPORT)/host/broker_ipc.c -o $@
 
 $(TESTDIR)/comch_client_test: tests/comch_client_test.c $(TRANSPORT)/host/comch_client.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@

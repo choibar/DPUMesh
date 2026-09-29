@@ -59,8 +59,10 @@ limits, concurrent calls, deadline and cancellation resets, GracefulStop,
 client close and keepalive pings. The fake poisons released buffers and
 checks for double releases and leaked leases.
 
-Configure `DPUMESH_PCI_ADDR`, `DPUMESH_POD_IP` and `DPUMESH_SERVER` before
-opening a connection. A server additionally sets `DPUMESH_SERVICE` to its
+Configure `DPUMESH_POD_IP` and `DPUMESH_SERVER` before opening a connection,
+and either `DPUMESH_PCI_ADDR` (the process opens the DOCA device itself) or a
+running `dpumesh_broker` that owns the device for it (`DPUMESH_BROKER`, default
+`/run/dpumesh/broker.sock`). A server additionally sets `DPUMESH_SERVICE` to its
 `<host>:<port>` [service target](../../../design/API.md#naming).
 [Root configuration](../../../README.md#configuration) defines these values. The older `Dial`/`Listen` signatures accept only labels
 that agree with this process configuration; they do not create separate

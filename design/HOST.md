@@ -234,7 +234,13 @@ in the proxy's notification handling, not in this library.
 ## Configuration
 
 All values come from the environment; `.env.example` lists them with
-placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`),
+placeholders. On the dpu-dma reverse path a host broker can own the DOCA device
+(`dpumesh_broker --listen <socket> --pci <addr>`, [plan](../docs/2026-09-29_host-broker-plan.md)):
+the channel is its client when `DPUMESH_BROKER` names the socket, or when it is
+unset and `/run/dpumesh/broker.sock` exists, and maps the memory the broker
+registered. Otherwise the application opens the device itself at
+`DPUMESH_PCI_ADDR` (the direct path); `DPUMESH_BROKER=off` forces that, and the
+host-dpa path always takes it. `DPUMESH_SERVER` (default `DPUMesh0`),
 `DPUMESH_POD_IP`, `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
 `DPUMESH_SERVICE` (the `<host>:<port>` target a server serves),
 `DPUMESH_TARGETS` (the targets the preload shim carries),
@@ -249,6 +255,7 @@ descriptor and event traces to stderr.
 
 ```sh
 make lib            # host library and preload shim
+make broker         # build/bin/dpumesh_broker, the process that owns the DOCA device
 make test           # host-only checks and ABI contract
 make examples       # native and preload examples; see examples/README.md
 cd src/transport && meson setup build && meson compile -C build   # transport, on the DPU

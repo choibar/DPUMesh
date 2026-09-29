@@ -1,12 +1,18 @@
-#include "channel.h"
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* memfd_create, F_SEAL_* */
+#endif
+#include "channel_internal.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <pthread.h>
 #include <poll.h>
+#include <unistd.h>
 
 #include <doca_buf_array.h>
 #include <doca_comch_consumer.h>
@@ -15,6 +21,7 @@
 #include <doca_log.h>
 #include <doca_pe.h>
 
+#include "broker_ipc.h"
 #include "buffer.h"
 #include "comch_client.h"
 #include "comch_common.h"
@@ -42,6 +49,14 @@
  * completion per descriptor (dpa.c's recv callback queues it in recv_segs).
  * The application's releases feed the kernel's staging gate (rd_pos) so it
  * never overwrites bytes the host still holds.
+ *
+ * Device ownership: a dpu-dma channel is a broker client (channel_broker.c)
+ * whenever a broker is configured (channel_dev_open). The broker opens the
+ * device here with share_memory set, so every registered region and forward
+ * ring is a sealed memfd the client maps; the client's control calls travel
+ * over the broker socket and its data path runs on those mappings. Without a
+ * broker, and on the host-dpa path until the broker runs its DPA thread, the
+ * application opens the device here itself (the direct path).
  */
 
 DOCA_LOG_REGISTER(CHANNEL);
@@ -58,67 +73,10 @@ _Static_assert(CHANNEL_MODE_BACKEND_DPU_DMA == DMESH_FLOW_MODE_BACKEND, "backend
 _Static_assert(CHANNEL_MODE_CLIENT_DPU_DMA == DMESH_FLOW_MODE_INGRESS_PUSH, "ingress push mode");
 _Static_assert(CHANNEL_MODE_BACKEND_HOST_DPA == DMESH_FLOW_MODE_BACKEND_PULL, "backend host-dpa mode");
 
-#define CHANNEL_RING_SIZE 1024u            /* Forward ring depth of the host library */
 #define CHANNEL_REV_READY_MS 5000          /* Wait for the DPU's EXPORT_RCV_RING */
 #define CHANNEL_RD_POS_BATCH (64u * 1024u) /* Pull: bytes released between rd_pos publications */
 #define CHANNEL_DEFAULT_REV_PCI "0b:00.0"  /* Pull: the host PF that runs the DPA process */
 #define CHANNEL_CTX_STOP_SPINS 100000      /* Bound on progressing a stopping ctx to IDLE */
-
-struct channel_dev {
-	struct doca_dev *dev;               /* Comch / forward device */
-	/* Lock covers every control PE call, send, callback and flow-map change.
-	 * Callbacks only change flow control state: they never acquire slot locks.
-	 * No shared control fd is registered in competing EQs; the existing carrier
-	 * fallback tick drives control progress from whichever EQ is awake. */
-	pthread_mutex_t session_lock;
-	struct dmesh_comch_client *control;
-	struct channel_conn *flows[33];
-	uint32_t generations[33];
-	int hello_ready;
-	int session_error;
-	/* Idle wake (push reverse path): one ARM at a time, released by DOORBELL */
-	int arm_outstanding;
-	uint64_t arm_epoch;
-	uint64_t arms_sent, doorbells;
-	int host_dpa;                       /* Nonzero: the host-dpa reverse path */
-    struct doca_dev *reverse_dev;       /* base PF or optional SF */
-    struct doca_dpa *reverse_dpa;       /* base context or SF extension */
-    struct doca_dev *base_dev;
-    struct doca_dpa *base_dpa;
-};
-
-struct channel_mem {
-	struct doca_mmap *mmap;
-	void *buf;
-	size_t bytes;
-	doca_dpa_dev_mmap_t dpa;            /* Handle on the forward device (the DPU DPA reads the TX pool) */
-	doca_dpa_dev_mmap_t dpa_rev;        /* Pull: handle on the DPA device (the host DPA writes the RX region) */
-};
-
-struct channel_conn {
-    struct channel_dev *dev;
-    struct dma_ring *forward_ring;
-    struct dmesh_export_rcv_ring_msg reverse_metadata;
-    bool reverse_ready;
-	doca_dpa_dev_mmap_t tx_dpa;
-	volatile struct dmesh_push_desc *descs;
-	volatile struct dmesh_push_cursor *cursor;
-	size_t data_size;
-	uint64_t expected;                  /* Push: next batch sequence */
-	int rx_ended;                       /* Push: end of stream or a malformed batch was read */
-	uint32_t flow_id, generation;
-	int open_sent, ready, peer_closed, error, close_sent, close_error;
-	/* host-dpa reverse path */
-    struct dmesh_dpa_endpoint *reverse;
-	struct doca_mmap *tx_mmap;          /* Imported DPU tx_staging */
-	struct doca_mmap *ring_mmap;        /* Imported DPU rcv_ring */
-	uint64_t rx_seq;                    /* Segments delivered to the carrier */
-	uint64_t consumed_seq;              /* Segments the carrier released */
-	uint32_t seg_end[CHANNEL_DESC_N]; /* End offset of delivered segment seq % N */
-	uint32_t rd_pos;                    /* Kernel read watermark last published */
-	uint64_t rd_published_bytes;
-	uint64_t rd_published_seq;
-};
 
 /**
  * Map a DOCA error to the errno the carrier reports
@@ -319,6 +277,7 @@ static int session_wait_locked(struct channel_dev *dev, struct channel_conn *con
 int channel_session_open(struct channel_dev *dev, const char *server)
 {
 	if (!dev || !server || !*server) { errno = EINVAL; return -1; }
+	if (dev->broker) return channel_broker_session_open(dev, server);
 	pthread_mutex_lock(&dev->session_lock);
 	if (dev->control) { pthread_mutex_unlock(&dev->session_lock); errno = EALREADY; return -1; }
 	dev->control = calloc(1, sizeof(*dev->control));
@@ -341,6 +300,7 @@ int channel_session_close(struct channel_dev *dev)
 	/* Channel destruction has exclusive ownership: no EQ or slot may still run. */
 	for (int i = 1; i <= 32; ++i)
 		if (dev->flows[i] && channel_conn_close(dev->flows[i]) != 0) return -1;
+	if (dev->broker) return channel_broker_session_close(dev);
 	pthread_mutex_lock(&dev->session_lock);
 	struct dmesh_comch_client *control = dev->control;
 	if (control && control->cc_client) {
@@ -428,10 +388,18 @@ static doca_error_t open_pull_dpa(struct channel_dev *dev, const char *pci)
 	return DOCA_SUCCESS;
 }
 
-int channel_dev_open(const char *pci, struct channel_dev **out)
+/**
+ * Open the device in this process
+ *
+ * @pci [in]: Comch PCI address
+ * @host_dpa [in]: Nonzero to bring up the host-dpa reverse path
+ * @share_memory [in]: Nonzero to back registered memory with sealed memfds (the broker)
+ * @out [out]: Device
+ * @return: 0 on success, -1 with errno otherwise
+ */
+static int dev_open(const char *pci, int host_dpa, int share_memory, struct channel_dev **out)
 {
 	struct channel_dev *dev;
-	const char *reverse;
 	doca_error_t result;
 	int saved;
 
@@ -442,14 +410,14 @@ int channel_dev_open(const char *pci, struct channel_dev **out)
 		return -1;
 
 	pthread_mutex_init(&dev->session_lock, NULL);
+	dev->share_memory = share_memory;
 	result = open_doca_device_with_pci(pci, NULL, &dev->dev);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to open Comch device %s with error = %s", pci, doca_error_get_name(result));
 		goto fail;
 	}
 
-	reverse = getenv("DPUMESH_REVERSE");
-	dev->host_dpa = reverse != NULL && strcmp(reverse, "host-dpa") == 0;
+	dev->host_dpa = host_dpa;
 	if (dev->host_dpa) {
 		result = open_pull_dpa(dev, pci);
 		if (result != DOCA_SUCCESS)
@@ -466,12 +434,44 @@ fail:
 	return -1;
 }
 
+int channel_dev_open(const char *pci, struct channel_dev **out)
+{
+	const char *reverse = getenv("DPUMESH_REVERSE");
+	const char *broker = getenv("DPUMESH_BROKER");
+	int host_dpa = reverse != NULL && strcmp(reverse, "host-dpa") == 0;
+
+	logging_once(); /* the broker client logs through DOCA too */
+
+	/* A dpu-dma channel is a broker client when DPUMESH_BROKER names a socket,
+	 * or when it is unset and the default socket exists. DPUMESH_BROKER=off,
+	 * and the host-dpa path (its DPA thread still runs in this process), open
+	 * the device here: the direct path. */
+	if (!host_dpa && !(broker != NULL && strcmp(broker, "off") == 0)) {
+		if (broker != NULL && *broker != '\0')
+			return channel_broker_attach(broker, out);
+		if (access(BROKER_DEFAULT_SOCKET, F_OK) == 0)
+			return channel_broker_attach(BROKER_DEFAULT_SOCKET, out);
+	}
+	if (pci == NULL || *pci == '\0') { errno = EINVAL; return -1; }
+	return dev_open(pci, host_dpa, 0, out);
+}
+
+int channel_dev_open_owner(const char *pci, struct channel_dev **out)
+{
+	if (pci == NULL || *pci == '\0') { errno = EINVAL; return -1; }
+	return dev_open(pci, 0, 1, out);
+}
+
 void channel_dev_close(struct channel_dev *dev)
 {
 	if (dev == NULL)
 		return;
 
 	if (channel_session_close(dev) != 0) return;
+	if (dev->broker != NULL) {
+		channel_broker_detach(dev);
+		return;
+	}
     /* An extended context owns SF resources and retires before its base. */
     if (dev->reverse_dpa != NULL && dev->reverse_dpa != dev->base_dpa)
         (void)doca_dpa_destroy(dev->reverse_dpa);
@@ -495,6 +495,41 @@ void channel_dev_close(struct channel_dev *dev)
  */
 
 /**
+ * Allocate memfd-backed shared memory
+ *
+ * The size is sealed before any client sees the fd, so nobody can shrink or
+ * grow the pages the NIC registered (from ~/DPUmesh doca/buffer.c).
+ *
+ * @bytes [in]: Size
+ * @fd [out]: The memfd
+ * @return: The mapping, or NULL
+ */
+void *channel_shared_alloc(size_t bytes, int *fd)
+{
+	int memfd = memfd_create("dpumesh", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	void *buf = MAP_FAILED;
+
+	if (memfd >= 0 && ftruncate(memfd, (off_t)bytes) == 0 &&
+	    fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL) == 0)
+		buf = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+	if (buf == MAP_FAILED) {
+		if (memfd >= 0)
+			close(memfd);
+		return NULL;
+	}
+	*fd = memfd;
+	return buf;
+}
+
+void channel_shared_free(void *buf, size_t bytes, int fd)
+{
+	if (buf != NULL)
+		(void)munmap(buf, bytes);
+	if (fd >= 0)
+		close(fd);
+}
+
+/**
  * Allocate a buffer and register it with one or two devices
  *
  * Like alloc_buffer_and_set_mmap, with the DPA device added as a second device
@@ -507,10 +542,11 @@ void channel_dev_close(struct channel_dev *dev)
  * @buffer [out]: Allocated buffer
  * @bytes [in]: Buffer size
  * @access [in]: mmap permissions
+ * @memfd [out]: NULL for private memory; otherwise the buffer is shared memory and this is its memfd
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
 static doca_error_t alloc_buffer_and_set_mmap2(struct doca_mmap **mmap, struct doca_dev *dev, struct doca_dev *dev2,
-					       void **buffer, size_t bytes, uint32_t access)
+					       void **buffer, size_t bytes, uint32_t access, int *memfd)
 {
 	const char *step = "create";
 	doca_error_t result;
@@ -544,12 +580,21 @@ static doca_error_t alloc_buffer_and_set_mmap2(struct doca_mmap **mmap, struct d
 	if (result != DOCA_SUCCESS)
 		goto destroy_mmap;
 
-	step = "posix_memalign";
-	if (posix_memalign(buffer, 4096, bytes) != 0) {
-		result = DOCA_ERROR_NO_MEMORY;
-		goto destroy_mmap;
+	if (memfd != NULL) {
+		step = "memfd";
+		*buffer = channel_shared_alloc(bytes, memfd);   /* zero-filled by ftruncate */
+		if (*buffer == NULL) {
+			result = DOCA_ERROR_NO_MEMORY;
+			goto destroy_mmap;
+		}
+	} else {
+		step = "posix_memalign";
+		if (posix_memalign(buffer, 4096, bytes) != 0) {
+			result = DOCA_ERROR_NO_MEMORY;
+			goto destroy_mmap;
+		}
+		memset(*buffer, 0, bytes);
 	}
-	memset(*buffer, 0, bytes);
 
 	step = "set_memrange";
 	result = doca_mmap_set_memrange(*mmap, *buffer, bytes);
@@ -563,7 +608,12 @@ static doca_error_t alloc_buffer_and_set_mmap2(struct doca_mmap **mmap, struct d
 	return DOCA_SUCCESS;
 
 free_buffer:
-	free(*buffer);
+	if (memfd != NULL) {
+		channel_shared_free(*buffer, bytes, *memfd);
+		*memfd = -1;
+	} else {
+		free(*buffer);
+	}
 	*buffer = NULL;
 destroy_mmap:
 	(void)doca_mmap_destroy(*mmap);
@@ -579,29 +629,35 @@ int channel_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem 
 	struct doca_dev *dev2 = dev->host_dpa ? dev->reverse_dev : NULL;
 	doca_error_t result;
 
+	if (dev->broker)
+		return channel_broker_mem_alloc(dev, bytes, out);
+
 	mem = calloc(1, sizeof(*mem));
 	if (mem == NULL)
 		return -1;
+	mem->memfd = -1;
+	mem->shared = dev->share_memory;
 
 	result = alloc_buffer_and_set_mmap2(&mem->mmap, dev->dev, dev2, &mem->buf, bytes,
-					    DOCA_ACCESS_FLAG_PCI_READ_WRITE | DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
+					    DOCA_ACCESS_FLAG_PCI_READ_WRITE | DOCA_ACCESS_FLAG_LOCAL_READ_WRITE,
+					    mem->shared ? &mem->memfd : NULL);
 	if (result != DOCA_SUCCESS)
 		goto free_mem;
+	mem->bytes = bytes;
 
 	result = doca_mmap_dev_get_dpa_handle(mem->mmap, dev->dev, &mem->dpa);
 	if (result == DOCA_SUCCESS && dev2 != NULL)
 		result = doca_mmap_dev_get_dpa_handle(mem->mmap, dev2, &mem->dpa_rev);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to get DPA handle of the region with error = %s", doca_error_get_name(result));
-		goto free_buffer;
+		channel_mem_free(mem);
+		errno = error_number(result);
+		return -1;
 	}
 
-	mem->bytes = bytes;
 	*out = mem;
 	return 0;
 
-free_buffer:
-	(void)destroy_mmap_and_free_buffer(mem->mmap, mem->buf);
 free_mem:
 	free(mem);
 	errno = error_number(result);
@@ -617,9 +673,47 @@ void channel_mem_free(struct channel_mem *mem)
 {
 	if (mem == NULL)
 		return;
-	if (mem->mmap != NULL)
+	if (mem->shared) {
+		/* A broker client's view has no mmap: the broker registered the region. */
+		if (mem->mmap != NULL)
+			(void)doca_mmap_destroy(mem->mmap);
+		channel_shared_free(mem->buf, mem->bytes, mem->memfd);
+	} else if (mem->mmap != NULL) {
 		(void)destroy_mmap_and_free_buffer(mem->mmap, mem->buf);
+	}
 	free(mem);
+}
+
+/**
+ * Allocate a forward ring in shared memory
+ *
+ * Same layout as alloc_dma_ring (control block, then the descriptors), but
+ * memfd-backed so the broker's client posts into it directly.
+ *
+ * @conn [in]: Connection; receives the ring, its memfd and size
+ * @dev [in]: Forward device
+ * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
+ */
+static doca_error_t alloc_shared_ring(struct channel_conn *conn, struct doca_dev *dev)
+{
+	size_t bytes = sizeof(struct dma_ring_ctrl) + CHANNEL_RING_SIZE * sizeof(struct dma_desc);
+	struct dma_ring *ring = calloc(1, sizeof(*ring));
+	doca_error_t result;
+
+	if (ring == NULL)
+		return DOCA_ERROR_NO_MEMORY;
+	result = alloc_buffer_and_set_mmap2(&ring->mmap, dev, NULL, &ring->buffer, bytes,
+					    DOCA_ACCESS_FLAG_PCI_READ_WRITE, &conn->ring_fd);
+	if (result != DOCA_SUCCESS) {
+		free(ring);
+		return result;
+	}
+	ring->size = CHANNEL_RING_SIZE;
+	ring->ctrl = (struct dma_ring_ctrl *)ring->buffer;
+	ring->descs = (struct dma_desc *)((uint8_t *)ring->buffer + sizeof(struct dma_ring_ctrl));
+	conn->forward_ring = ring;
+	conn->ring_bytes = bytes;
+	return DOCA_SUCCESS;
 }
 
 /*
@@ -889,7 +983,15 @@ static int conn_teardown(struct channel_conn *conn)
 {
 	/* Only reached before OPEN or after confirmed CLOSED and reverse quiescence. */
 	if (conn->forward_ring != NULL) {
-		if (conn->forward_ring->mmap != NULL) {
+		if (conn->ring_bytes != 0) {
+			/* Shared ring: registered here by the broker, or a client's view (no mmap). */
+			if (conn->forward_ring->mmap != NULL) {
+				doca_error_t result = doca_mmap_destroy(conn->forward_ring->mmap);
+				if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
+				conn->forward_ring->mmap = NULL;
+			}
+			channel_shared_free(conn->forward_ring->buffer, conn->ring_bytes, conn->ring_fd);
+		} else if (conn->forward_ring->mmap != NULL) {
 			doca_error_t result = destroy_mmap_and_free_buffer(conn->forward_ring->mmap, conn->forward_ring->buffer);
 			if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
 		}
@@ -907,6 +1009,7 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 	if (!dev || !cfg || !out || !cfg->flow_id || cfg->flow_id > 32 || !cfg->tx || !cfg->rx ||
 	    cfg->rx_offset > cfg->rx->bytes || CHANNEL_WINDOW > cfg->rx->bytes - cfg->rx_offset) { errno = EINVAL; return -1; }
 	*out = NULL;
+	if (dev->broker) return channel_broker_conn_open(dev, cfg, out);
 
 	conn = calloc(1, sizeof(*conn));
     if (conn == NULL) {
@@ -914,6 +1017,7 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 		return -1;
 	}
 	conn->dev = dev;
+	conn->ring_fd = -1;
 
 	/* Install the flow before OPEN, so any completion is routed by id+generation. */
 	pthread_mutex_lock(&dev->session_lock);
@@ -943,7 +1047,8 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 		 cfg->workload != NULL ? cfg->workload : "");
 
 	/* forward ring and the shared regions as this connection's sndbuf/rcvbuf */
-	result = alloc_dma_ring(&conn->forward_ring, dev->dev, CHANNEL_RING_SIZE);
+	result = dev->share_memory ? alloc_shared_ring(conn, dev->dev)
+	                           : alloc_dma_ring(&conn->forward_ring, dev->dev, CHANNEL_RING_SIZE);
 	if (result != DOCA_SUCCESS) goto fail;
 	sndbuf.mmap = cfg->tx->mmap;
 	sndbuf.buf = cfg->tx->buf;
@@ -1003,6 +1108,7 @@ fail:
 int channel_conn_close(struct channel_conn *conn)
 {
 	if (conn == NULL) return 0;
+	if (conn->dev->broker) return channel_broker_conn_close(conn);
 	/* Stop the reverse reader BEFORE asking the DPU to release its source. */
 	if (conn->dev->host_dpa && host_dpa_teardown(conn) != 0) return -1;
 	struct channel_dev *dev = conn->dev;
@@ -1025,6 +1131,7 @@ int channel_conn_close(struct channel_conn *conn)
 
 int channel_dev_progress(struct channel_dev *dev)
 {
+	if (dev->broker) return channel_broker_dev_progress(dev);
 	pthread_mutex_lock(&dev->session_lock);
 	int rc = session_progress_locked(dev);
 	int saved = errno;
@@ -1036,6 +1143,7 @@ int channel_dev_progress(struct channel_dev *dev)
 int channel_conn_status(struct channel_conn *conn)
 {
 	struct channel_dev *dev = conn->dev;
+	if (dev->broker) return channel_broker_conn_progress(conn);
 	pthread_mutex_lock(&dev->session_lock);
 	int saved = dev->session_error ? dev->session_error : conn->error;
 	int gone = conn->peer_closed;
@@ -1049,6 +1157,7 @@ int channel_conn_status(struct channel_conn *conn)
 int channel_dev_fd(struct channel_dev *dev)
 {
 	doca_notification_handle_t handle;
+	if (dev->broker) return -1;
 	if (dev->control == NULL ||
 	    doca_pe_get_notification_handle(dev->control->pe, &handle) != DOCA_SUCCESS)
 		return -1;
@@ -1057,6 +1166,8 @@ int channel_dev_fd(struct channel_dev *dev)
 
 int channel_dev_arm(struct channel_dev *dev)
 {
+	/* A broker client has no control PE to sleep on: keep polling. */
+	if (dev->broker) { errno = ENOTSUP; return -1; }
 	pthread_mutex_lock(&dev->session_lock);
 	int rc = 0, saved = 0;
 	if (dev->control == NULL || !dev->hello_ready || dev->session_error) {
@@ -1114,6 +1225,7 @@ out:
 void channel_dev_clear(struct channel_dev *dev)
 {
 	doca_notification_handle_t handle;
+	if (dev->broker) return;
 	pthread_mutex_lock(&dev->session_lock);
 	/* A raised handle stays readable until the next request; clear it so an
 	 * EQ that keeps polling does not see its fd stay readable. */
@@ -1232,7 +1344,7 @@ uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t by
 	struct dma_desc *desc = get_next_dma_desc(ring); /* the caller checked ring_free */
 
 	desc->mmap = conn->tx_dpa;
-	desc->addr = addr;
+	desc->addr = addr + conn->tx_delta; /* the DPU knows the TX pool at its registering process's address */
 	desc->size = bytes;
 	commit_dma_desc(ring);
 	return ring->head;
