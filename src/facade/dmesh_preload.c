@@ -138,6 +138,7 @@ typedef struct pfd {
     int  fork_locked;          /* atfork's unique-entry marker */
     long rcv_timeout_ms;       /* SO_RCVTIMEO; 0 = block forever */
     long snd_timeout_ms;       /* SO_SNDTIMEO; 0 = block forever */
+    int  family;               /* the app socket's family: AF_INET or AF_INET6 */
     uint16_t lport;            /* synthesized getsockname port */
     uint16_t pport;            /* getpeername port */
     uint32_t paddr;            /* getpeername IP (net-order); 0 = synthesize loopback.
@@ -201,6 +202,7 @@ static pfd_t *pfd_new(dmesh_qp_t *c) {
         return NULL;
     }
     e->conn = c;
+    e->family = AF_INET;
     e->efd = sv[0];
     e->sigfd = sv[1];
     /* Keeping the gate small bounds the one-time work needed to suppress POLLOUT
@@ -1027,12 +1029,34 @@ static ssize_t shim_send(pfd_t *e, const void *buf, size_t len, int flags) {
 
 /* ========================= socket-call surface ========================= */
 
+/* The IPv4 destination named by an AF_INET address or by an AF_INET6 address
+ * in the v4-mapped range (::ffff:a.b.c.d), which dual-stack sockets use for
+ * IPv4 peers. Returns -1 for any other address. */
+static int ipv4_of(const struct sockaddr *addr, socklen_t alen, struct sockaddr_in *out) {
+    if (!addr) return -1;
+    if (addr->sa_family == AF_INET && alen >= (socklen_t)sizeof(struct sockaddr_in)) {
+        memcpy(out, addr, sizeof *out);
+        return 0;
+    }
+    if (addr->sa_family == AF_INET6 && alen >= (socklen_t)sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)addr;
+        if (!IN6_IS_ADDR_V4MAPPED(&s6->sin6_addr)) return -1;
+        memset(out, 0, sizeof *out);
+        out->sin_family = AF_INET;
+        out->sin_port = s6->sin6_port;
+        memcpy(&out->sin_addr, &s6->sin6_addr.s6_addr[12], sizeof(out->sin_addr));
+        return 0;
+    }
+    return -1;
+}
+
 int connect(int fd, const struct sockaddr *addr, socklen_t alen) {
     ENSURE_REAL();
     pfd_t *existing = pfd_get(fd);
     if (existing) { pfd_put(existing); errno = EISCONN; return -1; }
-    if (addr && addr->sa_family == AF_INET && alen >= sizeof(struct sockaddr_in)) {
-        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+    struct sockaddr_in v4;
+    if (ipv4_of(addr, alen, &v4) == 0) {
+        const struct sockaddr_in *sin = &v4;
         /* AF_INET SOCK_STREAM only — a UDP connect() to a mapped port must stay
          * kernel. */
         int so_type = 0; socklen_t tl = sizeof so_type;
@@ -1096,6 +1120,7 @@ int connect(int fd, const struct sockaddr *addr, socklen_t alen) {
             /* preserve O_NONBLOCK the app may have set on the TCP socket */
             int fl = real_fcntl(fd, F_GETFL);
             e->nonblock = (fl >= 0 && (fl & O_NONBLOCK)) ? 1 : 0;
+            e->family = addr->sa_family;           /* names read back in the app's family */
             e->lport = c->local_port;
             e->paddr = sin->sin_addr.s_addr;       /* real dst → getpeername tells the truth */
             e->pport = ntohs(sin->sin_port);
@@ -1129,13 +1154,21 @@ int listen(int fd, int backlog) {
     pfd_t *existing = pfd_get(fd);
     if (existing) pfd_put(existing);
     if (listen_port >= 0 && !existing) {
-        struct sockaddr_in sin; socklen_t sl = sizeof sin;
-        if (real_getsockname(fd, (struct sockaddr *)&sin, &sl) == 0 &&
-            sin.sin_family == AF_INET && ntohs(sin.sin_port) == (uint16_t)listen_port) {
+        /* A dual-stack server binds [::]; its port decides like an IPv4 one's. */
+        struct sockaddr_storage ss; socklen_t sl = sizeof ss;
+        int bound_port = -1;
+        if (real_getsockname(fd, (struct sockaddr *)&ss, &sl) == 0) {
+            if (ss.ss_family == AF_INET)
+                bound_port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
+            else if (ss.ss_family == AF_INET6)
+                bound_port = ntohs(((struct sockaddr_in6 *)&ss)->sin6_port);
+        }
+        if (bound_port == listen_port) {
             if (ensure_channel() < 0) { errno = EADDRNOTAVAIL; return -1; }
             pfd_t *e = pfd_new(NULL);
             if (!e) { errno = ENOMEM; return -1; }
             e->listener = 1;
+            e->family = ss.ss_family;
             int fl = real_fcntl(fd, F_GETFL);
             e->nonblock = (fl >= 0 && (fl & O_NONBLOCK)) ? 1 : 0;
             e->lport = (uint16_t)listen_port;
@@ -1159,6 +1192,34 @@ int listen(int fd, int backlog) {
         }
     }
     return real_listen(fd, backlog);
+}
+
+/* Build a socket address view in the app socket's family. addr==0 → loopback
+ * (a synthesized name); a CLIENT conn passes its real dialed ClusterIP so
+ * getpeername is truthful. An AF_INET6 socket sees the v4-mapped address. */
+static int synth_name(int family, uint32_t addr, uint16_t port, struct sockaddr *out, socklen_t *alen) {
+    if (!out || !alen) { errno = EFAULT; return -1; }
+    uint32_t ip = addr ? addr : htonl(INADDR_LOOPBACK);
+    union { struct sockaddr_in v4; struct sockaddr_in6 v6; } name;
+    socklen_t size;
+    memset(&name, 0, sizeof name);
+    if (family == AF_INET6) {
+        name.v6.sin6_family = AF_INET6;
+        name.v6.sin6_port = htons(port);
+        name.v6.sin6_addr.s6_addr[10] = 0xff;
+        name.v6.sin6_addr.s6_addr[11] = 0xff;
+        memcpy(&name.v6.sin6_addr.s6_addr[12], &ip, sizeof ip);
+        size = sizeof name.v6;
+    } else {
+        name.v4.sin_family = AF_INET;
+        name.v4.sin_addr.s_addr = ip;
+        name.v4.sin_port = htons(port);
+        size = sizeof name.v4;
+    }
+    socklen_t n = *alen < size ? *alen : size;
+    memcpy(out, &name, n);
+    *alen = size;
+    return 0;
 }
 
 static int shim_accept(int fd, struct sockaddr *addr, socklen_t *alen, int flags) {
@@ -1188,6 +1249,7 @@ static int shim_accept(int fd, struct sockaddr *addr, socklen_t *alen, int flags
     }
     pthread_mutex_lock(&e->mu);
     e->nonblock = (flags & SOCK_NONBLOCK) ? 1 : 0;
+    e->family = l->family;                          /* accepted like the listener's */
     pthread_mutex_unlock(&e->mu);
     if (flags & SOCK_CLOEXEC) real_fcntl(newfd, F_SETFD, FD_CLOEXEC);
     pthread_mutex_lock(&g_tbl_mu);
@@ -1195,15 +1257,7 @@ static int shim_accept(int fd, struct sockaddr *addr, socklen_t *alen, int flags
     e->refs++;
     pthread_mutex_unlock(&g_tbl_mu);
 
-    if (addr && alen && *alen >= (socklen_t)sizeof(struct sockaddr_in)) {
-        struct sockaddr_in sin;
-        memset(&sin, 0, sizeof sin);
-        sin.sin_family = AF_INET;
-        sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        sin.sin_port = htons(e->pport);
-        memcpy(addr, &sin, sizeof sin);
-        *alen = sizeof sin;
-    }
+    if (addr && alen) (void)synth_name(e->family, 0, e->pport, addr, alen);
     DBG("accept → fd=%d (peer port=%u)", newfd, e->pport);
     pfd_put(l);
     return newfd;
@@ -1645,6 +1699,18 @@ int getsockopt(int fd, int level, int optname, void *val, socklen_t *len) {
             if (*len >= sizeof(int)) { *(int *)val = SOCK_STREAM; *len = sizeof(int); }
             pfd_put(e);
             return 0;
+        case SO_DOMAIN:                             /* runtimes pick address parsing by it */
+            if (*len >= sizeof(int)) { *(int *)val = e->family; *len = sizeof(int); }
+            pfd_put(e);
+            return 0;
+        case SO_PROTOCOL:
+            if (*len >= sizeof(int)) { *(int *)val = IPPROTO_TCP; *len = sizeof(int); }
+            pfd_put(e);
+            return 0;
+        case SO_ACCEPTCONN:
+            if (*len >= sizeof(int)) { *(int *)val = e->listener; *len = sizeof(int); }
+            pfd_put(e);
+            return 0;
         case SO_SNDBUF:
         case SO_RCVBUF:                             /* NEVER 0 — apps size buffers by it */
             if (*len >= sizeof(int)) { *(int *)val = 262144; *len = sizeof(int); }
@@ -1682,26 +1748,11 @@ int getsockopt(int fd, int level, int optname, void *val, socklen_t *len) {
     return 0;                                       /* unknown: report "off/disabled" */
 }
 
-/* Build a sockaddr_in view. addr==0 → loopback (a synthesized name); a CLIENT conn
- * passes its real dialed ClusterIP so getpeername is truthful. */
-static int synth_name(uint32_t addr, uint16_t port, struct sockaddr *out, socklen_t *alen) {
-    if (!out || !alen) { errno = EFAULT; return -1; }
-    struct sockaddr_in sin;
-    memset(&sin, 0, sizeof sin);
-    sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = addr ? addr : htonl(INADDR_LOOPBACK);
-    sin.sin_port = htons(port);
-    socklen_t n = *alen < (socklen_t)sizeof sin ? *alen : (socklen_t)sizeof sin;
-    memcpy(out, &sin, n);
-    *alen = sizeof sin;
-    return 0;
-}
-
 int getsockname(int fd, struct sockaddr *addr, socklen_t *alen) {
     ENSURE_REAL();
     pfd_t *e = pfd_get(fd);
     if (!e) return real_getsockname(fd, addr, alen);
-    int r = synth_name(0, e->lport, addr, alen);   /* the socket has no pod-local IP */
+    int r = synth_name(e->family, 0, e->lport, addr, alen);   /* the socket has no pod-local IP */
     pfd_put(e);
     return r;
 }
@@ -1711,7 +1762,7 @@ int getpeername(int fd, struct sockaddr *addr, socklen_t *alen) {
     pfd_t *e = pfd_get(fd);
     if (!e) return real_getpeername(fd, addr, alen);
     if (e->listener) { pfd_put(e); errno = ENOTCONN; return -1; }
-    int r = synth_name(e->paddr, e->pport, addr, alen);
+    int r = synth_name(e->family, e->paddr, e->pport, addr, alen);
     pfd_put(e);
     return r;
 }
