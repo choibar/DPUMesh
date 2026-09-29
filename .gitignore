@@ -31,9 +31,22 @@ bench-results/*
 !bench-results/2026-09-26_grpc-go-64b-w16-k4-no-eu-partitions.md
 !bench-results/2026-09-29_grpc-go-adapter-rework.md
 !bench-results/2026-09-29_preload-gather-write.md
+!bench-results/2026-09-29_online-boutique-e2e.md
 
 # local test binary
 apps/dmesh-router-cpp/test/test_transcode
+
+# gRPC language adapter build trees
+/integrations/grpc/dotnet/**/bin/
+/integrations/grpc/dotnet/**/obj/
+/integrations/grpc/java/.gradle/
+/integrations/grpc/java/build/
+/integrations/grpc/node/build/
+/integrations/grpc/node/node_modules/
+/integrations/grpc/node/package-lock.json
+/integrations/grpc/python/build/
+/integrations/grpc/python/*.egg-info/
+__pycache__/
 
 # host library build tree
 /build/
