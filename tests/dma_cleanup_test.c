@@ -356,6 +356,26 @@ static void test_push_fin_follows_the_last_batch(void)
     finish_fixture(conn);
 }
 
+static void test_push_publication_failure_retains_custody(void)
+{
+    struct dmesh_conn *conn = create_fixture(1);
+    uint8_t staging[256], ring[64];
+    fixture->tasks[0].submitted = fixture->tasks[0].entry->in_flight = false;
+    assert(put_free_dma_task(conn, (void *)&fixture->tasks[0]) == DOCA_SUCCESS);
+    fixture->submit_error = DOCA_ERROR_AGAIN;
+    fixture->lend_buffers = 2;
+    conn->tx_staging = staging;
+    conn->tx_staging_len = sizeof(staging);
+    conn->rcvbuf.mmap = (void *)fixture;
+    conn->rcvbuf.buf = ring;
+    conn->push_len = 8;
+    dmesh_dma_push_submit_desc(conn);
+    assert(conn->dma_closing && conn->state == DMESH_CONN_ERROR && conn->error_status == EIO);
+    assert(conn->push_seq == 0 && conn->push_len == 8);
+    assert(fixture->buffers[4].refs == 0 && fixture->buffers[5].refs == 0);
+    finish_fixture(conn);
+}
+
 int main(void)
 {
     assert(cleanup_dma_tasks(NULL) == DOCA_SUCCESS);
@@ -367,6 +387,7 @@ int main(void)
     test_error_callback_keeps_sibling_tasks();
     test_submission_failure_does_not_release_caller_buffers();
     test_push_fin_follows_the_last_batch();
+    test_push_publication_failure_retains_custody();
     puts("dma_cleanup_test: PASS");
     return 0;
 }

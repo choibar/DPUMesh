@@ -894,6 +894,8 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     conn->push_pos = 0;
     conn->push_len = 0;
     conn->push_state = 0;
+    conn->push_unreported_pos = conn->push_unreported_len = 0;
+    conn->push_unreported_seq = 0;
     conn->push_shadow = NULL;
 
     /* Per-connection DMA engine (ctx, inventory, task pool, recv/pending rings). */
@@ -1275,6 +1277,8 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 					conn->push_seq = 0;
 					conn->push_pos = 0;
 					conn->push_state = 0;
+					conn->push_unreported_pos = conn->push_unreported_len = 0;
+					conn->push_unreported_seq = 0;
 				}
 				conn->reverse_exported = true;   /* nothing to export */
 				DOCA_LOG_INFO("Push channel ready (mode %u) for %u.%u.%u.%u:%u",
