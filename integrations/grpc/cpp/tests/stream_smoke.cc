@@ -181,7 +181,11 @@ int Client(const char* target, int count, size_t size) {
   bool ok = true;
   for (int i = 0; i < count && ok; ++i) {
     for (size_t j = 0; j < size; ++j) {
-      message[j] = static_cast<char>((i * 31 + j * 7) & 0xff);
+      // Encode the byte position across the whole message. A 256-byte
+      // repeating pattern cannot detect replay/reordering of 8 KiB segments.
+      const uint64_t word = (static_cast<uint64_t>(j / 8) * 0x9e3779b97f4a7c15ULL) ^
+                            (static_cast<uint64_t>(i) * 0xd6e8feb86659fd93ULL);
+      message[j] = static_cast<char>(word >> ((j % 8) * 8));
     }
     const auto start = Clock::now();
     size_t sent = 0;
@@ -208,7 +212,12 @@ int Client(const char* target, int count, size_t size) {
         std::chrono::duration<double, std::micro>(Clock::now() - start).count());
     std::lock_guard<std::mutex> lock(pinger.mu);
     if (ok && pinger.received.compare(expected - size, size, message) != 0) {
-      std::fprintf(stderr, "message %d: echo differs\n", i);
+      auto mismatch = std::mismatch(message.begin(), message.end(),
+                                   pinger.received.begin() + expected - size);
+      const size_t offset = static_cast<size_t>(mismatch.first - message.begin());
+      std::fprintf(stderr, "message %d: echo differs at byte %zu (expected=%02x actual=%02x)\n",
+                   i, offset, static_cast<unsigned char>(*mismatch.first),
+                   static_cast<unsigned char>(*mismatch.second));
       ok = false;
     }
   }
