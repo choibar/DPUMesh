@@ -99,6 +99,7 @@ struct dmesh_conn {
     struct dmesh_export_metadata_msg *pending_metadata;
 
     struct dmesh_doca_dpa_thread *dpa_thread; /* assigned from objs->dpa_pool */
+    uint32_t rx_wm_published; /* last staging consumption position sent to DPA */
     struct dmesh_doca_dpa_comch *dpa_comch;   /* msgqs bound to dpa_thread */
 
     struct local_mem_bufs *consumer_mem;

@@ -1177,6 +1177,7 @@ dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
     }
 #endif
 
+    conn->rx_wm_published = 0;
     *arg = (struct dpa_thread_arg) {
         .dpa_consumer_comp = dpa_consumer_comp,
         .dpa_producer_comp = dpa_producer_comp,
