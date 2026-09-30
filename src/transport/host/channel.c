@@ -1012,18 +1012,33 @@ int channel_conn_close(struct channel_conn *conn)
 	return rc;
 }
 
-int channel_conn_progress(struct channel_conn *conn)
+int channel_dev_progress(struct channel_dev *dev)
+{
+	pthread_mutex_lock(&dev->session_lock);
+	int rc = session_progress_locked(dev);
+	int saved = errno;
+	pthread_mutex_unlock(&dev->session_lock);
+	if (rc != 0) errno = saved;
+	return rc;
+}
+
+int channel_conn_status(struct channel_conn *conn)
 {
 	struct channel_dev *dev = conn->dev;
 	pthread_mutex_lock(&dev->session_lock);
-	int rc = session_progress_locked(dev);
-	int saved = rc != 0 ? errno : conn->error;
+	int saved = dev->session_error ? dev->session_error : conn->error;
 	int gone = conn->peer_closed;
 	pthread_mutex_unlock(&dev->session_lock);
 	if (conn->reverse != NULL && conn->reverse->pe != NULL)
 		(void)doca_pe_progress(conn->reverse->pe);
 	if (saved) { errno = saved; return -1; }
 	return gone;
+}
+
+int channel_conn_progress(struct channel_conn *conn)
+{
+	if (channel_dev_progress(conn->dev) != 0) return -1;
+	return channel_conn_status(conn);
 }
 
 /*

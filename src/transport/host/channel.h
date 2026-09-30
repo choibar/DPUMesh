@@ -59,6 +59,8 @@ int channel_session_open(struct channel_dev *dev, const char *server);
 int channel_session_close(struct channel_dev *dev);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);
+/* Progress the channel's shared Comch control session once per drain pass. */
+int channel_dev_progress(struct channel_dev *dev);
 
 /* Memory: allocates, registers and PCI-exports `bytes`; the buffer is owned by mem */
 int channel_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem **out);
@@ -73,6 +75,9 @@ int channel_conn_close(struct channel_conn *conn);
 /* Progresses the control path (and the reverse completions on the host-dpa reverse path).
  * Returns 1 for CLOSED, -1 with errno for flow/session failure, otherwise 0. */
 int channel_conn_progress(struct channel_conn *conn);
+/* Read the flow status and progress its private reverse PE. Call after
+ * channel_dev_progress; this never progresses the shared control PE again. */
+int channel_conn_status(struct channel_conn *conn);
 
 /* Doorbells: private reverse-completion engines only. The shared control PE
  * is serialized and polled through the carrier fallback tick. Returns the

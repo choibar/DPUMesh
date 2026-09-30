@@ -26,6 +26,8 @@ int dmesh_native_open(struct dmesh_native_transport **, struct dmesh_native_conf
 int dmesh_native_close(struct dmesh_native_transport *);
 /* submit borrows the registered TX range until a custody ACK, including FIN. */
 int dmesh_native_submit(struct dmesh_native_transport *, const sw_descriptor_t *);
+/* Progress channel-wide control once before polling the landing stripes. */
+void dmesh_native_progress(struct dmesh_native_transport *);
 /* A stripe has one consumer at a time; the core provides per-stripe exclusion. */
 int dmesh_native_poll(struct dmesh_native_transport *, int stripe, struct dmesh_native_event *);
 void dmesh_native_release(struct dmesh_native_transport *, int byte_offset);

@@ -10,6 +10,7 @@
 static struct dmesh_comch_client *mock_control;
 static unsigned client_creates, client_destroys, ring_allocs, ring_frees;
 static unsigned opens, closes;
+static unsigned control_progress;
 static int next_close_status;
 static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
@@ -85,6 +86,7 @@ uint8_t doca_pe_progress(struct doca_pe *pe)
 {
     if (pe == (struct doca_pe *)&fake_reverse_pe) return 0;
     assert(pe == (struct doca_pe *)mock_control);
+    ++control_progress;
     if (!pending_len) return 0;
     size_t len = pending_len;
     pending_len = 0;
@@ -292,6 +294,17 @@ int main(void)
     assert(channel_conn_open(&dev, &cfg, &b) == 0);
     assert(client_creates == 1 && opens == 2 && a->ready && b->ready);
 
+    /* One session progress delivers replies for all flows; status checks must
+     * neither re-progress that shared PE nor hide a sibling's error. */
+    unsigned progress_before = control_progress;
+    reply(DMESH_SESSION_ERROR, 1, a->generation, EIO);
+    assert(channel_dev_progress(&dev) == 0);
+    assert(control_progress == progress_before + 1);
+    assert(channel_conn_status(a) == -1 && errno == EIO);
+    assert(channel_conn_status(b) == 0);
+    assert(control_progress == progress_before + 1);
+    a->error = 0;
+
     /* A reply to a different incarnation cannot change the live flow. */
     dispatch(&dev, DMESH_SESSION_CLOSED, 1, a->generation + 1, 0);
     assert(!a->peer_closed && !b->peer_closed);
@@ -310,8 +323,9 @@ int main(void)
 
     /* A failed session is observed independently by every flow's poller. */
     control->peer_gone = 1;
-    assert(channel_conn_progress(again) == -1 && errno == ECONNRESET);
-    assert(channel_conn_progress(b) == -1 && errno == ECONNRESET);
+    assert(channel_dev_progress(&dev) == -1 && errno == ECONNRESET);
+    assert(channel_conn_status(again) == -1 && errno == ECONNRESET);
+    assert(channel_conn_status(b) == -1 && errno == ECONNRESET);
     control->peer_gone = 0; dev.session_error = 0; /* Test-only reset. */
 
     /* A failed close retains the flow and its ring, without closing siblings. */
