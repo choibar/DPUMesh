@@ -5,10 +5,13 @@ process owns one channel, one shared host–DPU Comch control connection, one EQ
 and one poller goroutine. Each Go connection owns a native QP; DMA rings,
 buffers and DPA resources remain per flow.
 
-- The poller is the EQ's only consumer. Its wait loop runs in C, so the
-  library's spin window and tick cost no Go scheduling. It hands receive
-  leases to their connections and runs every QP destruction; the native API
-  requires destruction to be serialized with polling.
+- The poller is the EQ's only consumer. It polls the EQ without blocking and,
+  while it is empty, parks on Go's netpoller with a duplicate of the EQ fd
+  (`eq_wait_linux.go`); no OS thread waits in cgo. The library's timers (naps,
+  retained-tail deadlines, the backstop) and doorbells raise that fd, so the
+  wait needs no Go timer. Commands interrupt it through the read deadline. It
+  hands receive leases to their connections and runs every QP destruction;
+  the native API requires destruction to be serialized with polling.
 - Read, Write and Dial run on the caller's goroutine. Each connection has its
   own lock, so no connection waits for another's I/O. A Dial waits for the
   DPU's answer without blocking other traffic; a `DialContext` whose context
