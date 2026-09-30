@@ -110,6 +110,7 @@ int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t 
     } else push(t, ack);
     pthread_mutex_unlock(&lock); return 0;
 }
+void dmesh_native_progress(struct dmesh_native_transport *t) { (void)t; }
 int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e) {
     pthread_mutex_lock(&lock);
     struct event_node *n = t->first[stripe];

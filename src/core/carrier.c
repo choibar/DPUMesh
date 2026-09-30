@@ -299,6 +299,10 @@ static void fill_ack(struct slot *s, struct dmesh_native_event *e, uint16_t seq)
     e->kind = DMESH_NATIVE_ACK; e->port = s->port; e->seq = seq; e->seq_count = 1;
     TRACE("ack port %u seq %u", s->port, seq);
 }
+void dmesh_native_progress(struct dmesh_native_transport *t)
+{
+    (void)channel_dev_progress(t->dev);
+}
 int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e)
 {
     if (stripe < 0 || stripe >= SLOTS) return 0;
@@ -307,7 +311,7 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
     pthread_mutex_lock(&s->lock);
     int n = 0;
     if (s->state == SLOT_OPEN) {
-        int gone = channel_conn_progress(s->conn);
+        int gone = channel_conn_status(s->conn);
         uint64_t consumed = channel_conn_consumed(s->conn);
         if (s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {
             fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1;
