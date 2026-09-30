@@ -35,7 +35,7 @@ connection당 동시 RPC 64개이며 backend pool도 K개다. Mode 비교는 EU 
 | --- | --- | --- |
 | [Go 어댑터 재구성 전후](2026-09-29_grpc-go-adapter-rework.md) | rapids4, `dpu-dma`, gRPC 64B 동시 1/64, raw 109B echo | 동시 64 처리량 약 +20%, 분리 goroutine raw echo p50 약 −45%; 단일 goroutine p50은 동일. 장비 smoke와 race 테스트 PASS |
 | [preload gather write](2026-09-29_preload-gather-write.md) | rapids4, `dpu-dma`, 109B 왕복, preload `tcp_echo` | `writev(9,100)` p50 569 µs → 55–62 µs; 변경 전과 후 교대 실행에서 회귀 없음. 동시 연결 4개/pool 2에서 1개 실패는 기존 문제 |
-| [Online Boutique end-to-end](2026-09-29_online-boutique-e2e.md) | rapids4, `dpu-dma`, v0.10.7, preload 모드와 언어별 native adapter 모드 | 두 모드 모두 서비스 간 gRPC 14개 경로가 DPUMesh와 linkerd2-proxy 경유, L7 요청 172개 모두 성공, DOCA 에러 0. 성능은 전체 부하에서 같고 서비스별 health RPC에서는 편차 안(Node.js native만 −11~−18%). 지속 부하에서 DPA process 크래시 관측 |
+| [Online Boutique end-to-end](2026-09-29_online-boutique-e2e.md) | rapids4, `dpu-dma`, v0.10.7, preload 모드와 언어별 native adapter 모드 | 두 모드 모두 서비스 간 gRPC 14개 경로가 DPUMesh와 linkerd2-proxy 경유, L7 요청 172개 모두 성공, DOCA 에러 0. kernel TCP와 호스트 linkerd2-proxy 기준선보다 느림(사용자 8명 184–190 대 582 req/s, RPC당 약 +1 ms, 페이지당 호스트 CPU 2.6–4.4배). preload와 native는 같음(DPU 경로 지연이 병목). upstream Locust의 GET당 40 ms 지연을 찾아 고침. 지속 부하에서 DPA process 크래시 |
 
 ## 자료 보존
 

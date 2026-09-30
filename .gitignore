@@ -32,6 +32,7 @@ bench-results/*
 !bench-results/2026-09-29_grpc-go-adapter-rework.md
 !bench-results/2026-09-29_preload-gather-write.md
 !bench-results/2026-09-29_online-boutique-e2e.md
+!bench-results/2026-09-29_online-boutique-e2e.csv
 
 # local test binary
 apps/dmesh-router-cpp/test/test_transcode
