@@ -7,8 +7,10 @@
  *
  * Each slot owns an epoll fd holding its connection's doorbells (the channel layer's
  * progress-engine notification fds); the core nests it in the owning EQ's fd.
- * Custody ACKs (the DPU's consumer_head) and push-wire batches have no
- * doorbell, so stripe_arm asks for periodic polling while either is possible. */
+ * Push batches have no doorbell: before sleeping, idle_arm asks the DPU to ring
+ * over the control session, whose fd the core nests in every EQ. Custody ACKs
+ * (the DPU's consumer_head) have neither, so stripe_arm keeps the consumer
+ * polling while any is outstanding. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -378,29 +380,39 @@ int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
 }
 /* An armed doorbell is one-shot: it fires on the next completion of any of the
  * connection's engines and stays readable until cleared. Rearmed only after a
- * clear, so a sleeping consumer costs one request per wake. */
+ * clear, so a sleeping consumer costs one request per wake. The ticket read
+ * under the slot lock pairs with the submitter's check of the EQ's sleep flag:
+ * either this sees the new custody or the submitter wakes the EQ. */
 int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
 {
     if (stripe < 0 || stripe >= SLOTS) return 0;
     struct slot *s = &t->slots[stripe];
     if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == SLOT_FREE) return 0;
-    /* Still armed from an earlier sleep (the common case of a busy consumer
-     * that ran empty): only the polling question remains, answered from a
-     * racy read that a concurrent poll can at worst make conservative. */
-    if (s->state == SLOT_OPEN && s->armed)
-        return 1; /* shared control PE has no stripe fd, including host-DPA */
     pthread_mutex_lock(&s->lock);
-    int tick = 0;
+    int busy = s->t_head != s->t_tail;
     if (s->state == SLOT_OPEN) {
         if (!s->armed && channel_conn_arm(s->conn) == 0) s->armed = 1;
-        /* The channel's shared control PE deliberately has no per-EQ fd.
-         * Poll it under the session mutex even when reverse DMA has a doorbell. */
-        tick = 1;
     } else {
-        tick = s->t_head != s->t_tail || s->fin_pending;   /* retired by the next poll */
+        busy |= s->fin_pending;   /* retired by the next poll */
     }
     pthread_mutex_unlock(&s->lock);
-    return tick;
+    return busy;
+}
+int dmesh_native_wake_fd(struct dmesh_native_transport *t)
+{
+    return channel_dev_fd(t->dev);
+}
+int dmesh_native_idle_arm(struct dmesh_native_transport *t)
+{
+    return channel_dev_arm(t->dev);
+}
+void dmesh_native_wake_clear(struct dmesh_native_transport *t)
+{
+    channel_dev_clear(t->dev);
+}
+void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms, uint64_t *doorbells)
+{
+    channel_dev_wake_counters(t->dev, arms, doorbells);
 }
 void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe)
 {

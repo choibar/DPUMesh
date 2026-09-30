@@ -84,12 +84,18 @@ struct dmesh_eq {
                                      * doorbells and the doorbells of the stripes it owns */
     int                notify_efd;  /* eventfd other threads write on ready edges; writes
                                      * begin when dmesh_eq_fd hands out epfd (wants_notify). */
-    int                tick_fd;     /* timerfd: fallback poll while doorbell-less traffic
-                                     * (custody ACKs, push batches) is outstanding */
-    int                tick_armed;
+    int                tick_fd;     /* one-shot timerfd: the next nap, linger poll or the
+                                     * backstop of a sleeping EQ (dpumesh_eq_arm) */
     int                tail_fd;     /* timerfd: fires at tx_earliest_ns so a sleeping EQ
                                      * thread wakes to publish its retained tails */
-    uint64_t           spin_since;  /* start of the current empty-poll spin window, 0 = none */
+    /* Idle wake state, owned by this EQ's thread except the atomics. */
+    uint64_t           nap_ns;      /* next nap; above the cap once the naps are spent */
+    int                timer_backstop; /* tick_fd holds the backstop, not a nap */
+    int                work_since_arm; /* this EQ found work since it last armed */
+    uint64_t           seen_doorbells; /* channel DOORBELLs this EQ has reacted to */
+    atomic_int         asleep;      /* doorbells armed: a submit on this EQ must wake it */
+    atomic_int         kick;        /* a send on this EQ: naps restart */
+    atomic_uint_fast64_t last_work_ns; /* last work or send, for the linger */
     /* Set when dmesh_eq_fd exposes epfd. Poll-only EQs skip eventfd writes and
      * never arm doorbells. */
     atomic_int         wants_notify;
@@ -249,6 +255,10 @@ void dpumesh_publish_due_tails(struct dmesh_eq *eq);
  * fd wakes its thread. */
 int  dpumesh_eq_drain(struct dmesh_eq *eq);
 void dpumesh_eq_arm(struct dmesh_eq *eq);
+/* dmesh_poll_eq returned events: naps restart. */
+void dpumesh_eq_note_work(struct dmesh_eq *eq);
+/* Entering dmesh_poll_eq: the EQ is no longer asleep. */
+void dpumesh_eq_awake(struct dmesh_eq *eq);
 
 /* ====== Connection lifecycle — internal, shared by both surfaces ======
  *

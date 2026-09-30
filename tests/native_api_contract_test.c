@@ -51,6 +51,8 @@ void dmesh_tx_pressure(dmesh_qp_t *qp) { assert(qp != NULL); pressure_calls++; }
 void dpumesh_publish_due_tails(struct dmesh_eq *eq) { assert(eq != NULL); publish_due_calls++; }
 int dpumesh_eq_drain(struct dmesh_eq *eq) { assert(eq != NULL); return 0; }
 void dpumesh_eq_arm(struct dmesh_eq *eq) { assert(eq != NULL); }
+void dpumesh_eq_awake(struct dmesh_eq *eq) { assert(eq != NULL); }
+void dpumesh_eq_note_work(struct dmesh_eq *eq) { assert(eq != NULL); }
 void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
 {
     assert(eq != NULL && (delta == 1 || delta == -1));
