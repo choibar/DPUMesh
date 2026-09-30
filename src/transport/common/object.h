@@ -58,7 +58,21 @@ struct dmesh_session {
     uint32_t generation[DMESH_MAX_CONNECTIONS];
     int32_t close_status[DMESH_MAX_CONNECTIONS];
     bool closed[DMESH_MAX_CONNECTIONS], close_pending[DMESH_MAX_CONNECTIONS];
+    /* Idle wake: the host ARMed before sleeping; the next push descriptor
+     * completion (or one the ARM had not seen) queues a DOORBELL, sent from
+     * sessions_advance and retried until the send is accepted. */
+    bool armed;
+    uint64_t armed_epoch, doorbell_pending_epoch, doorbell_sent_epoch;
 };
+
+/* A push descriptor reached host memory: queue one DOORBELL for an ARMed host. */
+static inline void dmesh_session_push_published(struct dmesh_session *s)
+{
+    if (s != NULL && s->armed) {
+        s->armed = false;
+        s->doorbell_pending_epoch = s->armed_epoch;
+    }
+}
 
 /* Per-connection init state, advanced by dmesh_doca_ctrl_advance() */
 enum dmesh_conn_state {
