@@ -5,10 +5,13 @@ process owns one channel, one shared host–DPU Comch control connection, one EQ
 and one poller goroutine. Each Go connection owns a native QP; DMA rings,
 buffers and DPA resources remain per flow.
 
-- The poller is the EQ's only consumer. Its wait loop runs in C, so the
-  library's spin window and tick cost no Go scheduling. It hands receive
-  leases to their connections and runs every QP destruction; the native API
-  requires destruction to be serialized with polling.
+- The poller is the EQ's only consumer. It polls the EQ without blocking and,
+  while it is empty, parks on Go's netpoller with a duplicate of the EQ fd
+  (`eq_wait_linux.go`); no OS thread waits in cgo. The library's timers (naps,
+  retained-tail deadlines, the backstop) and doorbells raise that fd, so the
+  wait needs no Go timer. Commands interrupt it through the read deadline. It
+  hands receive leases to their connections and runs every QP destruction;
+  the native API requires destruction to be serialized with polling.
 - Read, Write and Dial run on the caller's goroutine. Each connection has its
   own lock, so no connection waits for another's I/O. A Dial waits for the
   DPU's answer without blocking other traffic; a `DialContext` whose context
@@ -25,6 +28,15 @@ buffers and DPA resources remain per flow.
   life. Streams that arrive before the first `Listen` are held for it. Once a
   listener has closed, new streams are aborted at once instead of left
   hanging.
+
+Both reverse paths wait the same way. The EQ fd is registered with Go's
+runtime netpoller using an owned duplicate, so waiting parks the goroutine
+without blocking an OS thread in cgo; native code still owns and drains the EQ
+and its doorbells. The library arms that fd for what has no doorbell: its nap
+and linger timers, retained TX deadlines and the backstop, and on DPU-DMA the
+DOORBELL the DPU sends after an ARM (`design/HOST.md`, idle wake). The
+knobs are `DPUMESH_NAP_US`, `DPUMESH_NAP_CAP_US`, `DPUMESH_LINGER_US` and
+`DPUMESH_BACKSTOP_MS`; the poller adds no Go timer of its own.
 
 Build the native library from the repository root, then compile the module:
 
@@ -83,4 +95,8 @@ The server handles SIGTERM by stopping gRPC and closing its native transport.
 Earlier versions of both `dpu-dma` and `host-dpa` passed on the jet1/BF-3 testbed. See the
 [hardware validation report](../../../docs/2026-09-25_channel-comch-grpc-validation.md)
 for topology, exact environment, build commands and results. That report predates
-the poller described above and the payload larger than 1 MiB added above.
+the netpoller wait, the idle wake and the payload larger than 1 MiB added above.
+The waiter has unit coverage for nested readiness, fd ownership and interrupts.
+`dpu-dma` with this waiter passed the hardware regression
+(`bench-results/2026-09-30_host-idle-wake.md`); `host-dpa` was not available on
+that testbed.

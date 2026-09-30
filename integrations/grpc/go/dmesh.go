@@ -97,8 +97,10 @@ const (
 	// Inbound streams held for a listener that has not been created yet.
 	maxPrelisten = 64
 	// A live transport returns to Go at least this often even when the EQ
-	// stays empty; readiness normally wakes it sooner.
-	activeWaitNs = int64(time.Millisecond)
+	// stays empty. The EQ fd carries the library's naps, tail deadlines and
+	// doorbells, and commands raise the wake fd, so this is only a backstop;
+	// a short bound would wake an idle process on every expiry.
+	activeWaitNs = int64(time.Second)
 )
 
 type earlyEvents struct {
