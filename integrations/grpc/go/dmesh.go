@@ -11,9 +11,6 @@ package dmeshgo
 #include <stdlib.h>
 #include <string.h>
 #include "dpumesh/dmesh.h"
-#include <poll.h>
-#include <time.h>
-#include <unistd.h>
 // The EQ fd is a level-triggered epoll set: dmesh_poll_eq running to empty
 // settles it, so the wake needs no read.
 #define DMESH_GO_EVENTS 64
@@ -22,12 +19,6 @@ static dmesh_event_t *dmesh_go_events_alloc(void) { return calloc(DMESH_GO_EVENT
 static void dmesh_go_release(dmesh_channel_t *s, int32_t token) {
     dmesh_event_t e = { ._rx_token = token };
     dmesh_release_rx_buffer(s, &e);
-}
-static void dmesh_go_wait_fd(int fd, int64_t timeout_ns) {
-    if (timeout_ns < 0 || timeout_ns > 1000000) timeout_ns = 1000000;
-    struct timespec timeout = {0, timeout_ns};
-    struct pollfd event = {.fd = fd, .events = POLLIN};
-    (void)ppoll(&event, 1, &timeout, NULL);
 }
 */
 import "C"
@@ -237,10 +228,14 @@ func (t *transport) pollLocked() int {
 }
 
 // poll advances the shared Comch session and buffered TX while any connection
-// exists, even when no Read/Write is parked. An idle channel sleeps until a
-// connection or waiter appears; active channels wait at most 1 ms between polls.
+// exists, even when no Read/Write is parked. Host-DPA can wait for completion
+// doorbells. DPU-DMA writes memory without a doorbell, so use Go timer backoff
+// without enabling native timerfd/eventfd notifications just to poll it again.
 func (t *transport) poll() {
-	fd := int(C.dmesh_eq_fd(t.eq))
+	fd := -1
+	if os.Getenv("DPUMESH_REVERSE") == "host-dpa" {
+		fd = int(C.dmesh_eq_fd(t.eq))
+	}
 	t.runPoll(fd, func() (int, int64) {
 		count := t.pollLocked()
 		if count < 0 {
@@ -255,6 +250,29 @@ func (t *transport) poll() {
 // registering a hardware channel.
 func (t *transport) runPoll(fd int, progress func() (int, int64)) {
 	defer close(t.done)
+	fail := func(err error) {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		t.err = fmt.Errorf("dmesh: wait for EQ: %w", err)
+		t.notify()
+		for _, c := range t.conns {
+			c.notify()
+		}
+	}
+	var waiter *eqWaiter
+	if fd >= 0 {
+		var err error
+		waiter, err = newEQWaiter(fd)
+		if err != nil {
+			fail(err)
+			return
+		}
+		defer waiter.close()
+	}
+	backoff := 2 * time.Microsecond
+	timer := time.NewTimer(time.Hour)
+	timer.Stop()
+	defer timer.Stop()
 	for {
 		select {
 		case <-t.stop:
@@ -279,7 +297,35 @@ func (t *transport) runPoll(fd int, progress func() (int, int64)) {
 		if count == C.DMESH_GO_EVENTS {
 			continue
 		}
-		C.dmesh_go_wait_fd(C.int(fd), C.int64_t(deadline))
+		pause := time.Duration(deadline)
+		if pause < 0 || pause > time.Millisecond {
+			pause = time.Millisecond
+		}
+		if waiter != nil {
+			if err := waiter.wait(pause); err != nil {
+				fail(err)
+				return
+			}
+		} else {
+			if count > 0 {
+				backoff = 2 * time.Microsecond
+			}
+			if pause > backoff {
+				pause = backoff
+			}
+			timer.Reset(pause)
+			select {
+			case <-timer.C:
+			case <-t.parkedCh:
+				backoff = 2 * time.Microsecond
+			case <-t.stop:
+				return
+			}
+			timer.Stop()
+			if count == 0 && backoff < 128*time.Microsecond {
+				backoff *= 2
+			}
+		}
 	}
 }
 
@@ -474,6 +520,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 			return written, err
 		}
 		written += n
+		t.wakePoller() // publish retained TX promptly, even without a parked reader
 		t.mu.Unlock()
 	}
 	return written, nil

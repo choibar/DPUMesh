@@ -9,6 +9,18 @@ close follow the Go networking contract. The poller keeps progressing while any
 QP exists, including when no goroutine is blocked in Read or Write, so shared
 control events and buffered TX deadlines continue to run.
 
+DPU-DMA has no data completion doorbell. Its poller uses a Go timer with
+2–128µs empty-poll backoff, reset by received events and local writes/waiters;
+actual wake latency also depends on the Go scheduler. It does not enable native
+fd notifications solely to poll memory again. Retained TX deadlines shorten
+the next wait, and writes wake the poller even without a parked reader.
+
+For host-DPA the EQ fd is registered with Go's runtime netpoller using an owned
+duplicate. Waiting parks the goroutine without blocking an OS thread in cgo;
+native code still owns and drains the EQ and its doorbells. The maximum wait
+is 1ms even without a completion. `DPUMESH_SPIN_US` and `DPUMESH_TICK_US` retain
+their native fd behavior; they do not control the DPU-DMA Go timer path.
+
 Build the native library from the repository root, then compile the module:
 
 ```sh
@@ -58,6 +70,9 @@ It verifies payload bytes, keeps a sibling connection active during repeated
 close/reopen, checks native close errors, and recreates the process channel.
 The server handles SIGTERM by stopping gRPC and closing its native transport.
 
-Both `dpu-dma` and `host-dpa` passed on the jet1/BF-3 testbed. See the
+Earlier versions of both `dpu-dma` and `host-dpa` passed on the jet1/BF-3 testbed. See the
 [hardware validation report](../../../docs/2026-09-25_channel-comch-grpc-validation.md)
-for topology, exact environment, build commands and results.
+for topology, exact environment, build commands and results. That report predates
+the timer/netpoll changes and the payload larger than 1 MiB added above. The new
+host-DPA waiter has unit coverage for nested readiness and fd ownership; the
+historical report does not establish hardware validation of that waiter.
