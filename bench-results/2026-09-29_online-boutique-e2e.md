@@ -1,5 +1,7 @@
 # Online Boutique end-to-end — 2026-09-29
 
+2026-09-30 수정·재측정은 이 문서 아래에 추가한다. 본문 원측정은 수정 전 결과다.
+
 판정: **Online Boutique v0.10.7의 서비스 간 gRPC 14개 경로가 두 가지 방식 모두에서 DPUMesh와 DPU의 linkerd2-proxy를 거쳐 동작했다.**
 
 1. **preload 모드:** Go가 아닌 서비스 6개(Node.js, Python, Java, C#)를 코드 수정 없이 `LD_PRELOAD` shim으로 붙였다. Proxy가 HTTP/2를 종단하는 L7 모드에서 smoke 3회의 gRPC 요청 172개가 모두 성공했고, DOCA 에러는 0건이었다.
@@ -289,3 +291,165 @@ health RPC 부하 6회 가운데 4회에서 proxy가 멈췄다. 로그는 다음
   - Script: `ob-cycle.sh`, `ob-load.sh`, `ob-health.sh`, `stream-hw.sh`, `grpc-ab.sh`, 그리고 네 구성 비교 1회차에 쓴 `perf-run*.sh`와 `probe/`.
   - 로그: `ob-*`, `load-*`, `health-*`, `perf-*`(1회차), `stream-s1`, `grpc-ab`, `online-boutique-2026-09-29`.
   - 2회차 로그는 fork checkout의 `dpumesh/.build/bench/results/`에 있다.
+
+
+## 2026-09-30: host CPU 수정과 실장비 재검증
+
+아래의 host EQ spin window와 50 µs fallback tick은 같은 날 [host idle wake](2026-09-30_host-idle-wake.md)로 대체됐다.
+
+최종 native에서 **host CPU는 약 47% 감소했지만, 처리량과 지연은 원래 수준이다.**
+따라서 같은 node의 host proxy와 성능이 같다는 주장은 이 Online Boutique 구현과
+측정 조건에서는 성립하지 않는다. 아래 결과는 수정 전 본문의 기록과 별도다.
+
+### 코드에서 확인하고 고친 부분
+
+- Host EQ의 기본 spin window 1 ms를 0으로 바꿨다. ACK까지 window를 다시
+  시작시키므로 ACK 간격이 1 ms보다 짧으면 FD가 계속 readable이고 각 언어의
+  reactor가 잠들지 못했다. 명시적인 `DPUMESH_SPIN_US=1000` 설정은 유지한다.
+  Doorbell 없는 ACK·push·control 처리를 위한 50 µs fallback timer도 유지한다.
+- 공유 Comch session PE를 flow마다 진행하던 일을 drain pass마다 한 번으로
+  줄였다. Flow별 오류 확인과 private reverse PE 진행은 계속 수행한다.
+  Go·Node·Python·Java·.NET native adapter는 모두 이 공통 host core를 사용한다.
+- Proxy의 reader watermark를 64 KiB 단위로 갱신한다. 작은 read마다 synchronous
+  `doca_dpa_h2d_memcpy`를 호출하던 비용을 줄이고, 실패하면 이전 watermark를
+  유지해 다음 tick에서 재시도한다. 이 구현은 `~/DPUMesh`에 있는 batching을
+  가져왔으며 staging gate의 여유 공간을 compile-time assertion으로 검사한다.
+- DPU push 경로가 DMA **제출**을 Rust staging의 반환 가능한 byte 수로 보고해
+  writer가 아직 DMA 중인 source를 덮어쓸 수 있었다. 기존 8 KiB 직렬 batch를
+  유지하고 data·descriptor DMA가 완료된 뒤에만 credit을 반환하도록 고쳤다.
+  Descriptor 제출 실패도 flow 오류로 처리한다. 새 DMA pipeline은 추가하지 않았다.
+- Boutique forward DPA kernel에는 producer completion 회수가 없었고 모든 copy에
+  `OPTIMIZE_REPORTS`를 붙였다. `~/DPUmesh/doca/device/dpa_kernel.c`와
+  `doca/dpa_common.h`의 정책처럼 512개 제출마다 report를 요청하고 completion을
+  회수·ack한다. Receive credit 확인과 producer report 회수는 서로 다른 일이다.
+  이 수정 전 `after-final-r2`에서는 health 측정 중 DPA crash가 다시 발생했다.
+  회수만 더한 `after-final-r4`도 64개 동시 health RPC 도중 크래시했다.
+- 정상 DPA poll loop에는 reschedule이 전혀 없어 한 번 실행되면 종료 요청까지
+  EU를 넘기지 않았다. SDK API를 DPU PF 03:00.0에 직접 조회한 실제 scheduled
+  kernel 시간 한도는 **12초**였다(`dpa-capabilities.log`). 무한 실행은
+  [NVIDIA DOCA DPA의 watchdog 제약](https://networking-docs.nvidia.com/doca/sdk/doca-dpa)에
+  어긋난다. `~/DPUmesh`에 이미 있는 같은 EU의 helper와 notification을 통한
+  주기적 handoff를 옮겼다. 65536 DMA 제출 또는 262144 idle spin 뒤 reschedule하고,
+  descriptor head·DMA 제출 수·deferred report 수를 보존한다. Helper를 깨우는
+  trigger completion을 먼저 해제하고 helper를 멈춘 다음 resume completion을
+  해제한다. 정리 실패 때는 소유권을 유지해 재시도한다.
+  이 변경은 DPU pool에 적용하며 host-dpa의 미검증 경로까지 확장하지 않는다.
+- 같은 EU의 helper는 고정 affinity가 필요하다. 이 장비의 다른 PF 03:00.1에는
+  별도 DPA process(PID 2436467)가 이미 실행 중이다. `DPUMESH_DPA_EU_BASE`로
+  배치 범위를 선택하도록 하고, 이 장비의 Boutique profile에는 EU 64–127을
+  사용한다. Transport의 범용 기본값은 0이다. EU affinity는 자원 예약이 아니다.
+  기존 process는 종료하거나 변경하지 않았다. 그 process의 실제 affinity는
+  root 소유라 확인하지 못했으므로, 경합은 배치 A/B 결과에 근거한 추론이다.
+- DPA device log level은 `~/DPUmesh`처럼 ERROR로 둔다. Reschedule 때마다
+  반복되는 device INFO 로그가 hot path 비용이 됐다. 같은 yield 구현의
+  3 MiB stream 왕복 p50은 INFO에서 947 ms, ERROR에서 11.5 ms였다.
+  Device 로그를 낮춰도 EU base 0의 Online Boutique 긴 지연은 남았다.
+- 측정 script는 미기동 서비스·smoke 실패를 거부하고 자신이 시작한 process를
+  정리한다. 마지막 health `MEASURE_END`도 수집한다. CPU 계산은 종료한 thread를
+  포함한 process CPU 시간 / 실제 요청 수를 사용한다. TID와 thread 이름을 함께
+  기록하므로 같은 `MainThread` 이름을 JavaScript main thread로 단정하지 않는다.
+
+Busy TX tail 500 µs를 0으로 바꾸는 실험은 처리량·지연 개선이 확인되지 않아
+제외했다. 이 knob도 최종 코드에 남기지 않았다.
+
+### 같은 장비의 native 전후 비교
+
+Host rapids4(Xeon Gold 6554S, 36 cores), BF-3 DPU, DOCA 3.1.0105에서
+원래 host/DPU 바이너리와 수정본을 비교했다. 두 실행 모두 서비스 10개와 smoke가
+정상이며 L7, reverse `dpu-dma`, worker 1개, busy poll 1, proxy log `info`,
+Locust process 4개, level당 20초다. 기본 Rust proxy 로그 설정은 `warn`으로
+낮췄지만 이 비교에서는 양쪽 모두 `info`를 사용했다. 최종 DPA device 로그는
+ERROR, EU base는 64다. TX tail은 양쪽 모두 기존 500 µs다.
+
+| Native 실행 | 사용자 | req/s | p50 ms | p99 ms | host cores | host CPU ms/page |
+|---|---:|---:|---:|---:|---:|---:|
+| 수정 전 `before-r4` | 8 | 187 | 38 | 74 | 6.16 | 38.7 |
+| 최종 `after-eu64-r7` | 8 | 189 | 38 | 74 | 3.30 | 20.4 |
+| 수정 전 `before-r4` | 32 | 385 | 75 | 140 | 8.11 | 24.6 |
+| 최종 `after-eu64-r7` | 32 | 383 | 76 | 140 | 4.31 | 13.2 |
+| 최종 `after-eu64-r7` | 128 | 536 | 220 | 390 | 4.49 | 9.8 |
+
+Host CPU는 서비스 process의 합이다. Locust·Redis·mock은 제외한다.
+Snapshot 구간은 Locust의 시작·종료도 포함하므로 `cores / req/s` 대신 CPU 시간 /
+실제 요청 수를 사용했다. 이전 문서의 CPU/page 값과 계산 구간이 다르므로
+직접 섞지 않는다. DPU proxy는 busy poll 때문에 두 실행 모두 약 0.97 core다.
+
+같은 날 host proxy 기준선은 사용자 8명에서 561 req/s, p50 14 ms,
+9.1 ms CPU/page, 사용자 32명에서 620 req/s, p50 56 ms, 8.5 ms CPU/page였다.
+따라서 수정 후에도 native의 낮은 동시성 처리량은 host proxy의 약 1/3이고
+페이지당 CPU는 약 2.2배다. CPU 절감과 end-to-end 성능 동등성을 구분해야 한다.
+최종 Go health p50은 1.21–1.25 ms다. 기존의 DPU 왕복 지연이 남았으며,
+native adapter를 사용한다고 이 공통 transport 비용이 없어지지는 않는다.
+
+최종 preload도 같은 바이너리와 기본 EU base 64로 실행했다
+(`after-preload-eu64-r9`). 8/32/128명 처리량은 187/388/530 req/s,
+p50 39/75/220 ms, host CPU는 3.32/4.35/4.66 cores,
+CPU/page는 20.8/13.2/10.3 ms였다. HTTP 실패는 세 구간 모두 0이다.
+Native로 전환하는 것만으로 공통 경로의 병목을 해소하지 못한다는 결과도 같다.
+
+Locust에서 수정 전 8/32명은 HTTP 실패 0/0, 최종 8/32/128명은 2/0/9건이다.
+실패는 payment의 VISA_ELECTRON 거절에서 이어지는 checkout HTTP 500으로,
+TCP와 host proxy 기준선에도 발생했다. 실패 수를 결과에서 제거하지 않았다.
+Health RPC 오류와는 별도로 기록한다.
+
+### Hardware 검사 결과와 범위
+
+최종 바이너리와 EU base 64의 `hw-regression.sh`가 통과했다(`hw-eu64`).
+
+- 실제 gRPC: sibling flow를 계속 사용하면서 40번 close/reopen,
+  channel 재생성, 1·8064·8065·8192·8193·65537 B payload.
+- 실제 native stream: 64·128·129·8064·8192·65536·1048576·3145728 B를
+  byte마다 위치 의존 pattern으로 비교. 큰 메시지는 각각 8번 보내 staging을
+  여러 번 wrap한다. 8192 B stream 4개를 동시에 실행한다.
+- Server 종료가 10초 이내이며 stream server의 최종 live flow가 0이다.
+  Proxy crash/panic report가 없다.
+- 원본 바이너리도 강한 pattern으로 재검사했을 때 3 MiB 첫 메시지의 offset
+  360448에서 불일치했다. 기존 256 B 반복 pattern은 replay를 놓칠 수 있어
+  smoke 검사도 강화했다. 수정본은 같은 크기 8회와 동시 stream 검사를 통과했다.
+- Yield 수정 전 `after-final-r3`는 8/32/128명 부하 후 서비스 9개의 health RPC를
+  모두 완료했다. Health 오류 0, DPU ERR/crash/panic report 0, script exit 0이다.
+  이후 64개 동시 RPC를 추가한 `after-final-r4`에서는 DPA crash가 재현됐다.
+  두 실행은 yield 수정을 검증한 최종 결과로 취급하지 않는다.
+- 최종 `after-eu64-r7`는 8/32/128명 부하와 서비스 9곳의 health RPC를
+  1개 및 64개 동시성 모두에서 완료했다. Health 오류 0,
+  DPU ERR/crash/panic report 0, script exit 0이다. 유한한 검사에서 크래시가
+  없었다는 결과이며 장기 안정성을 보장하는 수치는 아니다.
+- 최종 preload `after-preload-eu64-r9`도 같은 전체 검사를 통과했다.
+  Native/preload의 64개 동시 health 검사에서 각각 687857/683076 call이
+  성공했고 오류는 0이다. Preload에서도 DPU ERR/crash/panic report 0,
+  script exit 0이다. 검사 종료 후 이번에 시작한 host/DPU process는 정리했으며
+  다른 PF의 기존 process는 계속 실행 중이다.
+- Yield + device ERROR + EU base 0의 `after-yield-quiet-r6`도 검사 오류와
+  크래시는 없었지만, 처리량은 8/32/128명에서 45/113/35 req/s,
+  p99는 2600/4000/8000 ms였다. EU base 64에서는 189/383/536 req/s,
+  p99 74/140/390 ms로 돌아왔다. 이 진단 실행도 원자료와 CSV에 보존한다.
+- 같은 최종 바이너리로 EU base만 0으로 되돌린 `placement-eu0-r8`에서도
+  8명 처리량 4 req/s, p50 1500 ms, p99 5300 ms가 재현됐다.
+  ERR/crash/panic은 0이다. 바이너리 차이가 아닌 EU 배치가 긴 지연을
+  만드는 조건임을 확인했다. 기존 job과의 정확한 겹침은 확인하지 못했다.
+
+Host C test 17개와 header/ABI 검사, Go race test, C++ ctest 6개,
+DPU `dmesh-doca` Rust test 13개, CPU 계산 test 2개가 통과했다.
+`host-dpa` reverse는 이 장비의 host PF 94:00.0에서 DPA process 생성 자체가
+`DOCA_ERROR_DRIVER`(syndrome `0xb398a0`)로 실패해 검증하지 못했다.
+위 데이터 무결성·성능 결과는 `dpu-dma`에 한정한다.
+
+### 재현과 보존 자료
+
+Fork checkout에서 다음과 같이 실행한다.
+
+```sh
+export DPUMESH_ROOT=/home/jukebox/DPUMesh-online-boutique
+DPU_EU_BASE=64 bash dpumesh/bench/hw-regression.sh
+DPUMESH_SPIN_US=0 DPU_PROXY_LOG=info DPU_EU_BASE=64 USERS_LIST='8 32 128' LDUR=20 \
+  M1_WARM=1s M1_DUR=3s bash dpumesh/bench/perf.sh native verify
+```
+
+- [2026-09-30_online-boutique-fixes.csv](2026-09-30_online-boutique-fixes.csv):
+  원본·최종 native/preload, 같은 날 TCP/host proxy 및 EU 배치 진단 측정치.
+- [2026-09-30_online-boutique-fixes.json](2026-09-30_online-boutique-fixes.json):
+  base commit, 실제 변경 source와 바이너리 SHA-256, 설정, 검사 및 제외한 실행의 이유.
+- `build/hw-ab-2026-09-30/`: CPU snapshot, proxy/service/Locust log,
+  baseline 3 MiB 실패, 최종 HW regression, build/test log를 로컬에 보존한다.
+  이 디렉터리는 git ignored다. Host와 DPU의 변경된 transport/shim source hash도
+  비교해 같음을 확인했다. 임시 작업 clone의 결과는 최종 비교에 사용하지 않았다.

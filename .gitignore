@@ -33,6 +33,10 @@ bench-results/*
 !bench-results/2026-09-29_preload-gather-write.md
 !bench-results/2026-09-29_online-boutique-e2e.md
 !bench-results/2026-09-29_online-boutique-e2e.csv
+!bench-results/2026-09-30_online-boutique-fixes.csv
+!bench-results/2026-09-30_online-boutique-fixes.json
+!bench-results/2026-09-30_host-idle-wake.md
+!bench-results/2026-09-30_host-idle-wake.csv
 
 # local test binary
 apps/dmesh-router-cpp/test/test_transcode

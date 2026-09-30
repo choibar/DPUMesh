@@ -37,6 +37,13 @@ connection당 동시 RPC 64개이며 backend pool도 K개다. Mode 비교는 EU 
 | [preload gather write](2026-09-29_preload-gather-write.md) | rapids4, `dpu-dma`, 109B 왕복, preload `tcp_echo` | `writev(9,100)` p50 569 µs → 55–62 µs; 변경 전과 후 교대 실행에서 회귀 없음. 동시 연결 4개/pool 2에서 1개 실패는 기존 문제 |
 | [Online Boutique end-to-end](2026-09-29_online-boutique-e2e.md) | rapids4, `dpu-dma`, v0.10.7, preload 모드와 언어별 native adapter 모드 | 두 모드 모두 서비스 간 gRPC 14개 경로가 DPUMesh와 linkerd2-proxy 경유, L7 요청 172개 모두 성공, DOCA 에러 0. kernel TCP와 호스트 linkerd2-proxy 기준선보다 느림(사용자 8명 184–190 대 582 req/s, RPC당 약 +1 ms, 페이지당 호스트 CPU 2.6–4.4배). preload와 native는 같음(DPU 경로 지연이 병목). upstream Locust의 GET당 40 ms 지연을 찾아 고침. 지속 부하에서 DPA process 크래시 |
 
+## 2026-09-30: Online Boutique 수정과 host idle wake
+
+| 보고서 | 조건 | 상태와 해석 |
+| --- | --- | --- |
+| [Online Boutique 수정 재검증](2026-09-29_online-boutique-e2e.md#2026-09-30-host-cpu-수정과-실장비-재검증) ([CSV](2026-09-30_online-boutique-fixes.csv), [JSON](2026-09-30_online-boutique-fixes.json)) | rapids4, `dpu-dma`, native/preload, 같은 날 TCP·host proxy | push source custody, producer report 회수, DPA EU 양보와 배치, reader watermark 묶음. 최종 native와 preload가 64개 동시 health까지 크래시 없이 통과. host CPU 약 47% 감소, 처리량과 지연은 그대로 |
+| [Host idle wake](2026-09-30_host-idle-wake.md) ([CSV](2026-09-30_host-idle-wake.csv)) | rapids4, `dpu-dma`, native, 수정 전/후 교대 | 50 µs tick 대신 nap·linger·DOORBELL. idle host CPU 1.74 → 0.01 core, 부하 중 페이지당 host CPU −23~−39%, 처리량 같음. Go netpoller로 Go 서버 m1 p50 −100~−250 µs. hw-regression busy poll 1/0 PASS |
+
 ## 자료 보존
 
 보고서의 상대 링크는 Git에 포함된 파일을 가리킨다. 아래 원본 파일은 이 작업에서
