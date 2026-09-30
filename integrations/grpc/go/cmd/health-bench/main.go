@@ -1,7 +1,8 @@
-// health-bench loads any gRPC server's standard health Check over DPUMesh:
-// C gRPC connections to each "<ip>:<port>" service address, each on its own
-// DPUMesh stream, then M concurrent Check loops per connection on one target
-// at a time. Every connection opens before the first load and closes after
+// health-bench loads any gRPC server's standard health Check: C gRPC
+// connections to each "<ip>:<port>" service address, then M concurrent Check
+// loops per connection on one target at a time. With DPUMESH_ENABLE=1 each
+// connection is its own DPUMesh stream; otherwise it is a TCP connection, for
+// a baseline. Every connection opens before the first load and closes after
 // the last, so no stream closes between measurements. It prints
 // MEASURE_START/MEASURE_END around each window and a RESULT line per target,
 // and closes its DPUMesh transport before exiting.
@@ -40,9 +41,9 @@ func main() {
 	clients := make([][]healthpb.HealthClient, len(list))
 	for t, target := range list {
 		for i := 0; i < *conns; i++ {
-			cc, err := grpc.NewClient("passthrough:///"+target,
-				grpc.WithContextDialer(dmeshgrpc.Dial),
+			opts := append(dmeshgrpc.DialOptions(),
 				grpc.WithTransportCredentials(insecure.NewCredentials()))
+			cc, err := grpc.NewClient("passthrough:///"+target, opts...)
 			if err != nil {
 				log.Fatalf("%s connection %d: %v", target, i, err)
 			}
@@ -62,8 +63,10 @@ func main() {
 	for _, cc := range all {
 		cc.Close()
 	}
-	if err := dmeshgo.CloseTransport(); err != nil {
-		log.Fatalf("close transport: %v", err)
+	if dmeshgrpc.Enabled() {
+		if err := dmeshgo.CloseTransport(); err != nil {
+			log.Fatalf("close transport: %v", err)
+		}
 	}
 }
 
