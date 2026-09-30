@@ -165,8 +165,12 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
  * drain and the arm is not slept through. */
 int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
     if (!eq || !events || max_events <= 0) { errno = EINVAL; return -1; }
+    dpumesh_eq_awake(eq);
     int n = poll_eq_once(eq, events, max_events);
-    if (n != 0) return n;
+    if (n != 0) {
+        if (n > 0) dpumesh_eq_note_work(eq);
+        return n;
+    }
     dpumesh_eq_arm(eq);
     if (dpumesh_eq_drain(eq) <= 0) return 0;
     return poll_eq_once(eq, events, max_events);
