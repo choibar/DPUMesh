@@ -24,6 +24,15 @@ struct dmesh_conn;
 struct dmesh_doca_dpa_thread {
     struct doca_dpa *dpa;           /* DOCA DPA */
     struct doca_dpa_thread *thread; /* DPA thread */
+    /* Same-EU helper follows an actual scheduler release before resuming. */
+    bool cooperative_yield;
+    unsigned int eu_id;
+    struct doca_dpa_eu_affinity *yield_affinity;
+    struct doca_dpa_thread *yield_thread;
+    bool yield_thread_started;
+    struct doca_dpa_notification_completion *resume_completion, *yield_completion;
+    bool resume_completion_started, yield_completion_started;
+    doca_dpa_dev_notification_completion_t resume_handle, yield_handle;
     bool running, quiesced;        /* run attempted; explicit DMA close fence completed */
     /* Stop handshake of the current run, advanced by dmesh_doca_dpa_quiesce_step(). */
     bool stop_sent, submitted_known;
