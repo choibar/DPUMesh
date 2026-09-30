@@ -13,11 +13,12 @@ enum operation {
     OP_CTX_STOP, OP_PRODUCER_DESTROY, OP_CONSUMER_DESTROY, OP_MSGQ_STOP,
     OP_MSGQ_DESTROY, OP_CONSUMER_COMP_STOP, OP_CONSUMER_COMP_DESTROY,
     OP_PRODUCER_COMP_STOP, OP_PRODUCER_COMP_DESTROY, OP_THREAD_DESTROY,
-    OP_ARG_FREE, OP_REPOST,
+    OP_ARG_FREE, OP_REPOST, OP_HELPER_STOP, OP_NOTIFY_STOP, OP_NOTIFY_DESTROY,
 };
 enum resource {
     SEND_PRODUCER, SEND_CONSUMER, SEND_MSGQ, RECV_PRODUCER, RECV_CONSUMER,
     RECV_MSGQ, CONSUMER_COMP, PRODUCER_COMP, RESOURCE_COUNT,
+    RESUME_COMP = RESOURCE_COUNT, YIELD_COMP, HELPER_THREAD, ALL_RESOURCE_COUNT,
 };
 struct fake_resource {
     enum doca_ctx_states state;
@@ -33,7 +34,7 @@ struct fixture {
     struct objects objs;
     struct dmesh_doca_dpa_thread thread;
     struct dpa_thread_arg args;
-    struct fake_resource resources[RESOURCE_COUNT];
+    struct fake_resource resources[ALL_RESOURCE_COUNT];
     struct fake_recv recv;
     enum operation fail;
     void *fail_handle;
@@ -205,11 +206,32 @@ doca_error_t doca_dpa_completion_destroy(struct doca_dpa_completion *c)
 }
 doca_error_t doca_dpa_thread_destroy(struct doca_dpa_thread *thread)
 {
+    if (thread == (void *)&f->resources[HELPER_THREAD]) {
+        assert(!f->thread.yield_thread_started);
+        assert(!f->thread.resume_completion && !f->thread.yield_completion);
+        return destroy_resource(thread, OP_THREAD_DESTROY);
+    }
     assert(thread == (void *)&f->thread && !f->thread_destroyed);
     ++f->thread_destroy_calls;
     if (fails(OP_THREAD_DESTROY, thread)) return DOCA_ERROR_DRIVER;
     f->thread_destroyed = true;
     return DOCA_SUCCESS;
+}
+doca_error_t doca_dpa_thread_stop(struct doca_dpa_thread *thread)
+{
+    assert(thread == (void *)&f->resources[HELPER_THREAD]);
+    assert(!f->thread.yield_completion && f->thread.resume_completion);
+    return stop_resource(thread, OP_HELPER_STOP);
+}
+doca_error_t doca_dpa_notification_completion_stop(struct doca_dpa_notification_completion *c)
+{
+    if (c == (void *)&f->resources[RESUME_COMP])
+        assert(!f->thread.yield_thread_started);
+    return stop_resource(c, OP_NOTIFY_STOP);
+}
+doca_error_t doca_dpa_notification_completion_destroy(struct doca_dpa_notification_completion *c)
+{
+    return destroy_resource(c, OP_NOTIFY_DESTROY);
 }
 doca_error_t doca_dpa_mem_free(struct doca_dpa *dpa, doca_dpa_dev_uintptr_t ptr)
 {
@@ -488,6 +510,35 @@ static void test_context_stop_timeout_retry(void)
     release_fixture();
 }
 
+static void test_helper_cleanup_retry(void)
+{
+    create_fixture();
+    struct dmesh_doca_dpa_thread *t = &f->thread;
+    t->quiesced = true;
+    for (int i = RESUME_COMP; i < ALL_RESOURCE_COUNT; ++i)
+        f->resources[i].started = true;
+    t->yield_thread = (void *)&f->resources[HELPER_THREAD];
+    t->resume_completion = (void *)&f->resources[RESUME_COMP];
+    t->yield_completion = (void *)&f->resources[YIELD_COMP];
+    t->yield_thread_started = t->resume_completion_started = t->yield_completion_started = true;
+    f->fail = OP_NOTIFY_DESTROY;
+    assert(dmesh_doca_dpa_thread_destroy_checked(t) == DOCA_ERROR_DRIVER);
+    assert(t->yield_thread_started && t->resume_completion && t->yield_completion);
+    assert(!t->yield_completion_started);
+    assert(!f->thread_destroyed && !f->arg_freed);
+    f->fail = OP_HELPER_STOP;
+    assert(dmesh_doca_dpa_thread_destroy_checked(t) == DOCA_ERROR_DRIVER);
+    assert(t->yield_thread_started && !t->yield_completion);
+    assert(t->resume_completion);
+    f->fail = OP_NONE;
+    assert(dmesh_doca_dpa_thread_destroy_checked(t) == DOCA_SUCCESS);
+    assert(!t->yield_thread && !t->resume_completion && !t->yield_completion);
+    assert(f->resources[HELPER_THREAD].stop_calls == 2);
+    assert(f->resources[YIELD_COMP].stop_calls == 1);
+    assert(f->thread_destroyed && f->arg_freed);
+    release_fixture();
+}
+
 static void test_thread_destroy_retry(void)
 {
     create_fixture();
@@ -557,6 +608,7 @@ int main(void)
     test_msgq_destroy_faults();
     test_context_stop_timeout_retry();
     test_thread_destroy_retry();
+    test_helper_cleanup_retry();
     puts("dpa_cleanup_test: PASS");
     return 0;
 }

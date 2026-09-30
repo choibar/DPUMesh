@@ -9,6 +9,7 @@
 /* The pool tests use already-created thread handles and never enter device
  * creation. This otherwise-unused kernel symbol lets the production dpa.c
  * allocator link without compiling a DPA program or requiring a device. */
+void run_dma_yield_helper(void) { assert(!"unexpected DPA invocation"); }
 void run_dma_manager(void)
 {
     abort();

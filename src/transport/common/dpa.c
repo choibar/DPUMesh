@@ -26,6 +26,7 @@ int dmesh_staging_fc = 0;
 
 /* Kernel function declaration */
 extern doca_dpa_func_t run_dma_manager;
+extern doca_dpa_func_t run_dma_yield_helper;
 extern doca_dpa_func_t thread_init_rpc;
 
 extern struct doca_dpa_app *DPU_mesh_dpa_app;
@@ -210,6 +211,12 @@ init_dpa_objects(struct objects *objs)
         goto destroy_dpa;
     }
 
+    /* Match DPUmesh: logging every polling activation is a hot-path cost
+     * once the watchdog-safe handoff periodically restarts the entry. */
+    result = doca_dpa_set_log_level(objs->dpa_pool->dpa, DOCA_DPA_DEV_LOG_LEVEL_ERROR);
+    if (result != DOCA_SUCCESS)
+        goto destroy_dpa;
+
     result = doca_dpa_start(objs->dpa_pool->dpa);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start DOCA DPA with error = %s", doca_error_get_name(result));
@@ -217,6 +224,9 @@ init_dpa_objects(struct objects *objs)
     }
 
     DOCA_LOG_INFO("Init DOCA DPA done.");
+    unsigned long long max_run;
+    if (doca_dpa_get_kernel_max_run_time(objs->dpa_pool->dpa, &max_run) == DOCA_SUCCESS)
+        DOCA_LOG_INFO("DPA maximum scheduled kernel runtime: %llu seconds", max_run);
     return DOCA_SUCCESS;
 
 destroy_dpa:
@@ -231,14 +241,31 @@ dmesh_dpa_thread_pool_init(struct objects *objs)
     struct dmesh_dpa_thread_pool *pool = objs->dpa_pool;
     doca_error_t result;
     int i;
+    unsigned int eus;
+    unsigned int eu_base = 0;
+    const char *eu_env = getenv("DPUMESH_DPA_EU_BASE");
 
     if (pool == NULL || pool->dpa == NULL) {
         DOCA_LOG_ERR("DPA thread pool: init_dpa_objects must run first");
         return DOCA_ERROR_BAD_STATE;
     }
 
+    result = doca_dpa_get_total_num_eus_available(pool->dpa, &eus);
+    if (result != DOCA_SUCCESS || eus == 0)
+        return result != DOCA_SUCCESS ? result : DOCA_ERROR_BAD_STATE;
+    if (eu_env != NULL && *eu_env != '\0') {
+        char *end;
+        unsigned long value = strtoul(eu_env, &end, 10);
+        if (*end != '\0' || value >= eus)
+            return DOCA_ERROR_INVALID_VALUE;
+        eu_base = (unsigned int)value;
+    }
+    DOCA_LOG_INFO("DPA cooperative pool: %u available EUs, base %u, %u data/helper pairs",
+                  eus, eu_base, DPA_THREAD_POOL_SIZE);
     for (i = 0; i < DPA_THREAD_POOL_SIZE; i++) {
         pool->threads[i].dpa = pool->dpa;
+        pool->threads[i].cooperative_yield = true;
+        pool->threads[i].eu_id = eu_base + (unsigned int)i % (eus - eu_base);
         result = dmesh_doca_dpa_thread_create(&pool->threads[i]);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to create DPA pool thread %d: %s", i, doca_error_get_name(result));
@@ -354,6 +381,15 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
         return result;
     }
     
+    if (dpa_thread->cooperative_yield) {
+        result = doca_dpa_eu_affinity_create(dpa_thread->dpa, &dpa_thread->yield_affinity);
+        if (result == DOCA_SUCCESS)
+            result = doca_dpa_eu_affinity_set(dpa_thread->yield_affinity, dpa_thread->eu_id);
+        if (result == DOCA_SUCCESS)
+            result = doca_dpa_thread_set_affinity(dpa_thread->thread, dpa_thread->yield_affinity);
+        if (result != DOCA_SUCCESS)
+            return result;
+    }
     result = doca_dpa_thread_start(dpa_thread->thread);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start DPA thread: %s",
@@ -361,6 +397,39 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
         return result;
     }
 
+    if (dpa_thread->cooperative_yield) {
+        result = doca_dpa_notification_completion_create(dpa_thread->dpa,
+                    dpa_thread->thread, &dpa_thread->resume_completion);
+        if (result != DOCA_SUCCESS) return result;
+        result = doca_dpa_notification_completion_start(dpa_thread->resume_completion);
+        if (result != DOCA_SUCCESS) return result;
+        dpa_thread->resume_completion_started = true;
+        result = doca_dpa_notification_completion_get_dpa_handle(
+                    dpa_thread->resume_completion, &dpa_thread->resume_handle);
+        if (result != DOCA_SUCCESS) return result;
+        result = doca_dpa_thread_create(dpa_thread->dpa, &dpa_thread->yield_thread);
+        if (result != DOCA_SUCCESS) return result;
+        result = doca_dpa_thread_set_func_arg(dpa_thread->yield_thread,
+                    run_dma_yield_helper, dpa_thread->resume_handle);
+        if (result != DOCA_SUCCESS) return result;
+        result = doca_dpa_thread_set_affinity(dpa_thread->yield_thread, dpa_thread->yield_affinity);
+        if (result != DOCA_SUCCESS) return result;
+        result = doca_dpa_thread_start(dpa_thread->yield_thread);
+        if (result != DOCA_SUCCESS) return result;
+        dpa_thread->yield_thread_started = true;
+        result = doca_dpa_notification_completion_create(dpa_thread->dpa,
+                    dpa_thread->yield_thread, &dpa_thread->yield_completion);
+        if (result != DOCA_SUCCESS) return result;
+        result = doca_dpa_notification_completion_start(dpa_thread->yield_completion);
+        if (result != DOCA_SUCCESS) return result;
+        dpa_thread->yield_completion_started = true;
+        result = doca_dpa_notification_completion_get_dpa_handle(
+                    dpa_thread->yield_completion, &dpa_thread->yield_handle);
+        if (result != DOCA_SUCCESS) return result;
+        /* Run makes it activatable; the helper waits for a notification. */
+        result = doca_dpa_thread_run(dpa_thread->yield_thread);
+        if (result != DOCA_SUCCESS) return result;
+    }
     return DOCA_SUCCESS;
 }
 
@@ -882,6 +951,47 @@ dmesh_dpa_comch_destroy_checked(struct dmesh_doca_dpa_thread *thread,
     return DOCA_SUCCESS;
 }
 
+static doca_error_t
+notification_destroy_checked(struct doca_dpa_notification_completion **comp, bool *started)
+{
+    doca_error_t result;
+    if (*comp == NULL) return DOCA_SUCCESS;
+    if (*started) {
+        result = doca_dpa_notification_completion_stop(*comp);
+        if (result != DOCA_SUCCESS) return result;
+        *started = false;
+    }
+    result = doca_dpa_notification_completion_destroy(*comp);
+    if (result == DOCA_SUCCESS) *comp = NULL;
+    return result;
+}
+
+static doca_error_t
+yield_helper_destroy_checked(struct dmesh_doca_dpa_thread *thread)
+{
+    doca_error_t result;
+    /* Stop/detach the trigger completion before stopping its helper thread,
+     * as required by the SDK thread lifecycle. Keep the resume handle alive
+     * until the helper can no longer notify it. The data thread is quiesced. */
+    result = notification_destroy_checked(&thread->yield_completion,
+                                          &thread->yield_completion_started);
+    if (result != DOCA_SUCCESS) return result;
+    if (thread->yield_thread != NULL && thread->yield_thread_started) {
+        result = doca_dpa_thread_stop(thread->yield_thread);
+        if (result != DOCA_SUCCESS) return result;
+        thread->yield_thread_started = false;
+    }
+    result = notification_destroy_checked(&thread->resume_completion,
+                                          &thread->resume_completion_started);
+    if (result != DOCA_SUCCESS) return result;
+    if (thread->yield_thread != NULL) {
+        result = doca_dpa_thread_destroy(thread->yield_thread);
+        if (result != DOCA_SUCCESS) return result;
+        thread->yield_thread = NULL;
+    }
+    return DOCA_SUCCESS;
+}
+
 doca_error_t
 dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *thread)
 {
@@ -890,12 +1000,19 @@ dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *thread)
         return DOCA_SUCCESS;
     if (thread->running && !thread->quiesced)
         return DOCA_ERROR_BAD_STATE;
+    result = yield_helper_destroy_checked(thread);
+    if (result != DOCA_SUCCESS) return result;
     if (thread->thread != NULL) {
         result = doca_dpa_thread_destroy(thread->thread);
         if (result != DOCA_SUCCESS)
             return result;
         thread->thread = NULL;
         thread->running = false;
+    }
+    if (thread->yield_affinity != NULL) {
+        result = doca_dpa_eu_affinity_destroy(thread->yield_affinity);
+        if (result != DOCA_SUCCESS) return result;
+        thread->yield_affinity = NULL;
     }
     if (thread->arg != 0) {
         result = doca_dpa_mem_free(thread->dpa, thread->arg);
@@ -1094,8 +1211,19 @@ dmesh_doca_dpa_thread_destroy(struct dmesh_doca_dpa_thread *dpa_thread)
     if (dpa_thread == NULL || dpa_thread->thread == NULL)
         return;
 
-    (void)doca_dpa_thread_destroy(dpa_thread->thread);
+    doca_error_t result = yield_helper_destroy_checked(dpa_thread);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_WARN("Failed to destroy DPA yield helper: %s", doca_error_get_name(result));
+        return;
+    }
+    result = doca_dpa_thread_destroy(dpa_thread->thread);
+    if (result != DOCA_SUCCESS) return;
     dpa_thread->thread = NULL;
+    if (dpa_thread->yield_affinity != NULL) {
+        result = doca_dpa_eu_affinity_destroy(dpa_thread->yield_affinity);
+        if (result != DOCA_SUCCESS) return;
+        dpa_thread->yield_affinity = NULL;
+    }
 
     if (dpa_thread->arg != 0) {
         (void)doca_dpa_mem_free(dpa_thread->dpa, dpa_thread->arg);
@@ -1183,6 +1311,7 @@ dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
         .dpa_producer_comp = dpa_producer_comp,
         .dpa_consumer = dpa_consumer,
         .dpa_producer = dpa_producer,
+        .yield_notification = conn->dpa_thread->yield_handle,
 #ifdef DOCA_ARCH_DPU
         .dpa_buf_arr = dpa_buf_arr,
         .buf_arr_size = DMA_RING_SIZE,
