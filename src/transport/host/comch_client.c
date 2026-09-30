@@ -30,7 +30,7 @@ static void client_send_task_completion_callback(struct doca_comch_task_send *ta
 {
 	(void)ctx_user_data;
 
-	DOCA_LOG_INFO("Client task sent successfully");
+	DOCA_LOG_DBG("Client task sent successfully");
 	doca_task_free(doca_comch_task_send_as_task(task));
 	free(task_user_data.ptr);
 }
@@ -190,6 +190,15 @@ doca_error_t dmesh_comch_client_open(const char *server_name,
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed creating pe with error = %s", doca_error_get_name(result));
         return result;
+    }
+    /* The control PE holds one context. Progress it whole: in the default
+     * selective mode an armed PE delivers no new event until its triggered
+     * notification is cleared, which stalls a synchronous flow open behind
+     * an idle wake. With PROGRESS_ALL a new request clears the old one. */
+    result = doca_pe_set_event_mode(control->pe, DOCA_PE_EVENT_MODE_PROGRESS_ALL);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to set Comch client PE event mode: %s", doca_error_get_descr(result));
+        goto destroy_pe;
     }
 
     result = doca_comch_client_create(control->dev, server_name, &(control->cc_client));
