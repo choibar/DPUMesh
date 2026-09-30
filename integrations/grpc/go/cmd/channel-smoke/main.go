@@ -25,7 +25,9 @@ import (
 
 const method = "/dmesh.ChannelSmoke/Echo"
 
-var sizes = []int{1, 8064, 8065, 8192, 8193, 65537}
+// Include a message larger than the 1 MiB transport staging window to exercise
+// credit return while the event-driven proxy is otherwise allowed to sleep.
+var sizes = []int{1, 8064, 8065, 8192, 8193, 65537, 1048577}
 
 type rawCodec struct{}
 

@@ -29,6 +29,15 @@ buffers and DPA resources remain per flow.
   listener has closed, new streams are aborted at once instead of left
   hanging.
 
+Both reverse paths wait the same way. The EQ fd is registered with Go's
+runtime netpoller using an owned duplicate, so waiting parks the goroutine
+without blocking an OS thread in cgo; native code still owns and drains the EQ
+and its doorbells. The library arms that fd for what has no doorbell: its nap
+and linger timers, retained TX deadlines and the backstop, and on DPU-DMA the
+DOORBELL the DPU sends after an ARM (`design/HOST.md`, idle wake). The
+knobs are `DPUMESH_NAP_US`, `DPUMESH_NAP_CAP_US`, `DPUMESH_LINGER_US` and
+`DPUMESH_BACKSTOP_MS`; the poller adds no Go timer of its own.
+
 Build the native library from the repository root, then compile the module:
 
 ```sh
@@ -90,6 +99,11 @@ It verifies payload bytes, keeps a sibling connection active during repeated
 close/reopen, checks native close errors, and recreates the process channel.
 The server handles SIGTERM by stopping gRPC and closing its native transport.
 
-Both `dpu-dma` and `host-dpa` passed on the jet1/BF-3 testbed. See the
+Earlier versions of both `dpu-dma` and `host-dpa` passed on the jet1/BF-3 testbed. See the
 [hardware validation report](../../../docs/2026-09-25_channel-comch-grpc-validation.md)
-for topology, exact environment, build commands and results.
+for topology, exact environment, build commands and results. That report predates
+the netpoller wait, the idle wake and the payload larger than 1 MiB added above.
+The waiter has unit coverage for nested readiness, fd ownership and interrupts.
+`dpu-dma` with this waiter passed the hardware regression
+(`bench-results/2026-09-30_host-idle-wake.md`); `host-dpa` was not available on
+that testbed.
