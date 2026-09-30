@@ -522,9 +522,109 @@ static void checked_close_test(void)
     callback_objects = NULL;
 }
 
+static void deliver_arm(struct doca_comch_connection *peer, uint64_t epoch,
+                        const struct dmesh_session_arm_flow *flows, uint32_t count)
+{
+    uint8_t payload[DMESH_SESSION_ARM_HEADER_SIZE +
+                    DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE];
+    size_t len = dmesh_session_arm_encode(payload, sizeof(payload), epoch, flows, count);
+    assert(len);
+    deliver(peer, DMESH_SESSION_ARM, 0, 0, payload, len);
+}
+
+static void expect_doorbell(unsigned before, struct doca_comch_connection *peer)
+{
+    assert(response_attempts == before + 1 && response_peer == peer);
+    assert(attempted_response.type == DMESH_SESSION_DOORBELL);
+    assert(attempted_response.flow_id == 0 && attempted_response.generation == 0);
+    assert(attempted_response.payload_len == DMESH_SESSION_DOORBELL_SIZE);
+}
+
+static void idle_wake_test(void)
+{
+    unsigned char peer_storage[2];
+    struct doca_comch_connection *peer = (void *)&peer_storage[0];
+    struct doca_comch_connection *stranger = (void *)&peer_storage[1];
+    struct objects *objs = calloc(1, sizeof(*objs));
+    assert(objs);
+    callback_objects = objs;
+    objs->cc_server = (void *)&server_storage;
+    struct dmesh_conn *push = new_test_flow(objs, peer, 1, 3);
+    struct dmesh_conn *pull = new_test_flow(objs, peer, 2, 5);
+    struct dmesh_session *s = push->session;
+    push->state = pull->state = DMESH_CONN_RUNNING;
+    push->close_requested = pull->close_requested = false;
+    push->flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
+    pull->flow.mode = DMESH_FLOW_MODE_BACKEND_PULL;
+    push->push_seq = 4;          /* descriptors 1..4 are in host memory */
+    pull->push_seq = 99;         /* a pull flow never counts */
+
+    /* The host saw everything published: stay armed, send nothing. */
+    struct dmesh_session_arm_flow seen[] = {{1, 3, 5}, {2, 5, 1}};
+    unsigned before = response_attempts;
+    deliver_arm(peer, 11, seen, 2);
+    assert(s->armed && s->armed_epoch == 11 && !s->closing);
+    sessions_advance(objs);
+    assert(response_attempts == before);
+
+    /* The next completion rings once; later completions do not re-ring. */
+    dmesh_session_push_published(s);
+    assert(!s->armed && s->doorbell_pending_epoch == 11);
+    dmesh_session_push_published(s);
+    assert(s->doorbell_pending_epoch == 11);
+    sessions_advance(objs);
+    expect_doorbell(before, peer);
+    /* A rejected send (the mock's full queue) is retried, never dropped. */
+    sessions_advance(objs);
+    expect_doorbell(before + 1, peer);
+    s->doorbell_sent_epoch = s->doorbell_pending_epoch;   /* model an accepted send */
+    before = response_attempts;
+    sessions_advance(objs);
+    assert(response_attempts == before);
+
+    /* A descriptor the ARM had not accounted for rings at once. */
+    struct dmesh_session_arm_flow behind[] = {{1, 3, 4}};
+    deliver_arm(peer, 12, behind, 1);
+    assert(!s->armed && s->doorbell_pending_epoch == 12);
+    sessions_advance(objs);
+    expect_doorbell(before, peer);
+    s->doorbell_sent_epoch = 12;
+
+    /* Stale generations and unknown flows are ignored, not trusted. */
+    struct dmesh_session_arm_flow stale[] = {{1, 2, 1}, {7, 1, 1}};
+    before = response_attempts;
+    deliver_arm(peer, 13, stale, 2);
+    assert(s->armed && s->armed_epoch == 13);
+    sessions_advance(objs);
+    assert(response_attempts == before);
+
+    /* An ARM with no push flow still arms the session. */
+    deliver_arm(peer, 14, NULL, 0);
+    assert(s->armed && s->armed_epoch == 14 && !s->closing);
+
+    /* Malformed ARM payloads and host DOORBELLs fail the session. */
+    uint8_t bad[DMESH_SESSION_ARM_HEADER_SIZE + DMESH_SESSION_ARM_FLOW_SIZE];
+    assert(dmesh_session_arm_encode(bad, sizeof(bad), 15, seen, 1) == sizeof(bad));
+    dmesh_session_put_u32(bad + 16, 0);                   /* flow id 0 */
+    deliver(peer, DMESH_SESSION_ARM, 0, 0, bad, sizeof(bad));
+    assert(s->closing);
+    struct dmesh_session *other = session_get(objs, stranger, true);
+    uint8_t epoch[DMESH_SESSION_DOORBELL_SIZE] = {0};
+    deliver(stranger, DMESH_SESSION_ARM, 0, 0, bad, DMESH_SESSION_ARM_HEADER_SIZE);
+    assert(other->closing && !other->armed);             /* before HELLO */
+    other = session_get(objs, stranger, false);
+    other->closing = false;
+    other->negotiated = true;
+    deliver(stranger, DMESH_SESSION_DOORBELL, 0, 0, epoch, sizeof(epoch));
+    assert(other->closing);
+    free(objs);
+    callback_objects = NULL;
+}
+
 int main(void)
 {
     receive_test();
+    idle_wake_test();
     checked_close_test();
     reader_fence_test();
     physical_disconnect_test();
