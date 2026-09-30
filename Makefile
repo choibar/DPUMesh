@@ -28,7 +28,7 @@ LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c 
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
 HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
-    channel_session_test comch_client_test session_server_test dma_cleanup_test dpa_cleanup_test rx_watermark_test
+    channel_session_test comch_client_test session_server_test dma_cleanup_test dpa_cleanup_test rx_watermark_test tx_staging_custody_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
 .PHONY: all lib test test-native-headers test-abi examples clean
@@ -84,6 +84,9 @@ $(TESTDIR)/dpa_cleanup_test: tests/dpa_cleanup_test.c $(TRANSPORT)/common/dpa.c 
 	$(CC) $(HOST_CFLAGS) -DDMESH_DPA_QUIESCE_TIMEOUT_MS=20 -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/rx_watermark_test: tests/rx_watermark_test.c linkerd2-proxy/linkerd/doca/src/shim.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
+
+$(TESTDIR)/tx_staging_custody_test: tests/tx_staging_custody_test.c linkerd2-proxy/linkerd/doca/src/shim.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
 
 

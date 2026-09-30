@@ -165,6 +165,10 @@ struct dmesh_conn {
     uint32_t push_pos;                        /* data-ring write offset (host side) */
     uint32_t push_len;                        /* in-flight batch length */
     int push_state;                           /* 0 idle, 1 data in flight, 2 desc in flight */
+    /* Rust may reuse staging only after the accepted push has completed.
+     * Its publish cursor stays put while this batch still owns the source. */
+    uint32_t push_unreported_pos, push_unreported_len;
+    uint64_t push_unreported_seq;
     /* The proxy finished sending: a zero-length descriptor follows the last
      * batch and the host reads it as end of stream (dmesh_dma_push_fin). */
     bool push_fin_requested, push_fin_sent;

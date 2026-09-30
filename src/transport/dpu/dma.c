@@ -797,7 +797,8 @@ dmesh_dma_push_submit_desc(struct dmesh_conn *conn)
         return;
     }
 
-    /* Batch is lost to the stream if we cannot publish it - log loudly. */
+    /* Accepted bytes cannot be replayed or silently dropped. Fail the flow
+     * without releasing staging custody if publication cannot be submitted. */
     DOCA_LOG_ERR("backend push: failed to submit desc DMA (seq=%lu): %s",
                  next_seq, doca_error_get_descr(result));
     if (dbuf != NULL)
@@ -805,6 +806,9 @@ dmesh_dma_push_submit_desc(struct dmesh_conn *conn)
     if (sbuf != NULL)
         (void)doca_buf_dec_refcount(sbuf, NULL);
     conn->push_state = 0;
+    conn->dma_closing = true;
+    conn->state = DMESH_CONN_ERROR;
+    conn->error_status = EIO;
 }
 
 /* Final stage: descriptor landed; the batch is visible to the host. */
