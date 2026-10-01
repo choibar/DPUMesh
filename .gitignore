@@ -31,6 +31,8 @@ bench-results/*
 !bench-results/2026-09-26_grpc-go-64b-w16-k4-no-eu-partitions.md
 !bench-results/2026-09-29_grpc-go-adapter-rework.md
 !bench-results/2026-09-29_preload-gather-write.md
+!bench-results/2026-09-30_host-idle-wake.md
+!bench-results/2026-09-30_host-idle-wake.csv
 
 # local test binary
 apps/dmesh-router-cpp/test/test_transcode
