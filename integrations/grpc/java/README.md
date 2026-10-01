@@ -35,3 +35,17 @@ The tests serve and call through the providers over the loopback: message
 sizes up to 4 MiB, 16 MiB of server streaming, 64 concurrent calls, deadlines,
 repeated channels, and a raw Netty channel that stalls past the credit
 threshold.
+
+## Channel benchmark
+
+`bench/` holds the Java peer of the Go
+[channel-bench](../go/cmd/channel-bench/README.md): the same wire, flags and
+JSON result, over DPUMesh or, with `-tcp host:port`, kernel TCP.
+`-start-file` is not supported, and `native_dials` counts each channel's
+transitions to READY, since grpc-java has no dial hook.
+
+```sh
+sh <project>/gradlew -p integrations/grpc/java benchClasspath
+java -cp "$(cat integrations/grpc/java/build/bench.classpath)" \
+    io.dpumesh.grpc.bench.ChannelBench -mode server
+```

@@ -68,3 +68,27 @@ test {
     environment 'DPUMESH_ENABLE', '1'
     testLogging { events 'failed'; exceptionFormat 'full' }
 }
+
+// channel-bench (bench/), the Java peer of the Go fixture. `benchClasspath`
+// compiles it and writes its runtime classpath to build/bench.classpath:
+// java -cp "$(cat build/bench.classpath)" io.dpumesh.grpc.bench.ChannelBench
+sourceSets {
+    bench {
+        java.srcDirs = ['bench']
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+dependencies {
+    benchImplementation "io.grpc:grpc-netty:${grpcVersion}"
+    benchImplementation "io.grpc:grpc-stub:${grpcVersion}"
+}
+
+tasks.register('benchClasspath') {
+    dependsOn tasks.named('benchClasses'), tasks.named('classes')
+    def out = layout.buildDirectory.file('bench.classpath')
+    inputs.files(sourceSets.bench.runtimeClasspath)
+    outputs.file(out)
+    doLast { out.get().asFile.text = sourceSets.bench.runtimeClasspath.files.join(':') + '\n' }
+}
