@@ -33,6 +33,8 @@ public final class DpumeshChannel extends AbstractChannel {
   private static final long HOLD_BYTES = 1 << 20;
 
   private final DefaultChannelConfig config = new StreamConfig(this);
+  // Reused by doWrite: the native write copies it before returning.
+  private byte[] gathered = new byte[0];
   private volatile boolean open = true;
   private volatile boolean active;
   private SocketAddress local;
@@ -146,6 +148,24 @@ public final class DpumeshChannel extends AbstractChannel {
   protected void doWrite(ChannelOutboundBuffer in) throws Exception {
     if (stream == 0) throw new ClosedChannelException();
     while (true) {
+      // Frames flushed together go out in one write. The native library holds
+      // a partial unit written while an earlier one is in flight until its
+      // tail deadline, so a frame written separately after the first would
+      // wait for it.
+      if (in.size() > 1) {
+        int gatheredBytes = gather(in);
+        if (gatheredBytes > 0) {
+          int n = NativeBridge.nativeWriteArray(stream, gathered, 0, gatheredBytes);
+          if (n > 0) {
+            in.removeBytes(n);
+            continue;
+          } else if (n == -NativeBridge.EAGAIN) {
+            writePending = true; // flushed again on the stream's writable event
+            return;
+          }
+          throw new IOException("DPUMesh write failed: errno " + -n);
+        }
+      }
       Object message = in.current();
       if (message == null) return;
       if (!(message instanceof ByteBuf)) {
@@ -167,6 +187,34 @@ public final class DpumeshChannel extends AbstractChannel {
         throw new IOException("DPUMesh write failed: errno " + -n);
       }
     }
+  }
+
+  // Copies the leading flushed ByteBufs that fit in one native post into
+  // `gathered`; returns their byte count, or 0 when fewer than two fit.
+  private int gather(ChannelOutboundBuffer in) throws Exception {
+    int limit = NativeBridge.postMax();
+    int[] total = {0};
+    int[] count = {0};
+    in.forEachFlushedMessage(message -> {
+      if (!(message instanceof ByteBuf)) return false;
+      int readable = ((ByteBuf) message).readableBytes();
+      if (total[0] + readable > limit) return false;
+      total[0] += readable;
+      count[0]++;
+      return true;
+    });
+    if (count[0] < 2 || total[0] == 0) return 0;
+    if (gathered.length < total[0]) gathered = new byte[limit];
+    int[] at = {0};
+    int[] left = {count[0]};
+    in.forEachFlushedMessage(message -> {
+      ByteBuf buffer = (ByteBuf) message;
+      int readable = buffer.readableBytes();
+      buffer.getBytes(buffer.readerIndex(), gathered, at[0], readable);
+      at[0] += readable;
+      return --left[0] > 0;
+    });
+    return total[0];
   }
 
   // Posts the start of `buffer`; returns the count accepted or -errno.
