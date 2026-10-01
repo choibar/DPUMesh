@@ -7,6 +7,19 @@
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 
+/* Match DPUmesh's forward producer report policy: a report retires the
+ * preceding optimized submissions as well as the current one. */
+#define DPA_PRODUCER_REPORT_BATCH 512u
+
+static inline int dpa_producer_report_due(uint32_t *deferred)
+{
+	(*deferred)++;
+	if (*deferred < DPA_PRODUCER_REPORT_BATCH)
+		return 0;
+	*deferred = 0;
+	return 1;
+}
+
 struct dpa_thread_arg {
 	uint64_t dpa_consumer_comp;
 	uint64_t dpa_producer_comp;
@@ -53,6 +66,10 @@ struct dpa_thread_arg {
 	/* Published before stopped: number of copies requiring CPU DMA-completed
 	 * messages. Kernel exit alone does not retire producer DMA operations. */
 	volatile uint64_t dma_submitted;
+
+	/* Persistent across cooperative reschedules, which restart the entry. */
+	uint64_t yield_notification;
+	uint32_t producer_deferred;
 
 } __attribute__((__packed__, aligned(8)));
 

@@ -17,6 +17,9 @@ option(DPUMESH_GRPC_ENABLE_TSAN
        OFF)
 option(DPUMESH_GRPC_BUILD_EXAMPLES "Build the hello gRPC example" ON)
 
+# libdpumesh_stream.so links the reactor and abseil statically.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 if(DPUMESH_GRPC_ENABLE_SANITIZERS AND DPUMESH_GRPC_ENABLE_TSAN)
   message(FATAL_ERROR
     "ASan/UBSan and ThreadSanitizer must use separate build configurations")
@@ -96,15 +99,22 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(grpc_dpumesh_endpoint STATIC
-  src/dmesh_endpoint.cc
-  src/thread_executor.cc)
+add_library(dpumesh_executor STATIC src/thread_executor.cc)
+target_compile_features(dpumesh_executor PUBLIC cxx_std_17)
+target_compile_options(dpumesh_executor PRIVATE -Wall -Wextra)
+target_include_directories(dpumesh_executor
+  PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src")
+target_link_libraries(dpumesh_executor
+  PUBLIC absl::status absl::any_invocable
+  PRIVATE Threads::Threads)
+
+add_library(grpc_dpumesh_endpoint STATIC src/dmesh_endpoint.cc)
 target_compile_features(grpc_dpumesh_endpoint PUBLIC cxx_std_17)
 target_compile_options(grpc_dpumesh_endpoint PRIVATE -Wall -Wextra)
 target_include_directories(grpc_dpumesh_endpoint
   PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src")
 target_link_libraries(grpc_dpumesh_endpoint
-  PUBLIC gRPC::grpc++
+  PUBLIC gRPC::grpc++ dpumesh_executor
   PRIVATE Threads::Threads)
 
 find_path(DPUMESH_INCLUDE_DIR dpumesh/dmesh.h
@@ -113,10 +123,22 @@ find_library(DPUMESH_LIBRARY NAMES dpumesh
   HINTS "${DPUMESH_ROOT}/build/lib" NO_DEFAULT_PATH)
 
 if(DPUMESH_INCLUDE_DIR)
-  add_library(grpc_dpumesh_reactor STATIC
+  # The EQ reactor and runtime need no gRPC: the gRPC endpoint and the stream
+  # C ABI are two sinks over them.
+  add_library(dpumesh_reactor_core STATIC
     src/dmesh_reactor.cc
-    src/dmesh_runtime.cc
-    src/dmesh_grpc_runtime.cc)
+    src/dmesh_runtime.cc)
+  target_compile_features(dpumesh_reactor_core PUBLIC cxx_std_17)
+  target_compile_options(dpumesh_reactor_core PRIVATE -Wall -Wextra)
+  target_include_directories(dpumesh_reactor_core
+    PUBLIC "${DPUMESH_INCLUDE_DIR}"
+    PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src")
+  target_link_libraries(dpumesh_reactor_core
+    PUBLIC dpumesh_executor absl::status absl::statusor absl::strings
+           absl::any_invocable absl::function_ref absl::span
+    PRIVATE Threads::Threads)
+
+  add_library(grpc_dpumesh_reactor STATIC src/dmesh_grpc_runtime.cc)
   target_compile_features(grpc_dpumesh_reactor PUBLIC cxx_std_17)
   target_compile_options(grpc_dpumesh_reactor PRIVATE -Wall -Wextra)
   target_include_directories(grpc_dpumesh_reactor
@@ -124,8 +146,30 @@ if(DPUMESH_INCLUDE_DIR)
       "${CMAKE_CURRENT_LIST_DIR}/src"
       "${DPUMESH_INCLUDE_DIR}")
   target_link_libraries(grpc_dpumesh_reactor
-    PUBLIC grpc_dpumesh_endpoint
+    PUBLIC dpumesh_reactor_core grpc_dpumesh_endpoint
     PRIVATE Threads::Threads)
+
+  # The stream C ABI (include/dpumesh_stream.h) for the language adapters.
+  add_library(dpumesh_stream_core STATIC src/dmesh_stream.cc)
+  target_compile_features(dpumesh_stream_core PUBLIC cxx_std_17)
+  target_compile_options(dpumesh_stream_core PRIVATE -Wall -Wextra)
+  target_include_directories(dpumesh_stream_core
+    PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include"
+    PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src")
+  target_link_libraries(dpumesh_stream_core PUBLIC dpumesh_reactor_core)
+
+  # The same ABI over an in-process loopback, for the adapters' tests.
+  add_library(dpumesh_stream_loopback SHARED
+    src/dmesh_stream.cc testing/loopback_dmesh_ops.cc)
+  target_compile_features(dpumesh_stream_loopback PRIVATE cxx_std_17)
+  target_compile_options(dpumesh_stream_loopback PRIVATE -Wall -Wextra)
+  target_include_directories(dpumesh_stream_loopback
+    PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include"
+    PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src" "${CMAKE_CURRENT_LIST_DIR}/testing")
+  target_link_libraries(dpumesh_stream_loopback PRIVATE dpumesh_reactor_core)
+  target_link_options(dpumesh_stream_loopback PRIVATE
+    "-Wl,--version-script=${CMAKE_CURRENT_LIST_DIR}/src/dpumesh_stream.map"
+    "-Wl,--exclude-libs,ALL" "-Wl,--no-undefined")
 else()
   message(STATUS
     "DPUmesh public headers were not found; the reactor target will not be built")
@@ -144,12 +188,34 @@ if(DPUMESH_INCLUDE_DIR AND DPUMESH_LIBRARY)
     PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src" "${DPUMESH_ROOT}")
   target_link_libraries(grpc_dpumesh_native PUBLIC dpumesh_native grpc_dpumesh_reactor)
 
+  # Exports only dms_*; the reactor and abseil stay private to the library.
+  add_library(dpumesh_stream SHARED
+    src/dmesh_stream.cc src/dmesh_stream_open.cc src/dmesh_api_ops.cc)
+  target_compile_features(dpumesh_stream PRIVATE cxx_std_17)
+  target_compile_options(dpumesh_stream PRIVATE -Wall -Wextra)
+  target_include_directories(dpumesh_stream
+    PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include"
+    PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src")
+  target_link_libraries(dpumesh_stream PRIVATE dpumesh_reactor_core dpumesh_native)
+  target_link_options(dpumesh_stream PRIVATE
+    "-Wl,--version-script=${CMAKE_CURRENT_LIST_DIR}/src/dpumesh_stream.map"
+    "-Wl,--exclude-libs,ALL" "-Wl,--no-undefined")
+  set_target_properties(dpumesh_stream PROPERTIES
+    LINK_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/dpumesh_stream.map")
+
   add_library(grpc_dpumesh INTERFACE)
   # Export bootstrap headers through the aggregate target.
   target_include_directories(grpc_dpumesh INTERFACE
     "${CMAKE_CURRENT_LIST_DIR}/src")
   target_link_libraries(grpc_dpumesh INTERFACE
     grpc_dpumesh_endpoint grpc_dpumesh_reactor grpc_dpumesh_native)
+
+  # The C++ peer of the Go channel-bench: 64-byte verified unary echo over
+  # DPUMesh or, with -tcp, kernel TCP (bench/channel_bench.cc).
+  add_executable(dpumesh_channel_bench bench/channel_bench.cc)
+  target_compile_features(dpumesh_channel_bench PRIVATE cxx_std_17)
+  target_compile_options(dpumesh_channel_bench PRIVATE -Wall -Wextra)
+  target_link_libraries(dpumesh_channel_bench PRIVATE grpc_dpumesh Threads::Threads)
 
   if(DPUMESH_GRPC_BUILD_EXAMPLES AND DPUMESH_GRPC_SOURCE_DIR)
     if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../examples/grpc/CMakeLists.txt")
@@ -189,6 +255,26 @@ if(BUILD_TESTING)
            COMMAND grpc_dpumesh_channel_test)
 
   if(DPUMESH_INCLUDE_DIR)
+    add_executable(dpumesh_stream_test
+      tests/stream_test.cc
+      tests/fake_dmesh_ops.cc)
+    target_compile_features(dpumesh_stream_test PRIVATE cxx_std_17)
+    target_compile_options(dpumesh_stream_test PRIVATE -Wall -Wextra)
+    target_include_directories(dpumesh_stream_test PRIVATE
+      "${CMAKE_CURRENT_LIST_DIR}/src"
+      "${CMAKE_CURRENT_LIST_DIR}/tests")
+    target_link_libraries(dpumesh_stream_test PRIVATE
+      dpumesh_stream_core Threads::Threads)
+    add_test(NAME dpumesh_stream_test COMMAND dpumesh_stream_test)
+
+    add_executable(dpumesh_stream_loopback_test tests/stream_loopback_test.cc)
+    target_compile_features(dpumesh_stream_loopback_test PRIVATE cxx_std_17)
+    target_compile_options(dpumesh_stream_loopback_test PRIVATE -Wall -Wextra)
+    target_link_libraries(dpumesh_stream_loopback_test PRIVATE
+      dpumesh_stream_loopback Threads::Threads)
+    add_test(NAME dpumesh_stream_loopback_test
+             COMMAND dpumesh_stream_loopback_test)
+
     add_executable(grpc_dpumesh_reactor_test
       tests/reactor_test.cc
       tests/fake_dmesh_ops.cc
@@ -228,6 +314,13 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_LIST_DIR}/src")
     target_link_libraries(grpc_dpumesh_native_runtime_smoke
       PRIVATE grpc_dpumesh Threads::Threads)
+
+    # Manual hardware test of the stream C ABI: an echo server and a
+    # ping-pong client in two processes.
+    add_executable(dpumesh_stream_smoke tests/stream_smoke.cc)
+    target_compile_features(dpumesh_stream_smoke PRIVATE cxx_std_17)
+    target_compile_options(dpumesh_stream_smoke PRIVATE -Wall -Wextra)
+    target_link_libraries(dpumesh_stream_smoke PRIVATE dpumesh_stream Threads::Threads)
 
     # Manual two-pod hardware test. Run one copy in server mode and another in
     # client mode; unlike native_runtime_smoke this executes a real gRPC RPC.

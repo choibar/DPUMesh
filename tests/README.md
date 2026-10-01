@@ -9,6 +9,9 @@
 | `native_api_contract_test`, `preload_api_contract_test` | Façade argument validation without a transport |
 | `native_core_transport_test` | Channel, EQ, QP, reservation, custody ACK, held RX buffers, FIN and teardown over the memory carrier in `support/` |
 | `native_writable_test` | Writable-buffer accounting of the core |
+| `native_polling_test` | Repeated custody ACKs permit sleeping by default; an explicit spin window remains available |
+| `rx_watermark_test` | Production proxy shim watermark batching, failed-copy retry and multiple staging wraps |
+| `tx_staging_custody_test` | Push retries retain source bytes until descriptor DMA completes, including failure paths |
 | `carrier_logic_test` | Forward chunking to the DPUMesh copy rule and the in-order release window of the carrier |
 | `service_resolve_test` | Service target grammar, DNS answer caching and invalidation, address ids, fail-closed `DPUMESH_TARGETS` membership |
 | `topology_test` | Topology header |
@@ -17,7 +20,7 @@
 | `channel_session_test` | Production host session code with mock Comch: one client for multiple flows, stale replies, isolated close/errors, failed-close retention and session failure |
 | `session_server_test` | Production DPU session progress: HELLO timeout, distinct OPEN metadata, stale requests, close failure/retry, reader detachment, no-teardown and quarantine |
 | `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression and retry after partial cleanup |
-| `dpa_cleanup_test` | DPA issued/completed close fence, MsgQ/context/thread cleanup failures and retryable ownership |
+| `dpa_cleanup_test` | DPA issued/completed close fence, MsgQ/context/thread cleanup failures, same-EU helper notification lifetime and retryable ownership |
 
 The session tests do not open a device. They exercise production control and cleanup code with mock SDK objects.
 Real DMA completion, hardware context teardown and sibling traffic during close

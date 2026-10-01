@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 
 #define CHANNELS 8
 #define EVENTS 16384
@@ -110,6 +112,7 @@ int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t 
     } else push(t, ack);
     pthread_mutex_unlock(&lock); return 0;
 }
+void dmesh_native_progress(struct dmesh_native_transport *t) { (void)t; }
 int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e) {
     pthread_mutex_lock(&lock);
     struct event_node *n = t->first[stripe];
@@ -126,11 +129,49 @@ void dmesh_native_release(struct dmesh_native_transport *t, int pos) {
     t->leased[pos / DPUMESH_SLOT_SIZE] = 0;
     pthread_mutex_unlock(&lock);
 }
-/* No doorbells: every stripe asks for the fallback tick. */
+/* No doorbells: every stripe keeps its consumer polling, unless a test lets
+ * the channel sleep (test_native_sleepable), where idle_arm succeeds and the
+ * wake fd is an eventfd the test raises. */
+static int sleepable, wake_efd = -1;
+static unsigned idle_arms, wake_clears;
+void test_native_sleepable(int value) { sleepable = value; }
+unsigned test_native_idle_arms(void) { return idle_arms; }
+unsigned test_native_wake_clears(void) { return wake_clears; }
+void test_native_raise_wake(void)
+{
+    uint64_t one = 1;
+    assert(wake_efd >= 0 && write(wake_efd, &one, sizeof(one)) == sizeof(one));
+}
 int dmesh_native_stripe_fd(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return -1; }
 int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return -1; }
-int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return 1; }
+int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return !sleepable; }
 void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; }
+int dmesh_native_wake_fd(struct dmesh_native_transport *t)
+{
+    (void)t;
+    if (wake_efd < 0) wake_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    return wake_efd;
+}
+int dmesh_native_idle_arm(struct dmesh_native_transport *t)
+{
+    (void)t;
+    if (!sleepable) { errno = EAGAIN; return -1; }
+    ++idle_arms;
+    return 0;
+}
+void dmesh_native_wake_clear(struct dmesh_native_transport *t)
+{
+    (void)t;
+    uint64_t v;
+    ++wake_clears;
+    while (wake_efd >= 0 && read(wake_efd, &v, sizeof(v)) > 0) {}
+}
+void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms, uint64_t *doorbells)
+{
+    (void)t;
+    *arms = idle_arms;
+    *doorbells = wake_clears;
+}
 int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int service_id) {
     (void)t; (void)port; (void)service_id; return 0;
 }

@@ -2,6 +2,8 @@
  * peer. DOCA data-path branches link against the SDK but must not execute. */
 #include <assert.h>
 #include <stdio.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include "src/transport/host/channel.c"
 #ifdef OBJECT_H_
 #error "Native host channels must not depend on the DPU objects layout"
@@ -10,9 +12,17 @@
 static struct dmesh_comch_client *mock_control;
 static unsigned client_creates, client_destroys, ring_allocs, ring_frees;
 static unsigned opens, closes;
+static unsigned control_progress;
 static int next_close_status;
 static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
+/* Idle wake: the last ARM the host sent, and the control PE notification. */
+static unsigned arms_seen, notify_requests, notify_clears;
+static uint64_t arm_epoch_seen;
+static uint32_t arm_count_seen;
+static struct dmesh_session_arm_flow arm_flows_seen[DMESH_SESSION_MAX_FLOWS];
+static doca_error_t send_result = DOCA_SUCCESS;
+static int control_notify_fd = -1;
 
 enum cleanup_phase {
     FAIL_NONE, FAIL_QUIESCE, FAIL_COMCH, FAIL_BUF_ARRAY, FAIL_THREAD,
@@ -57,7 +67,14 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
     const uint8_t *payload;
     assert(objs == mock_control);
     assert(dmesh_session_decode(data, len, &h, &payload) == 0);
+    if (send_result != DOCA_SUCCESS)
+        return send_result;
     switch (h.type) {
+    case DMESH_SESSION_ARM:
+        ++arms_seen;
+        assert(dmesh_session_arm_decode(payload, h.payload_len, &arm_epoch_seen,
+                                        arm_flows_seen, &arm_count_seen) == 0);
+        break;
     case DMESH_SESSION_HELLO:
         reply(DMESH_SESSION_HELLO_ACK, 0, 0, 0);
         break;
@@ -85,11 +102,33 @@ uint8_t doca_pe_progress(struct doca_pe *pe)
 {
     if (pe == (struct doca_pe *)&fake_reverse_pe) return 0;
     assert(pe == (struct doca_pe *)mock_control);
+    ++control_progress;
     if (!pending_len) return 0;
     size_t len = pending_len;
     pending_len = 0;
     mock_control->message(mock_control->owner, pending, len);
     return 1;
+}
+doca_error_t doca_pe_request_notification(struct doca_pe *pe)
+{
+    if (pe == (struct doca_pe *)&fake_reverse_pe) return DOCA_SUCCESS;
+    assert(pe == (struct doca_pe *)mock_control);
+    ++notify_requests;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_pe_get_notification_handle(const struct doca_pe *pe, doca_notification_handle_t *handle)
+{
+    assert(pe == (const struct doca_pe *)mock_control && control_notify_fd >= 0);
+    *handle = (doca_notification_handle_t)control_notify_fd;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_pe_clear_notification(struct doca_pe *pe, doca_notification_handle_t handle)
+{
+    uint64_t v;
+    assert(pe == (struct doca_pe *)mock_control && (int)handle == control_notify_fd);
+    ++notify_clears;
+    while (read(control_notify_fd, &v, sizeof(v)) > 0) {}
+    return DOCA_SUCCESS;
 }
 struct doca_ctx *doca_comch_client_as_ctx(struct doca_comch_client *client)
 { return (struct doca_ctx *)client; }
@@ -203,6 +242,83 @@ static void attach_reverse(struct channel_conn *flow, int running)
     flow->ring_mmap = (struct doca_mmap *)&fake_ring_import;
 }
 
+static void dispatch_doorbell(struct channel_dev *dev)
+{
+    uint8_t frame[DMESH_SESSION_MAX_FRAME], epoch[DMESH_SESSION_DOORBELL_SIZE] = {0};
+    size_t len = dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_DOORBELL, 0, 0, 0,
+                                      epoch, sizeof(epoch));
+    assert(len);
+    pthread_mutex_lock(&dev->session_lock);
+    session_message(dev, frame, len);
+    pthread_mutex_unlock(&dev->session_lock);
+}
+
+/* ARM lists the unread descriptor of each live push flow, at most one ARM is
+ * outstanding until a DOORBELL, and the control PE is armed then progressed. */
+static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, struct channel_conn *b)
+{
+    control_notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    assert(control_notify_fd >= 0 && channel_dev_fd(dev) == control_notify_fd);
+    unsigned arms = arms_seen, requests = notify_requests, progress = control_progress;
+    b->expected = 5;
+    assert(channel_dev_arm(dev) == 0);
+    assert(arms_seen == arms + 1 && arm_epoch_seen == 1 && arm_count_seen == 2);
+    assert(arm_flows_seen[0].flow_id == 1 && arm_flows_seen[0].generation == a->generation &&
+           arm_flows_seen[0].expected_seq == 1);
+    assert(arm_flows_seen[1].flow_id == 2 && arm_flows_seen[1].expected_seq == 5);
+    assert(notify_requests == requests + 1 && control_progress == progress + 1);
+    assert(dev->arm_outstanding);
+
+    /* Outstanding: the next sleep re-arms the PE but sends nothing. */
+    assert(channel_dev_arm(dev) == 0);
+    assert(arms_seen == arms + 1 && notify_requests == requests + 2);
+
+    /* DOORBELL releases it; ended, closed and failed flows are left out. */
+    dispatch_doorbell(dev);
+    assert(!dev->arm_outstanding && dev->doorbells == 1);
+    b->rx_ended = 1;
+    assert(channel_dev_arm(dev) == 0);
+    assert(arms_seen == arms + 2 && arm_epoch_seen == 2 && arm_count_seen == 1 &&
+           arm_flows_seen[0].flow_id == 1);
+    dispatch_doorbell(dev);
+    a->peer_closed = 1;
+    assert(channel_dev_arm(dev) == 0);              /* no push flow: no ARM */
+    assert(arms_seen == arms + 2 && !dev->arm_outstanding);
+    a->peer_closed = 0;
+    b->rx_ended = 0;
+
+    /* A queue-full ARM fails the arm: the caller keeps polling. */
+    send_result = DOCA_ERROR_AGAIN;
+    assert(channel_dev_arm(dev) == -1 && errno == EAGAIN && !dev->arm_outstanding);
+    send_result = DOCA_SUCCESS;
+
+    /* host-dpa receives have their own doorbells: no ARM, PE still armed. */
+    dev->host_dpa = 1;
+    requests = notify_requests;
+    assert(channel_dev_arm(dev) == 0 && arms_seen == arms + 2 && notify_requests == requests + 1);
+    dev->host_dpa = 0;
+
+    /* A raised fd is cleared once; an idle one is left alone. */
+    uint64_t one = 1;
+    assert(write(control_notify_fd, &one, sizeof(one)) == sizeof(one));
+    unsigned clears = notify_clears;
+    channel_dev_clear(dev);
+    channel_dev_clear(dev);
+    assert(notify_clears == clears + 1);
+
+    /* A failed session cannot arm. */
+    dev->session_error = ECONNRESET;
+    assert(channel_dev_arm(dev) == -1 && errno == ECONNRESET);
+    dev->session_error = 0;
+
+    uint64_t sent = 0, rung = 0;
+    channel_dev_wake_counters(dev, &sent, &rung);
+    assert(sent == 2 && rung == 2);
+    dev->arm_outstanding = 0;
+    close(control_notify_fd);
+    control_notify_fd = -1;
+}
+
 static void test_checked_close(void)
 {
     struct channel_dev dev = {0};
@@ -291,6 +407,18 @@ int main(void)
     cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW;
     assert(channel_conn_open(&dev, &cfg, &b) == 0);
     assert(client_creates == 1 && opens == 2 && a->ready && b->ready);
+    test_idle_wake(&dev, a, b);
+
+    /* One session progress delivers replies for all flows; status checks must
+     * neither re-progress that shared PE nor hide a sibling's error. */
+    unsigned progress_before = control_progress;
+    reply(DMESH_SESSION_ERROR, 1, a->generation, EIO);
+    assert(channel_dev_progress(&dev) == 0);
+    assert(control_progress == progress_before + 1);
+    assert(channel_conn_status(a) == -1 && errno == EIO);
+    assert(channel_conn_status(b) == 0);
+    assert(control_progress == progress_before + 1);
+    a->error = 0;
 
     /* A reply to a different incarnation cannot change the live flow. */
     dispatch(&dev, DMESH_SESSION_CLOSED, 1, a->generation + 1, 0);
@@ -310,8 +438,9 @@ int main(void)
 
     /* A failed session is observed independently by every flow's poller. */
     control->peer_gone = 1;
-    assert(channel_conn_progress(again) == -1 && errno == ECONNRESET);
-    assert(channel_conn_progress(b) == -1 && errno == ECONNRESET);
+    assert(channel_dev_progress(&dev) == -1 && errno == ECONNRESET);
+    assert(channel_conn_status(again) == -1 && errno == ECONNRESET);
+    assert(channel_conn_status(b) == -1 && errno == ECONNRESET);
     control->peer_gone = 0; dev.session_error = 0; /* Test-only reset. */
 
     /* A failed close retains the flow and its ring, without closing siblings. */

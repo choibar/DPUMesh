@@ -150,6 +150,40 @@ static void stop_desc_ring(struct dpa_thread_arg *arg, uint64_t submitted)
     doca_dpa_dev_thread_finish();
 }
 
+/* Retire producer reports independently of ARM-side DMA-completed messages.
+ * Consumer receive credits do not reclaim the producer completion queue. */
+static void drain_producer_completions(struct dpa_thread_arg *thread_arg)
+{
+    doca_dpa_dev_completion_element_t elem;
+    uint32_t count = 0;
+    while (doca_dpa_dev_get_completion(thread_arg->dpa_producer_comp, &elem) != 0)
+        count++;
+    if (count != 0) {
+        doca_dpa_dev_completion_ack(thread_arg->dpa_producer_comp, count);
+        doca_dpa_dev_completion_request_notification(thread_arg->dpa_producer_comp);
+    }
+}
+
+/* Same fixed EU as the data thread: notify only after its EU was released. */
+__dpa_global__ void run_dma_yield_helper(uint64_t resume_notification)
+{
+    doca_dpa_dev_thread_notify(resume_notification);
+    doca_dpa_dev_thread_reschedule();
+}
+
+#define DPA_IDLE_YIELD_SPINS 262144u
+#define DPA_DMA_YIELD_QUANTUM 65536u
+
+static void yield_desc_ring(struct dpa_thread_arg *arg, struct dma_ring_ctrl *ctrl,
+                            uint64_t head, uint64_t submitted)
+{
+    ctrl->consumer_head = head;
+    arg->dma_submitted = submitted;
+    __dpa_thread_window_writeback();
+    doca_dpa_dev_thread_notify(arg->yield_notification);
+    doca_dpa_dev_thread_reschedule();
+}
+
 static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 {
     doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
@@ -166,6 +200,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     uint32_t ring_mask = ring_size - 1;
     uint32_t buf_size = thread_arg->buf_size;
     uint64_t submitted = thread_arg->dma_submitted;
+    uint32_t idle_spins = 0, copies_since_yield = 0;
 
     DOCA_DPA_DEV_LOG_INFO("Polling descriptor ring with size %u, buf_size: %u\n", ring_size, buf_size);
     
@@ -181,6 +216,8 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     /* polling descriptor ring in host memory */
     while (1) {
 
+        drain_producer_completions(thread_arg);
+
         __dpa_thread_window_read_inv();
 
         if (thread_arg->stop) {
@@ -195,6 +232,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
         producer_tail = ctrl->producer_tail;
 
         while (consumer_head < producer_tail) {
+            drain_producer_completions(thread_arg);
             /* Staging backpressure (rd_fc): never copy into the DPU staging
              * ring past what the reader released. Unread = (pos - rd_pos)
              * circularly; leave room for this batch, a wrap's wasted tail and
@@ -255,9 +293,14 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 
             /* if consumer is empty, wait */
             while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
+                drain_producer_completions(thread_arg);
                 __dpa_thread_window_read_inv();
                 if (thread_arg->stop) {
                     stop_desc_ring(thread_arg, submitted);
+                    return;
+                }
+                if (thread_arg->yield_notification != 0 && ++idle_spins >= DPA_IDLE_YIELD_SPINS) {
+                    yield_desc_ring(thread_arg, ctrl, consumer_head, submitted);
                     return;
                 }
             }
@@ -271,8 +314,9 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
              * a final flush marker would itself need an unavailable credit.
              * Report coalescing is independent and remains enabled. */
             {
-                uint64_t submit_flags = DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
+                uint64_t submit_flags = DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
+                if (!dpa_producer_report_due(&thread_arg->producer_deferred))
+                    submit_flags |= DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS;
 
                 doca_dpa_dev_comch_producer_dma_copy(producer,
                                             /*consumer_id=*/1,
@@ -285,6 +329,8 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
                                             sizeof(struct comch_dma_comp_msg),
                                             submit_flags);
                 submitted++;
+                copies_since_yield++;
+                idle_spins = 0;
             }
 
             thread_arg->pos += batch_len;
@@ -293,12 +339,21 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
             }
 
             consumer_head += batch_cnt;
+            if (thread_arg->yield_notification != 0 &&
+                copies_since_yield >= DPA_DMA_YIELD_QUANTUM && thread_arg->producer_deferred == 0) {
+                yield_desc_ring(thread_arg, ctrl, consumer_head, submitted);
+                return;
+            }
         }
 
         if (consumer_head - last_published_head >= CONSUMER_HEAD_PUBLISH_BATCH) {
             ctrl->consumer_head = consumer_head;
             __dpa_thread_window_writeback();
             last_published_head = consumer_head;
+        }
+        if (thread_arg->yield_notification != 0 && ++idle_spins >= DPA_IDLE_YIELD_SPINS) {
+            yield_desc_ring(thread_arg, ctrl, consumer_head, submitted);
+            return;
         }
     }
 

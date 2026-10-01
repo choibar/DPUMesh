@@ -177,6 +177,33 @@ static void session_flow_error(struct objects *objs, struct dmesh_session *s,
                              h->generation, NULL, 0, status);
 }
 
+/* The host is about to sleep. Ring at once if a listed flow already published
+ * a descriptor the host had not seen; otherwise ring on the next completion. */
+static void session_arm(struct objects *objs, struct dmesh_session *s,
+                        struct doca_comch_connection *connection,
+                        const uint8_t *payload, uint32_t len)
+{
+    struct dmesh_session_arm_flow flows[DMESH_SESSION_MAX_FLOWS];
+    uint64_t epoch;
+    uint32_t count;
+    bool ring = false;
+    if (dmesh_session_arm_decode(payload, len, &epoch, flows, &count) != 0) {
+        session_fail(objs, s);
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        struct dmesh_conn *conn = dmesh_flow_get(objs, connection, flows[i].flow_id,
+                                                 flows[i].generation);
+        if (conn != NULL && DMESH_FLOW_USES_PUSH(conn->flow.mode) &&
+            conn->push_seq >= flows[i].expected_seq)
+            ring = true;
+    }
+    s->armed_epoch = epoch;
+    s->armed = !ring;
+    if (ring)
+        s->doorbell_pending_epoch = epoch;
+}
+
 static void server_message_recv_callback(struct doca_comch_event_msg_recv *event,
                                           uint8_t *buffer, uint32_t len,
                                           struct doca_comch_connection *connection)
@@ -208,6 +235,10 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
     if (h.type == DMESH_SESSION_HELLO) {
         s->negotiated = true;
         s->hello_pending = true;
+        return;
+    }
+    if (h.type == DMESH_SESSION_ARM && s->negotiated) {
+        session_arm(objs, s, connection, payload, h.payload_len);
         return;
     }
     if (!s->negotiated || h.flow_id == 0 || h.flow_id > DMESH_MAX_CONNECTIONS) {
@@ -894,6 +925,8 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     conn->push_pos = 0;
     conn->push_len = 0;
     conn->push_state = 0;
+    conn->push_unreported_pos = conn->push_unreported_len = 0;
+    conn->push_unreported_seq = 0;
     conn->push_shadow = NULL;
 
     /* Per-connection DMA engine (ctx, inventory, task pool, recv/pending rings). */
@@ -1099,6 +1132,13 @@ static void sessions_advance(struct objects *objs)
             if (s->hello_pending &&
                 session_send_frame(objs, s, DMESH_SESSION_HELLO_ACK, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)
                 s->hello_pending = false;
+            if (s->doorbell_pending_epoch != s->doorbell_sent_epoch) {
+                uint8_t epoch[DMESH_SESSION_DOORBELL_SIZE];
+                dmesh_session_put_u64(epoch, s->doorbell_pending_epoch);
+                if (session_send_frame(objs, s, DMESH_SESSION_DOORBELL, 0, 0, epoch,
+                                       sizeof(epoch), 0) == DOCA_SUCCESS)
+                    s->doorbell_sent_epoch = s->doorbell_pending_epoch;
+            }
             for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
                 if (s->close_pending[i] &&
                     session_send_frame(objs, s, DMESH_SESSION_CLOSED, i + 1, s->generation[i],
@@ -1275,6 +1315,8 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 					conn->push_seq = 0;
 					conn->push_pos = 0;
 					conn->push_state = 0;
+					conn->push_unreported_pos = conn->push_unreported_len = 0;
+					conn->push_unreported_seq = 0;
 				}
 				conn->reverse_exported = true;   /* nothing to export */
 				DOCA_LOG_INFO("Push channel ready (mode %u) for %u.%u.%u.%u:%u",

@@ -29,6 +29,25 @@ connection당 동시 RPC 64개이며 backend pool도 K개다. Mode 비교는 EU 
 다른 실험 사이의 참조 비교다. Busy polling에 의한 CPU 100%만으로 ARM 연산
 병목을 확정하지 않는다. 상세 조건·정상 종료 여부·artifact SHA는 각 보고서에 있다.
 
+## 2026-09-29: host adapter
+
+| 보고서 | 조건 | 상태와 해석 |
+| --- | --- | --- |
+| [Go 어댑터 재구성 전후](2026-09-29_grpc-go-adapter-rework.md) | rapids4, `dpu-dma`, gRPC 64B 동시 1/64, raw 109B echo | 동시 64 처리량 약 +20%, 분리 goroutine raw echo p50 약 −45%; 단일 goroutine p50은 동일. 장비 smoke와 race 테스트 PASS |
+| [preload gather write](2026-09-29_preload-gather-write.md) | rapids4, `dpu-dma`, 109B 왕복, preload `tcp_echo` | `writev(9,100)` p50 569 µs → 55–62 µs; 변경 전과 후 교대 실행에서 회귀 없음. 동시 연결 4개/pool 2에서 1개 실패는 기존 문제 |
+
+## 2026-09-30: host idle wake
+
+| 보고서 | 조건 | 상태와 해석 |
+| --- | --- | --- |
+| [Host idle wake](2026-09-30_host-idle-wake.md) ([CSV](2026-09-30_host-idle-wake.csv)) | rapids4, `dpu-dma`, native, 수정 전/후 교대 | 50 µs tick 대신 nap·linger·DOORBELL. idle host CPU 1.74 → 0.01 core, 부하 중 페이지당 host CPU −23~−39%, 처리량 같음. Go netpoller로 Go 서버 m1 p50 −100~−250 µs. hw-regression busy poll 1/0 PASS |
+
+## 2026-10-01: gRPC 64B echo, transport·adapter 변경 전후
+
+| 보고서 | 조건 | 상태와 해석 |
+| --- | --- | --- |
+| [gRPC 64B transport·adapter 변경 전후](2026-10-01_grpc-64b-perf.md) ([CSV](2026-10-01_grpc-64b-perf.csv)) | rapids4, `dpu-dma`, L7, proxy 1 core, Go와 C++ channel-bench, main·core만·Go까지·C++ | 46회 모두 유효, DPU 오류 0. 최대 처리량은 proxy 천장에서 main과 같고(4×64: 15.8k), 1×64는 +15%, 요청 1개씩 p50 1,114 → 622 µs. C++은 Go의 88–98% |
+
 ## 자료 보존
 
 보고서의 상대 링크는 Git에 포함된 파일을 가리킨다. 아래 원본 파일은 이 작업에서

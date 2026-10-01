@@ -1,25 +1,42 @@
 # Go gRPC transport
 
 `dmeshgo` implements `net.Conn` and `net.Listener` over the native API. One
-process owns one channel, one shared host–DPU Comch control connection and one
-EQ poller. Each Go connection owns a native QP; DMA rings, buffers and DPA
-resources remain per flow. Reads retain native RX leases until consumed, and
-writes resume on EQ readiness. Concurrent read/write, deadlines and connection
-close follow the Go networking contract. The poller keeps progressing while any
-QP exists, including when no goroutine is blocked in Read or Write, so shared
-control events and buffered TX deadlines continue to run.
+process owns one channel, one shared host–DPU Comch control connection, one EQ
+and one poller goroutine. Each Go connection owns a native QP; DMA rings,
+buffers and DPA resources remain per flow.
 
-DPU-DMA has no data completion doorbell. Its poller uses a Go timer with
-2–128µs empty-poll backoff, reset by received events and local writes/waiters;
-actual wake latency also depends on the Go scheduler. It does not enable native
-fd notifications solely to poll memory again. Retained TX deadlines shorten
-the next wait, and writes wake the poller even without a parked reader.
+- The poller is the EQ's only consumer. It polls the EQ without blocking and,
+  while it is empty, parks on Go's netpoller with a duplicate of the EQ fd
+  (`eq_wait_linux.go`); no OS thread waits in cgo. The library's timers (naps,
+  retained-tail deadlines, the backstop) and doorbells raise that fd, so the
+  wait needs no Go timer. Commands interrupt it through the read deadline. It
+  hands receive leases to their connections and runs every QP destruction;
+  the native API requires destruction to be serialized with polling.
+- Read, Write and Dial run on the caller's goroutine. Each connection has its
+  own lock, so no connection waits for another's I/O. A Dial waits for the
+  DPU's answer without blocking other traffic; a `DialContext` whose context
+  ends first returns at once, and the late stream is aborted. Bytes or a FIN
+  the peer sends before the dial returns (an HTTP/2 server's SETTINGS) are
+  held for the new connection, not dropped.
+- Reads keep native receive leases until the bytes are consumed. A write that
+  finds no transmit capacity waits for the EQ's TX_READY. A writer blocked on
+  a departed peer fails with `EPIPE`, because that peer returns no credit.
+- Concurrent Read/Write, deadlines and Close follow the Go networking
+  contract. Close wakes blocked calls, returns queued leases and reports the
+  native close result once.
+- A channel that serves `DPUMESH_SERVICE` is polled for the transport's whole
+  life. Streams that arrive before the first `Listen` are held for it. Once a
+  listener has closed, new streams are aborted at once instead of left
+  hanging.
 
-For host-DPA the EQ fd is registered with Go's runtime netpoller using an owned
-duplicate. Waiting parks the goroutine without blocking an OS thread in cgo;
-native code still owns and drains the EQ and its doorbells. The maximum wait
-is 1ms even without a completion. `DPUMESH_SPIN_US` and `DPUMESH_TICK_US` retain
-their native fd behavior; they do not control the DPU-DMA Go timer path.
+Both reverse paths wait the same way. The EQ fd is registered with Go's
+runtime netpoller using an owned duplicate, so waiting parks the goroutine
+without blocking an OS thread in cgo; native code still owns and drains the EQ
+and its doorbells. The library arms that fd for what has no doorbell: its nap
+and linger timers, retained TX deadlines and the backstop, and on DPU-DMA the
+DOORBELL the DPU sends after an ARM (`design/HOST.md`, idle wake). The
+knobs are `DPUMESH_NAP_US`, `DPUMESH_NAP_CAP_US`, `DPUMESH_LINGER_US` and
+`DPUMESH_BACKSTOP_MS`; the poller adds no Go timer of its own.
 
 Build the native library from the repository root, then compile the module:
 
@@ -35,7 +52,12 @@ rebuild the Go binaries after transport changes; the cgo build links
 `build/lib/libdpumesh.so` from this checkout. The DPU transport and proxy must
 also be rebuilt: the session control protocol is incompatible with the old
 per-flow Comch implementation, although the public C ABI remains version 5.
-The unit tests open no DOCA device.
+The unit tests open no DOCA device. They run the adapter over an in-memory
+native with the same lease, credit, TX_READY and FIN contract, including real
+gRPC-go clients and servers: message sizes around the fragment and post
+limits, concurrent calls, deadline and cancellation resets, GracefulStop,
+client close and keepalive pings. The fake poisons released buffers and
+checks for double releases and leaked leases.
 
 Configure `DPUMESH_PCI_ADDR`, `DPUMESH_POD_IP` and `DPUMESH_SERVER` before
 opening a connection. A server additionally sets `DPUMESH_SERVICE` to its
@@ -43,6 +65,11 @@ opening a connection. A server additionally sets `DPUMESH_SERVICE` to its
 [Root configuration](../../../README.md#configuration) defines these values. The older `Dial`/`Listen` signatures accept only labels
 that agree with this process configuration; they do not create separate
 physical registrations.
+
+The `dmeshgo/dmeshgrpc` package switches a program by configuration alone:
+with `DPUMESH_ENABLE=1`, `dmeshgrpc.Listen(tcpAddr)` serves `DPUMESH_SERVICE`
+and `dmeshgrpc.DialOptions()` routes `"<ip>:<port>"` targets over DPUMesh;
+otherwise they return a TCP listener and no options.
 
 Use `DialContext(ctx, serviceIP, port)` in `grpc.WithContextDialer` and
 `ListenService()` with `grpc.Server.Serve`. A service address is a Service
@@ -73,6 +100,8 @@ The server handles SIGTERM by stopping gRPC and closing its native transport.
 Earlier versions of both `dpu-dma` and `host-dpa` passed on the jet1/BF-3 testbed. See the
 [hardware validation report](../../../docs/2026-09-25_channel-comch-grpc-validation.md)
 for topology, exact environment, build commands and results. That report predates
-the timer/netpoll changes and the payload larger than 1 MiB added above. The new
-host-DPA waiter has unit coverage for nested readiness and fd ownership; the
-historical report does not establish hardware validation of that waiter.
+the netpoller wait, the idle wake and the payload larger than 1 MiB added above.
+The waiter has unit coverage for nested readiness, fd ownership and interrupts.
+`dpu-dma` with this waiter passed the hardware regression
+(`bench-results/2026-09-30_host-idle-wake.md`); `host-dpa` was not available on
+that testbed.
