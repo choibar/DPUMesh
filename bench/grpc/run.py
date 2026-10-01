@@ -40,6 +40,32 @@ def proc_ticks(pid):
     return int(fields[11]) + int(fields[12])
 
 
+def thread_ticks(pid):
+    """{tid: (name, ticks)} for every thread of the process."""
+    out = {}
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return out
+    for tid in tids:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/stat") as f:
+                stat = f.read()
+        except OSError:
+            continue
+        name = stat[stat.index("(") + 1:stat.rindex(")")]
+        fields = stat.rsplit(")", 1)[1].split()
+        out[tid] = (name, int(fields[11]) + int(fields[12]))
+    return out
+
+
+def top_threads(a, b, secs, n=6):
+    """The busiest threads over the window: [name, CPU %], 100% = one core."""
+    rows = [(name, 100 * (ticks - a[tid][1]) / HZ / secs)
+            for tid, (name, ticks) in b.items() if tid in a]
+    return [[name, round(pct, 1)] for name, pct in sorted(rows, key=lambda r: -r[1])[:n]]
+
+
 def core_ticks(cores):
     """(busy, total) clock ticks summed over the given CPUs."""
     busy = total = 0
@@ -74,8 +100,9 @@ class Dpu:
         return int(fields[11]) + int(fields[12]), float(out[1].split()[0])
 
 
-def snapshot(server, cores_c, cores_s, dpu):
+def snapshot(server, client, cores_c, cores_s, dpu):
     s = {"t": time.monotonic(), "server": proc_ticks(server.pid),
+         "server_threads": thread_ticks(server.pid), "client_threads": thread_ticks(client.pid),
          "client_cores": core_ticks(cores_c), "server_cores": core_ticks(cores_s)}
     if dpu:
         s["proxy"] = dpu.proxy_ticks()
@@ -85,7 +112,9 @@ def snapshot(server, cores_c, cores_s, dpu):
 def window(a, b):
     secs = b["t"] - a["t"]
     out = {"host_window_seconds": secs,
-           "server_cpu_pct": 100 * (b["server"] - a["server"]) / HZ / secs}
+           "server_cpu_pct": 100 * (b["server"] - a["server"]) / HZ / secs,
+           "server_threads": top_threads(a["server_threads"], b["server_threads"], secs),
+           "client_threads": top_threads(a["client_threads"], b["client_threads"], secs)}
     for k in ("client_cores", "server_cores"):
         busy, total = (y - x for x, y in zip(a[k], b[k]))
         out[k + "_busy_pct"] = 100 * busy / total if total else None
@@ -186,7 +215,7 @@ def main():
                 except ValueError:
                     continue
                 if ev.get("event") in ("measure_start", "measure_end"):
-                    snaps[ev["event"]] = snapshot(server, cores_c, cores_s, dpu)
+                    snaps[ev["event"]] = snapshot(server, client, cores_c, cores_s, dpu)
                 elif ev.get("event") == "result":
                     result = ev
             record["client_exit"] = client.wait()
