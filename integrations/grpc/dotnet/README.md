@@ -36,3 +36,17 @@ The tests run a Kestrel gRPC server and a Grpc.Net.Client channel over the
 loopback: message sizes around the post limit up to 4 MiB, bidirectional
 streaming, 64 concurrent calls, deadlines, cancellation, server restart, and a
 raw stream whose reader stalls past the credit threshold.
+
+## Channel benchmark
+
+`bench/ChannelBench` is the .NET peer of the Go
+[channel-bench](../go/cmd/channel-bench/README.md): the same wire, flags and
+JSON result, with an ASP.NET Core server on Kestrel and a Grpc.Net.Client
+client, over DPUMesh or, with `-tcp host:port`, kernel TCP. `-start-file` is
+not supported.
+
+```sh
+dotnet build -c Release bench/ChannelBench
+bench/ChannelBench/bin/Release/net10.0/ChannelBench -mode server
+bench/ChannelBench/bin/Release/net10.0/ChannelBench -mode client -connections 4 -concurrency 64
+```
