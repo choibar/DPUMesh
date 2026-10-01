@@ -41,3 +41,18 @@ python -m unittest discover integrations/grpc/python/tests   # needs the loopbac
 The tests serve and call through `dpumesh_grpc` over the loopback: message
 sizes up to 4 MiB, 16 MiB of server streaming, 64 concurrent calls, deadlines
 and repeated channels.
+
+## Channel benchmark
+
+`bench/channel_bench.py` is the grpcio peer of the Go
+[channel-bench](../go/cmd/channel-bench/README.md): the same wire, flags and
+JSON result, over DPUMesh with the patched grpcio or, with `-tcp host:port`,
+kernel TCP. The server is a synchronous `grpc.server` with 10 worker threads,
+as Online Boutique's Python services run; the client drives each RPC loop from
+future callbacks. `-start-file` is not supported, and `native_dials` counts
+each channel's transitions to READY.
+
+```sh
+python integrations/grpc/python/bench/channel_bench.py -mode server
+python integrations/grpc/python/bench/channel_bench.py -mode client -connections 4 -concurrency 64
+```
