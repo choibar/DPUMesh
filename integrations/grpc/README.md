@@ -38,5 +38,10 @@ another build of the ABI. A binding's tests can set it to
 to its own listener, so they run real gRPC clients and servers without a
 DOCA device.
 
+`DPUMESH_REACTORS` (1–64, default 1) sets how many EQ reactors a runtime
+created without explicit options runs, the stream library's included. A
+process's connections are spread across them round-robin, and a binding's
+callbacks then arrive from that many threads.
+
 A process should close its DPUMesh channel before it exits. A channel that
 vanishes mid-stream stalls the DPU proxy for several seconds.

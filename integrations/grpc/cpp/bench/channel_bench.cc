@@ -138,12 +138,17 @@ class CountingOps final : public dpumesh::grpc::DmeshApiOps {
 std::shared_ptr<dpumesh::grpc::DmeshRuntime> CreateRuntime(
     size_t reactors, const std::shared_ptr<NativeCounters>& counters,
     std::string* error) {
-  dpumesh::grpc::DmeshRuntime::Options options;
-  options.reactor_count = reactors;
-  auto runtime = dpumesh::grpc::DmeshRuntime::Create(
-      std::make_unique<CountingOps>(dpumesh::grpc::MakeNativeDmeshApiOps(),
-                                    counters),
-      options);
+  auto ops = std::make_unique<CountingOps>(dpumesh::grpc::MakeNativeDmeshApiOps(),
+                                          counters);
+  absl::StatusOr<std::shared_ptr<dpumesh::grpc::DmeshRuntime>> runtime;
+  if (reactors == 0) {
+    // DPUMESH_REACTORS decides, as for any runtime created without Options.
+    runtime = dpumesh::grpc::DmeshRuntime::Create(std::move(ops));
+  } else {
+    dpumesh::grpc::DmeshRuntime::Options options;
+    options.reactor_count = reactors;
+    runtime = dpumesh::grpc::DmeshRuntime::Create(std::move(ops), options);
+  }
   if (!runtime.ok()) {
     *error = "runtime: " + runtime.status().ToString();
     return nullptr;
@@ -162,7 +167,7 @@ struct Config {
   nanoseconds rpc_timeout = std::chrono::seconds(5);
   nanoseconds timeout = std::chrono::seconds(90);
   std::string tcp;
-  size_t reactors = 1;
+  size_t reactors = 0;  // 0: DPUMESH_REACTORS
 };
 
 // Go time.ParseDuration for the forms the harness uses: a decimal number and

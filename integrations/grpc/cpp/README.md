@@ -38,7 +38,8 @@ transports and native doubles; device smoke executables are manual.
 [channel-bench](../go/cmd/channel-bench/README.md): the same wire, flags and
 JSON result, so either one can be the client or the server. It runs over the
 adapter with the normal DPUMesh environment, or over kernel TCP with
-`-tcp host:port`. `-reactors` sets the runtime's EQ reactor count (default 1);
+`-tcp host:port`. `-reactors` sets the runtime's EQ reactor count (default:
+`DPUMESH_REACTORS`, else 1);
 `-start-file` is not supported. Over TCP `native_dials` stays empty, because
 gRPC C++ exposes no dial count.
 
