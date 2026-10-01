@@ -33,6 +33,8 @@ bench-results/*
 !bench-results/2026-09-29_preload-gather-write.md
 !bench-results/2026-09-30_host-idle-wake.md
 !bench-results/2026-09-30_host-idle-wake.csv
+# gRPC 64-byte echo records of every language
+!bench-results/*_grpc-*64b*
 
 # local test binary
 apps/dmesh-router-cpp/test/test_transcode
@@ -42,3 +44,8 @@ apps/dmesh-router-cpp/test/test_transcode
 /src/transport/build/
 /apps/dma_bench/build/
 /apps/dmeshgo/hostlib/build/
+
+# gRPC benchmark runs
+/bench/grpc/results/
+/bench/grpc/dpu/run/
+__pycache__/
