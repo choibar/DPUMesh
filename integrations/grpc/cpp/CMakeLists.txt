@@ -210,6 +210,13 @@ if(DPUMESH_INCLUDE_DIR AND DPUMESH_LIBRARY)
   target_link_libraries(grpc_dpumesh INTERFACE
     grpc_dpumesh_endpoint grpc_dpumesh_reactor grpc_dpumesh_native)
 
+  # The C++ peer of the Go channel-bench: 64-byte verified unary echo over
+  # DPUMesh or, with -tcp, kernel TCP (bench/channel_bench.cc).
+  add_executable(dpumesh_channel_bench bench/channel_bench.cc)
+  target_compile_features(dpumesh_channel_bench PRIVATE cxx_std_17)
+  target_compile_options(dpumesh_channel_bench PRIVATE -Wall -Wextra)
+  target_link_libraries(dpumesh_channel_bench PRIVATE grpc_dpumesh Threads::Threads)
+
   if(DPUMESH_GRPC_BUILD_EXAMPLES AND DPUMESH_GRPC_SOURCE_DIR)
     if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../../../examples/grpc/CMakeLists.txt")
       add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../../examples/grpc"
