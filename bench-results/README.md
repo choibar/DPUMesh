@@ -42,6 +42,12 @@ connection당 동시 RPC 64개이며 backend pool도 K개다. Mode 비교는 EU 
 | --- | --- | --- |
 | [Host idle wake](2026-09-30_host-idle-wake.md) ([CSV](2026-09-30_host-idle-wake.csv)) | rapids4, `dpu-dma`, native, 수정 전/후 교대 | 50 µs tick 대신 nap·linger·DOORBELL. idle host CPU 1.74 → 0.01 core, 부하 중 페이지당 host CPU −23~−39%, 처리량 같음. Go netpoller로 Go 서버 m1 p50 −100~−250 µs. hw-regression busy poll 1/0 PASS |
 
+## 2026-10-01: gRPC 64B echo, transport·adapter 변경 전후
+
+| 보고서 | 조건 | 상태와 해석 |
+| --- | --- | --- |
+| [gRPC 64B transport·adapter 변경 전후](2026-10-01_grpc-64b-perf.md) ([CSV](2026-10-01_grpc-64b-perf.csv)) | rapids4, `dpu-dma`, L7, proxy 1 core, Go와 C++ channel-bench, main·core만·Go까지·C++ | 46회 모두 유효, DPU 오류 0. 최대 처리량은 proxy 천장에서 main과 같고(4×64: 15.8k), 1×64는 +15%, 요청 1개씩 p50 1,114 → 622 µs. C++은 Go의 88–98% |
+
 ## 자료 보존
 
 보고서의 상대 링크는 Git에 포함된 파일을 가리킨다. 아래 원본 파일은 이 작업에서
