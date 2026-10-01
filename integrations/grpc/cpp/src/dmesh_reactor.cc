@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -214,6 +215,8 @@ class DmeshReactor::Impl final
     accepting_.store(true, std::memory_order_release);
     try {
       owner_thread_ = std::thread([self = shared_from_this()] {
+        // Named so per-thread CPU shows the EQ owner.
+        pthread_setname_np(pthread_self(), "dmesh-reactor");
         self->ThreadMain();
       });
     } catch (const std::system_error& error) {
