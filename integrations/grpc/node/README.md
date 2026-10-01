@@ -37,3 +37,17 @@ The tests run a grpc-js server and speak gRPC over `node:http2` on DPUMesh
 sockets: message sizes up to 4 MiB, 16 MiB of server streaming, 64 concurrent
 calls, deadlines, repeated connections, and a paused reader past the credit
 threshold.
+
+## Channel benchmark
+
+`bench/channel-bench.js` is the grpc-js server of the Go
+[channel-bench](../go/cmd/channel-bench/README.md): the same wire and flags,
+over DPUMesh or, with `-tcp host:port`, kernel TCP. There is no client mode,
+since grpc-js cannot dial over DPUMesh; drive it with the Go or C++ client,
+for example through [bench/grpc](../../../bench/grpc/README.md):
+
+```sh
+python3 bench/grpc/run.py --tag node-1x64 --l7 --lib build/lib:build/grpc \
+    --server "node integrations/grpc/node/bench/channel-bench.js" \
+    --client integrations/grpc/go/bin/channel-bench
+```
