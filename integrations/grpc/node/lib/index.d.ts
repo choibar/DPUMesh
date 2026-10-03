@@ -9,5 +9,8 @@ export function listen(onSocket: (socket: DpumeshSocket) => void): { close(): vo
 export function serve(server: Server, credentials: ServerCredentials): { close(): void };
 /** Opens a DPUMesh stream to a "<host>:<port>" service address. */
 export function connect(service: string): Promise<DpumeshSocket>;
-export class DpumeshSocket extends Duplex {}
+export class DpumeshSocket extends Duplex {
+  ref(): this;
+  unref(): this;
+}
 export const postMax: number;

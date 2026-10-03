@@ -25,6 +25,8 @@ transport hook, so a grpc-js client cannot use DPUMesh yet.
   [measurements](../../../bench-results/2026-09-29_online-boutique-e2e.md).
 - The runtime opens on first use and closes on `exit` and on a SIGTERM that
   nothing else handles.
+- As with `net`, a listener, a pending connect and every referenced socket
+  keep the process alive; `socket.unref()` releases one.
 
 Build and test (the tests need the loopback, see [the overview](../README.md#build)):
 

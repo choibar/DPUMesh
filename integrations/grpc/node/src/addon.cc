@@ -79,7 +79,6 @@ bool g_loaded = false;
 std::string g_load_error;
 dms_runtime* g_rt = nullptr;
 napi_threadsafe_function g_tsfn = nullptr;
-bool g_tsfn_ref = false;
 std::mutex g_streams_mu;
 std::unordered_map<uint32_t, Stream*> g_streams;
 std::atomic<uint32_t> g_next_id{1};
@@ -294,7 +293,7 @@ napi_value Open(napi_env env, napi_callback_info info) {
                                       nullptr, nullptr, CallJs, &g_tsfn) != napi_ok) {
     return Throw(env, "napi_create_threadsafe_function failed");
   }
-  // Only a listener keeps the process alive.
+  // JavaScript refs it while anything that can still receive events is live.
   napi_unref_threadsafe_function(env, g_tsfn);
   char err[256] = {0};
   g_rt = g_api.runtime_open(err, sizeof(err));
@@ -329,10 +328,21 @@ napi_value Listen(napi_env env, napi_callback_info info) {
   if (g_rt == nullptr) return Throw(env, "DPUMesh runtime is not open");
   const int rc = g_api.listen(g_rt, enabled ? OnAccept : nullptr, nullptr);
   if (rc != 0) return Throw(env, "dms_listen failed: " + std::string(std::strerror(-rc)));
-  if (enabled != g_tsfn_ref) {
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+// ref(enabled): whether pending events keep the process alive.
+napi_value Ref(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  bool enabled = false;
+  napi_get_value_bool(env, argv[0], &enabled);
+  if (g_tsfn != nullptr) {
     if (enabled) napi_ref_threadsafe_function(env, g_tsfn);
     else napi_unref_threadsafe_function(env, g_tsfn);
-    g_tsfn_ref = enabled;
   }
   napi_value undefined;
   napi_get_undefined(env, &undefined);
@@ -424,6 +434,7 @@ napi_value Init(napi_env env, napi_value exports) {
       {"open", nullptr, Open, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"close", nullptr, Close, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"listen", nullptr, Listen, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"ref", nullptr, Ref, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"connect", nullptr, Connect, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"write", nullptr, Write, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"pause", nullptr, Pause, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -14,6 +14,15 @@ const sockets = new Map();
 const pendingConnects = new Map();
 let nextRequest = 1;
 let onAccept = null;
+// What keeps the process alive, as for net: a listener, a pending connect and
+// every referenced socket until its stream is released.
+let holds = 0;
+
+function hold(delta) {
+  const before = holds;
+  holds += delta;
+  if ((before > 0) !== (holds > 0)) addon.ref(holds > 0);
+}
 
 function enabled() {
   return process.env.DPUMESH_ENABLE === '1';
@@ -50,6 +59,7 @@ function dispatch(kind, id, value, extra) {
     case EVENT.CONNECT: {
       const pending = pendingConnects.get(id);
       pendingConnects.delete(id);
+      hold(-1);
       if (value === 0) {
         pending.reject(new Error(`DPUMesh connect failed: ${extra}`));
         break;
@@ -72,6 +82,7 @@ function dispatch(kind, id, value, extra) {
       sockets.get(id)?._onError(value, extra);
       break;
     case EVENT.RELEASED:
+      sockets.get(id)?._onReleased();
       sockets.delete(id);
       break;
   }
@@ -86,6 +97,9 @@ class DpumeshSocket extends Duplex {
     this._id = id;
     this._ended = false;
     this._pending = null;
+    this._released = false;
+    this._refed = true;
+    hold(1);
     this.remoteAddress = undefined;
     this.remotePort = undefined;
     this.localAddress = undefined;
@@ -159,6 +173,28 @@ class DpumeshSocket extends Duplex {
     this.destroy(new Error(`DPUMesh stream failed: ${message} (errno ${errno})`));
   }
 
+  _onReleased() {
+    this.unref();
+    this._released = true;
+  }
+
+  // As net.Socket: a referenced socket keeps the process alive.
+  ref() {
+    if (!this._refed && !this._released) {
+      this._refed = true;
+      hold(1);
+    }
+    return this;
+  }
+
+  unref() {
+    if (this._refed) {
+      this._refed = false;
+      hold(-1);
+    }
+    return this;
+  }
+
   // net.Socket methods HTTP/2 may call; a DPUMesh stream has no such knobs.
   setNoDelay() { return this; }
   setKeepAlive() { return this; }
@@ -166,8 +202,6 @@ class DpumeshSocket extends Duplex {
     if (callback) this.once('timeout', callback);
     return this;
   }
-  ref() { return this; }
-  unref() { return this; }
 }
 
 // Hands the streams the DPU routes to DPUMESH_SERVICE to `onSocket`. One
@@ -177,11 +211,13 @@ function listen(onSocket) {
   if (onAccept !== null) throw new Error('DPUMesh already has a listener');
   onAccept = onSocket;
   addon.listen(true);
+  hold(1);
   return {
     close() {
       if (onAccept !== onSocket) return;
       addon.listen(false);
       onAccept = null;
+      hold(-1);
     },
   };
 }
@@ -206,6 +242,7 @@ function connect(service) {
   return new Promise((resolve, reject) => {
     const request = nextRequest++;
     pendingConnects.set(request, { resolve, reject });
+    hold(1);
     addon.connect(service, request);
   });
 }

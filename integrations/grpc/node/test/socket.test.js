@@ -3,6 +3,7 @@
 // keeps a gRPC connection's input drained, so only a paused raw reader drives
 // the receive credit hold and its resume.
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -65,4 +66,23 @@ test('destroy resets the local side and ends the peer', async () => {
   }));
   assert.equal((await ended).length, 0);
   server.destroy();
+});
+
+test('unreferenced sockets let the process exit', () => {
+  // The pair stays open with its listener closed; only unref() lets the
+  // event loop drain.
+  const script = `
+    const dpumesh = require(${JSON.stringify(path.join(__dirname, '..'))});
+    let accepted;
+    const arrived = new Promise((resolve) => { accepted = resolve; });
+    const listener = dpumesh.listen((socket) => accepted(socket));
+    dpumesh.connect('raw.test:1').then(async (client) => {
+      const server = await arrived;
+      listener.close();
+      client.unref();
+      server.unref();
+    });`;
+  const child = spawnSync(process.execPath, ['-e', script], { env: process.env, timeout: 10000 });
+  assert.equal(child.error, undefined, 'the process did not exit');
+  assert.equal(child.status, 0, child.stderr.toString());
 });
