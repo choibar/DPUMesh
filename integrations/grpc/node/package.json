@@ -1,0 +1,23 @@
+{
+  "name": "@dpumesh/grpc-js",
+  "version": "0.1.0",
+  "description": "gRPC over DPUMesh for @grpc/grpc-js servers",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": ["lib", "src", "binding.gyp"],
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "test": "node --test test/*.test.js"
+  },
+  "peerDependencies": {
+    "@grpc/grpc-js": ">=1.10.0"
+  },
+  "devDependencies": {
+    "@grpc/grpc-js": "1.14.4",
+    "@grpc/proto-loader": "0.8.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "Apache-2.0"
+}
