@@ -37,6 +37,10 @@ bench-results/*
 !bench-results/2026-09-30_online-boutique-fixes.json
 !bench-results/2026-09-30_host-idle-wake.md
 !bench-results/2026-09-30_host-idle-wake.csv
+!bench-results/2026-09-29_host-broker-ab.csv
+!bench-results/2026-09-29_host-broker-ab.md
+!bench-results/2026-10-06_host-broker-grpc-ab.csv
+!bench-results/2026-10-06_host-broker-grpc-ab.md
 # gRPC 64-byte echo records of every language
 !bench-results/*_grpc-*64b*
 

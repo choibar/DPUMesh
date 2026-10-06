@@ -29,6 +29,15 @@ Three trees at the repo root:
 - `src/core/`, `src/facade/`, `include/dpumesh/` — the DOCA-free host library
   (`libdpumesh.so.5`, root `Makefile`): core, carrier, native/preload façades.
   `src/core` sees the transport only through `src/transport/host/channel.h`.
+- `src/broker/` — `dpumesh_broker` (`make broker`), the host process that can
+  own the DOCA device for applications: listen + fork one child per client. A
+  dpu-dma channel is its client when `DPUMESH_BROKER` names the socket, or when
+  it is unset and `/run/dpumesh/broker.sock` exists (control over
+  `host/broker_ipc.h`, data path on the memfds it hands over, idle-wake
+  ARM/DOORBELL relayed through an arm page and two eventfds; client and server
+  in `host/channel_broker.c`). Otherwise — `DPUMESH_BROKER=off`, no broker, or
+  the host-dpa path — the application opens the device in-process (the direct
+  path). Plan: `docs/2026-09-29_host-broker-plan.md`.
 - `linkerd2-proxy/` — a git submodule (Rust), a fork carrying a `dmesh_doca`
   transport crate + `doca` cargo features that plug the DMA path into
   Linkerd's outbound stack. Built and run separately on the DPU.
@@ -94,7 +103,8 @@ fixed-size messages through `libdpumesh` (one channel, one EQ + QP per thread;
 `BENCH_WINDOW`); `dpumesh_dpu` (`dpu/dpumesh_dpu.c`, `DMESH_MODE=sink|echo`,
 `DMESH_BUSY_POLL`) serves the flows over the shim, counting every forward DMA
 completion and, in echo mode, pushing the bytes back. Both print a per-second
-line and a `*_BENCH_DONE` summary; the DPU's `recv … DMA/s` is the ground truth
+line and a `*_BENCH_DONE` summary (`dpumesh_host` is a `dpumesh_broker` client
+when one is configured, otherwise it opens `DPUMESH_PCI_ADDR` itself); the DPU's `recv … DMA/s` is the ground truth
 for "DMAs per second" (the host library coalesces small posts into 8064-byte
 units, so the host's estimate only holds for >= 8 KiB messages). Restart the
 DPU side per run. `DPUMESH_REVERSE=host-dpa DPUMESH_HOST_DPA_PCI=0b:00.0` on the host
@@ -203,7 +213,12 @@ wrap the DOCA Comch consumer/producer used as the DPA↔host completion channel.
 - **Forward (host→proxy):** host writes request bytes into an exported staging
   buffer; the DPU's per-connection DPA thread (`device/dpa_kernel.c`, running on
   the DPA processor) polls a descriptor ring and DMAs the bytes into the proxy's
-  receive buffer, delivering a fused completion. `dpa.c` builds the DPA thread
+  receive buffer, delivering a fused completion. The consumer's staging read
+  watermark (`rd_pos`, the DPA's staging gate) is a synchronous
+  `doca_dpa_h2d_memcpy` (~1.6 µs of the driver core), so `shim.c` publishes it
+  only every 64 KiB of release (`DMESH_RX_WM_BATCH`); per-tick publication
+  cost a third of the core and made DPU throughput depend on the host's post
+  rhythm (`bench-results/2026-09-29_host-broker-ab.md`). `dpa.c` builds the DPA thread
   pool (`DPA_THREAD_POOL_SIZE`, one thread handed out per connection) and the
   msgq/completion plumbing; `dma.c` builds each connection's private
   `doca_dma` engine + task pool.
