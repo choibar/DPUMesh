@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -91,6 +92,23 @@ int broker_ipc_check_memfd(int fd, size_t bytes)
 	}
 	if (seals < 0 || (seals & required) != required || (seals & F_SEAL_WRITE)) {
 		errno = EPERM;
+		return -1;
+	}
+	return 0;
+}
+
+int broker_ipc_check_eventfd(int fd)
+{
+	char link[32], target[32];
+	ssize_t n;
+
+	snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+	n = readlink(link, target, sizeof(target) - 1);
+	if (n < 0)
+		return -1;
+	target[n] = '\0';
+	if (strcmp(target, "anon_inode:[eventfd]") != 0) {
+		errno = EBADMSG;
 		return -1;
 	}
 	return 0;

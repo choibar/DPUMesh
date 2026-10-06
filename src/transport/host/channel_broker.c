@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -21,6 +22,7 @@
 #include "comch_client.h"
 #include "dpa_common.h"
 #include "ring.h"
+#include "session_protocol.h"
 
 /*
  * The host broker owns the DOCA device of an application's channel (plan:
@@ -34,6 +36,10 @@
  *           with shared memory, and publishes what the DPU reports about each
  *           flow (CLOSED, errors) in the status page the client polls.
  *
+ * Idle wake: the client's channel_dev_arm lists its push flows in the arm page
+ * and kicks the broker, which sends the DPU the ARM; the DOORBELL, and any
+ * status the broker publishes, raise the wake eventfd the client sleeps on.
+ *
  * Only dpu-dma flows are brokered; the host-dpa path, and any channel without
  * a broker configured, opens the device in the application (channel_dev_open).
  */
@@ -46,13 +52,17 @@ DOCA_LOG_REGISTER(CHANNEL_BROKER);
 #define BROKER_IDLE_MS 1000                             /* Server: wait bound with an armed PE */
 #define BROKER_POLL_MS 10                               /* Server: wait bound without a PE doorbell */
 #define BROKER_REPLY_TIMEOUT_S 30                       /* Client: longest request (open + failed-open close) */
+#define BROKER_ARM_READ_TRIES 64                        /* Server: seqlock retries before the client is ignored */
 
 _Static_assert(BROKER_FLOWS == sizeof(((struct channel_dev *)0)->flows) / sizeof(void *), "flow slots");
+_Static_assert(BROKER_FLOWS - 1 == DMESH_SESSION_MAX_FLOWS, "one ARM lists every flow");
 
 struct channel_broker {
 	int sock;
 	pthread_mutex_t lock;                           /* One request in flight on sock */
 	const volatile struct broker_status *status;    /* Mapped read-only */
+	struct broker_arm_page *arm;                    /* Written under the channel's session_lock */
+	int wake_fd, kick_fd;                           /* Idle wake eventfds (-1 before HELLO) */
 	uint64_t next_check_ns;
 	int dead;                                       /* errno once the broker connection failed */
 };
@@ -114,12 +124,14 @@ static void broker_fail(struct channel_broker *b, int error)
  * @b [in]: Broker connection
  * @req [in]: Request (magic and version are filled in)
  * @rep [out]: Reply
- * @fd [out]: The memfd the reply carries, or NULL for a reply without one
+ * @fds [out]: The descriptors a successful reply carries
+ * @nfds [in]: How many it must carry
  * @return: 0 on success, -1 with errno (the broker's status, or the failure)
  */
-static int broker_call(struct channel_broker *b, struct broker_request *req, struct broker_reply *rep, int *fd)
+static int broker_call(struct channel_broker *b, struct broker_request *req, struct broker_reply *rep, int *fds,
+		       int nfds)
 {
-	int fds[BROKER_MAX_FDS], n = -1;
+	int got[BROKER_MAX_FDS], n = -1;
 
 	memcpy(req->magic, BROKER_IPC_MAGIC, sizeof(req->magic));
 	req->version = BROKER_IPC_VERSION;
@@ -127,7 +139,7 @@ static int broker_call(struct channel_broker *b, struct broker_request *req, str
 	if (broker_dead(b))
 		errno = broker_dead(b);
 	else if (broker_ipc_send(b->sock, req, sizeof(*req), NULL, 0) == 0)
-		n = broker_ipc_recv(b->sock, rep, sizeof(*rep), fds, BROKER_MAX_FDS);
+		n = broker_ipc_recv(b->sock, rep, sizeof(*rep), got, BROKER_MAX_FDS);
 	if (n < 0 && !broker_dead(b))
 		broker_fail(b, errno == EAGAIN ? ETIMEDOUT : errno); /* a late reply would desync the socket */
 	pthread_mutex_unlock(&b->lock);
@@ -135,19 +147,19 @@ static int broker_call(struct channel_broker *b, struct broker_request *req, str
 		return -1;
 
 	if (memcmp(rep->magic, BROKER_IPC_MAGIC, sizeof(rep->magic)) != 0 || rep->type != BROKER_REPLY ||
-	    rep->version != BROKER_IPC_VERSION || rep->fd_count != n || (rep->status == 0 && (fd != NULL) != (n == 1))) {
-		while (n > 0) close(fds[--n]);
+	    rep->version != BROKER_IPC_VERSION || rep->fd_count != n || (rep->status == 0 && n != nfds)) {
+		while (n > 0) close(got[--n]);
 		broker_fail(b, EPROTO);
 		errno = EPROTO;
 		return -1;
 	}
 	if (rep->status != 0) {
-		while (n > 0) close(fds[--n]);
+		while (n > 0) close(got[--n]);
 		errno = rep->status;
 		return -1;
 	}
-	if (fd != NULL)
-		*fd = fds[0];
+	if (n > 0)
+		memcpy(fds, got, sizeof(int) * (size_t)n);
 	return 0;
 }
 
@@ -176,6 +188,8 @@ int channel_broker_attach(const char *path, struct channel_dev **out)
 	(void)setsockopt(b->sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 	pthread_mutex_init(&b->lock, NULL);
 	pthread_mutex_init(&dev->session_lock, NULL);
+	b->wake_fd = -1;
+	b->kick_fd = -1;
 	dev->broker = b;
 	*out = dev;
 	return 0;
@@ -188,6 +202,12 @@ void channel_broker_detach(struct channel_dev *dev)
 	close(b->sock); /* the broker closes whatever the client left open */
 	if (b->status != NULL)
 		(void)munmap((void *)b->status, sizeof(struct broker_status));
+	if (b->arm != NULL)
+		(void)munmap(b->arm, sizeof(struct broker_arm_page));
+	if (b->wake_fd >= 0)
+		close(b->wake_fd);
+	if (b->kick_fd >= 0)
+		close(b->kick_fd);
 	pthread_mutex_destroy(&b->lock);
 	pthread_mutex_destroy(&dev->session_lock);
 	free(b);
@@ -199,18 +219,23 @@ int channel_broker_session_open(struct channel_dev *dev, const char *server)
 	struct channel_broker *b = dev->broker;
 	struct broker_request req = { .type = BROKER_HELLO };
 	struct broker_reply rep;
-	int fd;
+	int fds[BROKER_HELLO_FDS];
 
 	if (b->status != NULL) { errno = EALREADY; return -1; }
 	if (strlen(server) >= sizeof(req.name)) { errno = EINVAL; return -1; }
 	snprintf(req.name, sizeof(req.name), "%s", server);
-	if (broker_call(b, &req, &rep, &fd) != 0)
+	if (broker_call(b, &req, &rep, fds, BROKER_HELLO_FDS) != 0)
 		return -1;
-	if (rep.bytes != sizeof(struct broker_status))
-		close(fd);
-	else
-		b->status = map_memfd(fd, sizeof(struct broker_status), PROT_READ);
-	if (b->status == NULL) {
+	if (rep.bytes == sizeof(struct broker_status) && broker_ipc_check_eventfd(fds[BROKER_FD_WAKE]) == 0 &&
+	    broker_ipc_check_eventfd(fds[BROKER_FD_KICK]) == 0) {
+		b->status = map_memfd(fds[BROKER_FD_STATUS], sizeof(struct broker_status), PROT_READ);
+		b->arm = map_memfd(fds[BROKER_FD_ARM], sizeof(struct broker_arm_page), PROT_READ | PROT_WRITE);
+		b->wake_fd = fds[BROKER_FD_WAKE];
+		b->kick_fd = fds[BROKER_FD_KICK];
+	} else {
+		for (int i = 0; i < BROKER_HELLO_FDS; ++i) close(fds[i]);
+	}
+	if (b->status == NULL || b->arm == NULL) {
 		broker_fail(b, EPROTO);
 		errno = EPROTO;
 		return -1;
@@ -227,7 +252,7 @@ int channel_broker_session_close(struct channel_dev *dev)
 	if (!dev->hello_ready)
 		return 0;
 	/* A lost broker took the session and its registrations with it. */
-	if (broker_call(dev->broker, &req, &rep, NULL) != 0 && !broker_dead(dev->broker))
+	if (broker_call(dev->broker, &req, &rep, NULL, 0) != 0 && !broker_dead(dev->broker))
 		return -1;
 	dev->hello_ready = 0;
 	return 0;
@@ -240,7 +265,7 @@ int channel_broker_mem_alloc(struct channel_dev *dev, size_t bytes, struct chann
 	struct channel_mem *mem;
 	int fd;
 
-	if (broker_call(dev->broker, &req, &rep, &fd) != 0)
+	if (broker_call(dev->broker, &req, &rep, &fd, 1) != 0)
 		return -1;
 	mem = calloc(1, sizeof(*mem));
 	if (mem == NULL) {
@@ -292,7 +317,7 @@ int channel_broker_conn_open(struct channel_dev *dev, const struct channel_conn_
 	if (!push_mode(cfg->mode) || !cfg->tx->shared || !cfg->rx->shared) { errno = ENOTSUP; return -1; }
 	if (dev->flows[cfg->flow_id] != NULL) { errno = EBUSY; return -1; }
 	snprintf(req.name, sizeof(req.name), "%s", cfg->workload != NULL ? cfg->workload : "");
-	if (broker_call(dev->broker, &req, &rep, &fd) != 0)
+	if (broker_call(dev->broker, &req, &rep, &fd, 1) != 0)
 		return -1;
 	map = rep.bytes == ring_bytes ? map_memfd(fd, ring_bytes, PROT_READ | PROT_WRITE) : NULL;
 	conn = calloc(1, sizeof(*conn));
@@ -305,7 +330,7 @@ int channel_broker_conn_open(struct channel_dev *dev, const struct channel_conn_
 		else if (rep.bytes != ring_bytes) close(fd);
 		free(conn);
 		free(ring);
-		(void)broker_call(dev->broker, &close_req, &rep, NULL);
+		(void)broker_call(dev->broker, &close_req, &rep, NULL, 0);
 		errno = saved;
 		return -1;
 	}
@@ -345,7 +370,7 @@ int channel_broker_conn_close(struct channel_conn *conn)
 
 	/* A failed close retains the flow for a retry, unless the broker (and with
 	 * it every DMA mapping of this memory) is gone. */
-	if (broker_call(dev->broker, &req, &rep, NULL) != 0 && !broker_dead(dev->broker))
+	if (broker_call(dev->broker, &req, &rep, NULL, 0) != 0 && !broker_dead(dev->broker))
 		return -1;
 	pthread_mutex_lock(&dev->session_lock);
 	dev->flows[conn->flow_id] = NULL;
@@ -394,6 +419,68 @@ int channel_broker_conn_progress(struct channel_conn *conn)
 	return state > 0;
 }
 
+int channel_broker_dev_fd(struct channel_dev *dev)
+{
+	return dev->broker->wake_fd;
+}
+
+/* The flow's incarnation is open in the broker's view (status page). */
+static int flow_open(const struct channel_broker *b, const struct channel_conn *conn)
+{
+	const volatile struct broker_flow_status *f = &b->status->flow[conn->flow_id];
+	return __atomic_load_n(&f->generation, __ATOMIC_ACQUIRE) == conn->generation &&
+	       __atomic_load_n(&f->state, __ATOMIC_ACQUIRE) == 0;
+}
+
+int channel_broker_dev_arm(struct channel_dev *dev)
+{
+	struct channel_broker *b = dev->broker;
+	const uint64_t one = 1;
+
+	if (channel_broker_dev_progress(dev) != 0)
+		return -1;
+	if (b->arm == NULL || b->kick_fd < 0) { errno = ENOTCONN; return -1; }
+
+	/* Same flows as the in-process ARM: each live push flow's next unread
+	 * descriptor. The broker sends the ARM; this only publishes the list. */
+	pthread_mutex_lock(&dev->session_lock);
+	uint64_t seq = __atomic_load_n(&b->arm->seq, __ATOMIC_RELAXED);
+	__atomic_store_n(&b->arm->seq, seq + 1, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	for (uint32_t id = 1; id < BROKER_FLOWS; ++id) {
+		struct channel_conn *conn = dev->flows[id];
+		struct broker_arm_flow *f = &b->arm->flow[id];
+		int armed = conn != NULL && conn->ready && conn->descs != NULL && !conn->rx_ended && flow_open(b, conn);
+		__atomic_store_n(&f->generation, armed ? conn->generation : 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&f->expected, armed ? conn->expected : 0, __ATOMIC_RELAXED);
+		__atomic_store_n(&f->armed, (uint32_t)armed, __ATOMIC_RELAXED);
+	}
+	__atomic_store_n(&b->arm->seq, seq + 2, __ATOMIC_RELEASE);
+	pthread_mutex_unlock(&dev->session_lock);
+
+	/* An eventfd write fails only at counter overflow, when a kick is pending anyway. */
+	if (write(b->kick_fd, &one, sizeof(one)) < 0 && errno != EAGAIN)
+		return -1;
+	return 0;
+}
+
+void channel_broker_dev_clear(struct channel_dev *dev)
+{
+	uint64_t count;
+	int fd = dev->broker->wake_fd;
+
+	if (fd >= 0)
+		(void)!read(fd, &count, sizeof(count)); /* nonblocking: a clear fd stays clear */
+}
+
+void channel_broker_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells)
+{
+	const volatile struct broker_status *status = dev->broker->status;
+
+	*arms_sent = status != NULL ? __atomic_load_n(&status->arms_sent, __ATOMIC_RELAXED) : 0;
+	*doorbells = status != NULL ? __atomic_load_n(&status->doorbells, __ATOMIC_RELAXED) : 0;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Server
@@ -407,6 +494,9 @@ struct broker_server {
 	struct channel_mem *mems[BROKER_MEMS];
 	struct broker_status *status;
 	int status_fd;
+	struct broker_arm_page *arm;                    /* Written by the client */
+	int arm_fd;
+	int wake_fd, kick_fd;                           /* Idle wake eventfds, shared with the client */
 };
 
 static volatile sig_atomic_t serve_stop;
@@ -417,29 +507,102 @@ static void serve_on_signal(int signo)
 	serve_stop = 1;
 }
 
-/* Mirrors every open flow's progress result into the status page. */
+/* Wakes the client, which then polls: a spurious wake costs one drain pass. */
+static void raise_wake(struct broker_server *srv)
+{
+	const uint64_t one = 1;
+
+	if (srv->wake_fd >= 0)
+		(void)!write(srv->wake_fd, &one, sizeof(one));
+}
+
+/* Progresses the control session once and mirrors every open flow's status
+ * into the status page; a changed status wakes the client to read it. */
 static void publish(struct broker_server *srv)
 {
+	int changed = 0;
+
 	if (srv->dev == NULL || srv->status == NULL)
 		return;
+	(void)channel_dev_progress(srv->dev); /* a session error reaches every flow's status */
 	for (uint32_t id = 1; id < BROKER_FLOWS; ++id) {
 		struct channel_conn *conn = srv->dev->flows[id];
 		if (conn == NULL)
 			continue;
-		int state = channel_conn_progress(conn);
+		int state = channel_conn_status(conn);
 		int error = state < 0 ? errno : 0;
 		struct broker_flow_status *f = &srv->status->flow[id];
+		changed |= f->state != state || f->error != error;
 		__atomic_store_n(&f->error, error, __ATOMIC_RELAXED);
 		__atomic_store_n(&f->state, state, __ATOMIC_RELEASE);
 	}
+	__atomic_store_n(&srv->status->arms_sent, srv->dev->arms_sent, __ATOMIC_RELAXED);
+	__atomic_store_n(&srv->status->doorbells, srv->dev->doorbells, __ATOMIC_RELAXED);
+	if (changed)
+		raise_wake(srv);
 }
 
-static int serve_hello(struct broker_server *srv, const struct broker_request *req, struct broker_reply *rep, int *fd)
+int channel_broker_arm_collect(const struct broker_arm_page *page, const struct channel_dev *dev,
+			       struct dmesh_session_arm_flow *flows)
+{
+	for (int tries = 0; tries < BROKER_ARM_READ_TRIES; ++tries) {
+		uint64_t seq = __atomic_load_n(&page->seq, __ATOMIC_ACQUIRE);
+		uint32_t count = 0;
+		if (seq & 1)
+			continue;
+		for (uint32_t id = 1; id < BROKER_FLOWS; ++id) {
+			const struct broker_arm_flow *f = &page->flow[id];
+			uint32_t armed = __atomic_load_n(&f->armed, __ATOMIC_RELAXED);
+			uint32_t generation = __atomic_load_n(&f->generation, __ATOMIC_RELAXED);
+			uint64_t expected = __atomic_load_n(&f->expected, __ATOMIC_RELAXED);
+			const struct channel_conn *conn = dev->flows[id];
+			if (armed && conn != NULL && conn->generation == generation)
+				flows[count++] = (struct dmesh_session_arm_flow){
+					.flow_id = id, .generation = generation, .expected_seq = expected };
+		}
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		if (__atomic_load_n(&page->seq, __ATOMIC_RELAXED) == seq)
+			return (int)count;
+	}
+	return -1;
+}
+
+/**
+ * ARM the flows the client listed in the arm page
+ *
+ * Whenever no ARM can stand for the client's sleep (a torn read, a failed
+ * send) the client is woken to keep polling.
+ *
+ * @srv [in]: Server
+ */
+static void serve_arm(struct broker_server *srv)
+{
+	struct dmesh_session_arm_flow flows[DMESH_SESSION_MAX_FLOWS];
+	uint64_t kicks;
+
+	(void)!read(srv->kick_fd, &kicks, sizeof(kicks));
+	if (srv->dev == NULL || srv->arm == NULL)
+		return;
+	int count = channel_broker_arm_collect(srv->arm, srv->dev, flows);
+	if (count < 0 || channel_dev_send_arm(srv->dev, flows, (uint32_t)count) != 0)
+		raise_wake(srv);
+}
+
+static int serve_hello(struct broker_server *srv, const struct broker_request *req, struct broker_reply *rep,
+		       int *fds, int *nfds)
 {
 	if (srv->dev != NULL) return EALREADY;
 	if (srv->status == NULL && (srv->status = channel_shared_alloc(sizeof(*srv->status), &srv->status_fd)) == NULL)
 		return ENOMEM;
+	if (srv->arm == NULL && (srv->arm = channel_shared_alloc(sizeof(*srv->arm), &srv->arm_fd)) == NULL)
+		return ENOMEM;
+	if (srv->wake_fd < 0 && (srv->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0)
+		return errno;
+	if (srv->kick_fd < 0 && (srv->kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)) < 0)
+		return errno;
 	if (channel_dev_open_owner(srv->pci, &srv->dev) != 0) return errno;
+	srv->dev->wake_relay = 1;
+	srv->dev->wake_relay_fd = srv->wake_fd;
 	if (channel_session_open(srv->dev, req->name) != 0) {
 		int saved = errno;
 		channel_dev_close(srv->dev); /* HELLO may be retried */
@@ -454,12 +617,16 @@ static int serve_hello(struct broker_server *srv, const struct broker_request *r
 	srv->pe_doorbell = doca_pe_set_event_mode(srv->dev->control->pe, DOCA_PE_EVENT_MODE_PROGRESS_ALL) ==
 			   DOCA_SUCCESS;
 	rep->bytes = sizeof(*srv->status);
-	*fd = srv->status_fd;
+	fds[BROKER_FD_STATUS] = srv->status_fd;
+	fds[BROKER_FD_ARM] = srv->arm_fd;
+	fds[BROKER_FD_WAKE] = srv->wake_fd;
+	fds[BROKER_FD_KICK] = srv->kick_fd;
+	*nfds = BROKER_HELLO_FDS;
 	return 0;
 }
 
 static int serve_mem_alloc(struct broker_server *srv, const struct broker_request *req, struct broker_reply *rep,
-			   int *fd)
+			   int *fds, int *nfds)
 {
 	struct channel_mem *mem;
 	uint32_t id = 0;
@@ -473,12 +640,13 @@ static int serve_mem_alloc(struct broker_server *srv, const struct broker_reques
 	rep->dpa = mem->dpa;
 	rep->bytes = mem->bytes;
 	rep->base = (uint64_t)(uintptr_t)mem->buf;
-	*fd = mem->memfd;
+	fds[0] = mem->memfd;
+	*nfds = 1;
 	return 0;
 }
 
 static int serve_conn_open(struct broker_server *srv, const struct broker_request *req, struct broker_reply *rep,
-			   int *fd)
+			   int *fds, int *nfds)
 {
 	struct channel_conn *conn;
 
@@ -506,7 +674,8 @@ static int serve_conn_open(struct broker_server *srv, const struct broker_reques
 	__atomic_store_n(&f->generation, conn->generation, __ATOMIC_RELEASE);
 	rep->id = conn->generation;
 	rep->bytes = conn->ring_bytes;
-	*fd = conn->ring_fd;
+	fds[0] = conn->ring_fd;
+	*nfds = 1;
 	return 0;
 }
 
@@ -526,7 +695,7 @@ static int serve_request(struct broker_server *srv, int sock)
 {
 	struct broker_request req;
 	struct broker_reply rep = { .type = BROKER_REPLY, .version = BROKER_IPC_VERSION };
-	int fd = -1, status;
+	int fds[BROKER_MAX_FDS], nfds = 0, status;
 
 	if (broker_ipc_recv(sock, &req, sizeof(req), NULL, 0) < 0)
 		return -1; /* EOF or a malformed request: the client is gone or broken */
@@ -537,9 +706,9 @@ static int serve_request(struct broker_server *srv, int sock)
 		status = ENOTCONN;
 	else {
 		switch (req.type) {
-		case BROKER_HELLO: status = serve_hello(srv, &req, &rep, &fd); break;
-		case BROKER_MEM_ALLOC: status = serve_mem_alloc(srv, &req, &rep, &fd); break;
-		case BROKER_CONN_OPEN: status = serve_conn_open(srv, &req, &rep, &fd); break;
+		case BROKER_HELLO: status = serve_hello(srv, &req, &rep, fds, &nfds); break;
+		case BROKER_MEM_ALLOC: status = serve_mem_alloc(srv, &req, &rep, fds, &nfds); break;
+		case BROKER_CONN_OPEN: status = serve_conn_open(srv, &req, &rep, fds, &nfds); break;
 		case BROKER_CONN_CLOSE: status = serve_conn_close(srv, &req); break;
 		case BROKER_SESSION_CLOSE: status = channel_session_close(srv->dev) == 0 ? 0 : errno; break;
 		default: status = EPROTO; break;
@@ -547,15 +716,15 @@ static int serve_request(struct broker_server *srv, int sock)
 	}
 	memcpy(rep.magic, BROKER_IPC_MAGIC, sizeof(rep.magic));
 	rep.status = status ? status : 0;
-	rep.fd_count = status == 0 && fd >= 0;
+	rep.fd_count = status == 0 ? (uint16_t)nfds : 0;
 	if (status != 0)
 		DOCA_LOG_WARN("Broker request %u (flow %u) failed: %s", req.type, req.flow_id, strerror(status));
-	return broker_ipc_send(sock, &rep, sizeof(rep), &fd, rep.fd_count) == 0 ? 0 : -1;
+	return broker_ipc_send(sock, &rep, sizeof(rep), fds, rep.fd_count) == 0 ? 0 : -1;
 }
 
 int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock)
 {
-	struct broker_server srv = { .pci = pci, .status_fd = -1 };
+	struct broker_server srv = { .pci = pci, .status_fd = -1, .arm_fd = -1, .wake_fd = -1, .kick_fd = -1 };
 	struct sigaction action = { .sa_handler = serve_on_signal };
 	int rc = 0;
 
@@ -566,10 +735,10 @@ int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock)
 		(void)sigprocmask(SIG_UNBLOCK, unblock, NULL);
 
 	while (!serve_stop) {
-		struct pollfd fds[2] = { { .fd = sock, .events = POLLIN } };
+		struct pollfd fds[3] = { { .fd = sock, .events = POLLIN } };
 		struct doca_pe *pe = srv.pe_doorbell && srv.dev->control != NULL ? srv.dev->control->pe : NULL;
 		doca_notification_handle_t handle;
-		int nfds = 1, timeout = BROKER_POLL_MS;
+		int nfds = 1, timeout = BROKER_POLL_MS, pe_slot = -1, kick_slot = -1;
 
 		publish(&srv);
 		/* Sleep on the control PE's doorbell: arm, then progress once more
@@ -582,18 +751,24 @@ int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock)
 			if (busy)
 				continue;
 			if (armed) {
-				fds[1] = (struct pollfd){ .fd = (int)handle, .events = POLLIN };
-				nfds = 2;
+				pe_slot = nfds;
+				fds[nfds++] = (struct pollfd){ .fd = (int)handle, .events = POLLIN };
 				timeout = BROKER_IDLE_MS;
 			}
+		}
+		if (srv.kick_fd >= 0) {
+			kick_slot = nfds;
+			fds[nfds++] = (struct pollfd){ .fd = srv.kick_fd, .events = POLLIN };
 		}
 		if (poll(fds, nfds, timeout) < 0) {
 			if (errno == EINTR) continue;
 			rc = -1;
 			break;
 		}
-		if (nfds == 2 && (fds[1].revents & POLLIN))
+		if (pe_slot >= 0 && (fds[pe_slot].revents & POLLIN))
 			(void)doca_pe_clear_notification(pe, handle);
+		if (kick_slot >= 0 && (fds[kick_slot].revents & POLLIN))
+			serve_arm(&srv);
 		if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
 			if (serve_request(&srv, sock) != 0)
 				break;
@@ -616,6 +791,12 @@ int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock)
 	}
 	if (srv.status != NULL)
 		channel_shared_free(srv.status, sizeof(*srv.status), srv.status_fd);
+	if (srv.arm != NULL)
+		channel_shared_free(srv.arm, sizeof(*srv.arm), srv.arm_fd);
+	if (srv.wake_fd >= 0)
+		close(srv.wake_fd);
+	if (srv.kick_fd >= 0)
+		close(srv.kick_fd);
 	close(sock);
 	return rc;
 }

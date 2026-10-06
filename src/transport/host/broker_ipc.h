@@ -7,7 +7,8 @@
  * dmesh_brokerlink.c). One SOCK_SEQPACKET connection per channel; every
  * request gets one reply, and a reply may carry memfds over SCM_RIGHTS:
  *
- *   HELLO          open the device and the Comch session  -> status page memfd
+ *   HELLO          open the device and the Comch session  -> status page memfd, arm page
+ *                                                             memfd, wake and kick eventfds
  *   MEM_ALLOC      register a region                       -> region memfd
  *   CONN_OPEN      open a flow on registered regions       -> forward ring memfd
  *   CONN_CLOSE     close a flow
@@ -16,18 +17,32 @@
  * No data bytes cross the socket: the application maps the memfds and runs the
  * forward ring and the push window on shared memory. Flow outcomes the DPU
  * reports asynchronously (CLOSED, errors) are published in the status page.
- * No DOCA types appear here.
+ *
+ * Idle wake runs beside the request socket, so it never waits behind a request:
+ * the application writes each push flow's next unread descriptor into the arm
+ * page and raises the kick eventfd; the broker sends the DPU one ARM for them
+ * and raises the wake eventfd on the DOORBELL, and on any change it publishes
+ * in the status page. No DOCA types appear here.
  */
 
 #include <stddef.h>
 #include <stdint.h>
 
 #define BROKER_IPC_MAGIC "DPMBRK01"
-#define BROKER_IPC_VERSION 1
+#define BROKER_IPC_VERSION 2
 #define BROKER_DEFAULT_SOCKET "/run/dpumesh/broker.sock"
 #define BROKER_FLOWS 33          /* flow ids 1..32, the channel's slots */
-#define BROKER_MAX_FDS 1
+#define BROKER_MAX_FDS 4
 #define BROKER_NAME_LEN 64
+
+/* Descriptors of a HELLO reply, in this order */
+enum broker_hello_fd {
+	BROKER_FD_STATUS,             /* status page memfd: the application maps it read-only */
+	BROKER_FD_ARM,                /* arm page memfd: written by the application */
+	BROKER_FD_WAKE,               /* eventfd the broker raises for the application */
+	BROKER_FD_KICK,               /* eventfd the application raises after writing the arm page */
+	BROKER_HELLO_FDS,
+};
 
 enum broker_msg_type {
 	BROKER_HELLO = 1,
@@ -80,6 +95,23 @@ struct broker_flow_status {
 
 struct broker_status {
 	struct broker_flow_status flow[BROKER_FLOWS];
+	uint64_t arms_sent;           /* ARMs the broker sent the DPU */
+	uint64_t doorbells;           /* DOORBELLs the DPU answered them with */
+};
+
+/* Written by the application, read by the broker. `seq` is a seqlock (odd
+ * while the application writes); an armed entry asks the DPU to ring once the
+ * flow incarnation `generation` has published descriptor `expected`. */
+struct broker_arm_flow {
+	uint32_t generation;
+	uint32_t armed;
+	uint64_t expected;
+};
+
+struct broker_arm_page {
+	uint64_t seq;
+	uint64_t reserved;
+	struct broker_arm_flow flow[BROKER_FLOWS];
 };
 
 /* Sends one message with up to BROKER_MAX_FDS descriptors (still owned by the caller). */
@@ -92,6 +124,8 @@ int broker_ipc_recv(int sock, void *msg, size_t len, int *fds, int max_fds);
 /* A memfd the broker registered: exactly `bytes` long, and sealed against
  * shrink/grow and further sealing so its size cannot change under the NIC. */
 int broker_ipc_check_memfd(int fd, size_t bytes);
+/* An eventfd (the wake and kick descriptors of a HELLO reply). */
+int broker_ipc_check_eventfd(int fd);
 
 /* Connects to the broker. The socket must be owned by root or by this user. */
 int broker_ipc_connect(const char *path);

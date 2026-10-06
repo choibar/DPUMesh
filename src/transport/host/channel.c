@@ -173,6 +173,11 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
 		/* The DPU published after our ARM; the drain pass that follows reads it. */
 		dev->arm_outstanding = 0;
 		dev->doorbells++;
+		if (dev->wake_relay) {
+			/* Broker: the application sleeps on this eventfd, not on our PE. */
+			uint64_t one = 1;
+			(void)!write(dev->wake_relay_fd, &one, sizeof(one));
+		}
 		return;
 	}
 	if (h.type == DMESH_SESSION_HELLO_ACK && h.flow_id == 0 && h.generation == 0) {
@@ -1157,17 +1162,46 @@ int channel_conn_status(struct channel_conn *conn)
 int channel_dev_fd(struct channel_dev *dev)
 {
 	doca_notification_handle_t handle;
-	if (dev->broker) return -1;
+	if (dev->broker) return channel_broker_dev_fd(dev);
 	if (dev->control == NULL ||
 	    doca_pe_get_notification_handle(dev->control->pe, &handle) != DOCA_SUCCESS)
 		return -1;
 	return (int)handle;
 }
 
+/* Sends one ARM for `flows` unless one is outstanding: a DOORBELL releases it. */
+static int arm_send_locked(struct channel_dev *dev, const struct dmesh_session_arm_flow *flows, uint32_t count)
+{
+	uint8_t payload[DMESH_SESSION_ARM_HEADER_SIZE +
+			DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE];
+
+	if (dev->arm_outstanding || count == 0)
+		return 0;
+	size_t len = dmesh_session_arm_encode(payload, sizeof(payload), dev->arm_epoch + 1, flows, count);
+	if (session_send_locked(dev, DMESH_SESSION_ARM, 0, 0, payload, len) != 0)
+		return -1;
+	dev->arm_epoch++;
+	dev->arms_sent++;
+	dev->arm_outstanding = 1;
+	return 0;
+}
+
+int channel_dev_send_arm(struct channel_dev *dev, const struct dmesh_session_arm_flow *flows, uint32_t count)
+{
+	pthread_mutex_lock(&dev->session_lock);
+	int rc = -1, saved = 0;
+	if (dev->control == NULL || !dev->hello_ready || dev->session_error)
+		saved = dev->session_error ? dev->session_error : ENOTCONN;
+	else if ((rc = arm_send_locked(dev, flows, count)) != 0)
+		saved = errno;
+	pthread_mutex_unlock(&dev->session_lock);
+	if (rc != 0) errno = saved;
+	return rc;
+}
+
 int channel_dev_arm(struct channel_dev *dev)
 {
-	/* A broker client has no control PE to sleep on: keep polling. */
-	if (dev->broker) { errno = ENOTSUP; return -1; }
+	if (dev->broker) return channel_broker_dev_arm(dev);
 	pthread_mutex_lock(&dev->session_lock);
 	int rc = 0, saved = 0;
 	if (dev->control == NULL || !dev->hello_ready || dev->session_error) {
@@ -1178,10 +1212,8 @@ int channel_dev_arm(struct channel_dev *dev)
 	/* Push batches have no completion doorbell: list, per flow, the next
 	 * descriptor this host has not read. The DPU rings at once if it already
 	 * published one, otherwise on its next publication. */
-	if (!dev->host_dpa && !dev->arm_outstanding) {
+	if (!dev->host_dpa) {
 		struct dmesh_session_arm_flow flows[DMESH_SESSION_MAX_FLOWS];
-		uint8_t payload[DMESH_SESSION_ARM_HEADER_SIZE +
-				DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE];
 		uint32_t count = 0;
 		for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id) {
 			struct channel_conn *conn = dev->flows[id];
@@ -1190,17 +1222,10 @@ int channel_dev_arm(struct channel_dev *dev)
 				continue;
 			flows[count++] = (struct dmesh_session_arm_flow){id, conn->generation, conn->expected};
 		}
-		if (count != 0) {
-			size_t len = dmesh_session_arm_encode(payload, sizeof(payload), dev->arm_epoch + 1,
-							      flows, count);
-			if (session_send_locked(dev, DMESH_SESSION_ARM, 0, 0, payload, len) != 0) {
-				saved = errno;
-				rc = -1;
-				goto out;
-			}
-			dev->arm_epoch++;
-			dev->arms_sent++;
-			dev->arm_outstanding = 1;
+		if (arm_send_locked(dev, flows, count) != 0) {
+			saved = errno;
+			rc = -1;
+			goto out;
 		}
 	}
 	/* Control messages (DOORBELL, CLOSED, ERROR) now raise the fd. Progress
@@ -1225,7 +1250,7 @@ out:
 void channel_dev_clear(struct channel_dev *dev)
 {
 	doca_notification_handle_t handle;
-	if (dev->broker) return;
+	if (dev->broker) { channel_broker_dev_clear(dev); return; }
 	pthread_mutex_lock(&dev->session_lock);
 	/* A raised handle stays readable until the next request; clear it so an
 	 * EQ that keeps polling does not see its fd stay readable. */
@@ -1240,6 +1265,7 @@ void channel_dev_clear(struct channel_dev *dev)
 
 void channel_dev_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells)
 {
+	if (dev->broker) { channel_broker_wake_counters(dev, arms_sent, doorbells); return; }
 	pthread_mutex_lock(&dev->session_lock);
 	*arms_sent = dev->arms_sent;
 	*doorbells = dev->doorbells;

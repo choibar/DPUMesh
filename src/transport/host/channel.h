@@ -70,7 +70,9 @@ int channel_dev_progress(struct channel_dev *dev);
  * (DOORBELL, CLOSED, ERROR) arrives. channel_dev_arm first sends one ARM for
  * the push flows, so the DPU rings for descriptors this host has not read.
  * It fails, leaving the caller to keep polling, when the session is down or
- * the ARM cannot be queued. channel_dev_clear acknowledges a raised fd. */
+ * the ARM cannot be queued. channel_dev_clear acknowledges a raised fd. On a
+ * broker client the fd is an eventfd the broker raises and the broker sends
+ * the ARM; a failure it meets there raises the fd, so the caller polls again. */
 int channel_dev_fd(struct channel_dev *dev);
 int channel_dev_arm(struct channel_dev *dev);
 void channel_dev_clear(struct channel_dev *dev);

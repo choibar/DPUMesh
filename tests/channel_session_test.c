@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include "src/transport/host/channel.c"
 #ifdef OBJECT_H_
@@ -319,6 +320,150 @@ static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, stru
     control_notify_fd = -1;
 }
 
+/* Broker side: the ARM a client listed goes out through the shared sender, one
+ * at a time, and the DOORBELL raises the client's eventfd. */
+static void test_broker_owner_wake(struct channel_dev *dev, struct channel_conn *a, struct channel_conn *b)
+{
+    struct dmesh_session_arm_flow listed[2] = {
+        {.flow_id = 1, .generation = a->generation, .expected_seq = 7},
+        {.flow_id = 2, .generation = b->generation, .expected_seq = 9},
+    };
+    unsigned arms = arms_seen;
+    assert(channel_dev_send_arm(dev, listed, 2) == 0);
+    assert(arms_seen == arms + 1 && arm_count_seen == 2 && arm_flows_seen[1].expected_seq == 9);
+    assert(dev->arm_outstanding);
+    assert(channel_dev_send_arm(dev, listed, 2) == 0 && arms_seen == arms + 1);
+
+    int relay = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    assert(relay >= 0);
+    dev->wake_relay = 1;
+    dev->wake_relay_fd = relay;
+    dispatch_doorbell(dev);
+    uint64_t raised = 0;
+    assert(read(relay, &raised, sizeof(raised)) == sizeof(raised) && raised == 1 && !dev->arm_outstanding);
+
+    /* Nothing listed sends nothing; a failed session refuses the ARM. */
+    assert(channel_dev_send_arm(dev, listed, 0) == 0 && arms_seen == arms + 1);
+    dev->session_error = ECONNRESET;
+    assert(channel_dev_send_arm(dev, listed, 2) == -1 && errno == ECONNRESET);
+    dev->session_error = 0;
+    dev->wake_relay = 0;
+    close(relay);
+
+    /* The broker arms only entries naming an incarnation it holds, and never
+     * from a page the client is still writing. */
+    struct broker_arm_page page = {0};
+    struct dmesh_session_arm_flow flows[DMESH_SESSION_MAX_FLOWS];
+    page.flow[1] = (struct broker_arm_flow){.generation = a->generation, .armed = 1, .expected = 3};
+    page.flow[2] = (struct broker_arm_flow){.generation = b->generation + 1, .armed = 1, .expected = 4};
+    page.flow[3] = (struct broker_arm_flow){.generation = 1, .armed = 1, .expected = 5};
+    assert(channel_broker_arm_collect(&page, dev, flows) == 1);
+    assert(flows[0].flow_id == 1 && flows[0].generation == a->generation && flows[0].expected_seq == 3);
+    page.flow[1].armed = 0;
+    assert(channel_broker_arm_collect(&page, dev, flows) == 0);
+    page.seq = 1;
+    assert(channel_broker_arm_collect(&page, dev, flows) == -1);
+}
+
+/* A broker that answers HELLO with its status and arm pages and eventfds, then
+ * keeps the connection open: the client's liveness check watches it. */
+struct fake_broker {
+    int listener, sock;
+    struct broker_status *status;
+    struct broker_arm_page *arm;
+    int status_fd, arm_fd, wake_fd, kick_fd;
+};
+
+static void *fake_broker_main(void *arg)
+{
+    struct fake_broker *f = arg;
+    struct broker_request req;
+    f->sock = accept(f->listener, NULL, NULL);
+    assert(f->sock >= 0);
+    assert(broker_ipc_recv(f->sock, &req, sizeof(req), NULL, 0) == 0 && req.type == BROKER_HELLO);
+    assert(strcmp(req.name, "unit-broker") == 0);
+    struct broker_reply rep = {.type = BROKER_REPLY, .version = BROKER_IPC_VERSION,
+                               .fd_count = BROKER_HELLO_FDS, .bytes = sizeof(struct broker_status)};
+    memcpy(rep.magic, BROKER_IPC_MAGIC, sizeof(rep.magic));
+    int fds[BROKER_HELLO_FDS] = {f->status_fd, f->arm_fd, f->wake_fd, f->kick_fd};
+    assert(broker_ipc_send(f->sock, &rep, sizeof(rep), fds, BROKER_HELLO_FDS) == 0);
+    return NULL;
+}
+
+/* Client side: the wake fd is the broker's eventfd, an ARM is the arm page
+ * plus a kick, and a lost broker fails the arm so the caller keeps polling. */
+static void test_broker_client_wake(void)
+{
+    char dir[] = "/tmp/channel-broker-XXXXXX", path[128];
+    assert(mkdtemp(dir));
+    snprintf(path, sizeof(path), "%s/broker.sock", dir);
+    struct fake_broker f = {.sock = -1};
+    f.listener = broker_ipc_listen(path);
+    f.status = channel_shared_alloc(sizeof(*f.status), &f.status_fd);
+    f.arm = channel_shared_alloc(sizeof(*f.arm), &f.arm_fd);
+    f.wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    f.kick_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    assert(f.listener >= 0 && f.status && f.arm && f.wake_fd >= 0 && f.kick_fd >= 0);
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, fake_broker_main, &f) == 0);
+
+    struct channel_dev *dev;
+    assert(channel_broker_attach(path, &dev) == 0);
+    assert(channel_session_open(dev, "unit-broker") == 0 && dev->hello_ready);
+    assert(pthread_join(thread, NULL) == 0);
+
+    int wake = channel_dev_fd(dev);
+    struct pollfd ready = {.fd = wake, .events = POLLIN};
+    uint64_t one = 1, kicks = 0;
+    assert(wake >= 0 && poll(&ready, 1, 0) == 0);
+    assert(write(f.wake_fd, &one, sizeof(one)) == sizeof(one));
+    assert(poll(&ready, 1, 0) == 1);
+    channel_dev_clear(dev);
+    channel_dev_clear(dev);
+    assert(poll(&ready, 1, 0) == 0);
+
+    /* An open push flow is listed; one the broker reported CLOSED, or whose
+     * stream ended, is not. */
+    struct channel_conn a = {.dev = dev, .flow_id = 1, .generation = 4, .ready = 1, .expected = 11};
+    struct channel_conn c = {.dev = dev, .flow_id = 3, .generation = 2, .ready = 1, .expected = 6};
+    a.descs = c.descs = (volatile struct dmesh_push_desc *)f.arm;
+    dev->flows[1] = &a;
+    dev->flows[3] = &c;
+    f.status->flow[1] = (struct broker_flow_status){.generation = 4, .state = 0};
+    f.status->flow[3] = (struct broker_flow_status){.generation = 2, .state = 1};
+    assert(channel_dev_arm(dev) == 0);
+    assert(read(f.kick_fd, &kicks, sizeof(kicks)) == sizeof(kicks) && kicks == 1);
+    assert(f.arm->seq == 2 && f.arm->flow[1].armed && f.arm->flow[1].generation == 4 &&
+           f.arm->flow[1].expected == 11);
+    assert(!f.arm->flow[2].armed && !f.arm->flow[3].armed);
+    a.rx_ended = 1;
+    assert(channel_dev_arm(dev) == 0 && f.arm->seq == 4 && !f.arm->flow[1].armed);
+    a.rx_ended = 0;
+
+    f.status->arms_sent = 5;
+    f.status->doorbells = 3;
+    uint64_t sent = 0, rung = 0;
+    channel_dev_wake_counters(dev, &sent, &rung);
+    assert(sent == 5 && rung == 3);
+
+    /* The liveness check runs every 20 ms (BROKER_CHECK_NS). */
+    close(f.sock);
+    const struct timespec pause = {.tv_nsec = 30 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+    assert(channel_dev_arm(dev) == -1 && errno == ECONNRESET);
+    assert(channel_dev_progress(dev) == -1 && errno == ECONNRESET);
+
+    dev->flows[1] = dev->flows[3] = NULL;
+    channel_broker_detach(dev);
+    channel_shared_free(f.status, sizeof(*f.status), f.status_fd);
+    channel_shared_free(f.arm, sizeof(*f.arm), f.arm_fd);
+    close(f.wake_fd);
+    close(f.kick_fd);
+    close(f.listener);
+    unlink(path);
+    rmdir(dir);
+}
+
 static void test_checked_close(void)
 {
     struct channel_dev dev = {0};
@@ -408,6 +553,8 @@ int main(void)
     assert(channel_conn_open(&dev, &cfg, &b) == 0);
     assert(client_creates == 1 && opens == 2 && a->ready && b->ready);
     test_idle_wake(&dev, a, b);
+    test_broker_owner_wake(&dev, a, b);
+    test_broker_client_wake();
 
     /* One session progress delivers replies for all flows; status checks must
      * neither re-progress that shared PE nor hide a sibling's error. */

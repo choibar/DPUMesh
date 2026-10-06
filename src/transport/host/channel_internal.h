@@ -45,6 +45,8 @@ struct channel_dev {
     struct doca_dev *base_dev;
     struct doca_dpa *base_dpa;
 	int share_memory;                   /* Broker: registered memory is memfd-backed, for its client to map */
+	int wake_relay;                     /* Broker: a DOORBELL raises wake_relay_fd for the client */
+	int wake_relay_fd;
 	struct channel_broker *broker;      /* Client: the broker owns the device; NULL when this process does */
 };
 
@@ -94,6 +96,12 @@ struct channel_conn {
  * memory and forward rings: the broker's side of a client channel. */
 int channel_dev_open_owner(const char *pci, struct channel_dev **out);
 
+/* The owner's ARM for flows a client listed (the broker): sends one ARM unless
+ * one is outstanding or `count` is 0. Fails when the session is down or the
+ * ARM cannot be queued. */
+struct dmesh_session_arm_flow;
+int channel_dev_send_arm(struct channel_dev *dev, const struct dmesh_session_arm_flow *flows, uint32_t count);
+
 /* Sealed memfd-backed MAP_SHARED memory, zero-filled; free takes fd -1 when closed. */
 void *channel_shared_alloc(size_t bytes, int *fd);
 void channel_shared_free(void *buf, size_t bytes, int fd);
@@ -111,5 +119,16 @@ int channel_broker_conn_close(struct channel_conn *conn);
 int channel_broker_conn_progress(struct channel_conn *conn);
 /* Fails once the broker connection is gone. */
 int channel_broker_dev_progress(struct channel_dev *dev);
+/* Idle wake of a client channel (channel_dev_fd/arm/clear/wake_counters). */
+int channel_broker_dev_fd(struct channel_dev *dev);
+int channel_broker_dev_arm(struct channel_dev *dev);
+void channel_broker_dev_clear(struct channel_dev *dev);
+void channel_broker_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells);
+/* Broker: the flows a client listed in its arm page (a seqlock) that name an
+ * incarnation `dev` still holds. Returns their count, or -1 when the client
+ * kept the page torn for every retry. */
+struct broker_arm_page;
+int channel_broker_arm_collect(const struct broker_arm_page *page, const struct channel_dev *dev,
+			       struct dmesh_session_arm_flow *flows);
 
 #endif /* CHANNEL_INTERNAL_H */

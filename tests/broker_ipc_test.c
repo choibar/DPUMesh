@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "src/transport/host/broker_ipc.h"
@@ -74,6 +75,40 @@ static void test_roundtrip(void)
     close(sv[1]);
 }
 
+/* A HELLO reply carries the status and arm pages and the two idle-wake eventfds. */
+static void test_hello_fds(void)
+{
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == 0);
+    const int seals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
+    int fds[BROKER_HELLO_FDS] = {
+        [BROKER_FD_STATUS] = sealed_memfd(4096, seals),
+        [BROKER_FD_ARM] = sealed_memfd(8192, seals),
+        [BROKER_FD_WAKE] = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC),
+        [BROKER_FD_KICK] = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC),
+    };
+    struct broker_reply out = { .type = BROKER_REPLY, .version = BROKER_IPC_VERSION, .fd_count = BROKER_HELLO_FDS };
+    assert(broker_ipc_send(sv[0], &out, sizeof(out), fds, BROKER_HELLO_FDS) == 0);
+    struct broker_reply in;
+    int got[BROKER_MAX_FDS];
+    assert(broker_ipc_recv(sv[1], &in, sizeof(in), got, BROKER_MAX_FDS) == BROKER_HELLO_FDS);
+    assert(broker_ipc_check_memfd(got[BROKER_FD_STATUS], 4096) == 0);
+    assert(broker_ipc_check_memfd(got[BROKER_FD_ARM], 8192) == 0);
+    assert(broker_ipc_check_eventfd(got[BROKER_FD_WAKE]) == 0);
+    assert(broker_ipc_check_eventfd(got[BROKER_FD_KICK]) == 0);
+
+    /* Both ends share one counter: the broker's raise is the client's wake. */
+    uint64_t one = 1, value = 0;
+    assert(write(fds[BROKER_FD_WAKE], &one, sizeof(one)) == sizeof(one));
+    assert(read(got[BROKER_FD_WAKE], &value, sizeof(value)) == sizeof(value) && value == 1);
+
+    /* A memfd is not an eventfd. */
+    errno = 0;
+    assert(broker_ipc_check_eventfd(got[BROKER_FD_STATUS]) == -1 && errno == EBADMSG);
+    for (int i = 0; i < BROKER_HELLO_FDS; i++) { close(fds[i]); close(got[i]); }
+    close(sv[0]); close(sv[1]);
+}
+
 static void test_memfd_checks(void)
 {
     int fd = sealed_memfd(4096, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL);
@@ -133,6 +168,7 @@ static void test_connect_listen(void)
 int main(void)
 {
     test_roundtrip();
+    test_hello_fds();
     test_memfd_checks();
     test_connect_listen();
     printf("broker_ipc_test: ok\n");
