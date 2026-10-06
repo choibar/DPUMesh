@@ -260,12 +260,57 @@ dmesh_dpa_thread_pool_init(struct objects *objs)
             return DOCA_ERROR_INVALID_VALUE;
         eu_base = (unsigned int)value;
     }
-    DOCA_LOG_INFO("DPA cooperative pool: %u available EUs, base %u, %u data/helper pairs",
-                  eus, eu_base, DPA_THREAD_POOL_SIZE);
+    /* DPUMESH_DPA_EU_STRIDE: each further pool in this process (one per DPU
+     * worker) starts that many EUs later, so the workers' first connections
+     * do not share EUs. 0 (default) keeps every pool at the base. */
+    unsigned int stride = 0;
+    const char *stride_env = getenv("DPUMESH_DPA_EU_STRIDE");
+    if (stride_env != NULL && *stride_env != '\0') {
+        char *end;
+        unsigned long value = strtoul(stride_env, &end, 10);
+        if (*end != '\0' || value >= eus - eu_base)
+            return DOCA_ERROR_INVALID_VALUE;
+        stride = (unsigned int)value;
+    }
+    /* DPUMESH_DPA_EU_END: first EU the pools must not use (default: every
+     * EU the device reports). Each pool creates all its threads up front, so
+     * a stride needs this to keep every thread on an EU that accepts one. */
+    unsigned int eu_end = eus;
+    const char *end_env = getenv("DPUMESH_DPA_EU_END");
+    if (end_env != NULL && *end_env != '\0') {
+        char *end;
+        unsigned long value = strtoul(end_env, &end, 10);
+        if (*end != '\0' || value <= eu_base || value > eus)
+            return DOCA_ERROR_INVALID_VALUE;
+        eu_end = (unsigned int)value;
+    }
+    static unsigned int pools_created;
+    unsigned int pool_index = __atomic_fetch_add(&pools_created, 1, __ATOMIC_RELAXED);
+    unsigned int offset = stride * pool_index;
+    /* DPUMESH_DPA_EU_OFFSETS: "o0,o1,...", the offset of pool k from the base;
+     * pools past the list use the stride. Lets a worker with many connections
+     * get a wider range than the rest. */
+    const char *offsets_env = getenv("DPUMESH_DPA_EU_OFFSETS");
+    if (offsets_env != NULL && *offsets_env != '\0') {
+        const char *p = offsets_env;
+        for (unsigned int k = 0; *p != '\0'; k++) {
+            char *end;
+            unsigned long value = strtoul(p, &end, 10);
+            if (end == p || (*end != ',' && *end != '\0') || value >= eu_end - eu_base)
+                return DOCA_ERROR_INVALID_VALUE;
+            if (k == pool_index) {
+                offset = (unsigned int)value;
+                break;
+            }
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
+    DOCA_LOG_INFO("DPA cooperative pool: %u available EUs, base %u, end %u, offset %u, %u data/helper pairs",
+                  eus, eu_base, eu_end, offset, DPA_THREAD_POOL_SIZE);
     for (i = 0; i < DPA_THREAD_POOL_SIZE; i++) {
         pool->threads[i].dpa = pool->dpa;
         pool->threads[i].cooperative_yield = true;
-        pool->threads[i].eu_id = eu_base + (unsigned int)i % (eus - eu_base);
+        pool->threads[i].eu_id = eu_base + (offset + (unsigned int)i) % (eu_end - eu_base);
         result = dmesh_doca_dpa_thread_create(&pool->threads[i]);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to create DPA pool thread %d: %s", i, doca_error_get_name(result));
