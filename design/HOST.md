@@ -59,6 +59,26 @@ An infinite polling activation violates the SDK's scheduled kernel time limit.
 Choose a free range when another DPA process shares the device; fixed affinity
 does not reserve EUs. The Boutique bench profile uses 64 on the test node.
 
+A proxy with several DPU workers (`DMESH_NUM_WORKERS`) builds one pool per
+worker, and by default every pool starts at the base, so connections of
+different workers share EUs; two streams on one EU stall for seconds. Three
+variables give each pool its own range; left unset, every pool keeps the old
+placement:
+
+- `DPUMESH_DPA_EU_STRIDE`: pool k (in creation order) starts `k * stride`
+  EUs after the base.
+- `DPUMESH_DPA_EU_END`: first EU no pool may use (default: every EU the device
+  reports). Thread placement wraps at this end. Set it when the device takes
+  DPA threads only below some EU (190 on the BF-3 test node, although it
+  reports 254).
+- `DPUMESH_DPA_EU_OFFSETS`: `o0,o1,...`, the start of pool k from the base,
+  overriding the stride for the pools listed; a worker with many connections
+  can get a wider range. Size the ranges so each covers its worker's streams.
+
+A value out of range fails the pool with `DOCA_ERROR_INVALID_VALUE`. The
+Online Boutique benchmark (microservices-demo `mesh-bench`) runs 10 workers
+with `END=190` and `OFFSETS=0,25,45,65,84,103,120,138,155,173`.
+
 ### Readiness: no background thread
 
 The library creates no thread of its own. The EQ thread that calls
