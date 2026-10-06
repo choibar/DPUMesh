@@ -1,0 +1,176 @@
+{
+  "date": "2026-09-30",
+  "dpumesh_base_commit": "1b2cbdba16fff2d6d01878e9dbcb7fc0c96968cf",
+  "proxy_base_commit": "e4e93c245464d86c0f85bbbaf84f4b13c6f3a226",
+  "boutique_base_commit": "9d7b6dad20b384cf8ae8100c727f092b4c837d9a",
+  "working_tree_modifications_included": true,
+  "source_sha256": {
+    "src/core/carrier.c": "b0916445973c263c53f835a23d99476935b320a275763e3208962c8ee4ae0392",
+    "src/core/dmesh_core.c": "c0285e0579840ddd986f986378165f526d636d32a581b3615a8e5d9bca815dfc",
+    "src/core/native_transport.h": "c3101da5942888ac3b929a614aff043c409abfb7fdb3d09b5297259d0ab02859",
+    "src/transport/common/dpa.c": "65ebc3f9f99f2195e8444d9ba71dbd94faec4c63e946e42d15159fc7f99cc98e",
+    "src/transport/common/dpa.h": "48ca2224f65bd08fce6cbfebd254d96e049e132088bca6ed3894ae7370a3203f",
+    "src/transport/common/dpa_common.h": "214b52df74d165d04f22b450290ab3279ddfc575a946c78e123c808f349dbe60",
+    "src/transport/common/object.h": "349e7440f178b8a06c4c37539b3e4a8c4fa6153b85387e03d58624a1ec88e994",
+    "src/transport/device/dpa_kernel.c": "08dc893af20954ac3e13c2ed90ce3cb7de53c1dc34707972bdad9545d63a1bd0",
+    "src/transport/dpu/comch_server.c": "ec23b1bdf46744b541cf68944cd250c4aa5fa16c0ed053f10451506f7805a72a",
+    "src/transport/dpu/dma.c": "ef6b51eba1f45df67b62d29d2ca7515ac032ff9dc1f59a23900bf73f5b250ab2",
+    "src/transport/host/channel.c": "4861e6208f9af515826f73b67cfb6f8472b422a7b7c7348a3dcbf35c9298b890",
+    "src/transport/host/channel.h": "b44f40abe8c9d46f5155fa2020896e3d33251fab83900bde9e213e7602a1ba0d",
+    "linkerd2-proxy/linkerd/doca/src/shim.c": "0af380bf6a5f0ca066d50ec35a1da14281333eb8bba31aada3e0d5eca32b46ca"
+  },
+  "binary_sha256": {
+    "baseline_host_core": "352ee868c806b79fb4d524a6239a368889bf8a959b53f71003ba6b3d3c5e4835",
+    "baseline_dpu_proxy": "0c959d065c63b178f11c02d85f2836d78bf4d0394759d07a2da1d0a53dbabc38",
+    "final_host_core": "125a514acecca6fe4f3eab3c9fbca6d025011c0a56ceddc7e5734e6e369f01ed",
+    "final_dpu_proxy": "f3cf095bf756181689bafeb4125544b01de378e2b8cbd07aae42bb426e948f09"
+  },
+  "hardware": {
+    "host": "rapids4, Xeon Gold 6554S, 36 cores, 2 NUMA nodes",
+    "dpu": "BlueField-3, 16 Arm cores, DOCA 3.1.0105",
+    "host_pci": "94:00.0",
+    "dpu_pci": "03:00.0",
+    "representor": "94:00.0",
+    "reverse": "dpu-dma",
+    "available_dpa_eus": 254,
+    "kernel_max_scheduled_seconds": 12,
+    "other_existing_job": {
+      "pid": 2436467,
+      "dpu_pci": "03:00.1",
+      "representor": "94:00.1",
+      "left_running_and_unmodified": true,
+      "actual_affinity": "unreadable without root; contention is an inference from EU-placement A/B"
+    }
+  },
+  "benchmark_settings": {
+    "locust_processes": 4,
+    "users": [
+      8,
+      32,
+      128
+    ],
+    "seconds_per_level": 20,
+    "dpu_workers": 1,
+    "dpu_sharded": 1,
+    "dpu_busy_poll": 1,
+    "dpu_log_filter": "info",
+    "baseline_spin_us": 1000,
+    "final_spin_us": 0,
+    "tx_tail_us": 500,
+    "m1_warm": "1s",
+    "m1_duration": "3s",
+    "final_dpa_device_log": "ERROR",
+    "final_dpa_eu_base": 64,
+    "final_dpa_eu_range": [
+      64,
+      127
+    ],
+    "transport_default_dpa_eu_base": 0,
+    "cooperative_yield": true,
+    "idle_yield_spins": 262144,
+    "dma_yield_quantum": 65536,
+    "producer_report_batch": 512,
+    "m64_warm": "3s",
+    "m64_duration": "10s",
+    "health_targets": 9
+  },
+  "verified": {
+    "host_c_tests": 17,
+    "host_header_and_abi_checks": "pass",
+    "go_race_tests": "pass",
+    "grpc_cpp_ctest": 6,
+    "dpu_dmesh_doca_tests": 13,
+    "cpu_accounting_tests": 2,
+    "hardware_regression": {
+      "run": "hw-eu64",
+      "result": "exit 0; integrity and lifecycle passed",
+      "stream_sizes": [
+        64,
+        128,
+        129,
+        8064,
+        8192,
+        65536,
+        1048576,
+        3145728
+      ],
+      "large_message_count_each": 8,
+      "concurrent_streams": 4,
+      "grpc_close_reopen_cycles": 40,
+      "final_stream_server_live_flows": 0,
+      "backend_pool": 4,
+      "backend_max": 8,
+      "dpa_eu_base": 64
+    },
+    "performance_runs": {
+      "after-eu64-r7": {
+        "result": "complete, exit 0",
+        "health": {
+          "m1": {
+            "completed_targets": 9,
+            "calls": 18842,
+            "errors": 0
+          },
+          "m64": {
+            "completed_targets": 9,
+            "calls": 687857,
+            "errors": 0
+          }
+        },
+        "dpu_error_crash_panic_report_lines": 0
+      },
+      "after-preload-eu64-r9": {
+        "result": "complete, exit 0",
+        "health": {
+          "m1": {
+            "completed_targets": 9,
+            "calls": 19184,
+            "errors": 0
+          },
+          "m64": {
+            "completed_targets": 9,
+            "calls": 683076,
+            "errors": 0
+          }
+        },
+        "dpu_error_crash_panic_report_lines": 0
+      }
+    }
+  },
+  "not_verified": {
+    "host-dpa": "DPA process creation failed on host PF 94:00.0 (DOCA_ERROR_DRIVER, syndrome 0xb398a0); no firmware/resource changes attempted"
+  },
+  "excluded_runs": {
+    "before-r1": "incomplete service startup",
+    "before-r2": "measurement windows valid, teardown failed after script was edited during execution; omitted from final table",
+    "before-r3": "startup failed with leftover proxy from before-r2",
+    "after-r1": "intermediate CPU/watermark fixes, prior to source custody correction",
+    "after-final-r1": "experimental TX tail 0 setting; no convincing gain, experiment removed",
+    "after-final-r2": "source custody fixed, producer completion drain not yet fixed; DPA crash detected during health phase",
+    "dpumesh-hw-regression-final": "large transfer passed, concurrent streams failed with insufficient test server backend pool; rerun with pool 4/max 8 passed"
+  },
+  "raw_artifacts": "build/hw-ab-2026-09-30/ (ignored local directory)",
+  "interpretation": "Final native host CPU per page fell about 47% at similar throughput to original. End-to-end parity with host proxy was not achieved. EU base 0 caused seconds-long tail latency, including a rerun using the same final binaries. EU base 64 restored throughput while the other PF job remained running. The other job actual affinity is not known. Finite crash-free tests do not establish long-term stability.",
+  "source_sha256_scope": "all changed production C sources/headers in src plus the proxy shim",
+  "host_dpu_transport_sources_match": true,
+  "diagnostic_runs": {
+    "after-final-r3": "diagnostic intermediate; before cooperative yield",
+    "after-final-r4": "diagnostic intermediate; before cooperative yield; DPA crash during m64",
+    "after-yield-final-r5": "diagnostic; yield with device INFO and EU base 0; poor performance",
+    "after-yield-quiet-r6": "diagnostic; device ERROR and EU base 0; poor performance",
+    "placement-eu0-r8": "diagnostic; same final binaries as r7; EU base 0 only; poor performance",
+    "hw-yield-final": "helper teardown failed; trigger completion was still attached before helper stop; corrected and reruns passed"
+  },
+  "reference_checkouts": {
+    "/home/jukebox/DPUMesh": "untouched, clean",
+    "/home/jukebox/DPUmesh": "untouched; 27 pre-existing dirty entries retained"
+  },
+  "benchmark_source_sha256": {
+    "dpumesh/run.sh": "70cc62d2552ab3b286f4bfbbe62778ef2740706800fc6e83e77538a58a832e16",
+    "dpumesh/bench/perf.sh": "64c38fc4fcc7c9b9173bf09e5c6b69313f594facb06b0dbb87930fde73f8abda",
+    "dpumesh/bench/hw-regression.sh": "a7b28d7f5c510267eb006a411529020cf7e05c1fa87cb0b90ca8eae88800f06a",
+    "dpumesh/bench/cpusample.py": "314b42b995d72b09faf1d224a1811a8bb4e8235c0d4391a06d380b30d4c4e549",
+    "dpumesh/bench/summarize.py": "b73477717d63d735ca3a5b77798009795668fc9e4d917b5051bf8f59e409122e",
+    "dpumesh/bench/dpu/env.sh": "0368f49d57a7060b4845e5781fd9c82de138cb97e419524950f7e5d575f67d7a"
+  }
+}
