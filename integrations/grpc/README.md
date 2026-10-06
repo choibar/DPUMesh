@@ -45,3 +45,10 @@ callbacks then arrive from that many threads.
 
 A process should close its DPUMesh channel before it exits. A channel that
 vanishes mid-stream stalls the DPU proxy for several seconds.
+
+## Online Boutique
+
+[jukebox03/microservices-demo](https://github.com/jukebox03/microservices-demo),
+branch `dpumesh`, runs every Online Boutique service over DPUMesh either
+through these adapters or unmodified under the preload shim; results are in
+[bench-results](../../bench-results/2026-09-29_online-boutique-e2e.md).
