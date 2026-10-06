@@ -9,10 +9,13 @@ metadata stay unchanged; a service opts in with a few lines and
 |---|---|---|---|
 | Go | grpc-go | `net.Listener` / `grpc.WithContextDialer` | [go](go/README.md) |
 | C++ | gRPC C++ 1.80 | EventEngine endpoint, passive listener | [cpp](cpp/README.md) |
+| C# | ASP.NET Core Kestrel, Grpc.Net.Client | `IConnectionListenerFactory`, `SocketsHttpHandler.ConnectCallback` | [dotnet](dotnet/README.md) |
+| Node.js | @grpc/grpc-js ≥ 1.10 | `Server.createConnectionInjector` | [node](node/README.md) |
+| Java | grpc-java with grpc-netty | Netty channel, `ServerProvider` / `ManagedChannelProvider` | [java](java/README.md) |
+| Python | grpcio 1.80 (patched build) | C-core EventEngine and passive listener | [python](python/README.md) |
 
-The Go and C++ adapters drive the native API directly. Adapters for other
-runtimes share the **stream C ABI**
-([`cpp/include/dpumesh_stream.h`](cpp/include/dpumesh_stream.h)),
+The Go and C++ adapters drive the native API directly. The others share the
+**stream C ABI** ([`cpp/include/dpumesh_stream.h`](cpp/include/dpumesh_stream.h)),
 `libdpumesh_stream.so`: the C++ adapter's EQ reactor behind a byte-stream
 interface — connect, listen, write, and callbacks for data, transmit credit,
 end of stream and errors. The reactor keeps the native rules (one EQ consumer,
