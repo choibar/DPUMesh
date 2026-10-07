@@ -9,6 +9,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -73,6 +74,7 @@ func main() {
 	log.Printf("preflight OK: %d conns, %dB echo verified", p, payload)
 
 	var total int64
+	var failures atomic.Int64
 	var stop, measuring atomic.Bool
 	var wg sync.WaitGroup
 	var latMu sync.Mutex
@@ -85,11 +87,13 @@ func main() {
 				var out []byte
 				var local int64
 				var mine []time.Duration
-				ctx := context.Background()
+				ctx, cancel := context.WithTimeout(context.Background(), warm+dur+15*time.Second)
+				defer cancel()
 				for !stop.Load() {
 					t0 := time.Now()
 					if err := cc.Invoke(ctx, bench.MethodPing, req, &out, grpc.ForceCodec(bench.RawCodec{})); err != nil {
 						if !stop.Load() {
+							failures.Add(1)
 							log.Printf("rpc error: %v", err)
 						}
 						return
@@ -109,11 +113,14 @@ func main() {
 		}
 	}
 	time.Sleep(warm)
-	measuring.Store(true)
 	start := time.Now()
+	log.Printf("MEASURE_START unix_ns=%d", start.UnixNano())
+	measuring.Store(true)
 	time.Sleep(dur)
 	measuring.Store(false)
-	elapsed := time.Since(start)
+	end := time.Now()
+	elapsed := end.Sub(start)
+	log.Printf("MEASURE_END unix_ns=%d", end.UnixNano())
 	stop.Store(true)
 	wg.Wait()
 	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
@@ -125,7 +132,17 @@ func main() {
 	}
 	log.Printf("RESULT: %.0f req/s (P=%d M=%d payload=%dB dur=%v total=%d) lat_p50=%v p99=%v",
 		float64(total)/elapsed.Seconds(), p, m, payload, elapsed.Round(time.Millisecond), total, pct(0.5), pct(0.99))
+	result := map[string]any{"rps": float64(total) / elapsed.Seconds(), "total": total, "errors": failures.Load(), "flows": p, "inflight_per_flow": m, "payload": payload, "start_ns": start.UnixNano(), "end_ns": end.UnixNano(), "p50_us": float64(pct(0.5)) / float64(time.Microsecond), "p99_us": float64(pct(0.99)) / float64(time.Microsecond)}
+	encoded, _ := json.Marshal(result)
+	fmt.Printf("RESULT_JSON %s\n", encoded)
 	for _, cc := range conns {
 		cc.Close()
+	}
+	if err := dmeshgo.CloseTransport(); err != nil {
+		log.Printf("close transport: %v", err)
+		failures.Add(1)
+	}
+	if failures.Load() != 0 {
+		os.Exit(1)
 	}
 }
