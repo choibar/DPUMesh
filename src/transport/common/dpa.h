@@ -2,6 +2,7 @@
 #define DPA_H_
 
 #include <stdbool.h>
+#include "dpa_runtime.h"
 #include <doca_dpa.h>
 #include <doca_ctx.h>
 #include <doca_pe.h>
@@ -12,7 +13,7 @@
 #define CC_DPA_MAX_MSG_NUM  512
 
 /* Number of DPA threads pre-created per DPU worker thread and handed out per
- * connection (each worker owns a private pool - shared-nothing design) */
+ * connection (each worker owns private slots in a process-wide shared DPA context) */
 #define DPA_THREAD_POOL_SIZE 32
 
 struct objects;
@@ -24,6 +25,7 @@ struct dmesh_conn;
 struct dmesh_doca_dpa_thread {
     struct doca_dpa *dpa;           /* DOCA DPA */
     struct doca_dpa_thread *thread; /* DPA thread */
+    bool started;                  /* SDK start succeeded; partial creation is not allocatable */
     bool running, quiesced;        /* run attempted; explicit DMA close fence completed */
     /* Stop handshake of the current run, advanced by dmesh_doca_dpa_quiesce_step(). */
     bool stop_sent, submitted_known;
@@ -38,7 +40,8 @@ struct dmesh_doca_dpa_thread {
  * are created before any host connection exists; each remote connection is
  * assigned one thread (owner[i] tracks which connection holds slot i). */
 struct dmesh_dpa_thread_pool {
-    struct doca_dpa *dpa;                          /* shared DPA instance */
+    struct doca_dpa *dpa;                          /* borrowed shared context */
+    struct dmesh_dpa_runtime *runtime;             /* worker lease */
     int size;                                      /* number of usable slots */
     struct dmesh_doca_dpa_thread threads[DPA_THREAD_POOL_SIZE];
     struct dmesh_conn *owner[DPA_THREAD_POOL_SIZE]; /* NULL = free */
@@ -125,8 +128,7 @@ doca_error_t
 dmesh_dpa_thread_pool_init(struct objects *objs);
 
 /* Assign a free pool thread to a connection; returns NULL if the pool is
- * exhausted or not yet initialized. Pure memory operation - safe to call from
- * a DOCA event callback. */
+ * exhausted or not yet initialized. Recycled slots recreate SDK resources. */
 struct dmesh_doca_dpa_thread *
 dmesh_dpa_thread_pool_alloc(struct objects *objs, struct dmesh_conn *conn);
 

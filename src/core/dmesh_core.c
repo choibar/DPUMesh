@@ -1102,7 +1102,9 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
 static int drain_rev_rings_span(dpumesh_ctx_t *ctx, uint32_t budget)
 {
     uint32_t drained = 0;
+    uint32_t active = dmesh_native_progress(ctx->transport);
     for (int stripe = 0; stripe < ctx->landing_stripes && drained < budget; ++stripe) {
+        if (!(active & (UINT32_C(1) << stripe))) continue;
         if (__atomic_exchange_n(&ctx->stripe_lock[stripe], 1u, __ATOMIC_ACQUIRE))
             continue;
         struct dmesh_native_event ev;

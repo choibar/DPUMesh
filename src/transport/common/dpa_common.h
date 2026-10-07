@@ -7,6 +7,8 @@
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 
+#define DMESH_DPA_BENCH_SCRATCH_SIZE (64u * 1024u)
+
 struct dpa_thread_arg {
 	uint64_t dpa_consumer_comp;
 	uint64_t dpa_producer_comp;
@@ -53,6 +55,8 @@ struct dpa_thread_arg {
 	/* Published before stopped: number of copies requiring CPU DMA-completed
 	 * messages. Kernel exit alone does not retire producer DMA operations. */
 	volatile uint64_t dma_submitted;
+
+    uint64_t bench_scratch; /* optional per-thread HPACK scratch in DPA heap */
 
 } __attribute__((__packed__, aligned(8)));
 

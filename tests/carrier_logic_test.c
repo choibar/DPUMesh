@@ -3,6 +3,37 @@
 #include <stdio.h>
 static unsigned arm_calls;
 static int arm_result;
+static unsigned progress_calls;
+int channel_dev_progress(struct channel_dev *dev)
+{ (void)dev; ++progress_calls; return 0; }
+
+int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *token)
+{ (void)dev; (void)worker; (void)token; return 0; }
+void channel_backend_finish(struct channel_dev *dev, uint32_t worker, uint32_t token, int error)
+{ (void)dev; (void)worker; (void)token; (void)error; assert(!"unexpected request"); }
+int dmesh_target_addr(int service, uint32_t *ip, uint16_t *port)
+{ (void)service; (void)ip; (void)port; assert(!"unexpected open"); return -1; }
+int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
+{ (void)dev; (void)cfg; (void)out; assert(!"unexpected open"); return -1; }
+int channel_conn_fds(struct channel_conn *conn, int *fds, int max)
+{ (void)conn; (void)fds; (void)max; return 0; }
+
+static void test_closed_stripe_stays_pollable_until_retired(void)
+{
+    struct dmesh_native_transport *t = calloc(1, sizeof(*t));
+    assert(t);
+    struct slot *s = &t->slots[31];
+    s->state = SLOT_CLOSED;
+    s->fin_pending = 1;
+    t->active_stripes = UINT32_C(1) << 31;
+    assert(dmesh_native_progress(t) == (UINT32_C(1) << 31));
+    assert(progress_calls == 1);
+    /* Only retirement, not close, may remove the stripe from future drains. */
+    s->fin_pending = 0;
+    slot_free(t, s);
+    assert(dmesh_native_progress(t) == 0 && progress_calls == 2);
+    free(t);
+}
 
 int channel_conn_arm(struct channel_conn *conn)
 {
@@ -47,6 +78,7 @@ static void test_shared_control_poll_tick(void)
 
 int main(void)
 {
+    test_closed_stripe_stays_pollable_until_retired();
     test_shared_control_poll_tick();
     uint32_t p[2];
     assert(carrier_chunks(0, p) == 0);

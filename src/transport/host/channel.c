@@ -74,7 +74,10 @@ struct channel_dev {
 	struct dmesh_comch_client *control;
 	struct channel_conn *flows[33];
 	uint32_t generations[33];
-	int hello_ready;
+	int hello_ready, listen_ready, listen_error;
+    struct { uint32_t token; int state, error; } backend[DMESH_SESSION_MAX_WORKERS];
+    unsigned backend_pending, backend_rejections;
+    /* state: 1=pending, 2=processing, 3=done, 4=reject pending */
 	int session_error;
 	int host_dpa;                       /* Nonzero: the host-dpa reverse path */
     struct doca_dev *reverse_dev;       /* base PF or optional SF */
@@ -211,6 +214,23 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
 		else dev->hello_ready = 1;
 		return;
 	}
+    if (h.type == DMESH_SESSION_LISTEN_ACK) {
+        dev->listen_ready = 1; dev->listen_error = h.status;
+        return;
+    }
+    if (h.type == DMESH_SESSION_BACKEND_REQUEST) {
+        uint32_t w = dmesh_session_get_u32(payload);
+        if (w >= DMESH_SESSION_MAX_WORKERS) { dev->session_error = EPROTO; return; }
+        if (h.generation > dev->backend[w].token) {
+            /* Dispatcher cannot replace a still-admitted request. */
+            if (dev->backend[w].state == 1) --dev->backend_pending;
+            if (dev->backend[w].state == 4) --dev->backend_rejections;
+            ++dev->backend_pending;
+            dev->backend[w].token = h.generation;
+            dev->backend[w].state = 1; dev->backend[w].error = 0;
+        }
+        return;
+    }
 	if (h.flow_id == 0) {
 		dev->session_error = h.status ? h.status : EPROTO;
 		return;
@@ -259,10 +279,26 @@ static uint64_t channel_now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+static void backend_flush_rejections(struct channel_dev *dev)
+{
+    if (!dev->backend_rejections) return;
+    for (unsigned w = 0; w < DMESH_SESSION_MAX_WORKERS; ++w) {
+        if (dev->backend[w].state != 4) continue;
+        uint8_t frame[DMESH_SESSION_HEADER_SIZE + 4], payload[4];
+        dmesh_session_put_u32(payload, w);
+        size_t n = dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_BACKEND_REJECT,
+            0, dev->backend[w].token, dev->backend[w].error, payload, sizeof(payload));
+        if (dmesh_comch_client_send(dev->control, (const char *)frame, n) == DOCA_SUCCESS) {
+            dev->backend[w].state = 3; --dev->backend_rejections;
+        }
+    }
+}
+
 static int session_progress_locked(struct channel_dev *dev)
 {
 	if (!dev->control) { errno = ENOTCONN; return -1; }
 	(void)doca_pe_progress(dev->control->pe);
+    backend_flush_rejections(dev);
 	if (dev->control->peer_gone && !dev->session_error)
 		dev->session_error = ECONNRESET;
 	if (dev->session_error) { errno = dev->session_error; return -1; }
@@ -322,6 +358,52 @@ int channel_session_open(struct channel_dev *dev, const char *server)
 		rc = session_wait_locked(dev, NULL, 0);
 	pthread_mutex_unlock(&dev->session_lock);
 	return rc;
+}
+
+int channel_session_listen(struct channel_dev *dev, uint32_t ip, uint16_t port)
+{
+    uint8_t payload[8];
+    dmesh_session_put_u32(payload, ip); dmesh_session_put_u32(payload + 4, port);
+    pthread_mutex_lock(&dev->session_lock);
+    dev->listen_ready = 0; dev->listen_error = 0;
+    int rc = session_send_locked(dev, DMESH_SESSION_LISTEN, 0, 1, payload, sizeof(payload));
+    uint64_t deadline = channel_now_ms() + CHANNEL_REV_READY_MS;
+    while (rc == 0 && !dev->listen_ready) {
+        rc = session_progress_locked(dev);
+        if (channel_now_ms() >= deadline) { errno = ETIMEDOUT; rc = -1; break; }
+        if (rc == 0 && !dev->listen_ready) {
+            pthread_mutex_unlock(&dev->session_lock);
+            const struct timespec pause = {.tv_nsec = 10000}; nanosleep(&pause, NULL);
+            pthread_mutex_lock(&dev->session_lock);
+        }
+    }
+    if (rc == 0 && dev->listen_error) { errno = dev->listen_error; rc = -1; }
+    pthread_mutex_unlock(&dev->session_lock);
+    return rc;
+}
+
+int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *token)
+{
+    pthread_mutex_lock(&dev->session_lock);
+    int found = 0;
+    if (!dev->session_error && dev->backend_pending) for (unsigned w = 0; w < DMESH_SESSION_MAX_WORKERS; ++w) {
+        if (dev->backend[w].state != 1) continue;
+        *worker = w; *token = dev->backend[w].token;
+        dev->backend[w].state = 2; --dev->backend_pending; found = 1; break;
+    }
+    pthread_mutex_unlock(&dev->session_lock);
+    return found;
+}
+void channel_backend_finish(struct channel_dev *dev, uint32_t worker, uint32_t token, int error)
+{
+    pthread_mutex_lock(&dev->session_lock);
+    if (worker < DMESH_SESSION_MAX_WORKERS && dev->backend[worker].token == token) {
+        if (dev->backend[worker].state == 4) --dev->backend_rejections;
+        if (error) ++dev->backend_rejections;
+        dev->backend[worker].error = error;
+        dev->backend[worker].state = error ? 4 : 3;
+    }
+    pthread_mutex_unlock(&dev->session_lock);
 }
 
 int channel_session_close(struct channel_dev *dev)
@@ -957,11 +1039,19 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 	result = dmesh_build_dma_metadata(dev->dev, conn->forward_ring, &sndbuf, &rcvbuf, &flow, &metadata);
 	int rc = -1;
 	if (result != DOCA_SUCCESS) errno = error_number(result);
-	else if (session_send_locked(dev, DMESH_SESSION_OPEN, conn->flow_id, conn->generation,
-	                             &metadata, sizeof(metadata)) == 0) {
-		conn->open_sent = 1;
-		rc = session_wait_locked(dev, conn, 0);
-	}
+    else {
+        uint8_t payload[8 + sizeof(metadata)];
+        uint16_t type = cfg->backend_token ? DMESH_SESSION_BACKEND_OPEN : DMESH_SESSION_OPEN;
+        size_t offset = cfg->backend_token ? 8 : 0;
+        dmesh_session_put_u32(payload, cfg->backend_worker);
+        dmesh_session_put_u32(payload + 4, cfg->backend_token);
+        memcpy(payload + offset, &metadata, sizeof(metadata));
+        if (session_send_locked(dev, type, conn->flow_id, conn->generation,
+                               payload, offset + sizeof(metadata)) == 0) {
+            conn->open_sent = 1;
+            rc = session_wait_locked(dev, conn, 0);
+        }
+    }
 	int saved = errno;
 	pthread_mutex_unlock(&dev->session_lock);
 	if (rc != 0) {
@@ -1012,18 +1102,32 @@ int channel_conn_close(struct channel_conn *conn)
 	return rc;
 }
 
-int channel_conn_progress(struct channel_conn *conn)
+int channel_dev_progress(struct channel_dev *dev)
+{
+	pthread_mutex_lock(&dev->session_lock);
+	int rc = session_progress_locked(dev);
+	pthread_mutex_unlock(&dev->session_lock);
+	return rc;
+}
+
+int channel_conn_poll(struct channel_conn *conn)
 {
 	struct channel_dev *dev = conn->dev;
 	pthread_mutex_lock(&dev->session_lock);
-	int rc = session_progress_locked(dev);
-	int saved = rc != 0 ? errno : conn->error;
+	int saved = !dev->control ? ENOTCONN :
+		(dev->session_error ? dev->session_error : conn->error);
 	int gone = conn->peer_closed;
 	pthread_mutex_unlock(&dev->session_lock);
 	if (conn->reverse != NULL && conn->reverse->pe != NULL)
 		(void)doca_pe_progress(conn->reverse->pe);
 	if (saved) { errno = saved; return -1; }
 	return gone;
+}
+
+int channel_conn_progress(struct channel_conn *conn)
+{
+	(void)channel_dev_progress(conn->dev);
+	return channel_conn_poll(conn);
 }
 
 /*

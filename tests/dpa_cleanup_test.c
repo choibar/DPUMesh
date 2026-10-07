@@ -127,6 +127,8 @@ doca_error_t doca_ctx_stop(struct doca_ctx *ctx)
 }
 uint8_t doca_pe_progress(struct doca_pe *pe)
 {
+    assert(pthread_mutex_trylock(&dmesh_dpa_sdk_mutex) == 0);
+    pthread_mutex_unlock(&dmesh_dpa_sdk_mutex);
     assert(pe == (void *)&f->objs);
     ++f->progress_calls;
     if (!f->hold_contexts)
@@ -544,8 +546,38 @@ static void test_host_endpoint_completion(void)
     release_fixture();
 }
 
+/* Even an incomplete pool (size=0) may own a partially created thread. */
+static void test_worker_pool_cleanup_retry(void)
+{
+    create_fixture();
+    struct dmesh_dpa_thread_pool *pool = calloc(1, sizeof(*pool));
+    assert(pool);
+    f->objs.dpa_pool = pool;
+    f->objs.release_dpa = release_dpa_objects;
+    pool->threads[3] = f->thread;
+    pool->threads[3].running = false;
+    conn()->state = DMESH_CONN_CLOSING;
+    assert(release_dpa_objects(&f->objs) == DOCA_ERROR_IN_USE);
+    assert(f->thread_destroy_calls == 0);
+    conn()->state = DMESH_CONN_FREE;
+    pool->owner[3] = conn();
+    assert(release_dpa_objects(&f->objs) == DOCA_ERROR_IN_USE);
+    pool->owner[3] = NULL;
+    f->fail = OP_THREAD_DESTROY;
+    assert(release_dpa_objects(&f->objs) == DOCA_ERROR_DRIVER);
+    assert(f->objs.dpa_pool == pool && !f->arg_freed);
+    f->fail = OP_ARG_FREE;
+    assert(release_dpa_objects(&f->objs) == DOCA_ERROR_DRIVER);
+    assert(f->objs.dpa_pool == pool && pool->threads[3].thread == NULL);
+    f->fail = OP_NONE;
+    assert(release_dpa_objects(&f->objs) == DOCA_SUCCESS);
+    assert(f->objs.dpa_pool == NULL && f->objs.release_dpa == NULL && f->arg_freed);
+    release_fixture();
+}
+
 int main(void)
 {
+    test_worker_pool_cleanup_retry();
     test_host_endpoint_completion();
     test_quiesce_requires_copy_completion();
     test_quiesce_faults();

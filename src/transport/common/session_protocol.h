@@ -3,17 +3,19 @@
 
 /* Host/DPU control protocol. The public native ABI and DMA descriptor format
  * are independent of this version. Integers in the envelope are little endian;
- * v1 metadata payloads retain the existing LP64 host/DPU layout. */
+ * v2 adds listener registration and worker-pinned backend requests. DMA
+ * metadata payloads retain the existing LP64 host/DPU layout. */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #define DMESH_SESSION_MAGIC UINT32_C(0x444d5348)
-#define DMESH_SESSION_VERSION 1u
+#define DMESH_SESSION_VERSION 2u
 #define DMESH_SESSION_HEADER_SIZE 24u
 #define DMESH_SESSION_MAX_PAYLOAD 2048u
 #define DMESH_SESSION_MAX_FRAME (DMESH_SESSION_HEADER_SIZE + DMESH_SESSION_MAX_PAYLOAD)
 #define DMESH_SESSION_MAX_FLOWS 32u
+#define DMESH_SESSION_MAX_WORKERS 128u
 
 enum dmesh_session_message_type {
     DMESH_SESSION_HELLO = 1,
@@ -24,6 +26,11 @@ enum dmesh_session_message_type {
     DMESH_SESSION_CLOSE = 6,
     DMESH_SESSION_CLOSED = 7,
     DMESH_SESSION_ERROR = 8,
+    DMESH_SESSION_LISTEN = 9,       /* flow=0, generation=1, endpoint (ip, port) */
+    DMESH_SESSION_LISTEN_ACK = 10,
+    DMESH_SESSION_BACKEND_REQUEST = 11, /* flow=0, generation=request token, worker */
+    DMESH_SESSION_BACKEND_OPEN = 12, /* worker + request token + DMA metadata */
+    DMESH_SESSION_BACKEND_REJECT = 13, /* flow=0, generation=request token, worker */
 };
 
 struct dmesh_session_header {
@@ -54,10 +61,18 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 &&
                (h->type == DMESH_SESSION_HELLO_ACK || h->status == 0);
+    if (h->type == DMESH_SESSION_LISTEN)
+        return h->flow_id == 0 && h->generation == 1 && h->payload_len == 8 && h->status == 0;
+    if (h->type == DMESH_SESSION_LISTEN_ACK)
+        return h->flow_id == 0 && h->generation == 1 && h->payload_len == 0;
+    if (h->type == DMESH_SESSION_BACKEND_REQUEST || h->type == DMESH_SESSION_BACKEND_REJECT)
+        return h->flow_id == 0 && h->generation != 0 && h->payload_len == 4 &&
+            (h->type == DMESH_SESSION_BACKEND_REQUEST ? h->status == 0 : h->status != 0);
     if (h->flow_id == 0 || h->flow_id > DMESH_SESSION_MAX_FLOWS || h->generation == 0)
         return 0;
     switch (h->type) {
     case DMESH_SESSION_OPEN:
+    case DMESH_SESSION_BACKEND_OPEN:
     case DMESH_SESSION_REVERSE_EXPORT:
         return h->payload_len != 0 && h->status == 0;
     case DMESH_SESSION_READY:

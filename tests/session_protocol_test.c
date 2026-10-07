@@ -11,7 +11,7 @@
 static void test_wire_layout(void)
 {
     static const uint8_t golden[] = {
-        0x48, 0x53, 0x4d, 0x44, 0x01, 0x00, 0x03, 0x00,
+        0x48, 0x53, 0x4d, 0x44, 0x02, 0x00, 0x03, 0x00,
         0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
         0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
         0xa5, 0x00, 0x7e,
@@ -28,7 +28,7 @@ static void test_wire_layout(void)
     assert(memcmp(frame, golden, sizeof(golden)) == 0);
     assert(storage[0] == 0xcc && storage[sizeof(storage) - 1] == 0xcc);
     assert(dmesh_session_decode(frame, sizeof(golden), &h, &payload) == 0);
-    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 1);
+    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 2);
     assert(h.type == DMESH_SESSION_OPEN && h.flow_id == 2);
     assert(h.generation == UINT32_C(0x12345678) && h.status == 0);
     assert(h.payload_len == 3 && payload == frame + 24);
@@ -53,6 +53,15 @@ struct message_case {
 static void test_message_shapes(void)
 {
     static const struct message_case cases[] = {
+        {DMESH_SESSION_LISTEN,         0, 1, 0,      8, 1},
+        {DMESH_SESSION_LISTEN,         1, 1, 0,      8, 0},
+        {DMESH_SESSION_LISTEN_ACK,     0, 1, EADDRINUSE, 0, 1},
+        {DMESH_SESSION_BACKEND_REQUEST,0, 7, 0,      4, 1},
+        {DMESH_SESSION_BACKEND_REQUEST,0, 0, 0,      4, 0},
+        {DMESH_SESSION_BACKEND_REQUEST,0, 7, 0,      8, 0},
+        {DMESH_SESSION_BACKEND_REJECT, 0, 7, ENOSPC, 4, 1},
+        {DMESH_SESSION_BACKEND_REJECT, 0, 7, 0,      4, 0},
+        {DMESH_SESSION_BACKEND_OPEN,   1, 1, 0,      8, 1},
         {DMESH_SESSION_HELLO,          0, 0, 0,      0, 1},
         {DMESH_SESSION_HELLO_ACK,      0, 0, 0,      0, 1},
         {DMESH_SESSION_HELLO_ACK,      0, 0, EPROTO, 0, 1},
@@ -87,8 +96,8 @@ static void test_message_shapes(void)
         {0,                           1, 1, 0,      0, 0},
         {UINT16_MAX,                  1, 1, 0,      0, 0},
     };
-    uint8_t frame[DMESH_SESSION_HEADER_SIZE + 1];
-    uint8_t body = 0x5a;
+    uint8_t frame[DMESH_SESSION_HEADER_SIZE + 8];
+    uint8_t body[8] = {0x5a};
     struct dmesh_session_header h;
     const uint8_t *payload;
 
@@ -96,12 +105,12 @@ static void test_message_shapes(void)
         const struct message_case *c = &cases[i];
         size_t len = dmesh_session_encode(frame, sizeof(frame), c->type,
                                           c->flow_id, c->generation, c->status,
-                                          &body, c->payload_len);
+                                          body, c->payload_len);
         assert((len != 0) == c->valid);
 
         /* Construct even rejected frames without passing through encode, so
          * decode is independently exercised against malformed peer input. */
-        const uint8_t prefix[8] = {0x48, 0x53, 0x4d, 0x44, 1, 0, 0, 0};
+        const uint8_t prefix[8] = {0x48, 0x53, 0x4d, 0x44, 2, 0, 0, 0};
         memcpy(frame, prefix, sizeof(prefix));
         frame[6] = (uint8_t)c->type;
         frame[7] = (uint8_t)(c->type >> 8);
@@ -109,14 +118,14 @@ static void test_message_shapes(void)
         dmesh_session_put_u32(frame + 12, c->flow_id);
         dmesh_session_put_u32(frame + 16, c->generation);
         dmesh_session_put_u32(frame + 20, (uint32_t)c->status);
-        frame[24] = body;
+        memcpy(frame + 24, body, c->payload_len);
         int rc = dmesh_session_decode(frame, 24 + c->payload_len, &h, &payload);
         assert((rc == 0) == c->valid);
         if (rc == 0) {
             assert(h.type == c->type && h.flow_id == c->flow_id);
             assert(h.generation == c->generation && h.status == c->status);
             assert(h.payload_len == c->payload_len);
-            if (h.payload_len) assert(*payload == body);
+            if (h.payload_len) assert(*payload == body[0]);
         }
     }
 }
@@ -150,9 +159,9 @@ static void test_frame_limits(void)
     frame[0] ^= 1;
     assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
     frame[0] ^= 1;
-    frame[4] = 2;
-    assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
     frame[4] = 1;
+    assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
+    frame[4] = 2;
     dmesh_session_put_u32(frame + 8, DMESH_SESSION_MAX_PAYLOAD + 1);
     assert(dmesh_session_decode(frame, sizeof(frame), &h, &payload) == -1);
     dmesh_session_put_u32(frame + 8, UINT32_MAX);

@@ -27,6 +27,11 @@ int dmesh_native_close(struct dmesh_native_transport *);
 /* submit borrows the registered TX range until a custody ACK, including FIN. */
 int dmesh_native_submit(struct dmesh_native_transport *, const sw_descriptor_t *);
 /* A stripe has one consumer at a time; the core provides per-stripe exclusion. */
+/* Advance the channel's shared control PE once before scanning its stripes.
+ * Errors are retained and delivered by each affected flow's poll. */
+/* Returns a snapshot of stripes needing drain, including closed flows whose
+ * custody/FIN events still need retirement. New flows appear on the next pass. */
+uint32_t dmesh_native_progress(struct dmesh_native_transport *);
 int dmesh_native_poll(struct dmesh_native_transport *, int stripe, struct dmesh_native_event *);
 void dmesh_native_release(struct dmesh_native_transport *, int byte_offset);
 /* Doorbell of a stripe: an fd readable while the stripe has signalled work, or

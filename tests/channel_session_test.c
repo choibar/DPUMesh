@@ -10,6 +10,7 @@
 static struct dmesh_comch_client *mock_control;
 static unsigned client_creates, client_destroys, ring_allocs, ring_frees;
 static unsigned opens, closes;
+static unsigned shared_progress_calls;
 static int next_close_status;
 static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
@@ -61,6 +62,13 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
     case DMESH_SESSION_HELLO:
         reply(DMESH_SESSION_HELLO_ACK, 0, 0, 0);
         break;
+    case DMESH_SESSION_LISTEN:
+        assert(h.flow_id == 0 && h.payload_len == 8);
+        reply(DMESH_SESSION_LISTEN_ACK, 0, 1, 0);
+        break;
+    case DMESH_SESSION_BACKEND_REJECT:
+        assert(h.status == ENOSPC && h.generation == 10);
+        break;
     case DMESH_SESSION_OPEN:
         assert(h.payload_len == sizeof(struct dmesh_export_metadata_msg));
         ++opens;
@@ -85,6 +93,7 @@ uint8_t doca_pe_progress(struct doca_pe *pe)
 {
     if (pe == (struct doca_pe *)&fake_reverse_pe) return 0;
     assert(pe == (struct doca_pe *)mock_control);
+    ++shared_progress_calls;
     if (!pending_len) return 0;
     size_t len = pending_len;
     pending_len = 0;
@@ -274,12 +283,34 @@ static void test_checked_close(void)
     assert(ring_allocs == ring_frees);
 }
 
+static void test_backend_requests(struct channel_dev *dev)
+{
+    unsigned before = opens;
+    assert(channel_session_listen(dev, 0x0100510a, 8080) == 0);
+    assert(opens == before); /* listener registration must not preallocate flows */
+    uint8_t frame[DMESH_SESSION_HEADER_SIZE + 4], payload[4];
+    dmesh_session_put_u32(payload, 3);
+    size_t n = dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_BACKEND_REQUEST,
+        0, 10, 0, payload, 4);
+    session_message(dev, frame, n);
+    session_message(dev, frame, n);
+    uint32_t worker, token;
+    assert(channel_backend_next(dev, &worker, &token) == 1 && worker == 3 && token == 10);
+    assert(channel_backend_next(dev, &worker, &token) == 0);
+    channel_backend_finish(dev, 3, 10, ENOSPC);
+    assert(dev->backend_rejections == 1);
+    assert(channel_dev_progress(dev) == 0 && dev->backend_rejections == 0);
+    session_message(dev, frame, n);
+    assert(channel_backend_next(dev, &worker, &token) == 0); /* replay cannot allocate again */
+}
+
 int main(void)
 {
     struct channel_dev dev = {0};
     pthread_mutex_init(&dev.session_lock, NULL);
     assert(channel_session_open(&dev, "unit-session") == 0);
     assert(client_creates == 1 && dev.hello_ready);
+    test_backend_requests(&dev);
     struct dmesh_comch_client *control = dev.control;
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
     struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW * 3), .bytes = CHANNEL_WINDOW * 3};
@@ -310,8 +341,11 @@ int main(void)
 
     /* A failed session is observed independently by every flow's poller. */
     control->peer_gone = 1;
-    assert(channel_conn_progress(again) == -1 && errno == ECONNRESET);
-    assert(channel_conn_progress(b) == -1 && errno == ECONNRESET);
+    unsigned progress_before = shared_progress_calls;
+    assert(channel_dev_progress(&dev) == -1 && errno == ECONNRESET);
+    assert(channel_conn_poll(again) == -1 && errno == ECONNRESET);
+    assert(channel_conn_poll(b) == -1 && errno == ECONNRESET);
+    assert(shared_progress_calls == progress_before + 1);
     control->peer_gone = 0; dev.session_error = 0; /* Test-only reset. */
 
     /* A failed close retains the flow and its ring, without closing siblings. */

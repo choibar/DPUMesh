@@ -140,6 +140,7 @@ static void test_pool_ownership_is_per_flow(void)
     pool.size = 2;
     pool.threads[0].thread = (void *)&thread_storage[0];
     pool.threads[1].thread = (void *)&thread_storage[1];
+    pool.threads[0].started = pool.threads[1].started = true;
     assert(dmesh_dpa_thread_pool_alloc(objs, NULL) == NULL);
 
     struct dmesh_doca_dpa_thread *ta = dmesh_dpa_thread_pool_alloc(objs, a);

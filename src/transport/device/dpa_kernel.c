@@ -138,6 +138,10 @@ static void handle_msgs(struct dpa_thread_arg *thread_arg)
 /* The standalone throughput microbenchmark batches doorbells; native ring
  * copies flush every submission to make bounded shutdown possible. */
 #define DMA_FLUSH_BATCH 32
+/* Bound every activation, including idle and credit-starved polling. The SDK
+ * watchdog forbids indefinitely scheduled kernels. Retrigger retains this
+ * flow's thread/EU ownership model; it does not multiplex other rings. */
+#define DMA_POLL_ACTIVATION_BUDGET 65536u
 
 /* Every native copy is flushed when submitted, so stopping never needs an
  * extra receive credit merely to flush previously queued DMA operations. */
@@ -166,8 +170,7 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
     uint32_t ring_mask = ring_size - 1;
     uint32_t buf_size = thread_arg->buf_size;
     uint64_t submitted = thread_arg->dma_submitted;
-
-    DOCA_DPA_DEV_LOG_INFO("Polling descriptor ring with size %u, buf_size: %u\n", ring_size, buf_size);
+    uint32_t budget = DMA_POLL_ACTIVATION_BUDGET;
     
     buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
@@ -175,8 +178,6 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
 
     consumer_head = ctrl->consumer_head;
     last_published_head = consumer_head;
-    DOCA_DPA_DEV_LOG_INFO("DPA ring init: producer_tail=%lu, consumer_head=%lu\n",
-                          ctrl->producer_tail, consumer_head);
 
     /* polling descriptor ring in host memory */
     while (1) {
@@ -187,6 +188,8 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
             stop_desc_ring(thread_arg, submitted);
             return;
         }
+        if (--budget == 0)
+            goto checkpoint;
 
         buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
         dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
@@ -260,6 +263,8 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
                     stop_desc_ring(thread_arg, submitted);
                     return;
                 }
+                if (--budget == 0)
+                    goto checkpoint;
             }
 
             msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
@@ -293,6 +298,8 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
             }
 
             consumer_head += batch_cnt;
+            if (--budget == 0)
+                goto checkpoint;
         }
 
         if (consumer_head - last_published_head >= CONSUMER_HEAD_PUBLISH_BATCH) {
@@ -302,73 +309,14 @@ static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
         }
     }
 
-    // while (consumer_head < ctrl->producer_tail) {
-    //     desc_idx = (consumer_head & ring_mask) + 1;
-    //     buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, desc_idx);
-    //     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    //     desc = (struct dma_desc *)dev_ptr;
-    //     DOCA_DPA_DEV_LOG_INFO("Read DMA desc: idx=%lu, addr=0x%lx, size=%lu\n", desc->idx, desc->addr, desc->size);
-        
-    //     consumer_head++;
-    // }
+checkpoint:
+    /* Never replay descriptors after retrigger, and keep the cumulative copy
+     * count used by the CPU teardown fence across all activations. This also
+     * covers yielding while waiting for credit: that descriptor was not sent. */
+    ctrl->consumer_head = consumer_head;
+    thread_arg->dma_submitted = submitted;
+    __dpa_thread_window_writeback();
 
-    // while (1) {
-    //     __dpa_thread_window_read_inv();
-    //     producer_tail = ctrl->producer_tail;
-    //     while (consumer_head == producer_tail) {
-    //         if (consumer_head != last_published_head) {
-    //             ctrl->consumer_head = consumer_head;
-    //             __dpa_thread_window_writeback();
-    //             last_published_head = consumer_head;
-    //         }
-    //         __dpa_thread_window_read_inv();
-    //         producer_tail = ctrl->producer_tail;
-    //     }
-
-    //     buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, (consumer_head & ring_mask) + 1);
-    //     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    //     __dpa_thread_window_read_inv();
-    //     desc = (struct dma_desc *)dev_ptr;
-
-    //     /* if consumer is empty, wait */
-    //     while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
-    //     }
-
-    //     // DOCA_DPA_DEV_LOG_INFO("Read DMA desc: idx=%lu, addr=0x%lx, size=%lu\n", desc->idx, desc->addr, desc->size);
-    //     msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-    //     msg.pos = thread_arg->pos;
-    //     msg.length = desc->size;
-
-    //     doca_dpa_dev_comch_producer_dma_copy(producer,
-    //                                 /*consumer_id=*/1,
-    //                                 thread_arg->dpu_mmap,
-    //                                 thread_arg->src_addr + thread_arg->pos,
-    //                                 thread_arg->host_mmap,
-    //                                 desc->addr,
-    //                                 desc->size,
-    //                                 (uint8_t *)&msg,
-    //                                 sizeof(struct comch_dma_comp_msg),
-    //                                 DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS | 
-    //                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-
-    //     thread_arg->pos += desc->size;
-    //     if (thread_arg->pos >= buf_size) {
-    //         thread_arg->pos = 0;
-    //     }
-
-    //     consumer_head++;
-    //     if (consumer_head - last_published_head >= CONSUMER_HEAD_PUBLISH_BATCH) {
-    //         ctrl->consumer_head = consumer_head;
-    //         __dpa_thread_window_writeback();
-    //         last_published_head = consumer_head;
-    //     }
-
-    //     if (consumer_head - last_logged_head >= DMA_RING_LOG_INTERVAL) {
-    //         // DOCA_DPA_DEV_LOG_INFO("DPA ring consume: producer_tail=%lu, consumer_head=%lu\n",
-    //         //                       producer_tail, consumer_head);
-    //         last_logged_head = consumer_head;
-    //     }
-    // }
 }
 
 /*
@@ -510,50 +458,65 @@ static const unsigned char hpack_block_steady[11] = {
 #define DSB_NI(i)  (dsb_ni_steady_data + dsb_ni_steady_off[i]), \
                    (int)(dsb_ni_steady_off[(i) + 1] - dsb_ni_steady_off[(i)])
 
+/* Program globals are shared by every worker using the same DPA context.
+ * Keep benchmark state in each thread's heap allocation, off its small stack. */
+union hpack_bench_scratch {
+    struct { struct hw_state st; struct hw_out out; } walk;
+    struct {
+        struct ht_table dec, enc;
+        struct ht_field fields[HT_MAX_FIELDS];
+        unsigned char blk[512];
+    } term;
+};
+_Static_assert(sizeof(union hpack_bench_scratch) <= DMESH_DPA_BENCH_SCRATCH_SIZE,
+               "increase per-thread HPACK scratch allocation");
+
 /* bench_mode 3: selective walk over the DSB gRPC blocks (256-block cycle,
  * churning dynamic table). Old h2load blocks kept for reference. */
 static void run_hpack_walk_bench(struct dpa_thread_arg *a)
 {
-    static struct hw_state st;      /* static: DPA stack is tiny */
-    static struct hw_out out;
+    union hpack_bench_scratch *scratch = (void *)a->bench_scratch;
+    if (!scratch) return;
+    struct hw_state *st = &scratch->walk.st;
+    struct hw_out *out = &scratch->walk.out;
     uint32_t n = a->bench_num_ops;
     uint64_t t0, t1, c0, c1;
     uint32_t i;
     int rc;
     volatile unsigned int sink = 0;
 
-    hw_init(&st);
-    rc = hw_walk(dsb_first, sizeof(dsb_first), &st, &out, 0);
+    hw_init(st);
+    rc = hw_walk(dsb_first, sizeof(dsb_first), st, out, 0);
     DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH dsb first rc=%d have=%x plen=%u\n",
-                          rc, out.have, out.plen);
+                          rc, out->have, out->plen);
 
     t0 = __dpa_thread_time();
     c0 = __dpa_thread_cycles();
     for (i = 0; i < n; i++) {
         if (i % DSB_STEADY_N == 0) {   /* connection replay boundary */
-            hw_init(&st);
-            hw_walk(dsb_first, sizeof(dsb_first), &st, &out, 0);
+            hw_init(st);
+            hw_walk(dsb_first, sizeof(dsb_first), st, out, 0);
         }
-        rc = hw_walk(DSB_BLK(i % DSB_STEADY_N), &st, &out, 0);
+        rc = hw_walk(DSB_BLK(i % DSB_STEADY_N), st, out, 0);
         if (rc) { DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH walk FAIL i=%u\n", i); return; }
-        sink += out.plen;
+        sink += out->plen;
     }
     c1 = __dpa_thread_cycles();
     t1 = __dpa_thread_time();
     DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH dsb SELECTIVE ops=%u cycles=%lu us=%lu have=%x sink=%u\n",
-                          n, c1 - c0, t1 - t0, out.have, sink);
+                          n, c1 - c0, t1 - t0, out->have, sink);
 
     /* NI variant: trace-id without indexing */
     t0 = __dpa_thread_time();
     c0 = __dpa_thread_cycles();
     for (i = 0; i < n; i++) {
         if (i % DSB_STEADY_N == 0) {
-            hw_init(&st);
-            hw_walk(dsb_ni_first, sizeof(dsb_ni_first), &st, &out, 0);
+            hw_init(st);
+            hw_walk(dsb_ni_first, sizeof(dsb_ni_first), st, out, 0);
         }
-        rc = hw_walk(DSB_NI(i % DSB_STEADY_N), &st, &out, 0);
+        rc = hw_walk(DSB_NI(i % DSB_STEADY_N), st, out, 0);
         if (rc) { DOCA_DPA_DEV_LOG_INFO("HPACK_BENCH NI walk FAIL i=%u\n", i); return; }
-        sink += out.plen;
+        sink += out->plen;
     }
     c1 = __dpa_thread_cycles();
     t1 = __dpa_thread_time();
@@ -565,19 +528,21 @@ static void run_hpack_walk_bench(struct dpa_thread_arg *a)
  * bench_mode 5: decode + re-encode (termination baseline). */
 static void run_hpack_term_bench(struct dpa_thread_arg *a, int reencode)
 {
-    static struct ht_table dec, enc;
-    static struct ht_field fields[HT_MAX_FIELDS];
-    static unsigned char blk[512];
+    union hpack_bench_scratch *scratch = (void *)a->bench_scratch;
+    if (!scratch) return;
+    struct ht_table *dec = &scratch->term.dec, *enc = &scratch->term.enc;
+    struct ht_field *fields = scratch->term.fields;
+    unsigned char *blk = scratch->term.blk;
     uint32_t n = a->bench_num_ops;
     uint64_t t0, t1, c0, c1;
     uint32_t i;
     int rc, nf = 0, el = 0;
     volatile int sink = 0;
 
-    ht_init(&dec); ht_init(&enc);
-    rc = ht_decode(dsb_first, sizeof(dsb_first), &dec, fields, &nf);
+    ht_init(dec); ht_init(enc);
+    rc = ht_decode(dsb_first, sizeof(dsb_first), dec, fields, &nf);
     if (reencode)
-        el = ht_encode(fields, nf, &enc, blk, sizeof(blk));
+        el = ht_encode(fields, nf, enc, blk, sizeof(scratch->term.blk));
     DOCA_DPA_DEV_LOG_INFO("HPACK_TERM first rc=%d nf=%d el=%d mode=%d\n",
                           rc, nf, el, reencode);
 
@@ -585,15 +550,15 @@ static void run_hpack_term_bench(struct dpa_thread_arg *a, int reencode)
     c0 = __dpa_thread_cycles();
     for (i = 0; i < n; i++) {
         if (i % DSB_STEADY_N == 0) {   /* connection replay boundary */
-            ht_init(&dec); ht_init(&enc);
-            ht_decode(dsb_first, sizeof(dsb_first), &dec, fields, &nf);
+            ht_init(dec); ht_init(enc);
+            ht_decode(dsb_first, sizeof(dsb_first), dec, fields, &nf);
             if (reencode)
-                ht_encode(fields, nf, &enc, blk, sizeof(blk));
+                ht_encode(fields, nf, enc, blk, sizeof(scratch->term.blk));
         }
-        rc = ht_decode(DSB_BLK(i % DSB_STEADY_N), &dec, fields, &nf);
+        rc = ht_decode(DSB_BLK(i % DSB_STEADY_N), dec, fields, &nf);
         if (rc) { DOCA_DPA_DEV_LOG_INFO("HPACK_TERM decode FAIL i=%u\n", i); return; }
         if (reencode) {
-            el = ht_encode(fields, nf, &enc, blk, sizeof(blk));
+            el = ht_encode(fields, nf, enc, blk, sizeof(scratch->term.blk));
             if (el <= 0) { DOCA_DPA_DEV_LOG_INFO("HPACK_TERM encode FAIL i=%u\n", i); return; }
             sink += el;
         } else {
@@ -611,15 +576,15 @@ static void run_hpack_term_bench(struct dpa_thread_arg *a, int reencode)
     c0 = __dpa_thread_cycles();
     for (i = 0; i < n; i++) {
         if (i % DSB_STEADY_N == 0) {
-            ht_init(&dec); ht_init(&enc);
-            ht_decode(dsb_ni_first, sizeof(dsb_ni_first), &dec, fields, &nf);
+            ht_init(dec); ht_init(enc);
+            ht_decode(dsb_ni_first, sizeof(dsb_ni_first), dec, fields, &nf);
             if (reencode)
-                ht_encode(fields, nf, &enc, blk, sizeof(blk));
+                ht_encode(fields, nf, enc, blk, sizeof(scratch->term.blk));
         }
-        rc = ht_decode(DSB_NI(i % DSB_STEADY_N), &dec, fields, &nf);
+        rc = ht_decode(DSB_NI(i % DSB_STEADY_N), dec, fields, &nf);
         if (rc) { DOCA_DPA_DEV_LOG_INFO("HPACK_TERM NI decode FAIL i=%u\n", i); return; }
         if (reencode) {
-            el = ht_encode(fields, nf, &enc, blk, sizeof(blk));
+            el = ht_encode(fields, nf, enc, blk, sizeof(scratch->term.blk));
             if (el <= 0) { DOCA_DPA_DEV_LOG_INFO("HPACK_TERM NI encode FAIL i=%u\n", i); return; }
             sink += el;
         } else sink += nf;
@@ -639,9 +604,6 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
 
     struct dpa_thread_arg *thread_arg = (struct dpa_thread_arg *)arg;
 
-    DOCA_DPA_DEV_LOG_INFO("Starting DMA manager thread...\n");
-    DOCA_DPA_DEV_LOG_INFO("DPA buffer array handle: 0x%lx, size: %u\n", thread_arg->dpa_buf_arr, thread_arg->buf_arr_size);
-    DOCA_DPA_DEV_LOG_INFO("DPU mmap: %u, addr: %p host mmap: %u\n", thread_arg->dpu_mmap, thread_arg->src_addr, thread_arg->host_mmap);
 
     if (thread_arg->bench_mode != 0) {
         if (thread_arg->bench_mode == 3)
@@ -663,9 +625,11 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
 
     poll_desc_ring(thread_arg);
 
-    /* poll_desc_ring only returns when the host requested a stop. Do NOT
-     * reschedule in that case: let this activation end so the thread becomes
-     * idle and stoppable. Otherwise keep the thread armed. */
-    if (!thread_arg->stop)
-        doca_dpa_dev_thread_reschedule();
+    /* A descriptor-ring writer does not signal a completion, so ordinary
+     * reschedule could sleep forever after an idle activation. Retrigger
+     * requests immediate execution and resets the bounded activation. */
+    if (thread_arg->stop)
+        stop_desc_ring(thread_arg, thread_arg->dma_submitted);
+    else
+        doca_dpa_dev_thread_retrigger();
 }

@@ -13,6 +13,7 @@
 #include "comch_common.h"
 #include "comch_client.h"
 #include "dpa.h"
+#include "dispatcher.h"
 
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
@@ -51,6 +52,7 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 /* A Comch peer is a channel, independently of its logical data flows. */
 struct dmesh_session {
+    uint64_t epoch;
     struct doca_comch_connection *connection;
     bool occupied, negotiated, hello_pending, closing;
     unsigned sends_pending;
@@ -58,6 +60,16 @@ struct dmesh_session {
     uint32_t generation[DMESH_MAX_CONNECTIONS];
     int32_t close_status[DMESH_MAX_CONNECTIONS];
     bool closed[DMESH_MAX_CONNECTIONS], close_pending[DMESH_MAX_CONNECTIONS];
+    /* Dispatcher-owned listener and one outstanding/active backend per worker.
+     * A request remains reserved until its physical flow retires. */
+    uint32_t listen_ip;
+    uint16_t listen_port;
+    bool listen_pending;
+    int listen_status;
+    struct {
+        uint32_t token;
+        bool sent;
+    } backend[DMESH_SESSION_MAX_WORKERS];
 };
 
 /* Per-connection init state, advanced by dmesh_doca_ctrl_advance() */
@@ -89,6 +101,8 @@ struct dma_pending_copy {
  * struct objects; everything a second connection would clash on lives here. */
 struct dmesh_conn {
     struct objects *objs;                     /* back pointer to shared state */
+    struct dmesh_flow_key key;
+    struct dmesh_flow_location location;
     struct doca_comch_connection *connection;
     enum dmesh_conn_state state;
     struct dmesh_session *session;
@@ -193,6 +207,9 @@ struct dmesh_doca_objects {
 };
 
 struct objects {
+    /* Exactly one is non-NULL: control endpoint or data worker. */
+    struct dmesh_dispatcher *dispatcher;
+    struct dmesh_worker_mailbox *mailbox;
     struct dmesh_comch_client legacy_client; /* compatibility adapter, not used by native channels */
     int worker_idx;                 /* index of the owning worker thread */
     struct doca_dev *dev;
@@ -240,6 +257,7 @@ struct objects {
 
     struct doca_buf_arr *buf_arr;
 
+    doca_error_t (*release_dpa)(struct objects *); /* optional checked worker cleanup */
     struct dmesh_dpa_thread_pool *dpa_pool;   /* pre-created DPA threads */
     struct dmesh_doca_dpa_thread *dpa_thread; /* thread assigned to the active connection */
 	struct dmesh_doca_dpa_comch *dpa_comch;
@@ -302,7 +320,7 @@ struct objects {
     struct dmesh_session sessions[DMESH_MAX_SESSIONS];
 };
 
-void
+doca_error_t
 cleanup_objects(struct objects *objs);
 
 /* Bind a new host connection to a free slot; returns NULL if all in use
