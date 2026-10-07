@@ -49,6 +49,9 @@ struct dmesh_doca_dpa_thread {
 struct dmesh_dpa_thread_pool {
     struct doca_dpa *dpa;                          /* shared DPA instance */
     int size;                                      /* number of usable slots */
+    unsigned int index;                            /* which pool (see dpa_pool_index) */
+    unsigned int eu_width;                         /* EUs in this pool's range */
+    bool eu_shared_warned;                         /* more streams than EUs, logged */
     struct dmesh_doca_dpa_thread threads[DPA_THREAD_POOL_SIZE];
     struct dmesh_conn *owner[DPA_THREAD_POOL_SIZE]; /* NULL = free */
 };

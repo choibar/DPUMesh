@@ -60,24 +60,30 @@ Choose a free range when another DPA process shares the device; fixed affinity
 does not reserve EUs. The Boutique bench profile uses 64 on the test node.
 
 A proxy with several DPU workers (`DMESH_NUM_WORKERS`) builds one pool per
-worker, and by default every pool starts at the base, so connections of
-different workers share EUs; two streams on one EU stall for seconds. Three
-variables give each pool its own range; left unset, every pool keeps the old
-placement:
+worker. Pool k belongs to the worker whose Comch server is `DPUMesh<k>` (a
+name without a numeric suffix falls back to creation order). Every stream
+holds one pool thread, and DPA threads are not preempted: two busy streams on
+one EU starve each other, from a few hundred milliseconds to as long as the
+other stays busy. By default every pool starts at the base and spans the whole
+device, so different workers' streams share EUs. Three variables give each
+pool its own range; every thread of a pool stays inside that range:
 
-- `DPUMESH_DPA_EU_STRIDE`: pool k (in creation order) starts `k * stride`
-  EUs after the base.
+- `DPUMESH_DPA_EU_STRIDE`: pool k uses the `stride` EUs from `k * stride`
+  after the base.
 - `DPUMESH_DPA_EU_END`: first EU no pool may use (default: every EU the device
-  reports). Thread placement wraps at this end. Set it when the device takes
-  DPA threads only below some EU (190 on the BF-3 test node, although it
-  reports 254).
-- `DPUMESH_DPA_EU_OFFSETS`: `o0,o1,...`, the start of pool k from the base,
-  overriding the stride for the pools listed; a worker with many connections
-  can get a wider range. Size the ranges so each covers its worker's streams.
+  reports). Set it when the device takes DPA threads only below some EU (190
+  on the BF-3 test node, although it reports 254).
+- `DPUMESH_DPA_EU_OFFSETS`: `o0,o1,...`, increasing, the start of pool k from
+  the base; pool k ends where pool k+1 starts, the last listed pool at the
+  end. Pools past the list use the stride. Gives a worker with many
+  connections a wider range than the rest.
 
-A value out of range fails the pool with `DOCA_ERROR_INVALID_VALUE`. The
-Online Boutique benchmark (microservices-demo `mesh-bench`) runs 10 workers
-with `END=190` and `OFFSETS=0,25,45,65,84,103,120,138,155,173`.
+A pool whose streams outnumber its EUs reuses its own EUs and logs `more
+streams than its N EUs` once; size the ranges so each covers its worker's
+peak stream count. The log line `Assigned DPA pool thread i (EU e)` shows
+where each stream runs. A value out of range fails the pool with
+`DOCA_ERROR_INVALID_VALUE`. The Online Boutique benchmark (microservices-demo
+`mesh-bench`) runs 14 workers with `END=190` and a stride of 13.
 
 ### Readiness: no background thread
 
