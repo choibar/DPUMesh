@@ -284,33 +284,64 @@ dmesh_dpa_thread_pool_init(struct objects *objs)
             return DOCA_ERROR_INVALID_VALUE;
         eu_end = (unsigned int)value;
     }
+    /* Pool k is the worker whose comch server is DPUMesh<k>; a name without a
+     * suffix falls back to creation order (a single-worker process). */
     static unsigned int pools_created;
-    unsigned int pool_index = __atomic_fetch_add(&pools_created, 1, __ATOMIC_RELAXED);
-    unsigned int offset = stride * pool_index;
-    /* DPUMESH_DPA_EU_OFFSETS: "o0,o1,...", the offset of pool k from the base;
-     * pools past the list use the stride. Lets a worker with many connections
-     * get a wider range than the rest. */
+    unsigned int pool_index = objs->dpa_pool_index >= 0
+        ? (unsigned int)objs->dpa_pool_index
+        : __atomic_fetch_add(&pools_created, 1, __ATOMIC_RELAXED);
+    unsigned int span = eu_end - eu_base;
+    /* The pool's range is [offset, offset + width) from the base. With no
+     * stride every pool spans the whole device (the old placement). */
+    unsigned int offset = 0, width = span;
+    if (stride > 0) {
+        offset = stride * pool_index;
+        width = stride;
+    }
+    /* DPUMESH_DPA_EU_OFFSETS: "o0,o1,...", increasing, the start of pool k
+     * from the base; pool k ends where pool k+1 starts (the last one at the
+     * end). Pools past the list use the stride. Lets a worker with many
+     * connections get a wider range than the rest. */
     const char *offsets_env = getenv("DPUMESH_DPA_EU_OFFSETS");
     if (offsets_env != NULL && *offsets_env != '\0') {
         const char *p = offsets_env;
+        unsigned long prev = 0;
         for (unsigned int k = 0; *p != '\0'; k++) {
             char *end;
             unsigned long value = strtoul(p, &end, 10);
-            if (end == p || (*end != ',' && *end != '\0') || value >= eu_end - eu_base)
+            if (end == p || (*end != ',' && *end != '\0') || value >= span || (k > 0 && value <= prev))
                 return DOCA_ERROR_INVALID_VALUE;
             if (k == pool_index) {
                 offset = (unsigned int)value;
+                width = span - offset;
+            } else if (k == pool_index + 1) {
+                width = (unsigned int)value - offset;
                 break;
             }
+            prev = value;
             p = *end == ',' ? end + 1 : end;
         }
     }
-    DOCA_LOG_INFO("DPA cooperative pool: %u available EUs, base %u, end %u, offset %u, %u data/helper pairs",
-                  eus, eu_base, eu_end, offset, DPA_THREAD_POOL_SIZE);
+    if (offset >= span) {
+        DOCA_LOG_ERR("DPA pool %u starts at EU offset %u, past the %u EUs from base %u to end %u",
+                     pool_index, offset, span, eu_base, eu_end);
+        return DOCA_ERROR_INVALID_VALUE;
+    }
+    if (width > span - offset)
+        width = span - offset;
+    pool->index = pool_index;
+    pool->eu_width = width;
+    pool->eu_shared_warned = false;
+    DOCA_LOG_INFO("DPA cooperative pool: pool %u, %u available EUs, base %u, end %u, offset %u, width %u, %u data/helper pairs",
+                  pool_index, eus, eu_base, eu_end, offset, width, DPA_THREAD_POOL_SIZE);
+    /* Every thread stays inside the pool's range: a thread past the width
+     * shares an EU with an earlier thread of the same pool rather than with
+     * another worker's. DPA threads are not preempted, so two busy streams on
+     * one EU starve each other; size the ranges for each worker's streams. */
     for (i = 0; i < DPA_THREAD_POOL_SIZE; i++) {
         pool->threads[i].dpa = pool->dpa;
         pool->threads[i].cooperative_yield = true;
-        pool->threads[i].eu_id = eu_base + (offset + (unsigned int)i) % (eu_end - eu_base);
+        pool->threads[i].eu_id = eu_base + offset + (unsigned int)i % width;
         result = dmesh_doca_dpa_thread_create(&pool->threads[i]);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to create DPA pool thread %d: %s", i, doca_error_get_name(result));
@@ -351,7 +382,13 @@ dmesh_dpa_thread_pool_alloc(struct objects *objs, struct dmesh_conn *conn)
                 }
             }
             pool->owner[i] = conn;
-            DOCA_LOG_INFO("Assigned DPA pool thread %d to connection %p", i, (void *)conn);
+            DOCA_LOG_INFO("Assigned DPA pool thread %d (EU %u) to connection %p", i,
+                          pool->threads[i].eu_id, (void *)conn);
+            if ((unsigned int)i >= pool->eu_width && !pool->eu_shared_warned) {
+                DOCA_LOG_WARN("DPA pool %u: more streams than its %u EUs; streams now share EUs and may stall",
+                              pool->index, pool->eu_width);
+                pool->eu_shared_warned = true;
+            }
             return &pool->threads[i];
         }
     }

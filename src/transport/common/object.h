@@ -214,6 +214,10 @@ struct dmesh_doca_objects {
 struct objects {
     struct dmesh_comch_client legacy_client; /* compatibility adapter, not used by native channels */
     int worker_idx;                 /* index of the owning worker thread */
+    /* DPA pool of this worker: the decimal suffix of its comch server name
+     * (DPUMesh<k> -> k), or -1 when the name has none. Picks the pool's EU
+     * range in dmesh_dpa_thread_pool_init. */
+    int dpa_pool_index;
     struct doca_dev *dev;
     struct doca_dev_rep *rep_dev;
     struct doca_pe *pe;
