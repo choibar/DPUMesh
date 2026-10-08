@@ -13,7 +13,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / 'src/transport/device/dpa_kernel.c').read_text()
-region = source[source.index('static void stop_desc_ring('):source.index('__dpa_global__ void run_dma_manager')]
+region = source[source.index('static void stop_desc_ring('):]
 prefix = r'''
 #include <assert.h>
 #include <stdint.h>
@@ -31,6 +31,13 @@ typedef uint64_t doca_dpa_dev_t;
 static struct dma_ring_ctrl ring;
 static struct dma_desc descriptors[256];
 static unsigned copies, credit_limit, finished, ready, read_cq, acked, arms;
+static struct dpa_thread_ctx *tls;
+static unsigned tls_reads, retriggers, reschedules;
+static uint64_t selected_device;
+static uint64_t doca_dpa_dev_thread_get_local_storage(void) { ++tls_reads;return (uintptr_t)tls; }
+static void doca_dpa_dev_device_set(uint64_t dev) { selected_device=dev; }
+static void doca_dpa_dev_thread_retrigger(void) { ++retriggers; }
+static void doca_dpa_dev_thread_reschedule(void) { ++reschedules; }
 static unsigned char src[256][8064], dst[1024*1024];
 static struct { uint64_t src, dst; uint32_t len, type; } pending[1024];
 static void __dpa_thread_window_writeback(void) {}
@@ -63,11 +70,11 @@ static void complete_to(unsigned n) {
   ++ready;
  }
 }
-static struct dpa_thread_arg reset(unsigned size) {
+static struct dpa_thread_ctx reset(unsigned size) {
  memset(&ring,0,sizeof(ring));memset(descriptors,0,sizeof(descriptors));
  memset(pending,0,sizeof(pending));memset(dst,0,sizeof(dst));
  copies=finished=ready=read_cq=acked=arms=0;credit_limit=1024;
- return (struct dpa_thread_arg){.dpa_buf_arr=1,.buf_arr_size=size,
+ return (struct dpa_thread_ctx){.dpa_buf_arr=1,.buf_arr_size=size,
  .buf_size=sizeof(dst),.src_addr=(uintptr_t)dst};
 }
 static void descriptor(unsigned seq,unsigned ring_size,unsigned len) {
@@ -81,7 +88,7 @@ prefix = prefix.replace('#define DMA_POLL_ACTIVATION_BUDGET 65536u',
 tests = r'''
 int main(void) {
  assert(sizeof(struct dma_ring_ctrl)==64);
- struct dpa_thread_arg a=reset(4);
+ struct dpa_thread_ctx a=reset(4);
  poll_desc_ring(&a);assert(!finished && !copies);
  for(unsigned i=0;i<4;i++)descriptor(i,4,16);
  ring.producer_tail=4;credit_limit=2;
@@ -141,7 +148,22 @@ int main(void) {
  a=reset(4);descriptor(0,4,16);descriptors[0].size=8193;ring.producer_tail=1;
  poll_desc_ring(&a);assert(!copies && ring.error && a.stopped && !ring.consumer_head);
 
- puts("DPA: delayed completion, source lifetime, pipeline bound, credit starvation, wrap, stop, errors PASS");
+ /* Exercise the actual no-argument entry through TLS, including a retrigger
+  * with a DMA still pending and switching to another thread's local state. */
+ a=reset(4);a.dpa_dev=11;tls=&a;
+ descriptor(0,4,16);ring.producer_tail=1;
+ run_dma_manager();run_dma_manager();
+ assert(tls_reads==2 && retriggers==2 && copies==1 && a.submit_head==1);
+ assert(selected_device==11 && ring.consumer_head==0);
+ complete_to(1);a.stop=1;run_dma_manager();
+ assert(a.stopped && finished==1 && retriggers==2 && ring.consumer_head==1);
+ struct dpa_thread_ctx other=reset(4);other.dpa_dev=22;tls=&other;
+ run_dma_manager();
+ assert(selected_device==22 && !other.stopped && other.submit_head==0);
+ assert(a.stopped && a.submit_head==1 && retriggers==3);
+ other.dpa_buf_arr=0;run_dma_manager();assert(reschedules==1 && retriggers==3);
+ tls=NULL;run_dma_manager();assert(finished==1 && retriggers==3);
+ puts("DPA: delayed completion, source lifetime, pipeline bound, credit starvation, wrap, stop, errors and TLS entry PASS");
 }
 '''
 flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'doca-common'], text=True))

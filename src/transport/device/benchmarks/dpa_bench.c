@@ -290,10 +290,14 @@ static void run_hpack_term_bench(struct dpa_bench_state *a, int reencode)
 }
 
 /* A separate entry keeps benchmark selection out of the native kernel. */
-__dpa_global__ void run_dpa_benchmark(uint64_t thread_arg)
+__dpa_global__ void run_dpa_benchmark(void)
 {
-    struct dpa_bench_state *arg = (void *)thread_arg;
-
+    struct dpa_bench_state *arg = (void *)doca_dpa_dev_thread_get_local_storage();
+    if (arg == NULL) {
+        DOCA_DPA_DEV_LOG_ERR("Benchmark thread has no local storage\n");
+        doca_dpa_dev_thread_finish();
+        return;
+    }
     if (arg->dma.dpa_dev != 0)
         doca_dpa_dev_device_set((doca_dpa_dev_t)arg->dma.dpa_dev);
     if (arg->mode != 0) {

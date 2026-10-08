@@ -31,7 +31,7 @@ struct dmesh_doca_dpa_thread {
     bool stop_sent, submitted_known;
     uint64_t submitted;             /* DMA copies the kernel issued before it stopped */
     uint64_t quiesce_deadline_ns;   /* CLOCK_MONOTONIC; the handshake fails after it */
-    doca_dpa_dev_uintptr_t arg; /* owned DPA argument allocation */
+    doca_dpa_dev_uintptr_t local_storage; /* owned DPA TLS allocation */
     doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */
     uint32_t bench_mode;           /* CPU launch selection; 0 = native kernel */
 	doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
@@ -147,7 +147,7 @@ dmesh_doca_dpa_msgq_create(const struct dmesh_doca_dpa_msgq_create_attr *attr,
 doca_error_t
 dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread);
 
-/* Explicit benchmark entry/argument allocation; native create stays native. */
+/* Explicit benchmark entry/TLS allocation; native create stays native. */
 doca_error_t
 dmesh_doca_dpa_bench_thread_create(struct dmesh_doca_dpa_thread *thread, uint32_t mode);
 

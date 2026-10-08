@@ -5,7 +5,7 @@
 #include "dpaintrin.h"
 #include "dpa_common.h"
 
-_Static_assert(sizeof(struct dpa_thread_arg) == 96, "native DPA argument layout");
+_Static_assert(sizeof(struct dpa_thread_ctx) == 96, "native DPA argument layout");
 
 /* dpa_dev: extended DPA context handle whose device the consumer belongs to
  * (0 = base context); an RPC runs outside the thread, so it must switch too. */
@@ -26,7 +26,7 @@ __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uin
 
 /* Every native copy is flushed when submitted, so stopping never needs an
  * extra receive credit merely to flush previously queued DMA operations. */
-static void stop_desc_ring(struct dpa_thread_arg *arg, uint64_t submitted)
+static void stop_desc_ring(struct dpa_thread_ctx *arg, uint64_t submitted)
 {
     arg->dma_submitted = submitted;
     __dpa_thread_window_writeback();
@@ -35,7 +35,7 @@ static void stop_desc_ring(struct dpa_thread_arg *arg, uint64_t submitted)
     doca_dpa_dev_thread_finish();
 }
 
-static void poll_desc_ring(struct dpa_thread_arg *a)
+static void poll_desc_ring(struct dpa_thread_ctx *a)
 {
     const uint32_t ring_size = a->buf_arr_size;
     const uint32_t ring_mask = ring_size - 1;
@@ -135,10 +135,14 @@ static void poll_desc_ring(struct dpa_thread_arg *a)
     __dpa_thread_window_writeback();
 }
 
-__dpa_global__ void run_dma_manager(uint64_t thread_arg)
+__dpa_global__ void run_dma_manager(void)
 {
-    struct dpa_thread_arg *state = (void *)thread_arg;
-
+    struct dpa_thread_ctx *state = (void *)doca_dpa_dev_thread_get_local_storage();
+    if (state == NULL) {
+        DOCA_DPA_DEV_LOG_ERR("DMA thread has no local storage\n");
+        doca_dpa_dev_thread_finish();
+        return;
+    }
     /* Extended context: select its device before accessing communication objects. */
     if (state->dpa_dev != 0)
         doca_dpa_dev_device_set((doca_dpa_dev_t)state->dpa_dev);
@@ -153,7 +157,7 @@ __dpa_global__ void run_dma_manager(uint64_t thread_arg)
 
     /* A descriptor-ring writer does not signal a completion, so ordinary
      * reschedule could sleep forever after an idle activation. Retrigger
-     * requests immediate execution; argument retains this thread's progress. */
+     * requests immediate execution; TLS retains this thread's progress. */
     if (!state->stopped)
         doca_dpa_dev_thread_retrigger();
 }

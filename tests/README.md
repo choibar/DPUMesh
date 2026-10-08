@@ -13,12 +13,12 @@
 | `service_resolve_test` | Service target grammar, DNS answer caching and invalidation, address ids, fail-closed `DPUMESH_TARGETS` membership |
 | `topology_test` | Topology header |
 | `session_protocol_test` | Versioned Comch envelopes, malformed frames, unaligned input and flow identities |
-| `session_flow_test` | Shared-session flow lookup, generation checks, independent DPA pool ownership, disconnect fan-out |
+| `session_flow_test` | Shared-session flow lookup, generation checks, independent DPA pool ownership, disconnect fan-out, native/benchmark TLS allocation and failed TLS setup ownership |
 | `channel_session_test` | Production host session code with mock Comch: one client for multiple flows, stale replies, isolated close/errors, failed-close retention and session failure |
 | `session_server_test` | Production DPU session progress: HELLO timeout, distinct OPEN metadata, stale requests, close failure/retry, reader detachment, no-teardown and quarantine |
 | `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression, TX completion cursors and descriptor-publication failure |
 | `dpa_cleanup_test` | DPA issued/completed close fence, kernel error retention, MsgQ/context/thread cleanup failures and retryable ownership |
-| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, credit starvation, wrap and consume/resume, shutdown, errors across retriggers |
+| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, credit starvation, wrap and consume/resume, shutdown, errors and TLS across retriggers |
 
 The session tests do not open a device. They exercise production control and cleanup code with mock SDK objects.
 Real DMA completion, hardware context teardown and sibling traffic during close

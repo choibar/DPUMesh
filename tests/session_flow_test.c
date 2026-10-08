@@ -5,16 +5,127 @@
 
 #include "src/transport/common/object.h"
 #include "src/transport/common/dpa.h"
+#include "src/transport/common/dpa_bench.h"
 
-/* The pool tests use already-created thread handles and never enter device
- * creation. This otherwise-unused kernel symbol lets the production dpa.c
- * allocator link without compiling a DPA program or requiring a device. */
+/* Kernel host stubs and fake SDK creation; no device is opened or run. */
 void run_dma_manager(void)
 {
     abort();
 }
+void run_dpa_benchmark(void)
+{
+    abort();
+}
 
-void run_dpa_benchmark(void) { abort(); }
+static struct {
+    bool enabled;
+    size_t allocated;
+    doca_dpa_func_t *func;
+    doca_dpa_dev_uintptr_t local_storage;
+    doca_error_t tls_error, destroy_error;
+    unsigned starts, frees;
+    bool destroyed;
+    struct dpa_bench_state storage;
+} creation;
+
+doca_error_t doca_dpa_mem_alloc(struct doca_dpa *dpa, size_t size, doca_dpa_dev_uintptr_t *ptr)
+{
+    assert(creation.enabled && dpa == (void *)&creation);
+    assert(size <= sizeof(creation.storage));
+    creation.allocated = size;
+    creation.local_storage = 0;
+    creation.func = NULL;
+    creation.starts = creation.frees = 0;
+    creation.destroyed = false;
+    *ptr = (uintptr_t)&creation.storage;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_dpa_thread_create(struct doca_dpa *dpa, struct doca_dpa_thread **thread)
+{
+    assert(creation.enabled && dpa == (void *)&creation);
+    *thread = (void *)&creation;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_dpa_thread_set_func_arg(struct doca_dpa_thread *thread,
+                                       doca_dpa_func_t *func, uint64_t arg)
+{
+    assert(creation.enabled && thread == (void *)&creation);
+    assert(arg == 0); /* Kernel state must never travel as an input argument. */
+    creation.func = func;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_dpa_thread_set_local_storage(struct doca_dpa_thread *thread,
+                                             doca_dpa_dev_uintptr_t ptr)
+{
+    assert(creation.enabled && thread == (void *)&creation && creation.func);
+    assert(!creation.starts && ptr == (uintptr_t)&creation.storage);
+    if (creation.tls_error) return creation.tls_error;
+    creation.local_storage = ptr;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_dpa_thread_start(struct doca_dpa_thread *thread)
+{
+    assert(creation.enabled && thread == (void *)&creation && creation.func);
+    assert(creation.local_storage == (uintptr_t)&creation.storage);
+    ++creation.starts;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_dpa_thread_destroy(struct doca_dpa_thread *thread)
+{
+    assert(creation.enabled && thread == (void *)&creation);
+    if (creation.destroy_error) return creation.destroy_error;
+    creation.destroyed = true;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_dpa_mem_free(struct doca_dpa *dpa, doca_dpa_dev_uintptr_t ptr)
+{
+    assert(creation.enabled && dpa == (void *)&creation);
+    assert(creation.destroyed && ptr == (uintptr_t)&creation.storage);
+    ++creation.frees;
+    return DOCA_SUCCESS;
+}
+
+static void test_native_and_benchmark_arguments(void)
+{
+    creation.enabled = true;
+    /* A host reverse-DMA thread must stay native even in a benchmark process. */
+    assert(setenv("DMESH_DPA_BENCH_MODE", "5", 1) == 0);
+    struct dmesh_doca_dpa_thread native = {.dpa = (void *)&creation};
+    assert(dmesh_doca_dpa_thread_create(&native) == DOCA_SUCCESS);
+    assert(native.started && !native.bench_mode);
+    assert(creation.allocated == sizeof(struct dpa_thread_ctx));
+    assert(creation.func == run_dma_manager);
+    assert(dmesh_doca_dpa_bench_thread_create(&native, 1) == DOCA_ERROR_BAD_STATE);
+    assert(creation.allocated == sizeof(struct dpa_thread_ctx));
+    for (uint32_t mode = 1; mode <= 5; ++mode) {
+        struct dmesh_doca_dpa_thread bench = {.dpa = (void *)&creation};
+        assert(dmesh_doca_dpa_bench_thread_create(&bench, mode) == DOCA_SUCCESS);
+        assert(bench.started && bench.bench_mode == mode);
+        assert(creation.allocated == sizeof(struct dpa_bench_state));
+        assert(creation.func == run_dpa_benchmark);
+    }
+    struct dmesh_doca_dpa_thread invalid = {.dpa = (void *)&creation};
+    assert(dmesh_doca_dpa_bench_thread_create(&invalid, 0) == DOCA_ERROR_INVALID_VALUE);
+    assert(dmesh_doca_dpa_bench_thread_create(&invalid, 6) == DOCA_ERROR_INVALID_VALUE);
+    assert(!invalid.local_storage && !invalid.thread);
+
+    /* TLS setup failure must not start a thread or lose its allocation.
+     * Even then, a failed thread destruction must retain that allocation. */
+    struct dmesh_doca_dpa_thread failed = {.dpa = (void *)&creation};
+    creation.tls_error = DOCA_ERROR_DRIVER;
+    assert(dmesh_doca_dpa_thread_create(&failed) == DOCA_ERROR_DRIVER);
+    assert(failed.local_storage && failed.thread && !failed.started);
+    assert(!creation.starts && !creation.frees);
+    creation.destroy_error = DOCA_ERROR_DRIVER;
+    assert(dmesh_doca_dpa_thread_destroy_checked(&failed) == DOCA_ERROR_DRIVER);
+    assert(failed.local_storage && failed.thread && !creation.frees);
+    creation.destroy_error = DOCA_SUCCESS;
+    assert(dmesh_doca_dpa_thread_destroy_checked(&failed) == DOCA_SUCCESS);
+    assert(!failed.local_storage && !failed.thread && creation.frees == 1);
+    creation.tls_error = DOCA_SUCCESS;
+    assert(unsetenv("DMESH_DPA_BENCH_MODE") == 0);
+    creation.enabled = false;
+}
 
 static void test_flow_identity(void)
 {
@@ -178,6 +289,7 @@ int main(void)
     test_flow_table_capacity();
     test_session_disconnect_fanout();
     test_pool_ownership_is_per_flow();
+    test_native_and_benchmark_arguments();
     puts("session_flow_test: PASS");
     return 0;
 }

@@ -59,7 +59,7 @@ setup_reverse_dpa(struct objects *objs)
 {
     doca_error_t result;
     struct dmesh_conn *conn;
-    struct dpa_thread_arg arg = {0};
+    struct dpa_thread_ctx arg = {0};
     doca_dpa_dev_completion_t dpa_producer_comp;
     doca_dpa_dev_comch_producer_t dpa_producer;
     doca_dpa_dev_comch_consumer_t dpa_consumer;
@@ -175,7 +175,7 @@ setup_reverse_dpa(struct objects *objs)
         return result;
     }
 
-    arg = (struct dpa_thread_arg) {
+    arg = (struct dpa_thread_ctx) {
         .dpa_producer_comp = dpa_producer_comp,
         .dpa_producer = dpa_producer,
         .dpa_buf_arr = dpa_buf_arr,
@@ -192,7 +192,7 @@ setup_reverse_dpa(struct objects *objs)
         DOCA_LOG_ERR("reverse: init RPC failed: %s", doca_error_get_descr(result));
         return result;
     }
-    result = doca_dpa_h2d_memcpy(conn->dpa_thread->dpa, conn->dpa_thread->arg, &arg, sizeof(arg));
+    result = doca_dpa_h2d_memcpy(conn->dpa_thread->dpa, conn->dpa_thread->local_storage, &arg, sizeof(arg));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("reverse: failed to copy thread arg: %s", doca_error_get_descr(result));
         return result;
@@ -1126,7 +1126,7 @@ run_host_dpa_bench(const struct global_config *gcfg)
             return;
         }
 
-        result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg, &arg, sizeof(arg));
+        result = doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->local_storage, &arg, sizeof(arg));
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("host bench: failed to copy thread arg %u: %s", i, doca_error_get_descr(result));
             return;

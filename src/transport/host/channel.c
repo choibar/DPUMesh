@@ -851,7 +851,7 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 {
 	struct channel_dev *dev = conn->dev;
 	struct dmesh_dpa_endpoint *rc = conn->reverse;
-	struct dpa_thread_arg arg;
+	struct dpa_thread_ctx arg;
 	doca_dpa_dev_completion_t producer_comp;
 	doca_dpa_dev_comch_producer_t producer;
 	doca_dpa_dev_comch_consumer_t consumer;
@@ -882,7 +882,7 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 
 	/* destination: this connection's window data area, same layout as push */
 	dst = (uint8_t *)cfg->rx->buf + cfg->rx_offset + CHANNEL_DATA_OFF;
-	arg = (struct dpa_thread_arg) {
+	arg = (struct dpa_thread_ctx) {
 		.dpa_producer_comp = producer_comp,
 		.dpa_producer = producer,
 		.dpa_buf_arr = buf_arr,
@@ -899,7 +899,7 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 	result = doca_dpa_rpc(rc->dpa_thread->dpa, thread_init_rpc, &rpc_ret, consumer,
 			      (uint32_t)CC_DPA_MAX_MSG_NUM, arg.dpa_dev);
 	if (result == DOCA_SUCCESS)
-		result = doca_dpa_h2d_memcpy(rc->dpa_thread->dpa, rc->dpa_thread->arg, &arg, sizeof(arg));
+		result = doca_dpa_h2d_memcpy(rc->dpa_thread->dpa, rc->dpa_thread->local_storage, &arg, sizeof(arg));
 	if (result == DOCA_SUCCESS) {
 		/* A failed run can be ambiguous: cleanup must establish quiescence. */
 		rc->dpa_thread->running = true;
@@ -1324,7 +1324,7 @@ static void host_dpa_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64
 	conn->rd_published_bytes = bytes;
 	conn->rd_published_seq = seq;
 	(void)doca_dpa_h2d_memcpy(conn->reverse->dpa_thread->dpa,
-				  conn->reverse->dpa_thread->arg + offsetof(struct dpa_thread_arg, rd_pos),
+				  conn->reverse->dpa_thread->local_storage + offsetof(struct dpa_thread_ctx, rd_pos),
 				  &conn->rd_pos, sizeof(conn->rd_pos));
 }
 

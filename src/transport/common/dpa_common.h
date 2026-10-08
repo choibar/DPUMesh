@@ -10,9 +10,9 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* Below both the producer SQ and completion CQ capacities (512). */
 #define DMESH_DPA_MAX_INFLIGHT 128u
 
-/* Native DMA per-thread state shared by CPU setup/teardown and the DPA.
+/* Native DMA thread-local state shared by CPU setup/teardown and the DPA.
  * Fixed-width fields are naturally aligned on both processors. */
-struct dpa_thread_arg {
+struct dpa_thread_ctx {
     /* Comch handles and descriptor source. */
     uint64_t dpa_producer_comp;
     uint64_t dpa_producer;

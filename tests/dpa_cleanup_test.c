@@ -32,7 +32,7 @@ struct fake_recv {
 struct fixture {
     struct objects objs;
     struct dmesh_doca_dpa_thread thread;
-    struct dpa_thread_arg args;
+    struct dpa_thread_ctx args;
     struct fake_resource resources[RESOURCE_COUNT];
     struct fake_recv recv;
     enum operation fail;
@@ -83,7 +83,7 @@ doca_error_t doca_dpa_h2d_memcpy(struct doca_dpa *dpa, doca_dpa_dev_uintptr_t ds
                                 void *src, size_t size)
 {
     assert(dpa == (void *)f);
-    assert(dst == f->thread.arg + offsetof(struct dpa_thread_arg, stop));
+    assert(dst == f->thread.local_storage + offsetof(struct dpa_thread_ctx, stop));
     assert(size == sizeof(uint32_t) && *(uint32_t *)src == 1);
     ++f->stop_writes;
     if (fails(OP_WRITE_STOP, NULL)) return DOCA_ERROR_DRIVER;
@@ -99,11 +99,11 @@ doca_error_t doca_dpa_d2h_memcpy(struct doca_dpa *dpa, void *dst,
                                 doca_dpa_dev_uintptr_t src, size_t size)
 {
     assert(dpa == (void *)f);
-    enum operation op = src == f->thread.arg + offsetof(struct dpa_thread_arg, stopped)
+    enum operation op = src == f->thread.local_storage + offsetof(struct dpa_thread_ctx, stopped)
                       ? OP_READ_STOPPED : OP_READ_COUNT;
     if (op == OP_READ_COUNT)
-        assert(src == f->thread.arg + offsetof(struct dpa_thread_arg, dma_submitted) ||
-               src == f->thread.arg + offsetof(struct dpa_thread_arg, dma_error));
+        assert(src == f->thread.local_storage + offsetof(struct dpa_thread_ctx, dma_submitted) ||
+               src == f->thread.local_storage + offsetof(struct dpa_thread_ctx, dma_error));
     ++f->reads;
     if (fails(op, NULL)) return DOCA_ERROR_DRIVER;
     memcpy(dst, (const void *)(uintptr_t)src, size);
@@ -238,7 +238,7 @@ static void create_fixture(void)
     f->objs.consumer_pe = (void *)&f->objs;
     f->thread.dpa = (void *)f;
     f->thread.thread = (void *)&f->thread;
-    f->thread.arg = (uintptr_t)&f->args;
+    f->thread.local_storage = (uintptr_t)&f->args;
     f->thread.running = true;
     f->args.stopped = 1;
     f->recv.message = (struct comch_dma_comp_msg){.type = COMCH_MSG_TYPE_DMA_COMPLETED,
@@ -294,7 +294,7 @@ static void test_quiesce_requires_copy_completion(void)
     conn()->dpa_comch->dma_completed = 1;
     assert(dmesh_doca_dpa_quiesce_checked(conn()) == DOCA_ERROR_TIME_OUT);
     assert(!f->thread.quiesced && f->args.stop == 1);
-    assert(f->thread.thread && f->thread.arg && conn()->dpa_comch);
+    assert(f->thread.thread && f->thread.local_storage && conn()->dpa_comch);
     assert(f->thread_destroy_calls == 0 && f->task_frees == 0);
     f->deliveries = 1;
     assert(dmesh_doca_dpa_quiesce_checked(conn()) == DOCA_SUCCESS);
@@ -313,7 +313,7 @@ static void test_quiesce_faults(void)
         create_fixture();
         f->fail = errors[i];
         assert(dmesh_doca_dpa_quiesce_checked(conn()) == DOCA_ERROR_DRIVER);
-        assert(!f->thread.quiesced && f->thread.thread && f->thread.arg);
+        assert(!f->thread.quiesced && f->thread.thread && f->thread.local_storage);
         f->fail = OP_NONE;
         assert(dmesh_doca_dpa_quiesce_checked(conn()) == DOCA_SUCCESS);
         release_fixture();
@@ -339,7 +339,7 @@ static void test_kernel_error_prevents_successful_cleanup(void)
     f->args.stopped = 1;
     f->args.dma_error = 1;
     assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_IO_FAILED);
-    assert(!f->thread.quiesced && f->thread.arg && f->thread.thread);
+    assert(!f->thread.quiesced && f->thread.local_storage && f->thread.thread);
     /* Test fixture only: the real error is sticky and preserves mappings. */
     f->args.dma_error = 0;
     release_fixture();
@@ -512,14 +512,14 @@ static void test_thread_destroy_retry(void)
     f->thread.quiesced = true;
     f->fail = OP_THREAD_DESTROY;
     assert(dmesh_doca_dpa_thread_destroy_checked(&f->thread) == DOCA_ERROR_DRIVER);
-    assert(f->thread.thread && f->thread.arg && f->thread.running);
+    assert(f->thread.thread && f->thread.local_storage && f->thread.running);
     f->fail = OP_ARG_FREE;
     assert(dmesh_doca_dpa_thread_destroy_checked(&f->thread) == DOCA_ERROR_DRIVER);
-    assert(!f->thread.thread && !f->thread.running && f->thread.arg);
+    assert(!f->thread.thread && !f->thread.running && f->thread.local_storage);
     unsigned destroys = f->thread_destroy_calls;
     f->fail = OP_NONE;
     assert(dmesh_doca_dpa_thread_destroy_checked(&f->thread) == DOCA_SUCCESS);
-    assert(!f->thread.arg && !f->thread.quiesced && f->arg_freed);
+    assert(!f->thread.local_storage && !f->thread.quiesced && f->arg_freed);
     assert(f->thread_destroy_calls == destroys);
     assert(dmesh_doca_dpa_thread_destroy_checked(&f->thread) == DOCA_SUCCESS);
     release_fixture();
