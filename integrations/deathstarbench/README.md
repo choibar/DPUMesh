@@ -32,7 +32,7 @@ The Host's 32 flow slots also include outgoing connections. Topology budgets
 model all worker/replica pairs and balanced clients, and need additional review
 for skew and reconnects. No live flow migration or idle backend eviction is added.
 
-Session protocol v2 requires matching rebuilt Host and DPU binaries; the public
+Session protocol v3 requires matching rebuilt Host and DPU binaries; the public
 Host ABI remains 5. First-use setup has a bounded wait and request admission is
 bounded; connection creation is deduplicated per worker/replica. Listener
 registration currently follows service-channel initialization, and the Host

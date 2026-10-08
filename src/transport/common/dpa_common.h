@@ -7,6 +7,9 @@
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 
+/* Below both the producer SQ and completion CQ capacities (512). */
+#define DMESH_DPA_MAX_INFLIGHT 128u
+
 #define DMESH_DPA_BENCH_SCRATCH_SIZE (64u * 1024u)
 
 struct dpa_thread_arg {
@@ -55,6 +58,8 @@ struct dpa_thread_arg {
 	/* Published before stopped: number of copies requiring CPU DMA-completed
 	 * messages. Kernel exit alone does not retire producer DMA operations. */
 	volatile uint64_t dma_submitted;
+	uint64_t submit_head;
+	volatile uint32_t dma_error;
 
     uint64_t bench_scratch; /* optional per-thread HPACK scratch in DPA heap */
 
@@ -97,8 +102,10 @@ struct comch_msg {
 
 struct dma_ring_ctrl {
 	volatile uint64_t producer_tail;
-	volatile uint64_t consumer_head;
-	uint8_t reserved[48];
+	volatile uint64_t consumer_head; /* contiguous DMA-completed descriptors */
+	volatile uint64_t completed_bytes; /* source bytes safe to reuse */
+	volatile uint32_t error; /* sticky device error; never acknowledge past it */
+	uint8_t reserved[36];
 } __attribute__((aligned(64)));
 
 struct dma_desc {

@@ -58,7 +58,7 @@ On first use, the DPU requests a flow pinned to the client flow's worker; H2
 clients on that worker share it per replica. The Go server accepts one connection
 per active worker/replica pair. `DPUMESH_BACKEND_POOL` is ignored;
 `DPUMESH_BACKEND_MAX` caps backends within the channel's shared 32-flow capacity.
-Host and DPU must both use session protocol v2 (public ABI5 is unchanged).
+Host and DPU must both use session protocol v3 (public ABI5 is unchanged).
 
 Close all connections and listeners before calling `CloseTransport`. It returns
 `EBUSY` without invalidating active objects. If native channel teardown fails,
@@ -94,7 +94,7 @@ client flows (at most the current 32-flow channel limit). Client flow placement
 is round-robin to hold each worker's client flow count constant; backend flows
 remain pinned to the requesting worker.
 
-Build protocol-v2 Host libraries and `bench-client`/`bench-server` under the
+Build protocol-v3 Host libraries and `bench-client`/`bench-server` under the
 isolated `--host-root` first, and build the DPU release proxy and mock services.
 On the current 12-online-core DPU and 16-core Host, run:
 

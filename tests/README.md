@@ -13,11 +13,12 @@
 | `service_resolve_test` | Service target grammar, DNS answer caching and invalidation, address ids, fail-closed `DPUMESH_TARGETS` membership |
 | `topology_test` | Topology header |
 | `session_protocol_test` | Versioned Comch envelopes, malformed frames, unaligned input and flow identities |
-| `session_flow_test` | Shared-session flow lookup, generation checks, independent DPA pool ownership and disconnect fan-out |
+| `session_flow_test` | Shared-session flow lookup, generation checks, independent DPA pool ownership, disconnect fan-out |
 | `channel_session_test` | Production host session code with mock Comch: one client for multiple flows, stale replies, isolated close/errors, failed-close retention and session failure |
 | `session_server_test` | Production DPU session progress: HELLO timeout, distinct OPEN metadata, stale requests, close failure/retry, reader detachment, no-teardown and quarantine |
-| `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression and retry after partial cleanup |
-| `dpa_cleanup_test` | DPA issued/completed close fence, MsgQ/context/thread cleanup failures and retryable ownership |
+| `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression, TX completion cursors and descriptor-publication failure |
+| `dpa_cleanup_test` | DPA issued/completed close fence, kernel error retention, MsgQ/context/thread cleanup failures and retryable ownership |
+| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, credit starvation, wrap and consume/resume, shutdown, errors across retriggers |
 
 The session tests do not open a device. They exercise production control and cleanup code with mock SDK objects.
 Real DMA completion, hardware context teardown and sibling traffic during close
@@ -25,6 +26,11 @@ were verified on matching host/DPU/proxy builds in both reverse modes on
 2026-09-25. See the [hardware validation report](../docs/2026-09-25_channel-comch-grpc-validation.md)
 for the actual topology, lifecycle assertions and limits of that run. The Comch envelope changes the private wire protocol,
 so host and DPU must be rebuilt together even though the public ABI remains 5.
+Session protocol v3 additionally requires completion-fenced TX reclamation:
+Host forward-ring `consumer_head` advances only on producer CQ completion;
+the proxy's reverse TX source is held until `completed_bytes` (host-DPA) or
+`pushed_bytes` (DPU-DMA) advances. The historical hardware report predates v3
+and does not validate this completion protocol on devices.
 
 `support/native_memory_transport.c` is a deterministic loopback carrier for the
 core: it implements the private carrier contract in memory, can hold custody
@@ -33,16 +39,16 @@ ACKs and is never linked into the library. The device-backed carrier
 
 ## Proxy reader fence
 
-After `ninja -C src/transport/build`, run `cargo check -p dmesh-doca --offline`
-from `linkerd2-proxy`. The 12 library tests (including three reader-fence tests)
-pass with the installed DOCA 3.5 SDK. Its existing Rust link order requires
-repeating these shared libraries after the transport archives:
+After `ninja -C src/transport/build`, run the DOCA library tests from
+`linkerd2-proxy` with the installed DOCA SDK:
 
 ```sh
 cd linkerd2-proxy
-RUSTFLAGS='-C link-arg=-L/opt/mellanox/doca/lib/aarch64-linux-gnu -C link-arg=-L/opt/mellanox/flexio/lib -C link-arg=-ldoca_common -C link-arg=-ldoca_dpa -C link-arg=-lflexio' cargo test -p dmesh-doca --offline
+RUSTFLAGS='--cfg tokio_unstable' cargo test -p dmesh-doca --offline --locked --lib
 ```
 
-This is a test invocation workaround; the proxy build configuration is unchanged.
 The tests verify that C receives the reader-detachment acknowledgement only
 after Rust IO can no longer access staging, including acknowledgement retry.
+They also verify that publication does not free TX space, partial completions
+release only their own prefix across wrap, FIN waits for completion, and a
+detached handle cannot release a replacement flow's staging.

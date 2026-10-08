@@ -74,8 +74,8 @@ static int dmesh_drain_tx_upto_locked(dmesh_qp_t *, int, uint64_t);
  * timer sleeps until the earliest deadline in the context, clamped to the wait
  * range below. */
 #define TX_TAIL_DELAY_NS        500000ull
-/* Close publishes FIN only after every submitted unit has left DPU proxy
- * custody, bounded by this deadline. */
+/* Close publishes FIN only after every submitted unit's DMA has completed,
+ * bounded by this deadline. */
 #define TX_CLOSE_DRAIN_DEADLINE_NS 5000000000ull
 #define TX_CLOSE_DRAIN_MIN_WAIT_NS       1000L
 #define TX_CLOSE_DRAIN_MAX_WAIT_NS      50000L
@@ -2732,7 +2732,7 @@ static int dmesh_tx_inflight_locked(const struct dmesh_port_slot *psl) {
     return head != tail;
 }
 
-/* Wait until every previously submitted unit has left DPU proxy custody before
+/* Wait until every previously submitted unit has completed its DMA copy before
  * publishing FIN. tx_reclaim_ack() only advances su_tail across the contiguous
  * completed prefix, so an empty FIFO is the exact data-before-FIN fence. The
  * ACKs are polled here, since no other thread drains for a sleeping caller.
@@ -3036,9 +3036,8 @@ static int dmesh_release_qp(dmesh_qp_t *c, int graceful) {
      * unsent committed bytes unless its flush failed; a live, un-posted reservation
      * is never application data owned by the transport and is discarded either way. */
     dpumesh_tx_discard_unsent(ctx, c->local_port);
-    /* A data ACK releases DPU proxy custody rather than reporting a DMA copy, so
-     * an empty submitted FIFO is the stream-order fence that keeps the
-     * zero-copy FIN behind the payload. */
+    /* A data ACK proves DMA no longer reads its source. Drain that prefix
+     * before FIN; this does not imply the proxy/application consumed the data. */
     if (!reset && dmesh_wait_tx_reclaimed_locked(ctx, psl) != 0) {
         reset = 1;
         if (close_result == 0) {

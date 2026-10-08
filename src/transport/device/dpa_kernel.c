@@ -154,169 +154,104 @@ static void stop_desc_ring(struct dpa_thread_arg *arg, uint64_t submitted)
     doca_dpa_dev_thread_finish();
 }
 
-static void poll_desc_ring(struct dpa_thread_arg *thread_arg)
+static void poll_desc_ring(struct dpa_thread_arg *a)
 {
-    doca_dpa_dev_comch_producer_t producer = thread_arg->dpa_producer;
-    struct comch_dma_comp_msg msg = {0};
-    doca_dpa_dev_uintptr_t dev_ptr;
-    doca_dpa_dev_buf_t buf;
-    struct dma_ring_ctrl *ctrl;
-    struct dma_desc *desc;
-    uint64_t producer_tail;
-    uint64_t consumer_head;
-    uint64_t last_published_head;
-
-    uint32_t ring_size = thread_arg->buf_arr_size;
-    uint32_t ring_mask = ring_size - 1;
-    uint32_t buf_size = thread_arg->buf_size;
-    uint64_t submitted = thread_arg->dma_submitted;
+    const uint32_t ring_size = a->buf_arr_size;
+    const uint32_t ring_mask = ring_size - 1;
     uint32_t budget = DMA_POLL_ACTIVATION_BUDGET;
-    
-    buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
-    dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-    ctrl = (struct dma_ring_ctrl *)dev_ptr;
+    struct dma_ring_ctrl *ctrl = (void *)doca_dpa_dev_buf_get_external_ptr(
+        doca_dpa_dev_buf_array_get_buf(a->dpa_buf_arr, 0));
+    __dpa_thread_window_read_inv();
+    uint64_t complete = ctrl->consumer_head;
+    uint64_t bytes = ctrl->completed_bytes;
+    uint64_t submit = a->submit_head;
+    uint64_t submitted = a->dma_submitted;
 
-    consumer_head = ctrl->consumer_head;
-    last_published_head = consumer_head;
-
-    /* polling descriptor ring in host memory */
-    while (1) {
-
+    /* A completion must be requested for every copy. Re-arm on entry and
+     * after consuming a CQE; retrigger alone does not arm the completion CQ. */
+    doca_dpa_dev_completion_request_notification(a->dpa_producer_comp);
+    while (budget-- != 0) {
+        doca_dpa_dev_completion_element_t comp;
         __dpa_thread_window_read_inv();
 
-        if (thread_arg->stop) {
-            stop_desc_ring(thread_arg, submitted);
-            return;
-        }
-        if (--budget == 0)
-            goto checkpoint;
-
-        buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, 0);
-        dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-        ctrl = (struct dma_ring_ctrl *)dev_ptr;
-        consumer_head = ctrl->consumer_head;
-        producer_tail = ctrl->producer_tail;
-
-        while (consumer_head < producer_tail) {
-            /* Staging backpressure (rd_fc): never copy into the DPU staging
-             * ring past what the reader released. Unread = (pos - rd_pos)
-             * circularly; leave room for this batch, a wrap's wasted tail and
-             * a margin (3*8064). If short, stop consuming descriptors -
-             * consumer_head stalls, the host's forward gate holds its writes,
-             * and the pressure reaches the h2 client. Re-checked next spin. */
-            if (thread_arg->rd_fc) {
-                uint32_t rdp = thread_arg->rd_pos;
-                uint32_t unread = ((uint32_t)thread_arg->pos + buf_size - rdp) % buf_size;
-
-                if (buf_size - unread < 3u * 8064u)
-                    break;
+        /* Always drain completions, including when RX credits/staging or the
+         * submission window are exhausted and while shutting down. Same-flow
+         * copies use one producer and one CQ in submission order. Descriptor
+         * slots remain owned until this successful completion prefix advances. */
+        if (doca_dpa_dev_get_completion(a->dpa_producer_comp, &comp)) {
+            int ok = doca_dpa_dev_get_completion_type(comp) == DOCA_DPA_DEV_COMP_SEND;
+            doca_dpa_dev_completion_ack(a->dpa_producer_comp, 1);
+            doca_dpa_dev_completion_request_notification(a->dpa_producer_comp);
+            if (!ok || complete == submit) {
+                a->dma_error = 1;
+                ctrl->error = 1;
+                __dpa_thread_window_writeback();
+                stop_desc_ring(a, submitted);
+                return;
             }
-            uint64_t batch_src;
-            uint32_t batch_len, batch_cnt;
-            uint32_t dst_room = buf_size - (uint32_t)thread_arg->pos;
-
-            buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr, (consumer_head & ring_mask) + 1);
-            dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-            desc = (struct dma_desc *)dev_ptr;
-
-            batch_src = desc->addr;
-            batch_len = (uint32_t)desc->size;
-            batch_cnt = 1;
-
-            /* Coalesce contiguous descriptors into one DMA copy: one WQE, one
-             * doorbell and one completion message then cover the whole batch,
-             * amortizing the fixed per-operation cost. The host writes
-             * messages back-to-back in sndbuf, so descriptors are contiguous
-             * except at the buffer wrap; the batch also may not cross the
-             * staging-buffer wrap on the destination side. */
-            // while (batch_cnt < DMA_BATCH_MAX_DESCS &&
-            //        consumer_head + batch_cnt < producer_tail) {
-            //     buf = doca_dpa_dev_buf_array_get_buf(thread_arg->dpa_buf_arr,
-            //                                          ((consumer_head + batch_cnt) & ring_mask) + 1);
-            //     dev_ptr = doca_dpa_dev_buf_get_external_ptr(buf);
-            //     desc = (struct dma_desc *)dev_ptr;
-
-            //     if (desc->addr != batch_src + batch_len)   /* source discontinuity (wrap) */
-            //         break;
-            //     if (batch_len + desc->size > dst_room)     /* staging wrap on destination */
-            //         break;
-            //     if (batch_len + desc->size > DMA_BATCH_MAX_BYTES)
-            //         break;
-            //     batch_len += (uint32_t)desc->size;
-            //     batch_cnt++;
-            // }
-
-            /* Wrap the destination cursor BEFORE a copy that would cross the
-             * buffer end, so every copy stays within [0, buf_size) and no
-             * segment straddles the wrap. A straddling segment has pos+len >
-             * buf_size, which the reader (Rust staging read / host bridge)
-             * cannot represent as one [pos,len) and skips - losing the response
-             * and stalling the stream exactly once the buffer first fills.
-             * batch_len <= 8064 << buf_size, so wrapping always leaves room. */
-            if ((uint32_t)thread_arg->pos + batch_len > buf_size)
-                thread_arg->pos = 0;
-
-            /* if consumer is empty, wait */
-            while (doca_dpa_dev_comch_producer_is_consumer_empty(producer, /*consumer_id=*/1) == 1) {
-                __dpa_thread_window_read_inv();
-                if (thread_arg->stop) {
-                    stop_desc_ring(thread_arg, submitted);
-                    return;
-                }
-                if (--budget == 0)
-                    goto checkpoint;
-            }
-
-            msg.type = COMCH_MSG_TYPE_DMA_COMPLETED;
-            msg.pos = thread_arg->pos;
-            msg.length = batch_len;
-            msg.count = batch_cnt;
-
-            /* Do not retain unflushed WQEs: when receive credits run out,
-             * a final flush marker would itself need an unavailable credit.
-             * Report coalescing is independent and remains enabled. */
-            {
-                uint64_t submit_flags = DOCA_DPA_DEV_SUBMIT_FLAG_OPTIMIZE_REPORTS |
-                                        DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH;
-
-                doca_dpa_dev_comch_producer_dma_copy(producer,
-                                            /*consumer_id=*/1,
-                                            thread_arg->dpu_mmap,
-                                            thread_arg->src_addr + thread_arg->pos,
-                                            thread_arg->host_mmap,
-                                            batch_src,
-                                            batch_len,
-                                            (uint8_t *)&msg,
-                                            sizeof(struct comch_dma_comp_msg),
-                                            submit_flags);
-                submitted++;
-            }
-
-            thread_arg->pos += batch_len;
-            if (thread_arg->pos >= buf_size) {
-                thread_arg->pos = 0;
-            }
-
-            consumer_head += batch_cnt;
-            if (--budget == 0)
-                goto checkpoint;
-        }
-
-        if (consumer_head - last_published_head >= CONSUMER_HEAD_PUBLISH_BATCH) {
-            ctrl->consumer_head = consumer_head;
+            const struct dma_desc *d = (void *)doca_dpa_dev_buf_get_external_ptr(
+                doca_dpa_dev_buf_array_get_buf(a->dpa_buf_arr, (complete & ring_mask) + 1));
+            bytes += d->size;
+            ++complete;
+            ctrl->completed_bytes = bytes;
+            ctrl->consumer_head = complete;
             __dpa_thread_window_writeback();
-            last_published_head = consumer_head;
         }
+
+        /* Stop admission immediately, but keep the kernel alive until every
+         * submitted copy has produced its CQE. CPU teardown additionally
+         * drains the matching immediate receive messages. */
+        if (a->stop || ctrl->error) {
+            if (complete == submit) {
+                a->submit_head = submit;
+                stop_desc_ring(a, submitted);
+                return;
+            }
+            continue;
+        }
+        uint64_t tail = ctrl->producer_tail;
+        if (submit == tail || submit - complete >= DMESH_DPA_MAX_INFLIGHT)
+            continue;
+        if (tail < submit || tail - complete > ring_size) {
+            ctrl->error = 2;
+            __dpa_thread_window_writeback();
+            continue;
+        }
+        if (a->rd_fc) {
+            uint32_t unread = (a->pos + a->buf_size - a->rd_pos) % a->buf_size;
+            if (a->buf_size - unread < 3u * 8064u)
+                continue;
+        }
+        const struct dma_desc *d = (void *)doca_dpa_dev_buf_get_external_ptr(
+            doca_dpa_dev_buf_array_get_buf(a->dpa_buf_arr, (submit & ring_mask) + 1));
+        if (d->size == 0 || d->size > 8064u || d->size > a->buf_size) {
+            ctrl->error = 2;
+            __dpa_thread_window_writeback();
+            continue;
+        }
+        uint32_t len = (uint32_t)d->size;
+        if (doca_dpa_dev_comch_producer_is_consumer_empty(a->dpa_producer, 1))
+            continue;
+        if (a->pos + len > a->buf_size)
+            a->pos = 0;
+        struct comch_dma_comp_msg msg = {
+            .type = COMCH_MSG_TYPE_DMA_COMPLETED, .pos = a->pos,
+            .length = len, .count = 1,
+        };
+        /* FLUSH submits work; omitting OPTIMIZE_REPORTS requests its CQE.
+         * No CPU source reuse is allowed merely because this call returned. */
+        doca_dpa_dev_comch_producer_dma_copy(a->dpa_producer, 1,
+            a->dpu_mmap, a->src_addr + a->pos, a->host_mmap, d->addr, len,
+            (uint8_t *)&msg, sizeof(msg), DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+        ++submit;
+        ++submitted;
+        a->pos += len;
+        if (a->pos == a->buf_size)
+            a->pos = 0;
     }
-
-checkpoint:
-    /* Never replay descriptors after retrigger, and keep the cumulative copy
-     * count used by the CPU teardown fence across all activations. This also
-     * covers yielding while waiting for credit: that descriptor was not sent. */
-    ctrl->consumer_head = consumer_head;
-    thread_arg->dma_submitted = submitted;
+    a->submit_head = submit;
+    a->dma_submitted = submitted;
     __dpa_thread_window_writeback();
-
 }
 
 /*
@@ -628,8 +563,6 @@ __dpa_global__ void run_dma_manager(uint64_t arg)
     /* A descriptor-ring writer does not signal a completion, so ordinary
      * reschedule could sleep forever after an idle activation. Retrigger
      * requests immediate execution and resets the bounded activation. */
-    if (thread_arg->stop)
-        stop_desc_ring(thread_arg, thread_arg->dma_submitted);
-    else
+    if (!thread_arg->stopped)
         doca_dpa_dev_thread_retrigger();
 }

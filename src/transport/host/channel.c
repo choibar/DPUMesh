@@ -1120,6 +1120,9 @@ int channel_conn_poll(struct channel_conn *conn)
 	pthread_mutex_unlock(&dev->session_lock);
 	if (conn->reverse != NULL && conn->reverse->pe != NULL)
 		(void)doca_pe_progress(conn->reverse->pe);
+	if ((conn->forward_ring && __atomic_load_n(&conn->forward_ring->ctrl->error, __ATOMIC_ACQUIRE)) ||
+	    (conn->reverse && conn->reverse->dpa_comch && conn->reverse->dpa_comch->completion_error))
+		saved = EIO;
 	if (saved) { errno = saved; return -1; }
 	return gone;
 }
@@ -1230,7 +1233,7 @@ uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t by
 
 uint64_t channel_conn_consumed(const struct channel_conn *conn)
 {
-	return conn->forward_ring->ctrl->consumer_head;
+	return __atomic_load_n(&conn->forward_ring->ctrl->consumer_head, __ATOMIC_ACQUIRE);
 }
 
 /*

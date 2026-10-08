@@ -315,7 +315,7 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
     if (s->state == SLOT_OPEN) {
         int gone = channel_conn_poll(s->conn);
         uint64_t consumed = channel_conn_consumed(s->conn);
-        if (s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {
+        if (gone >= 0 && s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {
             fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1;
         } else if (gone && !s->peer_gone_reported) {
             s->peer_gone_reported = 1;

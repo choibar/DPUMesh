@@ -129,9 +129,10 @@ doca_error_t alloc_dma_ring(struct dma_ring **out, struct doca_dev *dev, size_t 
 {
     (void)dev;
     if (fail_ring_alloc) { fail_ring_alloc = 0; return DOCA_ERROR_NO_MEMORY; }
-    struct dma_ring *ring = calloc(1, sizeof(*ring));
+    struct dma_ring *ring = calloc(1, sizeof(*ring) + sizeof(struct dma_ring_ctrl));
     assert(ring);
     ring->size = (uint32_t)size;
+    ring->ctrl = (void *)(ring + 1);
     ring->mmap = (struct doca_mmap *)ring;
     *out = ring;
     ++ring_allocs;
@@ -322,6 +323,11 @@ int main(void)
     cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW;
     assert(channel_conn_open(&dev, &cfg, &b) == 0);
     assert(client_creates == 1 && opens == 2 && a->ready && b->ready);
+
+    a->forward_ring->ctrl->error = 1;
+    assert(channel_conn_poll(a) == -1 && errno == EIO);
+    assert(channel_conn_poll(b) == 0);
+    a->forward_ring->ctrl->error = 0; /* Test-only reset. */
 
     /* A reply to a different incarnation cannot change the live flow. */
     dispatch(&dev, DMESH_SESSION_CLOSED, 1, a->generation + 1, 0);

@@ -24,6 +24,9 @@ DOCA_LOG_REGISTER(DPA);
 int dmesh_staging_fc = 0;
 
 
+_Static_assert(DMESH_DPA_MAX_INFLIGHT <= CC_DPA_MAX_MSG_NUM,
+               "DPA inflight window must fit the producer SQ and CQ");
+
 /* Kernel function declaration */
 extern doca_dpa_func_t run_dma_manager;
 extern doca_dpa_func_t thread_init_rpc;
@@ -718,7 +721,7 @@ dmesh_dpa_quiesce_step(struct dmesh_doca_dpa_thread *thread,
                        struct dmesh_doca_dpa_comch *comch, struct doca_pe *pe)
 {
     doca_error_t result;
-    uint32_t one = 1, stopped = 0;
+    uint32_t one = 1, stopped = 0, dma_error = 0;
 
     if (thread == NULL || !thread->running || thread->quiesced)
         return DOCA_SUCCESS;
@@ -744,6 +747,10 @@ dmesh_dpa_quiesce_step(struct dmesh_doca_dpa_thread *thread,
         if (stopped == 0)
             return monotonic_ns() >= thread->quiesce_deadline_ns ? DOCA_ERROR_TIME_OUT
                                                                  : DOCA_ERROR_AGAIN;
+        result = DMESH_DPA_CALL(doca_dpa_d2h_memcpy(thread->dpa, &dma_error,
+            thread->arg + offsetof(struct dpa_thread_arg, dma_error), sizeof(dma_error)));
+        if (result != DOCA_SUCCESS) return result;
+        if (dma_error) return DOCA_ERROR_IO_FAILED;
         result = DMESH_DPA_CALL(doca_dpa_d2h_memcpy(thread->dpa, &thread->submitted,
             thread->arg + offsetof(struct dpa_thread_arg, dma_submitted), sizeof(thread->submitted)));
         if (result != DOCA_SUCCESS)

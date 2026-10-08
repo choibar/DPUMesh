@@ -102,7 +102,8 @@ doca_error_t doca_dpa_d2h_memcpy(struct doca_dpa *dpa, void *dst,
     enum operation op = src == f->thread.arg + offsetof(struct dpa_thread_arg, stopped)
                       ? OP_READ_STOPPED : OP_READ_COUNT;
     if (op == OP_READ_COUNT)
-        assert(src == f->thread.arg + offsetof(struct dpa_thread_arg, dma_submitted));
+        assert(src == f->thread.arg + offsetof(struct dpa_thread_arg, dma_submitted) ||
+               src == f->thread.arg + offsetof(struct dpa_thread_arg, dma_error));
     ++f->reads;
     if (fails(op, NULL)) return DOCA_ERROR_DRIVER;
     memcpy(dst, (const void *)(uintptr_t)src, size);
@@ -332,6 +333,18 @@ static void test_quiesce_faults(void)
     release_fixture();
 }
 
+static void test_kernel_error_prevents_successful_cleanup(void)
+{
+    create_fixture();
+    f->args.stopped = 1;
+    f->args.dma_error = 1;
+    assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_IO_FAILED);
+    assert(!f->thread.quiesced && f->thread.arg && f->thread.thread);
+    /* Test fixture only: the real error is sticky and preserves mappings. */
+    f->args.dma_error = 0;
+    release_fixture();
+}
+
 static void test_quiesce_step_never_waits(void)
 {
     create_fixture();
@@ -343,10 +356,10 @@ static void test_quiesce_step_never_waits(void)
     f->args.stopped = 1;
     f->args.dma_submitted = 1;
     assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_ERROR_AGAIN);
-    assert(f->reads == 4 && !f->thread.quiesced);
+    assert(f->reads == 5 && !f->thread.quiesced);
     f->deliveries = 1;
     assert(dmesh_doca_dpa_quiesce_step(conn()) == DOCA_SUCCESS);
-    assert(f->thread.quiesced && f->stop_writes == 1 && f->reads == 4);
+    assert(f->thread.quiesced && f->stop_writes == 1 && f->reads == 5);
     release_fixture();
 
     create_fixture();
@@ -582,6 +595,7 @@ int main(void)
     test_quiesce_requires_copy_completion();
     test_quiesce_faults();
     test_quiesce_step_never_waits();
+    test_kernel_error_prevents_successful_cleanup();
     test_failed_dpa_is_not_polled();
     test_never_run_needs_no_fence();
     test_recv_counter_and_shutdown();
