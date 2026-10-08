@@ -5,7 +5,8 @@ Kestrel transport and gives Grpc.Net.Client a handler whose connections are
 DPUMesh streams. It uses the [stream C ABI](../README.md) through P/Invoke.
 
 ```csharp
-// Server: with DPUMESH_ENABLE=1, Kestrel serves DPUMESH_SERVICE over DPUMesh
+// Server: with DPUMESH_ENABLE=1, Kestrel serves DPUMESH_PORT on the Pod IP (or
+// DPUMESH_SERVICE) over DPUMesh
 // (HTTP/2) instead of its configured addresses; otherwise nothing changes.
 webBuilder.UseDpumesh();
 
