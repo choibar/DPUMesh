@@ -116,6 +116,10 @@ int channel_broker_attach(const char *path, struct channel_dev **out);
 void channel_broker_detach(struct channel_dev *dev);
 int channel_broker_session_open(struct channel_dev *dev, const char *server);
 int channel_broker_session_close(struct channel_dev *dev);
+int channel_broker_session_listen(struct channel_dev *dev, uint32_t ip, uint16_t port);
+/* Backend requests the broker published in the status page, each taken once. */
+int channel_broker_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *token);
+void channel_broker_backend_finish(struct channel_dev *dev, uint32_t worker, uint32_t token, int error);
 int channel_broker_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem **out);
 int channel_broker_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg,
 			     struct channel_conn **out);
@@ -132,6 +136,10 @@ void channel_broker_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, 
  * incarnation `dev` still holds. Returns their count, or -1 when the client
  * kept the page torn for every retry. */
 struct broker_arm_page;
+struct broker_status;
+/* Broker: takes the DPU's new backend requests from `dev` (channel_backend_next)
+ * and publishes each in `status`. Returns how many. */
+int channel_broker_backend_publish(struct channel_dev *dev, struct broker_status *status);
 int channel_broker_arm_collect(const struct broker_arm_page *page, const struct channel_dev *dev,
 			       struct dmesh_session_arm_flow *flows);
 

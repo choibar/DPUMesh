@@ -34,8 +34,9 @@ Three trees at the repo root:
   dpu-dma channel is its client when `DPUMESH_BROKER` names the socket, or when
   it is unset and `/run/dpumesh/broker.sock` exists (control over
   `host/broker_ipc.h`, data path on the memfds it hands over, idle-wake
-  ARM/DOORBELL relayed through an arm page and two eventfds; client and server
-  in `host/channel_broker.c`). Otherwise — `DPUMESH_BROKER=off`, no broker, or
+  ARM/DOORBELL relayed through an arm page and two eventfds, the DPU's backend
+  requests published in the status page; client and server in
+  `host/channel_broker.c`). Otherwise — `DPUMESH_BROKER=off`, no broker, or
   the host-dpa path — the application opens the device in-process (the direct
   path). Plan: `docs/2026-09-29_host-broker-plan.md`.
 - `linkerd2-proxy/` — a git submodule (Rust), a fork carrying a `dmesh_doca`
@@ -213,10 +214,10 @@ wrap the DOCA Comch consumer/producer used as the DPA↔host completion channel.
 - **Forward (host→proxy):** host writes request bytes into an exported staging
   buffer; the DPU's per-connection DPA thread (`device/dpa_kernel.c`, running on
   the DPA processor) polls a descriptor ring and DMAs the bytes into the proxy's
-  receive buffer, delivering a fused completion. The consumer's staging read
-  watermark (`rd_pos`, the DPA's staging gate) is a synchronous
+  receive buffer, delivering a fused completion. The consumer's RX consumed
+  position (`rx_consumed_pos`, the DPA's staging gate) is a synchronous
   `doca_dpa_h2d_memcpy` (~1.6 µs of the driver core), so `shim.c` publishes it
-  only every 64 KiB of release (`DMESH_RX_WM_BATCH`); per-tick publication
+  only every 64 KiB of release (`DMESH_RX_CONSUMED_POS_BATCH`); per-tick publication
   cost a third of the core and made DPU throughput depend on the host's post
   rhythm (`bench-results/2026-09-29_host-broker-ab.md`). `dpa.c` builds the DPA thread
   pool (`DPA_THREAD_POOL_SIZE`, one thread handed out per connection) and the

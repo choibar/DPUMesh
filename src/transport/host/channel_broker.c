@@ -40,6 +40,11 @@
  * and kicks the broker, which sends the DPU the ARM; the DOORBELL, and any
  * status the broker publishes, raise the wake eventfd the client sleeps on.
  *
+ * Backend flows: the broker takes each backend request the DPU sends after a
+ * LISTEN and publishes its token per DPU worker; the client's
+ * channel_backend_next reads the status page, and the flow it opens carries
+ * the worker and token as in-process.
+ *
  * Only dpu-dma flows are brokered; the host-dpa path, and any channel without
  * a broker configured, opens the device in the application (channel_dev_open).
  */
@@ -56,6 +61,7 @@ DOCA_LOG_REGISTER(CHANNEL_BROKER);
 
 _Static_assert(BROKER_FLOWS == sizeof(((struct channel_dev *)0)->flows) / sizeof(void *), "flow slots");
 _Static_assert(BROKER_FLOWS - 1 == DMESH_SESSION_MAX_FLOWS, "one ARM lists every flow");
+_Static_assert(BROKER_WORKERS == DMESH_SESSION_MAX_WORKERS, "backend requests per DPU worker");
 
 struct channel_broker {
 	int sock;
@@ -65,6 +71,8 @@ struct channel_broker {
 	int wake_fd, kick_fd;                           /* Idle wake eventfds (-1 before HELLO) */
 	uint64_t next_check_ns;
 	int dead;                                       /* errno once the broker connection failed */
+	uint64_t backend_seen;                          /* status->backend_requests with none left untaken */
+	uint32_t backend_taken[BROKER_WORKERS];         /* Newest token taken per DPU worker (session_lock) */
 };
 
 static int push_mode(uint32_t mode)
@@ -258,6 +266,51 @@ int channel_broker_session_close(struct channel_dev *dev)
 	return 0;
 }
 
+int channel_broker_session_listen(struct channel_dev *dev, uint32_t ip, uint16_t port)
+{
+	struct broker_request req = { .type = BROKER_LISTEN, .dst_ip = ip, .dst_port = port };
+	struct broker_reply rep;
+
+	return broker_call(dev->broker, &req, &rep, NULL, 0);
+}
+
+int channel_broker_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *token)
+{
+	struct channel_broker *b = dev->broker;
+	int found = 0;
+
+	if (b->status == NULL || broker_dead(b))
+		return 0;
+	/* Called on every progress pass: only a new publication costs a scan. */
+	uint64_t published = __atomic_load_n(&b->status->backend_requests, __ATOMIC_ACQUIRE);
+	if (published == __atomic_load_n(&b->backend_seen, __ATOMIC_RELAXED))
+		return 0;
+	pthread_mutex_lock(&dev->session_lock);
+	for (uint32_t w = 0; w < BROKER_WORKERS && !found; ++w) {
+		uint32_t t = __atomic_load_n(&b->status->backend_token[w], __ATOMIC_RELAXED);
+		if (t > b->backend_taken[w]) { /* tokens only grow per worker, as in-process */
+			b->backend_taken[w] = t;
+			*worker = w;
+			*token = t;
+			found = 1;
+		}
+	}
+	if (!found)
+		__atomic_store_n(&b->backend_seen, published, __ATOMIC_RELAXED);
+	pthread_mutex_unlock(&dev->session_lock);
+	return found;
+}
+
+void channel_broker_backend_finish(struct channel_dev *dev, uint32_t worker, uint32_t token, int error)
+{
+	struct broker_request req = { .type = BROKER_BACKEND_FINISH, .worker = worker, .token = token, .error = error };
+	struct broker_reply rep;
+
+	/* void, as in-process; a lost broker closed the session and its requests. */
+	if (broker_call(dev->broker, &req, &rep, NULL, 0) != 0)
+		DOCA_LOG_WARN("Backend request %u/%u not finished: %s", worker, token, strerror(errno));
+}
+
 int channel_broker_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem **out)
 {
 	struct broker_request req = { .type = BROKER_MEM_ALLOC, .bytes = bytes };
@@ -306,6 +359,8 @@ int channel_broker_conn_open(struct channel_dev *dev, const struct channel_conn_
 		.tx_id = cfg->tx->id,
 		.rx_id = cfg->rx->id,
 		.rx_offset = cfg->rx_offset,
+		.worker = cfg->backend_worker,
+		.token = cfg->backend_token,
 	};
 	const size_t ring_bytes = sizeof(struct dma_ring_ctrl) + CHANNEL_RING_SIZE * sizeof(struct dma_desc);
 	struct broker_reply rep;
@@ -406,6 +461,11 @@ int channel_broker_conn_progress(struct channel_conn *conn)
 
 	if (channel_broker_dev_progress(conn->dev) != 0)
 		return -1;
+	/* The DPU's DPA reports a bad descriptor in the shared ring itself. */
+	if (conn->forward_ring != NULL && __atomic_load_n(&conn->forward_ring->ctrl->error, __ATOMIC_ACQUIRE)) {
+		errno = EIO;
+		return -1;
+	}
 
 	const volatile struct broker_flow_status *f = &b->status->flow[conn->flow_id];
 	if (__atomic_load_n(&f->generation, __ATOMIC_ACQUIRE) != conn->generation)
@@ -516,15 +576,30 @@ static void raise_wake(struct broker_server *srv)
 		(void)!write(srv->wake_fd, &one, sizeof(one));
 }
 
-/* Progresses the control session once and mirrors every open flow's status
- * into the status page; a changed status wakes the client to read it. */
+int channel_broker_backend_publish(struct channel_dev *dev, struct broker_status *status)
+{
+	uint32_t worker, token;
+	int count = 0;
+
+	while (channel_backend_next(dev, &worker, &token)) {
+		__atomic_store_n(&status->backend_token[worker], token, __ATOMIC_RELAXED);
+		__atomic_store_n(&status->backend_requests, status->backend_requests + 1, __ATOMIC_RELEASE);
+		++count;
+	}
+	return count;
+}
+
+/* Progresses the control session once and mirrors every open flow's status,
+ * and the DPU's backend requests, into the status page; a change wakes the
+ * client to read it. */
 static void publish(struct broker_server *srv)
 {
 	int changed = 0;
 
 	if (srv->dev == NULL || srv->status == NULL)
 		return;
-	(void)channel_dev_progress(srv->dev); /* a session error reaches every flow's status */
+	if (channel_dev_progress(srv->dev) == 0) /* a session error reaches every flow's status */
+		changed |= channel_broker_backend_publish(srv->dev, srv->status) > 0;
 	for (uint32_t id = 1; id < BROKER_FLOWS; ++id) {
 		struct channel_conn *conn = srv->dev->flows[id];
 		if (conn == NULL)
@@ -654,6 +729,8 @@ static int serve_conn_open(struct broker_server *srv, const struct broker_reques
 	    req->rx_id >= BROKER_MEMS || srv->mems[req->tx_id] == NULL || srv->mems[req->rx_id] == NULL)
 		return EINVAL;
 	if (!push_mode(req->mode)) return ENOTSUP; /* the broker runs no host DPA yet */
+	if (req->token != 0 && (req->mode != CHANNEL_MODE_BACKEND_DPU_DMA || req->worker >= BROKER_WORKERS))
+		return EINVAL;
 	/* Identity fields are the client's claim until Pod authentication exists. */
 	struct channel_conn_config cfg = {
 		.flow_id = req->flow_id,
@@ -666,6 +743,8 @@ static int serve_conn_open(struct broker_server *srv, const struct broker_reques
 		.tx = srv->mems[req->tx_id],
 		.rx = srv->mems[req->rx_id],
 		.rx_offset = (size_t)req->rx_offset,
+		.backend_worker = req->worker,
+		.backend_token = req->token,
 	};
 	if (channel_conn_open(srv->dev, &cfg, &conn) != 0) return errno;
 	struct broker_flow_status *f = &srv->status->flow[conn->flow_id];
@@ -684,6 +763,13 @@ static int serve_conn_close(struct broker_server *srv, const struct broker_reque
 	if (req->flow_id == 0 || req->flow_id >= BROKER_FLOWS) return EINVAL;
 	if (srv->dev->flows[req->flow_id] == NULL) return ENOENT;
 	return channel_conn_close(srv->dev->flows[req->flow_id]) == 0 ? 0 : errno;
+}
+
+static int serve_backend_finish(struct broker_server *srv, const struct broker_request *req)
+{
+	if (req->worker >= BROKER_WORKERS || req->token == 0 || req->error < 0) return EINVAL;
+	channel_backend_finish(srv->dev, req->worker, req->token, req->error);
+	return 0;
 }
 
 /**
@@ -711,6 +797,10 @@ static int serve_request(struct broker_server *srv, int sock)
 		case BROKER_CONN_OPEN: status = serve_conn_open(srv, &req, &rep, fds, &nfds); break;
 		case BROKER_CONN_CLOSE: status = serve_conn_close(srv, &req); break;
 		case BROKER_SESSION_CLOSE: status = channel_session_close(srv->dev) == 0 ? 0 : errno; break;
+		case BROKER_LISTEN:
+			status = channel_session_listen(srv->dev, req.dst_ip, req.dst_port) == 0 ? 0 : errno;
+			break;
+		case BROKER_BACKEND_FINISH: status = serve_backend_finish(srv, &req); break;
 		default: status = EPROTO; break;
 		}
 	}

@@ -1,11 +1,11 @@
 # Host broker: DOCA device 소유권을 broker로 옮기기 — 2026-09-29
 
-상태: **1단계 구현 완료.** 처음 구현은 브랜치 `feature/doca-broker`(main `b607129` 기준)였고, 지금은
-`feature/grpc-all`(main + PR #7–#11) 위로 옮긴 `feature/doca-broker-grpc`에 있다. 옮기면서 direct 경로를 남겼고,
-PR #7의 idle wake를 broker를 거쳐 전달하게 했다(6절).
+상태: **1단계 구현 완료.** 처음 구현은 main `b607129` 기준이었고, 지금 `feature/doca-broker`는
+`feature/grpc-all`(main + PR #7–#11) 위에 있다. 옮기면서 direct 경로를 남겼고,
+PR #7의 idle wake를 broker를 거쳐 전달하게 했다(6절). main의 backend 요청 방식도 broker를 거쳐 따라간다(7절).
 측정: [bench-results/2026-09-29_host-broker-ab.md](../bench-results/2026-09-29_host-broker-ab.md). 처음에는 4-thread 8 KiB echo가
 −4~7%였다. perf로 추적한 원인은 DPU 쪽 동기 rd_pos 갱신이었고(5절), `shim.c`에서 이를 묶어 모든 케이스를 before와 같게 맞췄다.
-같은 수정은 grpc-all의 submodule에 이미 들어 있다(`DMESH_RX_WM_BATCH`). grpc-all 위의 측정은
+같은 수정은 grpc-all의 submodule에 이미 들어 있다(`DMESH_RX_CONSUMED_POS_BATCH`). grpc-all 위의 측정은
 [bench-results/2026-10-06_host-broker-grpc-ab.md](../bench-results/2026-10-06_host-broker-grpc-ab.md).
 
 ## 1. 목표와 범위
@@ -78,7 +78,7 @@ Pod 인증 방식은 아직 정하지 않았다. 그래서 인증·격리 계층
 
 - **Poll cadence와 DPU rd_pos:** in-process 경로는 carrier가 poll할 때마다 Comch PE를 progress했다(1 thread 66 ns, 4 thread 경합 약 560 ns). broker client는 대신 status page를 읽으므로 host의 post 리듬이 더 매끄러워진다.
   - DPU driver 코어는 tick마다 새 데이터가 있던 flow마다 `doca_dpa_h2d_memcpy`(약 1.6 µs)로 rd_pos를 동기 갱신했다. 그래서 리듬이 매끄러울수록 메시지당 비용이 늘었고, 이 비용이 코어의 28–38%를 차지했다.
-  - 수정: `shim.c`가 64 KiB를 소비할 때마다만 rd_pos를 보낸다. host의 `CHANNEL_RD_POS_BATCH`와 같은 방식이다. 수정 후에는 리듬과 무관하게 before와 같고, 4-thread echo는 14.3 → 20.4 Gbps가 됐다.
+  - 수정: `shim.c`가 64 KiB를 소비할 때마다만 rd_pos를 보낸다. host의 `CHANNEL_RX_CONSUMED_POS_BATCH`와 같은 방식이다. 수정 후에는 리듬과 무관하게 before와 같고, 4-thread echo는 14.3 → 20.4 Gbps가 됐다.
 
 - control 요청은 channel당 소켓 하나로 직렬화된다. conn open이 DPU READY를 기다리는 동안 같은 channel의 다른 close는 잠깐 기다린다.
 - conn open/close마다 IPC 왕복과 ring memfd mmap이 한 번씩 추가된다. 데이터 경로에는 추가 hop이 없다.
@@ -106,3 +106,20 @@ Pod 인증 방식은 아직 정하지 않았다. 그래서 인증·격리 계층
 - nap과 linger 구간(마지막 일 뒤 1 ms)에는 ARM을 보내지 않으므로, 연속된 트래픽에는 이 비용이 없다.
 
 **뺀 것.** `629c12c`(DPU의 연결별 watermark)는 grpc-all에 같은 수정이 있어 가져오지 않았다.
+
+## 7. main의 backend 요청 방식 따라가기 — 2026-10-08
+
+grpc-all이 main을 merge하면서(`80363ab`) backend flow를 여는 방식이 바뀌었다.
+
+- 전: 앱이 BACKEND flow 여분(`DPUMESH_BACKEND_POOL`)을 미리 열어 두었다.
+- 후: 앱은 `LISTEN`으로 서비스만 등록한다. DPU dispatcher가 `BACKEND_REQUEST(worker, token)`를 보내면 앱이 `BACKEND_OPEN`으로 flow를 열거나 `BACKEND_REJECT`로 거절한다(`channel_session_listen`, `channel_backend_next`, `channel_backend_finish`).
+
+broker를 거칠 때는 다음과 같이 전달한다(broker IPC v3).
+
+- LISTEN은 요청 하나로 보내고, broker가 DPU의 LISTEN_ACK를 기다린다.
+- broker는 PE를 progress할 때마다 새 요청을 가져가(`channel_backend_next`) status page에 DPU worker별 token으로 게시하고 wake eventfd를 올린다.
+- 앱의 `channel_backend_next`는 status page를 읽는다. 게시 횟수(`backend_requests`)가 바뀌었을 때만 훑으므로, progress마다 드는 비용은 메모리 읽기 하나다.
+- 앱이 여는 flow는 CONN_OPEN에 worker와 token을 싣는다. 결과는 BACKEND_FINISH로 알리고, broker는 그대로 `channel_backend_finish`를 불러 거절을 DPU에 보낸다.
+- main의 `channel_conn_poll`이 forward ring의 DPA error를 보게 바뀐 것에 맞춰, 앱도 공유 ring의 `ctrl->error`를 직접 확인한다.
+
+**검증.** 장비 없는 단위 테스트만 했다(`tests/channel_session_test.c`). broker 경로에서 서버 앱이 backend flow를 받는 동작과 성능은 아직 장비에서 확인하지 않았다.

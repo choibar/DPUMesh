@@ -13,10 +13,15 @@
  *   CONN_OPEN      open a flow on registered regions       -> forward ring memfd
  *   CONN_CLOSE     close a flow
  *   SESSION_CLOSE  close the Comch session
+ *   LISTEN         register the served endpoint with the DPU
+ *   BACKEND_FINISH report how a backend request ended
  *
  * No data bytes cross the socket: the application maps the memfds and runs the
  * forward ring and the push window on shared memory. Flow outcomes the DPU
- * reports asynchronously (CLOSED, errors) are published in the status page.
+ * reports asynchronously (CLOSED, errors) are published in the status page,
+ * and so are the DPU's backend requests: the broker takes each one and the
+ * application opens the backend flow with CONN_OPEN carrying its worker and
+ * token, then reports the outcome with BACKEND_FINISH.
  *
  * Idle wake runs beside the request socket, so it never waits behind a request:
  * the application writes each push flow's next unread descriptor into the arm
@@ -29,9 +34,10 @@
 #include <stdint.h>
 
 #define BROKER_IPC_MAGIC "DPMBRK01"
-#define BROKER_IPC_VERSION 2
+#define BROKER_IPC_VERSION 3
 #define BROKER_DEFAULT_SOCKET "/run/dpumesh/broker.sock"
 #define BROKER_FLOWS 33          /* flow ids 1..32, the channel's slots */
+#define BROKER_WORKERS 128       /* DPU workers that can request a backend flow */
 #define BROKER_MAX_FDS 4
 #define BROKER_NAME_LEN 64
 
@@ -50,6 +56,8 @@ enum broker_msg_type {
 	BROKER_CONN_OPEN,
 	BROKER_CONN_CLOSE,
 	BROKER_SESSION_CLOSE,
+	BROKER_LISTEN,
+	BROKER_BACKEND_FINISH,
 	BROKER_REPLY,
 };
 
@@ -61,10 +69,13 @@ struct broker_request {
 	uint32_t flow_id;             /* CONN_OPEN, CONN_CLOSE */
 	uint64_t bytes;               /* MEM_ALLOC */
 	uint32_t mode;                /* CONN_OPEN: CHANNEL_MODE_* */
-	uint32_t src_ip, dst_ip;      /* CONN_OPEN: network byte order */
-	uint16_t src_port, dst_port;  /* CONN_OPEN: host order */
+	uint32_t src_ip, dst_ip;      /* CONN_OPEN; LISTEN (dst only): network byte order */
+	uint16_t src_port, dst_port;  /* CONN_OPEN; LISTEN (dst only): host order */
 	uint32_t tx_id, rx_id;        /* CONN_OPEN: region ids from MEM_ALLOC */
 	uint64_t rx_offset;           /* CONN_OPEN: the flow's window inside rx */
+	uint32_t worker, token;       /* CONN_OPEN of a requested backend flow (token 0: none), BACKEND_FINISH */
+	int32_t error;                /* BACKEND_FINISH: 0, or why no flow was opened */
+	uint32_t reserved2;
 	char name[BROKER_NAME_LEN];   /* HELLO: Comch server; CONN_OPEN: workload label */
 };
 
@@ -80,7 +91,7 @@ struct broker_reply {
 	uint64_t base;                /* MEM_ALLOC: the broker's address of the region */
 };
 
-_Static_assert(sizeof(struct broker_request) == 120, "broker request wire ABI changed");
+_Static_assert(sizeof(struct broker_request) == 136, "broker request wire ABI changed");
 _Static_assert(sizeof(struct broker_reply) == 40, "broker reply wire ABI changed");
 
 /* Written by the broker, read by the application. An entry describes the flow
@@ -97,6 +108,10 @@ struct broker_status {
 	struct broker_flow_status flow[BROKER_FLOWS];
 	uint64_t arms_sent;           /* ARMs the broker sent the DPU */
 	uint64_t doorbells;           /* DOORBELLs the DPU answered them with */
+	/* Backend requests: the newest token the broker took for each DPU worker
+	 * (0 none), stored before `backend_requests` counts it. */
+	uint64_t backend_requests;
+	uint32_t backend_token[BROKER_WORKERS];
 };
 
 /* Written by the application, read by the broker. `seq` is a seqlock (odd

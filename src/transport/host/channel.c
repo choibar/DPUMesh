@@ -334,6 +334,7 @@ int channel_session_open(struct channel_dev *dev, const char *server)
 
 int channel_session_listen(struct channel_dev *dev, uint32_t ip, uint16_t port)
 {
+    if (dev->broker) return channel_broker_session_listen(dev, ip, port);
     uint8_t payload[8];
     dmesh_session_put_u32(payload, ip); dmesh_session_put_u32(payload + 4, port);
     pthread_mutex_lock(&dev->session_lock);
@@ -356,6 +357,7 @@ int channel_session_listen(struct channel_dev *dev, uint32_t ip, uint16_t port)
 
 int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *token)
 {
+    if (dev->broker) return channel_broker_backend_next(dev, worker, token);
     pthread_mutex_lock(&dev->session_lock);
     int found = 0;
     if (!dev->session_error && dev->backend_pending) for (unsigned w = 0; w < DMESH_SESSION_MAX_WORKERS; ++w) {
@@ -368,6 +370,7 @@ int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *to
 }
 void channel_backend_finish(struct channel_dev *dev, uint32_t worker, uint32_t token, int error)
 {
+    if (dev->broker) { channel_broker_backend_finish(dev, worker, token, error); return; }
     pthread_mutex_lock(&dev->session_lock);
     if (worker < DMESH_SESSION_MAX_WORKERS && dev->backend[worker].token == token) {
         if (dev->backend[worker].state == 4) --dev->backend_rejections;

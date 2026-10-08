@@ -398,6 +398,28 @@ static void *fake_broker_main(void *arg)
     return NULL;
 }
 
+/* Answers the LISTEN, the refused backend CONN_OPEN and the BACKEND_FINISH
+ * of a serving client. */
+static void *fake_broker_backend(void *arg)
+{
+    struct fake_broker *f = arg;
+    struct broker_request req;
+    struct broker_reply rep = {.type = BROKER_REPLY, .version = BROKER_IPC_VERSION};
+    memcpy(rep.magic, BROKER_IPC_MAGIC, sizeof(rep.magic));
+    assert(broker_ipc_recv(f->sock, &req, sizeof(req), NULL, 0) == 0 && req.type == BROKER_LISTEN);
+    assert(req.dst_ip == 0x0100510a && req.dst_port == 8080);
+    assert(broker_ipc_send(f->sock, &rep, sizeof(rep), NULL, 0) == 0);
+    assert(broker_ipc_recv(f->sock, &req, sizeof(req), NULL, 0) == 0 && req.type == BROKER_CONN_OPEN);
+    assert(req.mode == CHANNEL_MODE_BACKEND_DPU_DMA && req.worker == 5 && req.token == 7);
+    rep.status = ENOSPC;
+    assert(broker_ipc_send(f->sock, &rep, sizeof(rep), NULL, 0) == 0);
+    assert(broker_ipc_recv(f->sock, &req, sizeof(req), NULL, 0) == 0 && req.type == BROKER_BACKEND_FINISH);
+    assert(req.worker == 5 && req.token == 7 && req.error == ENOSPC);
+    rep.status = 0;
+    assert(broker_ipc_send(f->sock, &rep, sizeof(rep), NULL, 0) == 0);
+    return NULL;
+}
+
 /* Client side: the wake fd is the broker's eventfd, an ARM is the arm page
  * plus a kick, and a lost broker fails the arm so the caller keeps polling. */
 static void test_broker_client_wake(void)
@@ -453,6 +475,40 @@ static void test_broker_client_wake(void)
     uint64_t sent = 0, rung = 0;
     channel_dev_wake_counters(dev, &sent, &rung);
     assert(sent == 5 && rung == 3);
+
+    /* The DPA's error flag in the shared ring fails the flow before the broker
+     * publishes anything. */
+    struct dma_ring_ctrl ctrl = {0};
+    struct dma_ring ring = {.ctrl = &ctrl};
+    a.forward_ring = &ring;
+    assert(channel_conn_poll(&a) == 0);
+    ctrl.error = 2;
+    assert(channel_conn_poll(&a) == -1 && errno == EIO);
+    a.forward_ring = NULL;
+
+    /* Backend requests arrive in the status page, each taken once; the flow
+     * and the outcome go back over the socket with the worker and token. */
+    uint32_t worker, token;
+    assert(channel_backend_next(dev, &worker, &token) == 0);
+    f.status->backend_token[5] = 7;
+    f.status->backend_requests = 1;
+    assert(channel_backend_next(dev, &worker, &token) == 1 && worker == 5 && token == 7);
+    assert(channel_backend_next(dev, &worker, &token) == 0);
+    assert(pthread_create(&thread, NULL, fake_broker_backend, &f) == 0);
+    assert(channel_session_listen(dev, 0x0100510a, 8080) == 0);
+    struct channel_mem tx = {.shared = 1, .id = 0}, rx = {.shared = 1, .id = 1, .bytes = CHANNEL_WINDOW};
+    struct channel_conn_config cfg = {.flow_id = 2, .mode = CHANNEL_MODE_BACKEND_DPU_DMA,
+                                      .backend_worker = worker, .backend_token = token, .tx = &tx, .rx = &rx};
+    struct channel_conn *flow;
+    assert(channel_conn_open(dev, &cfg, &flow) == -1 && errno == ENOSPC);
+    channel_backend_finish(dev, worker, token, ENOSPC);
+    assert(pthread_join(thread, NULL) == 0);
+    f.status->backend_token[2] = 3;
+    f.status->backend_token[5] = 9;
+    f.status->backend_requests = 3;
+    assert(channel_backend_next(dev, &worker, &token) == 1 && worker == 2 && token == 3);
+    assert(channel_backend_next(dev, &worker, &token) == 1 && worker == 5 && token == 9);
+    assert(channel_backend_next(dev, &worker, &token) == 0);
 
     /* The liveness check runs every 20 ms (BROKER_CHECK_NS). */
     close(f.sock);
@@ -564,6 +620,25 @@ static void test_backend_requests(struct channel_dev *dev)
     assert(channel_backend_next(dev, &worker, &token) == 0); /* replay cannot allocate again */
 }
 
+/* Broker side: each backend request the DPU sends is taken once and
+ * published in the status page; a replay publishes nothing. */
+static void test_broker_backend_publish(struct channel_dev *dev)
+{
+    struct broker_status status = {0};
+    uint8_t frame[DMESH_SESSION_HEADER_SIZE + 4], payload[4];
+    dmesh_session_put_u32(payload, 4);
+    size_t n = dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_BACKEND_REQUEST,
+        0, 12, 0, payload, 4);
+    assert(channel_broker_backend_publish(dev, &status) == 0 && status.backend_requests == 0);
+    session_message(dev, frame, n);
+    assert(channel_broker_backend_publish(dev, &status) == 1);
+    assert(status.backend_requests == 1 && status.backend_token[4] == 12 && dev->backend[4].state == 2);
+    session_message(dev, frame, n);
+    assert(channel_broker_backend_publish(dev, &status) == 0 && status.backend_requests == 1);
+    channel_backend_finish(dev, 4, 12, 0);
+    assert(dev->backend[4].state == 3 && dev->backend_rejections == 0);
+}
+
 int main(void)
 {
     struct channel_dev dev = {0};
@@ -571,6 +646,7 @@ int main(void)
     assert(channel_session_open(&dev, "unit-session") == 0);
     assert(client_creates == 1 && dev.hello_ready);
     test_backend_requests(&dev);
+    test_broker_backend_publish(&dev);
     struct dmesh_comch_client *control = dev.control;
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
     struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW * 3), .bytes = CHANNEL_WINDOW * 3};
