@@ -11,7 +11,7 @@
 static void test_wire_layout(void)
 {
     static const uint8_t golden[] = {
-        0x48, 0x53, 0x4d, 0x44, 0x02, 0x00, 0x03, 0x00,
+        0x48, 0x53, 0x4d, 0x44, 0x04, 0x00, 0x03, 0x00,
         0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
         0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
         0xa5, 0x00, 0x7e,
@@ -28,7 +28,7 @@ static void test_wire_layout(void)
     assert(memcmp(frame, golden, sizeof(golden)) == 0);
     assert(storage[0] == 0xcc && storage[sizeof(storage) - 1] == 0xcc);
     assert(dmesh_session_decode(frame, sizeof(golden), &h, &payload) == 0);
-    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 2);
+    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 4);
     assert(h.type == DMESH_SESSION_OPEN && h.flow_id == 2);
     assert(h.generation == UINT32_C(0x12345678) && h.status == 0);
     assert(h.payload_len == 3 && payload == frame + 24);
@@ -53,6 +53,15 @@ struct message_case {
 static void test_message_shapes(void)
 {
     static const struct message_case cases[] = {
+        {DMESH_SESSION_LISTEN,         0, 1, 0,      8, 1},
+        {DMESH_SESSION_LISTEN,         1, 1, 0,      8, 0},
+        {DMESH_SESSION_LISTEN_ACK,     0, 1, EADDRINUSE, 0, 1},
+        {DMESH_SESSION_BACKEND_REQUEST,0, 7, 0,      4, 1},
+        {DMESH_SESSION_BACKEND_REQUEST,0, 0, 0,      4, 0},
+        {DMESH_SESSION_BACKEND_REQUEST,0, 7, 0,      8, 0},
+        {DMESH_SESSION_BACKEND_REJECT, 0, 7, ENOSPC, 4, 1},
+        {DMESH_SESSION_BACKEND_REJECT, 0, 7, 0,      4, 0},
+        {DMESH_SESSION_BACKEND_OPEN,   1, 1, 0,      8, 1},
         {DMESH_SESSION_HELLO,          0, 0, 0,      0, 1},
         {DMESH_SESSION_HELLO_ACK,      0, 0, 0,      0, 1},
         {DMESH_SESSION_HELLO_ACK,      0, 0, EPROTO, 0, 1},
@@ -165,9 +174,11 @@ static void test_frame_limits(void)
     frame[0] ^= 1;
     assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
     frame[0] ^= 1;
-    frame[4] = 1;   /* a v1 peer has no ARM/DOORBELL and must fail at HELLO */
+    frame[4] = 1;
     assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
-    frame[4] = 3;
+    frame[4] = 2; /* v2 acknowledges submission, not DMA completion. */
+    assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
+    frame[4] = 3; /* v3 has no ARM/DOORBELL and must fail at HELLO. */
     assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
     frame[4] = DMESH_SESSION_VERSION;
     dmesh_session_put_u32(frame + 8, DMESH_SESSION_MAX_PAYLOAD + 1);

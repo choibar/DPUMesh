@@ -15,6 +15,7 @@
 #include "common.h"
 #include "dpa.h"
 #include "buffer.h"
+#include "ring.h"
 
 DOCA_LOG_REGISTER(DMA);
 
@@ -673,6 +674,26 @@ dmesh_dma_pull_cursor(struct dmesh_conn *conn)
     }
 }
 
+doca_error_t dmesh_dma_tx_completed(struct dmesh_conn *conn, uint64_t *bytes)
+{
+    if (!conn || !bytes) return DOCA_ERROR_INVALID_VALUE;
+    if (conn->state != DMESH_CONN_RUNNING || dma_admission_closed(conn))
+        return DOCA_ERROR_BAD_STATE;
+    if (DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
+        /* This prefix advances only after both data and descriptor DMA. */
+        *bytes = conn->pushed_bytes;
+        return DOCA_SUCCESS;
+    }
+    if (!conn->rcv_ring) return DOCA_ERROR_BAD_STATE;
+    if (__atomic_load_n(&conn->rcv_ring->ctrl->error, __ATOMIC_ACQUIRE)) {
+        conn->state = DMESH_CONN_ERROR;
+        conn->error_status = EIO;
+        return DOCA_ERROR_IO_FAILED;
+    }
+    *bytes = __atomic_load_n(&conn->rcv_ring->ctrl->completed_bytes, __ATOMIC_ACQUIRE);
+    return DOCA_SUCCESS;
+}
+
 int
 dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
 {
@@ -797,8 +818,7 @@ dmesh_dma_push_submit_desc(struct dmesh_conn *conn)
         return;
     }
 
-    /* Accepted bytes cannot be replayed or silently dropped. Fail the flow
-     * without releasing staging custody if publication cannot be submitted. */
+    /* Batch is lost to the stream if we cannot publish it - log loudly. */
     DOCA_LOG_ERR("backend push: failed to submit desc DMA (seq=%lu): %s",
                  next_seq, doca_error_get_descr(result));
     if (dbuf != NULL)

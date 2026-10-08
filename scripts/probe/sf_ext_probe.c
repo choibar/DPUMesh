@@ -81,7 +81,8 @@ int main(int argc, char **argv)
     if (!skip_thread1) {
     STEP(doca_dpa_mem_alloc(ext, 4096, &mem));
     STEP(doca_dpa_thread_create(ext, &th));
-    if (th) STEP(doca_dpa_thread_set_func_arg(th, run_dma_manager, mem));
+    if (th) STEP(doca_dpa_thread_set_func_arg(th, run_dma_manager, 0));
+    if (th) STEP(doca_dpa_thread_set_local_storage(th, mem));
     if (th && getenv("PROBE_EU1")) {
         struct doca_dpa_eu_affinity *af = NULL;
         printf("  pinning the first SF thread to EU %s\n", getenv("PROBE_EU1"));
@@ -149,7 +150,8 @@ int main(int argc, char **argv)
         if (ext2) {
             STEP(doca_dpa_mem_alloc(ext2, 4096, &mem2));
             STEP(doca_dpa_thread_create(ext2, &th2));
-            if (th2) STEP(doca_dpa_thread_set_func_arg(th2, run_dma_manager, mem2));
+            if (th2) STEP(doca_dpa_thread_set_func_arg(th2, run_dma_manager, 0));
+            if (th2) STEP(doca_dpa_thread_set_local_storage(th2, mem2));
             if (th2 && getenv("PROBE_EU2")) {
                 struct doca_dpa_eu_affinity *af2 = NULL;
                 printf("  pinning the second SF thread to EU %s\n", getenv("PROBE_EU2"));

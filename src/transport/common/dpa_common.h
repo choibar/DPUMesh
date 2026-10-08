@@ -7,71 +7,41 @@
 typedef uint64_t doca_dpa_dev_uintptr_t;
 typedef uint64_t doca_dpa_dev_buf_arr_t;
 
-/* Match DPUmesh's forward producer report policy: a report retires the
- * preceding optimized submissions as well as the current one. */
-#define DPA_PRODUCER_REPORT_BATCH 512u
+/* Below both the producer SQ and completion CQ capacities (512). */
+#define DMESH_DPA_MAX_INFLIGHT 128u
 
-static inline int dpa_producer_report_due(uint32_t *deferred)
-{
-	(*deferred)++;
-	if (*deferred < DPA_PRODUCER_REPORT_BATCH)
-		return 0;
-	*deferred = 0;
-	return 1;
-}
+/* Native DMA thread-local state shared by CPU setup/teardown and the DPA.
+ * Fixed-width fields are naturally aligned on both processors. */
+struct dpa_thread_ctx {
+    /* Comch handles and descriptor source. */
+    uint64_t dpa_producer_comp;
+    uint64_t dpa_producer;
+    doca_dpa_dev_buf_arr_t dpa_buf_arr;
 
-struct dpa_thread_arg {
-	uint64_t dpa_consumer_comp;
-	uint64_t dpa_producer_comp;
-	uint64_t dpa_producer;
-	uint64_t dpa_consumer;
-	doca_dpa_dev_buf_arr_t dpa_buf_arr;
-	uint32_t buf_arr_size;
+    uint64_t src_addr; /* destination staging base (legacy field name) */
+    uint64_t dpa_dev;  /* extended context device; 0 selects the base context */
 
-    doca_dpa_dev_mmap_t host_mmap;
+    /* Progress survives kernel retriggers. CPU cleanup additionally drains
+     * dma_submitted matching receive messages before releasing mappings. */
+    volatile uint64_t dma_submitted;
+    uint64_t submit_head;
 
-	doca_dpa_dev_mmap_t dpu_mmap;
-	uint64_t src_addr;
-	uint32_t buf_size;
-	uint32_t pos;
+    uint32_t buf_arr_size;
+    doca_dpa_dev_mmap_t host_mmap; /* DMA source mapping */
+    doca_dpa_dev_mmap_t dpu_mmap;  /* DMA destination mapping */
+    uint32_t buf_size;
+    uint32_t pos; /* next destination staging offset */
 
-	/* producer_dma_copy microbenchmark (DMESH_DPA_BENCH_* env vars on the DPU
-	 * app; bench_mode 0 = off -> normal ring-polling datapath) */
-	uint64_t bench_host_addr;   /* host sndbuf base VA (DMA source) */
-	uint32_t bench_host_size;   /* host sndbuf length */
-	uint32_t bench_mode;        /* 0=off, 1=throughput, 2=latency */
-	uint32_t bench_msg_size;    /* bytes per copy (max 8192 on this platform) */
-	uint32_t bench_num_ops;     /* copies per run */
+    /* CPU -> DPA consumed position for host or DPU RX staging.
+     * Every native DMA submission must respect this reuse boundary. */
+    volatile uint32_t rx_consumed_pos;
 
-	/* Cooperative shutdown stops admission in the kernel and finishes the
-	 * polling thread. CPU cleanup must also compare dma_submitted with the
-	 * received DMA completion count before freeing any mapping. */
-	volatile uint32_t stop;     /* host -> DPA: leave the poll loop */
-	volatile uint32_t stopped;  /* DPA -> host: poll loop has exited */
-
-	/* DPU-side staging flow control. rd_pos: offset up to which the DPU
-	 * reader (proxy) has consumed the staging ring, published by the DPU app
-	 * via h2d_memcpy on its tick. rd_fc: 1 = the DPU app publishes rd_pos,
-	 * so the kernel must not copy past it (opt-in: apps that never publish
-	 * keep the legacy free-running behavior). */
-	volatile uint32_t rd_pos;
-	volatile uint32_t rd_fc;
-
-	/* Extended DPA context (host PF process extended to an SF): the handle
-	 * from doca_dpa_get_dpa_handle(extended ctx); the kernel switches to it
-	 * with doca_dpa_dev_device_set() before touching that device's objects
-	 * (the official extended-context flow). 0 = base context, no switch. */
-	uint64_t dpa_dev;
-
-	/* Published before stopped: number of copies requiring CPU DMA-completed
-	 * messages. Kernel exit alone does not retire producer DMA operations. */
-	volatile uint64_t dma_submitted;
-
-	/* Persistent across cooperative reschedules, which restart the entry. */
-	uint64_t yield_notification;
-	uint32_t producer_deferred;
-
-} __attribute__((__packed__, aligned(8)));
+    /* Stop admission, drain producer CQ, then publish stopped. A nonzero
+     * dma_error prevents CPU cleanup from treating exit as a successful fence. */
+    volatile uint32_t stop;
+    volatile uint32_t stopped;
+    volatile uint32_t dma_error;
+};
 
 enum comch_msg_type {
 	COMCH_MSG_TYPE_DMA_REQ = 1,
@@ -110,8 +80,10 @@ struct comch_msg {
 
 struct dma_ring_ctrl {
 	volatile uint64_t producer_tail;
-	volatile uint64_t consumer_head;
-	uint8_t reserved[48];
+	volatile uint64_t consumer_head; /* contiguous DMA-completed descriptors */
+	volatile uint64_t completed_bytes; /* source bytes safe to reuse */
+	volatile uint32_t error; /* sticky device error; never acknowledge past it */
+	uint8_t reserved[36];
 } __attribute__((aligned(64)));
 
 struct dma_desc {

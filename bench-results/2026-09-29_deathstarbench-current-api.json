@@ -1,0 +1,1202 @@
+{
+  "date_utc": "2026-09-29",
+  "conditions": {
+    "reverse": "dpu-dma",
+    "sharded": true,
+    "busy_poll": true,
+    "service_replicas": 1,
+    "frontend_replicas": 1,
+    "service_processes": 10,
+    "host_cpus": "0-11",
+    "gomaxprocs": 4,
+    "wrk_cpus": "12-15",
+    "wrk_threads": 4,
+    "wrk_connections": 64,
+    "trial_seconds": 15,
+    "wrk_calibration_seconds": 10,
+    "rates": [
+      500,
+      2000,
+      5000
+    ],
+    "repeats": 3,
+    "workload": "mixed-workload_type_1",
+    "tls": false,
+    "trace_sample_rate": 0,
+    "host_pci": "0b:00.1",
+    "dpu_pci": "03:00.1"
+  },
+  "source": {
+    "dpumesh_base": "b60712998e8b0747fb62f2195716aeeeab6faffb",
+    "proxy_base": "c09915bfb38cbb8401b4d9136194923a6d23edd2",
+    "dsb_base": "312855ac450bcd35550a482517fd47e093a26ac4",
+    "uncommitted_changes": true
+  },
+  "hashes": {
+    "dpu": "fa049bb2b50be259d2f9dbfbad26dba633dc061a681b088530d086d8b9362972  linkerd2-proxy/target/release/linkerd2-proxy\n6bc2bafefbb2c433fd295854cb7d1c661e7ac9de3fc6532fdd1bfde36eb8eebe  src/transport/build/device/dpa_kernel.a\n",
+    "host": "3e380bd87be7464159c8d5e0f5bb11edd9ad634a651c287d6a9295cc299fc7f0  /tmp/dsb-current/dpumesh/build/lib/libdpumesh.so.5\nde597116d883400c7c64672c7e6a189a412b68ddef82ef2c764e9351d9588124  /tmp/dsb-current/hotelReservation/bin/attractions\n610978594f5193203fbccd8dd2235034fc007e42384f1aa7a45dc2e88fe18c0d  /tmp/dsb-current/hotelReservation/bin/dmesh-probe\n5b05c3ab0c818d987ab9e45995bdd43781babb20ee897e67b5faa262f45a64f4  /tmp/dsb-current/hotelReservation/bin/frontend\nd1a54f0a580c343708cdd9ed42f62def76a2198a551826f2dcbcc355969e5158  /tmp/dsb-current/hotelReservation/bin/geo\nd4dd7d833d89b89e4036ecfb9b10b28bcacde6abcc22bac4bd83049d694318bd  /tmp/dsb-current/hotelReservation/bin/profile\n35b242dac68955152be600949e95e3ac80dc4dc01174c87616255ff3d712d3b2  /tmp/dsb-current/hotelReservation/bin/rate\nae929690a405a36272acc1a3ae20a03729e731882206b1d4da24baf75e025f49  /tmp/dsb-current/hotelReservation/bin/recommendation\n8f04bd639f20f0d790c18bfd35625feee7746b13f2aca4cce306a5d7c7bc6f7e  /tmp/dsb-current/hotelReservation/bin/reservation\n0543d5be25c003d6c6bbb2931d3922ced124bd8a9cfc2bfb0ff5a28c129728a3  /tmp/dsb-current/hotelReservation/bin/review\n9709a6262b4cbf75486d3ff8a34d3d196dd8f20e34fbba1455e423bc37eb3619  /tmp/dsb-current/hotelReservation/bin/search\ne50120709185042a1ea618b5d98329a0c0163d4c5592ec5381de3cf4e451372d  /tmp/dsb-current/hotelReservation/bin/user\n"
+  },
+  "functional": {
+    "tcp-baseline": {
+      "validation_ok": true,
+      "matches_tcp": null,
+      "rpc_services": 9,
+      "http_paths": 8,
+      "additional_frontends": 0,
+      "concurrent_search_ok": true,
+      "stop": {
+        "ok": true,
+        "failed": []
+      }
+    },
+    "dma-watchdog-w1": {
+      "validation_ok": true,
+      "matches_tcp": true,
+      "rpc_services": 9,
+      "http_paths": 8,
+      "additional_frontends": 0,
+      "concurrent_search_ok": true,
+      "stop": {
+        "ok": true,
+        "failed": []
+      },
+      "idle_resume": true
+    },
+    "dma-watchdog-w2": {
+      "validation_ok": true,
+      "matches_tcp": true,
+      "rpc_services": 9,
+      "http_paths": 8,
+      "additional_frontends": 0,
+      "concurrent_search_ok": true,
+      "stop": {
+        "ok": true,
+        "failed": []
+      }
+    },
+    "dma-watchdog-w4": {
+      "validation_ok": true,
+      "matches_tcp": true,
+      "rpc_services": 9,
+      "http_paths": 8,
+      "additional_frontends": 0,
+      "concurrent_search_ok": true,
+      "stop": {
+        "ok": true,
+        "failed": []
+      }
+    },
+    "replicas-c": {
+      "validation_ok": true,
+      "matches_tcp": true,
+      "rpc_services": 9,
+      "http_paths": 8,
+      "additional_frontends": 1,
+      "concurrent_search_ok": true,
+      "stop": {
+        "ok": true,
+        "failed": []
+      }
+    },
+    "replicas-d": {
+      "validation_ok": true,
+      "matches_tcp": true,
+      "rpc_services": 9,
+      "http_paths": 8,
+      "additional_frontends": 1,
+      "concurrent_search_ok": true,
+      "stop": {
+        "ok": true,
+        "failed": []
+      }
+    }
+  },
+  "resources": {
+    "W1": {
+      "created_contexts": 1,
+      "preallocated_pools": 1,
+      "peak_active_flows_by_worker": {
+        "0": 28
+      },
+      "allocations_by_worker": {
+        "0": 45
+      },
+      "releases_by_worker": {
+        "0": 45
+      },
+      "remaining_active_flows": 0
+    },
+    "W2": {
+      "created_contexts": 1,
+      "preallocated_pools": 2,
+      "peak_active_flows_by_worker": {
+        "0": 13,
+        "1": 15
+      },
+      "allocations_by_worker": {
+        "0": 21,
+        "1": 15
+      },
+      "releases_by_worker": {
+        "0": 21,
+        "1": 15
+      },
+      "remaining_active_flows": 0
+    },
+    "W4": {
+      "created_contexts": 1,
+      "preallocated_pools": 4,
+      "peak_active_flows_by_worker": {
+        "0": 7,
+        "1": 11,
+        "2": 6,
+        "3": 4
+      },
+      "allocations_by_worker": {
+        "0": 15,
+        "1": 11,
+        "2": 6,
+        "3": 4
+      },
+      "releases_by_worker": {
+        "0": 15,
+        "1": 11,
+        "2": 6,
+        "3": 4
+      },
+      "remaining_active_flows": 0
+    },
+    "replicas": {
+      "created_contexts": 1,
+      "preallocated_pools": 4,
+      "peak_active_flows_by_worker": {
+        "0": 13,
+        "1": 6,
+        "2": 7,
+        "3": 13
+      },
+      "allocations_by_worker": {
+        "0": 42,
+        "1": 12,
+        "2": 14,
+        "3": 26
+      },
+      "releases_by_worker": {
+        "0": 42,
+        "3": 26,
+        "2": 14,
+        "1": 12
+      },
+      "remaining_active_flows": 0
+    }
+  },
+  "hardware_suite": [
+    {
+      "workers": 1,
+      "host_run": "/tmp/dsb-current/dma-watchdog-w1",
+      "dpu_run": "/tmp/dsb-port/dpu-watchdog-w1",
+      "validation": 0,
+      "idle_resume": 0,
+      "measurement": 0,
+      "host_stop": 0,
+      "proxy_stop": 0
+    },
+    {
+      "workers": 2,
+      "host_run": "/tmp/dsb-current/dma-watchdog-w2",
+      "dpu_run": "/tmp/dsb-port/dpu-watchdog-w2",
+      "validation": 0,
+      "measurement": 0,
+      "host_stop": 0,
+      "proxy_stop": 0
+    },
+    {
+      "workers": 4,
+      "host_run": "/tmp/dsb-current/dma-watchdog-w4",
+      "dpu_run": "/tmp/dsb-port/dpu-watchdog-w4",
+      "validation": 0,
+      "measurement": 0,
+      "host_stop": 0,
+      "proxy_stop": 0
+    }
+  ],
+  "replica_restart": {
+    "runs": [
+      {
+        "run": "/tmp/dsb-current/replicas-c",
+        "validation": 0,
+        "host_stop": 0
+      },
+      {
+        "run": "/tmp/dsb-current/replicas-d",
+        "validation": 0,
+        "host_stop": 0
+      }
+    ],
+    "proxy_stop": 0
+  },
+  "medians": [
+    {
+      "rps": 500.5,
+      "p50_ms": 3.03,
+      "p95_ms": 4.8,
+      "p99_ms": 5.7,
+      "host_cpu": 158.91,
+      "mode": "tcp",
+      "workers": 0,
+      "offered_rps": 500,
+      "repeats": 3
+    },
+    {
+      "rps": 1996.71,
+      "p50_ms": 2.38,
+      "p95_ms": 3.72,
+      "p99_ms": 4.4,
+      "host_cpu": 516.47,
+      "mode": "tcp",
+      "workers": 0,
+      "offered_rps": 2000,
+      "repeats": 3
+    },
+    {
+      "rps": 4908.43,
+      "p50_ms": 2.54,
+      "p95_ms": 4.18,
+      "p99_ms": 5.15,
+      "host_cpu": 836.89,
+      "mode": "tcp",
+      "workers": 0,
+      "offered_rps": 5000,
+      "repeats": 3
+    },
+    {
+      "rps": 500.34,
+      "p50_ms": 8.18,
+      "p95_ms": 11.62,
+      "p99_ms": 12.8,
+      "host_cpu": 501.06,
+      "mode": "dmesh",
+      "workers": 1,
+      "offered_rps": 500,
+      "repeats": 3,
+      "dpu_cpu": 99.96
+    },
+    {
+      "rps": 1994.21,
+      "p50_ms": 22.24,
+      "p95_ms": 28.5,
+      "p99_ms": 31.26,
+      "host_cpu": 828.8,
+      "mode": "dmesh",
+      "workers": 1,
+      "offered_rps": 2000,
+      "repeats": 3,
+      "dpu_cpu": 99.97
+    },
+    {
+      "rps": 2474.19,
+      "p50_ms": 6280.0,
+      "p95_ms": 7426.05,
+      "p99_ms": 7590.0,
+      "host_cpu": 783.77,
+      "mode": "dmesh",
+      "workers": 1,
+      "offered_rps": 5000,
+      "repeats": 3,
+      "dpu_cpu": 99.96
+    },
+    {
+      "rps": 500.43,
+      "p50_ms": 4.45,
+      "p95_ms": 6.12,
+      "p99_ms": 6.94,
+      "host_cpu": 480.87,
+      "mode": "dmesh",
+      "workers": 2,
+      "offered_rps": 500,
+      "repeats": 3,
+      "dpu_cpu": 199.83
+    },
+    {
+      "rps": 1996.14,
+      "p50_ms": 8.14,
+      "p95_ms": 13.38,
+      "p99_ms": 15.46,
+      "host_cpu": 850.66,
+      "mode": "dmesh",
+      "workers": 2,
+      "offered_rps": 2000,
+      "repeats": 3,
+      "dpu_cpu": 199.18
+    },
+    {
+      "rps": 4422.04,
+      "p50_ms": 1430.0,
+      "p95_ms": 1813.5,
+      "p99_ms": 1940.0,
+      "host_cpu": 880.34,
+      "mode": "dmesh",
+      "workers": 2,
+      "offered_rps": 5000,
+      "repeats": 3,
+      "dpu_cpu": 198.77
+    },
+    {
+      "rps": 500.44,
+      "p50_ms": 3.73,
+      "p95_ms": 5.07,
+      "p99_ms": 5.68,
+      "host_cpu": 463.29,
+      "mode": "dmesh",
+      "workers": 4,
+      "offered_rps": 500,
+      "repeats": 3,
+      "dpu_cpu": 399.72
+    },
+    {
+      "rps": 1996.44,
+      "p50_ms": 5.96,
+      "p95_ms": 10.66,
+      "p99_ms": 12.73,
+      "host_cpu": 850.55,
+      "mode": "dmesh",
+      "workers": 4,
+      "offered_rps": 2000,
+      "repeats": 3,
+      "dpu_cpu": 398.72
+    },
+    {
+      "rps": 4978.29,
+      "p50_ms": 18.16,
+      "p95_ms": 44.77,
+      "p99_ms": 62.17,
+      "host_cpu": 940.3,
+      "mode": "dmesh",
+      "workers": 4,
+      "offered_rps": 5000,
+      "repeats": 3,
+      "dpu_cpu": 397.86
+    }
+  ],
+  "trials": [
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 500,
+      "repeat": 1,
+      "ok": true,
+      "rps": 500.51,
+      "p50_ms": 3.04,
+      "p95_ms": 4.775,
+      "p99_ms": 5.58,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 159.78735205306666,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 500,
+      "repeat": 2,
+      "ok": true,
+      "rps": 500.5,
+      "p50_ms": 2.99,
+      "p95_ms": 4.803,
+      "p99_ms": 5.7,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 158.9078633381528,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 500,
+      "repeat": 3,
+      "ok": true,
+      "rps": 500.49,
+      "p50_ms": 3.03,
+      "p95_ms": 4.847,
+      "p99_ms": 5.8,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 158.88968312581088,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 2000,
+      "repeat": 1,
+      "ok": true,
+      "rps": 1996.61,
+      "p50_ms": 2.4,
+      "p95_ms": 3.721,
+      "p99_ms": 4.4,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 515.5059441033403,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 2000,
+      "repeat": 2,
+      "ok": true,
+      "rps": 1996.71,
+      "p50_ms": 2.36,
+      "p95_ms": 3.683,
+      "p99_ms": 4.4,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 516.4730461710108,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 2000,
+      "repeat": 3,
+      "ok": true,
+      "rps": 1996.86,
+      "p50_ms": 2.38,
+      "p95_ms": 3.725,
+      "p99_ms": 4.39,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 517.0825251486015,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 5000,
+      "repeat": 1,
+      "ok": true,
+      "rps": 4988.56,
+      "p50_ms": 2.47,
+      "p95_ms": 4.025,
+      "p99_ms": 5.06,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 857.8541183086563,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 5000,
+      "repeat": 2,
+      "ok": true,
+      "rps": 4908.43,
+      "p50_ms": 2.54,
+      "p95_ms": 4.183,
+      "p99_ms": 5.15,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 836.8879617545848,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "tcp",
+      "workers": 0,
+      "rate": 5000,
+      "repeat": 3,
+      "ok": true,
+      "rps": 4906.11,
+      "p50_ms": 2.6,
+      "p95_ms": 4.639,
+      "p99_ms": 5.7,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 819.6129325119617,
+      "loadgen_cpu": null
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 500,
+      "repeat": 1,
+      "ok": true,
+      "rps": 500.34,
+      "p50_ms": 8.32,
+      "p95_ms": 11.615,
+      "p99_ms": 12.8,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 502.6730106663936,
+      "loadgen_cpu": 4.045177762168883,
+      "dpu_cpu": 99.963750103666,
+      "shard_cpu": [
+        99.89260152707976
+      ],
+      "arm_busy": [
+        99.92887624466572
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 500,
+      "repeat": 2,
+      "ok": true,
+      "rps": 500.14,
+      "p50_ms": 8.06,
+      "p95_ms": 11.351,
+      "p99_ms": 12.49,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 492.9498503784001,
+      "loadgen_cpu": 4.014592093228735,
+      "dpu_cpu": 99.9543313813536,
+      "shard_cpu": [
+        99.9543313813536
+      ],
+      "arm_busy": [
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 500,
+      "repeat": 3,
+      "ok": true,
+      "rps": 500.35,
+      "p50_ms": 8.18,
+      "p95_ms": 12.111,
+      "p99_ms": 13.17,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 501.06444435861914,
+      "loadgen_cpu": 4.097696381190034,
+      "dpu_cpu": 100.03121652924115,
+      "shard_cpu": [
+        100.03121652924115
+      ],
+      "arm_busy": [
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 2000,
+      "repeat": 1,
+      "ok": true,
+      "rps": 1994.21,
+      "p50_ms": 22.59,
+      "p95_ms": 28.943,
+      "p99_ms": 32.29,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 828.977042436683,
+      "loadgen_cpu": 8.655512409144139,
+      "dpu_cpu": 100.0311893807473,
+      "shard_cpu": [
+        99.88889750396105
+      ],
+      "arm_busy": [
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 2000,
+      "repeat": 2,
+      "ok": true,
+      "rps": 1994.19,
+      "p50_ms": 22.24,
+      "p95_ms": 28.495,
+      "p99_ms": 31.26,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 827.146574383421,
+      "loadgen_cpu": 8.692999269404574,
+      "dpu_cpu": 99.96515077094746,
+      "shard_cpu": [
+        99.96515077094746
+      ],
+      "arm_busy": [
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 2000,
+      "repeat": 3,
+      "ok": true,
+      "rps": 1994.22,
+      "p50_ms": 22.06,
+      "p95_ms": 28.159,
+      "p99_ms": 30.45,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 828.797287047264,
+      "loadgen_cpu": 8.752931939041776,
+      "dpu_cpu": 99.96579855044602,
+      "shard_cpu": [
+        100.0369485850015
+      ],
+      "arm_busy": [
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 5000,
+      "repeat": 1,
+      "ok": true,
+      "rps": 2482.24,
+      "p50_ms": 6280.0,
+      "p95_ms": 7426.047,
+      "p99_ms": 7590.0,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 785.6338848505682,
+      "loadgen_cpu": 8.60245163823463,
+      "dpu_cpu": 99.96228164960813,
+      "shard_cpu": [
+        100.03342918103134
+      ],
+      "arm_busy": [
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 5000,
+      "repeat": 2,
+      "ok": true,
+      "rps": 2474.19,
+      "p50_ms": 6090.0,
+      "p95_ms": 7229.439,
+      "p99_ms": 7430.0,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 783.7686719584694,
+      "loadgen_cpu": 8.53658147706663,
+      "dpu_cpu": 99.95843606443786,
+      "shard_cpu": [
+        99.95843606443786
+      ],
+      "arm_busy": [
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 1,
+      "rate": 5000,
+      "repeat": 3,
+      "ok": true,
+      "rps": 2472.76,
+      "p50_ms": 6310.0,
+      "p95_ms": 7434.239,
+      "p99_ms": 7610.0,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 782.964055757791,
+      "loadgen_cpu": 8.463891982293463,
+      "dpu_cpu": 100.02986081933619,
+      "shard_cpu": [
+        99.95871582586582
+      ],
+      "arm_busy": [
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 500,
+      "repeat": 1,
+      "ok": true,
+      "rps": 500.43,
+      "p50_ms": 4.45,
+      "p95_ms": 6.075,
+      "p99_ms": 7.08,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 482.0711859827756,
+      "loadgen_cpu": 4.076476654028971,
+      "dpu_cpu": 199.82945069017723,
+      "shard_cpu": [
+        99.87915584514376,
+        99.87915584514376
+      ],
+      "arm_busy": [
+        100.0,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 500,
+      "repeat": 2,
+      "ok": true,
+      "rps": 500.41,
+      "p50_ms": 4.42,
+      "p95_ms": 6.123,
+      "p99_ms": 6.93,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 480.8659112867519,
+      "loadgen_cpu": 4.095127517191477,
+      "dpu_cpu": 199.8263258236289,
+      "shard_cpu": [
+        99.94873185553529,
+        99.87759396809363
+      ],
+      "arm_busy": [
+        100.0,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 500,
+      "repeat": 3,
+      "ok": true,
+      "rps": 500.52,
+      "p50_ms": 4.45,
+      "p95_ms": 6.135,
+      "p99_ms": 6.94,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 479.7992237888582,
+      "loadgen_cpu": 4.114795383347041,
+      "dpu_cpu": 199.95657914802698,
+      "shard_cpu": [
+        99.94272276875769,
+        99.87158915824612
+      ],
+      "arm_busy": [
+        100.0,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 2000,
+      "repeat": 1,
+      "ok": true,
+      "rps": 1996.14,
+      "p50_ms": 8.14,
+      "p95_ms": 13.383,
+      "p99_ms": 15.59,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 852.7821629145433,
+      "loadgen_cpu": 8.746363683122539,
+      "dpu_cpu": 199.15129427682137,
+      "shard_cpu": [
+        99.57564713841069,
+        99.57564713841069
+      ],
+      "arm_busy": [
+        99.92852037169406,
+        99.92846924177397
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 2000,
+      "repeat": 2,
+      "ok": true,
+      "rps": 1996.35,
+      "p50_ms": 8.14,
+      "p95_ms": 13.431,
+      "p99_ms": 15.46,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 850.660873442864,
+      "loadgen_cpu": 8.789936260803769,
+      "dpu_cpu": 199.182351869287,
+      "shard_cpu": [
+        99.66231248888253,
+        99.5911759346435
+      ],
+      "arm_busy": [
+        99.92857142857143,
+        99.92857142857143
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 2000,
+      "repeat": 3,
+      "ok": true,
+      "rps": 1995.94,
+      "p50_ms": 8.16,
+      "p95_ms": 13.103,
+      "p99_ms": 15.23,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 850.6245371011404,
+      "loadgen_cpu": 8.81607109735901,
+      "dpu_cpu": 199.19439921524804,
+      "shard_cpu": [
+        99.59719960762402,
+        99.66834046448662
+      ],
+      "arm_busy": [
+        99.92846924177397,
+        99.92857142857143
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 5000,
+      "repeat": 1,
+      "ok": true,
+      "rps": 4422.04,
+      "p50_ms": 1430.0,
+      "p95_ms": 1813.503,
+      "p99_ms": 1940.0,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 880.3437910468424,
+      "loadgen_cpu": 12.78101721491231,
+      "dpu_cpu": 198.82777854335006,
+      "shard_cpu": [
+        99.30718384490758,
+        99.52059469844248
+      ],
+      "arm_busy": [
+        99.85652797704448,
+        99.85693848354794
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 5000,
+      "repeat": 2,
+      "ok": true,
+      "rps": 4447.31,
+      "p50_ms": 1360.0,
+      "p95_ms": 1723.391,
+      "p99_ms": 1830.0,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 881.6844372103797,
+      "loadgen_cpu": 12.918282908982922,
+      "dpu_cpu": 198.76702814384788,
+      "shard_cpu": [
+        99.24123273466994,
+        99.52579540917795
+      ],
+      "arm_busy": [
+        99.85652797704448,
+        99.92841803865426
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 2,
+      "rate": 5000,
+      "repeat": 3,
+      "ok": true,
+      "rps": 4406.02,
+      "p50_ms": 1490.0,
+      "p95_ms": 1864.703,
+      "p99_ms": 2009.9999999999998,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 874.0828338951851,
+      "loadgen_cpu": 12.747206458032755,
+      "dpu_cpu": 198.17955582843445,
+      "shard_cpu": [
+        99.37128296510988,
+        98.80827286332456
+      ],
+      "arm_busy": [
+        99.85805535841023,
+        99.2226148409894
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 500,
+      "repeat": 1,
+      "ok": true,
+      "rps": 500.44,
+      "p50_ms": 3.69,
+      "p95_ms": 5.071,
+      "p99_ms": 5.68,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 460.83401549779575,
+      "loadgen_cpu": 4.17833480464391,
+      "dpu_cpu": 399.6915117016718,
+      "shard_cpu": [
+        99.81623664694898,
+        99.88733083259496,
+        100.0295192038869,
+        99.95842501824093
+      ],
+      "arm_busy": [
+        100.0,
+        99.92892679459844,
+        100.0,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 500,
+      "repeat": 2,
+      "ok": true,
+      "rps": 500.39,
+      "p50_ms": 3.73,
+      "p95_ms": 5.051,
+      "p99_ms": 5.53,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 465.28000392675267,
+      "loadgen_cpu": 4.258272918601895,
+      "dpu_cpu": 399.7186942121218,
+      "shard_cpu": [
+        99.82302502202401,
+        99.96522306336593,
+        99.89412404269497,
+        100.03632208403688
+      ],
+      "arm_busy": [
+        100.0,
+        100.0,
+        100.0,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 500,
+      "repeat": 3,
+      "ok": true,
+      "rps": 500.46,
+      "p50_ms": 3.74,
+      "p95_ms": 5.127,
+      "p99_ms": 5.81,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 463.2866783270017,
+      "loadgen_cpu": 4.233211369833372,
+      "dpu_cpu": 399.75438825549725,
+      "shard_cpu": [
+        99.83216618308212,
+        99.97407402413839,
+        99.97407402413839,
+        100.04502794466651
+      ],
+      "arm_busy": [
+        99.92897727272727,
+        100.0,
+        99.92912827781714,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 2000,
+      "repeat": 1,
+      "ok": true,
+      "rps": 1996.1,
+      "p50_ms": 6.03,
+      "p95_ms": 10.935,
+      "p99_ms": 14.14,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 847.3787318802705,
+      "loadgen_cpu": 8.81553192933373,
+      "dpu_cpu": 396.38611125614244,
+      "shard_cpu": [
+        97.97669261183216,
+        99.75420880580589,
+        98.75879973718061,
+        99.96751074908275
+      ],
+      "arm_busy": [
+        98.56733524355302,
+        100.0,
+        98.86039886039886,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 2000,
+      "repeat": 2,
+      "ok": true,
+      "rps": 1996.44,
+      "p50_ms": 5.96,
+      "p95_ms": 10.663,
+      "p99_ms": 12.73,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 850.5521651621644,
+      "loadgen_cpu": 8.721999845170657,
+      "dpu_cpu": 398.87259462183056,
+      "shard_cpu": [
+        99.2383072700188,
+        99.80700817127965,
+        99.80700817127965,
+        99.87809578393725
+      ],
+      "arm_busy": [
+        99.85642498205313,
+        99.92872416250891,
+        100.0,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 2000,
+      "repeat": 3,
+      "ok": true,
+      "rps": 1996.58,
+      "p50_ms": 5.96,
+      "p95_ms": 10.591,
+      "p99_ms": 12.73,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 853.0392067520833,
+      "loadgen_cpu": 8.842013733927548,
+      "dpu_cpu": 398.71613687008283,
+      "shard_cpu": [
+        99.25244776580521,
+        99.7501319594733,
+        99.89232744337846,
+        99.96342518533103
+      ],
+      "arm_busy": [
+        99.85642498205313,
+        100.0,
+        99.92887624466572,
+        99.92887624466572
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 5000,
+      "repeat": 1,
+      "ok": true,
+      "rps": 4978.29,
+      "p50_ms": 46.43,
+      "p95_ms": 222.591,
+      "p99_ms": 269.05,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 920.4010454844648,
+      "loadgen_cpu": 14.287818336026893,
+      "dpu_cpu": 394.55704358091407,
+      "shard_cpu": [
+        96.92609915720934,
+        97.91514098534412,
+        99.82257879674692,
+        99.75193295188016
+      ],
+      "arm_busy": [
+        98.058950395399,
+        98.22820694542878,
+        99.92922859164898,
+        99.85865724381625
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 5000,
+      "repeat": 2,
+      "ok": true,
+      "rps": 4901.61,
+      "p50_ms": 18.16,
+      "p95_ms": 44.767,
+      "p99_ms": 62.17,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 940.3032405750736,
+      "loadgen_cpu": 14.327667804720685,
+      "dpu_cpu": 397.8635844325566,
+      "shard_cpu": [
+        98.54162402135873,
+        99.53699396096842,
+        99.75028751945621,
+        99.96358107794399
+      ],
+      "arm_busy": [
+        99.78308026030369,
+        99.92857142857143,
+        99.92872416250891,
+        100.0
+      ]
+    },
+    {
+      "mode": "dmesh",
+      "workers": 4,
+      "rate": 5000,
+      "repeat": 3,
+      "ok": true,
+      "rps": 4980.92,
+      "p50_ms": 17.52,
+      "p95_ms": 41.791,
+      "p99_ms": 56.96,
+      "non2xx": 0,
+      "socket_errors": null,
+      "host_cpu": 944.7058839832032,
+      "loadgen_cpu": 14.443838750898765,
+      "dpu_cpu": 397.8697413292077,
+      "shard_cpu": [
+        98.66771501964273,
+        99.52075001981254,
+        99.734008769855,
+        99.94726751989745
+      ],
+      "arm_busy": [
+        99.78308026030369,
+        99.92857142857143,
+        99.92877492877493,
+        100.0
+      ]
+    }
+  ],
+  "limitations": [
+    "15-second trials include 10-second wrk2 calibration; short integration benchmark, not maximum sustainable RPS.",
+    "Direct TCP omits the L7 proxy; not an equivalent service-mesh baseline.",
+    "Busy-poll CPU utilization includes idle spinning.",
+    "One frontend in load trials; replica restart validation is a separate functional test.",
+    "Cancellation/deadline probes use already-cancelled/expired contexts, not cancellation of a slow in-flight server operation.",
+    "Tracing options preserved, but end-to-end trace-parent propagation was not separately inspected.",
+    "GC and DB/cache CPU profiles, per-endpoint performance, host-dpa and W8/12/16 not measured."
+  ],
+  "excluded": [
+    "Initial harness errors: occupied default ports, missing two port overrides, invalid load affinity, helper thread readiness count, stateful TCP comparison before data reset.",
+    "Pre-fix dma-final-w1: DPA fatal and teardown failures; all its data excluded.",
+    "First replica restart preflight rejected TIME_WAIT; fixed with SO_REUSEADDR, then both full runs passed."
+  ],
+  "raw_archive": {
+    "path": "bench-results/2026-09-29_deathstarbench-current-api-raw.tar.gz",
+    "sha256": "51d1119905f7a042549a7d95228444dac58d0fabe280e6b891ecdcf104844b6a"
+  }
+}

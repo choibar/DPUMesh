@@ -183,12 +183,20 @@ stop_comch_ctx(struct doca_ctx *ctx, struct objects *objs)
                  "device objects will leak until the driver reclaims them", state);
 }
 
-void
+doca_error_t
 cleanup_objects(struct objects *objs)
 {
     doca_error_t result;
     int i;
 
+    if (objs == NULL) return DOCA_SUCCESS;
+    if (objs->release_dpa != NULL) {
+        result = objs->release_dpa(objs);
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Retaining worker resources: DPA cleanup failed: %s", doca_error_get_name(result));
+            return result;
+        }
+    }
     /* tear down each connection's private DMA engine */
     for (i = 0; i < DMESH_MAX_CONNECTIONS; i++)
         cleanup_dma_tasks(&objs->conns[i]);
@@ -204,26 +212,37 @@ cleanup_objects(struct objects *objs)
         if (objs->is_server) {
             stop_comch_ctx(doca_comch_server_as_ctx(objs->cc_server), objs);
             result = doca_comch_server_destroy(objs->cc_server);
-            if (result != DOCA_SUCCESS)
+            if (result != DOCA_SUCCESS) {
                 DOCA_LOG_ERR("Failed to destroy cc server properly with error = %s",
                              doca_error_get_name(result));
+                return result;
+            }
         } else {
             /* cc_server/cc_client share a union - destroying a client through
              * the server API leaks the endpoint. */
             stop_comch_ctx(doca_comch_client_as_ctx(objs->cc_client), objs);
             result = doca_comch_client_destroy(objs->cc_client);
-            if (result != DOCA_SUCCESS)
+            if (result != DOCA_SUCCESS) {
                 DOCA_LOG_ERR("Failed to destroy cc client properly with error = %s",
                              doca_error_get_name(result));
+                return result;
+            }
         }
         objs->cc_server = NULL;
         objs->connection = NULL;
+    }
+
+    if (objs->is_server && objs->consumer_pe != NULL) {
+        result = doca_pe_destroy(objs->consumer_pe);
+        if (result != DOCA_SUCCESS) return result;
+        objs->consumer_pe = NULL;
     }
 
     if (objs->pe) {
         result = doca_pe_destroy(objs->pe);
         if(result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to destroy pe properly with error = %s", doca_error_get_name(result));
+            return result;
         }
         objs->pe = NULL;
     }
@@ -232,6 +251,7 @@ cleanup_objects(struct objects *objs)
         result = doca_dev_rep_close(objs->rep_dev);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to close rep device properly with error = %s", doca_error_get_name(result));
+            return result;
         }
         objs->rep_dev = NULL;
     }
@@ -240,7 +260,9 @@ cleanup_objects(struct objects *objs)
         result = doca_dev_close(objs->dev);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to close device properly with error = %s", doca_error_get_name(result));
+            return result;
         }
         objs->dev = NULL;
     }
+    return DOCA_SUCCESS;
 }

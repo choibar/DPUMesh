@@ -12,7 +12,7 @@
 static struct dmesh_comch_client *mock_control;
 static unsigned client_creates, client_destroys, ring_allocs, ring_frees;
 static unsigned opens, closes;
-static unsigned control_progress;
+static unsigned shared_progress_calls;
 static int next_close_status;
 static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
@@ -78,6 +78,13 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
     case DMESH_SESSION_HELLO:
         reply(DMESH_SESSION_HELLO_ACK, 0, 0, 0);
         break;
+    case DMESH_SESSION_LISTEN:
+        assert(h.flow_id == 0 && h.payload_len == 8);
+        reply(DMESH_SESSION_LISTEN_ACK, 0, 1, 0);
+        break;
+    case DMESH_SESSION_BACKEND_REJECT:
+        assert(h.status == ENOSPC && h.generation == 10);
+        break;
     case DMESH_SESSION_OPEN:
         assert(h.payload_len == sizeof(struct dmesh_export_metadata_msg));
         ++opens;
@@ -102,7 +109,7 @@ uint8_t doca_pe_progress(struct doca_pe *pe)
 {
     if (pe == (struct doca_pe *)&fake_reverse_pe) return 0;
     assert(pe == (struct doca_pe *)mock_control);
-    ++control_progress;
+    ++shared_progress_calls;
     if (!pending_len) return 0;
     size_t len = pending_len;
     pending_len = 0;
@@ -159,9 +166,10 @@ doca_error_t alloc_dma_ring(struct dma_ring **out, struct doca_dev *dev, size_t 
 {
     (void)dev;
     if (fail_ring_alloc) { fail_ring_alloc = 0; return DOCA_ERROR_NO_MEMORY; }
-    struct dma_ring *ring = calloc(1, sizeof(*ring));
+    struct dma_ring *ring = calloc(1, sizeof(*ring) + sizeof(struct dma_ring_ctrl));
     assert(ring);
     ring->size = (uint32_t)size;
+    ring->ctrl = (void *)(ring + 1);
     ring->mmap = (struct doca_mmap *)ring;
     *out = ring;
     ++ring_allocs;
@@ -259,14 +267,14 @@ static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, stru
 {
     control_notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     assert(control_notify_fd >= 0 && channel_dev_fd(dev) == control_notify_fd);
-    unsigned arms = arms_seen, requests = notify_requests, progress = control_progress;
+    unsigned arms = arms_seen, requests = notify_requests, progress = shared_progress_calls;
     b->expected = 5;
     assert(channel_dev_arm(dev) == 0);
     assert(arms_seen == arms + 1 && arm_epoch_seen == 1 && arm_count_seen == 2);
     assert(arm_flows_seen[0].flow_id == 1 && arm_flows_seen[0].generation == a->generation &&
            arm_flows_seen[0].expected_seq == 1);
     assert(arm_flows_seen[1].flow_id == 2 && arm_flows_seen[1].expected_seq == 5);
-    assert(notify_requests == requests + 1 && control_progress == progress + 1);
+    assert(notify_requests == requests + 1 && shared_progress_calls == progress + 1);
     assert(dev->arm_outstanding);
 
     /* Outstanding: the next sleep re-arms the PE but sends nothing. */
@@ -360,7 +368,7 @@ static void test_checked_close(void)
         (void)channel_conn_progress(a);
         /* A late application RX release must not write a freed thread arg. */
         if (phase != FAIL_QUIESCE)
-            channel_conn_rx_consumed(a, CHANNEL_DESC_N / 2, CHANNEL_RD_POS_BATCH);
+            channel_conn_rx_consumed(a, CHANNEL_DESC_N / 2, CHANNEL_RX_CONSUMED_POS_BATCH);
         assert(channel_conn_close(a) == 0);
         assert(!dev.flows[1] && dev.flows[2] == b && dev.control == control);
         assert(closes == before_close + 1 && ring_frees == before_free + 1);
@@ -390,12 +398,34 @@ static void test_checked_close(void)
     assert(ring_allocs == ring_frees);
 }
 
+static void test_backend_requests(struct channel_dev *dev)
+{
+    unsigned before = opens;
+    assert(channel_session_listen(dev, 0x0100510a, 8080) == 0);
+    assert(opens == before); /* listener registration must not preallocate flows */
+    uint8_t frame[DMESH_SESSION_HEADER_SIZE + 4], payload[4];
+    dmesh_session_put_u32(payload, 3);
+    size_t n = dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_BACKEND_REQUEST,
+        0, 10, 0, payload, 4);
+    session_message(dev, frame, n);
+    session_message(dev, frame, n);
+    uint32_t worker, token;
+    assert(channel_backend_next(dev, &worker, &token) == 1 && worker == 3 && token == 10);
+    assert(channel_backend_next(dev, &worker, &token) == 0);
+    channel_backend_finish(dev, 3, 10, ENOSPC);
+    assert(dev->backend_rejections == 1);
+    assert(channel_dev_progress(dev) == 0 && dev->backend_rejections == 0);
+    session_message(dev, frame, n);
+    assert(channel_backend_next(dev, &worker, &token) == 0); /* replay cannot allocate again */
+}
+
 int main(void)
 {
     struct channel_dev dev = {0};
     pthread_mutex_init(&dev.session_lock, NULL);
     assert(channel_session_open(&dev, "unit-session") == 0);
     assert(client_creates == 1 && dev.hello_ready);
+    test_backend_requests(&dev);
     struct dmesh_comch_client *control = dev.control;
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
     struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW * 3), .bytes = CHANNEL_WINDOW * 3};
@@ -411,14 +441,19 @@ int main(void)
 
     /* One session progress delivers replies for all flows; status checks must
      * neither re-progress that shared PE nor hide a sibling's error. */
-    unsigned progress_before = control_progress;
+    unsigned progress_once = shared_progress_calls;
     reply(DMESH_SESSION_ERROR, 1, a->generation, EIO);
     assert(channel_dev_progress(&dev) == 0);
-    assert(control_progress == progress_before + 1);
-    assert(channel_conn_status(a) == -1 && errno == EIO);
-    assert(channel_conn_status(b) == 0);
-    assert(control_progress == progress_before + 1);
+    assert(shared_progress_calls == progress_once + 1);
+    assert(channel_conn_poll(a) == -1 && errno == EIO);
+    assert(channel_conn_poll(b) == 0);
+    assert(shared_progress_calls == progress_once + 1);
     a->error = 0;
+
+    a->forward_ring->ctrl->error = 1;
+    assert(channel_conn_poll(a) == -1 && errno == EIO);
+    assert(channel_conn_poll(b) == 0);
+    a->forward_ring->ctrl->error = 0; /* Test-only reset. */
 
     /* A reply to a different incarnation cannot change the live flow. */
     dispatch(&dev, DMESH_SESSION_CLOSED, 1, a->generation + 1, 0);
@@ -438,9 +473,11 @@ int main(void)
 
     /* A failed session is observed independently by every flow's poller. */
     control->peer_gone = 1;
+    unsigned progress_before = shared_progress_calls;
     assert(channel_dev_progress(&dev) == -1 && errno == ECONNRESET);
-    assert(channel_conn_status(again) == -1 && errno == ECONNRESET);
-    assert(channel_conn_status(b) == -1 && errno == ECONNRESET);
+    assert(channel_conn_poll(again) == -1 && errno == ECONNRESET);
+    assert(channel_conn_poll(b) == -1 && errno == ECONNRESET);
+    assert(shared_progress_calls == progress_before + 1);
     control->peer_gone = 0; dev.session_error = 0; /* Test-only reset. */
 
     /* A failed close retains the flow and its ring, without closing siblings. */

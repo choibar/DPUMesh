@@ -82,6 +82,13 @@ when the target is an IPv4 literal. `ListenAddress(serviceIP, port)` is
 deprecated: it also checks that the target resolves to that address. The
 examples in `cmd/echo-client` and `cmd/echo-server` run the standard gRPC
 health RPC; the client dials `DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT`.
+The service channel registers a listener without opening spare backend flows.
+On first use, the DPU requests a flow pinned to the client flow's worker; H2
+clients on that worker share it per replica. The Go server accepts one connection
+per active worker/replica pair. `DPUMESH_BACKEND_POOL` is ignored;
+`DPUMESH_BACKEND_MAX` caps backends within the channel's shared 32-flow capacity.
+Host and DPU must both use session protocol v3 (public ABI5 is unchanged).
+
 Close all connections and listeners before calling `CloseTransport`. It returns
 `EBUSY` without invalidating active objects. If native channel teardown fails,
 the Go wrapper retains the channel and `CloseTransport` can be retried; new
@@ -107,3 +114,54 @@ The waiter has unit coverage for nested readiness, fd ownership and interrupts.
 `dpu-dma` with this waiter passed the hardware regression
 (`bench-results/2026-09-30_host-idle-wake.md`); `host-dpa` was not available on
 that testbed.
+
+### Worker-local backend benchmark
+
+`scripts/worker_backend_bench.py` runs an isolated Host/DPU matrix for the lazy,
+per-worker backend implementation. It uses one Host client process, 64-byte echo,
+64 in-flight RPCs per client flow, sharded busy-poll DPU workers, and DPU-DMA.
+The default matrix uses 1/2/4/8 workers, 1 or W server replicas, and W/2W/4W
+client flows (at most the current 32-flow channel limit). Client flow placement
+is round-robin to hold each worker's client flow count constant; backend flows
+remain pinned to the requesting worker.
+
+Build protocol-v4 Host libraries and `bench-client`/`bench-server` under the
+isolated `--host-root` first, and build the DPU release proxy and mock services.
+On the current 12-online-core DPU and 16-core Host, run:
+
+```sh
+taskset -c 0-3 python3 integrations/grpc/go/scripts/worker_backend_bench.py \
+  --out /tmp/dmesh-worker-local-bench/full \
+  --host youngmin@192.168.100.1 \
+  --host-root /tmp/dmesh-worker-backend-host
+python3 integrations/grpc/go/scripts/summarize_worker_backend.py \
+  /tmp/dmesh-worker-local-bench/full/results.json \
+  --out /tmp/dmesh-worker-local-bench/summary
+```
+
+The harness expects DPU CPUs 4–11 and Host CPUs 0–15 to be online. It fixes Host
+client affinity to 0–7 (`GOMAXPROCS=8`) and all server replicas to 8–15
+(`GOMAXPROCS=4` each). Workers use descending DPU CPUs starting at 11. It does
+not online/offline CPUs or change device/network settings. Scoped cleanup checks
+process identity before SIGTERM and never uses SIGKILL. Existing DPU proxies
+cause startup to fail rather than being stopped.
+
+Each case uses 10 seconds of warm-up, 30 seconds of measurement, and three
+repetitions. Results include measurement-window CPU samples, per-worker native
+flow assignments, and cumulative H2 request locality counters (delta per run,
+including warm-up). Thread-locality counters apply to sharded mode. The H2
+request queue still exists within each worker; zero cross-thread counts verify
+that its producer and consumer ran on the same OS thread. CPU use near 100% in
+busy-poll mode alone does not establish a compute bottleneck.
+
+Lazy backend admission allows up to 30 seconds for a cold worker/replica
+connection; an earlier caller cancellation still aborts the request immediately.
+This covers simultaneous setup of 64 backends in the 8-worker/8-replica case.
+H2 service readiness retains its separate three-second bound. A regression test
+publishes the backend after six seconds to exercise the previous five-second
+failure boundary.
+
+`cmd/worker-smoke` and `scripts/worker_backend_lifecycle_host.py` additionally
+check concurrent first RPCs, closing one client connection while others continue,
+and replacing the server process while client flows remain alive. Payloads carry
+unique sequence patterns, including boundary sizes up to 1,048,577 bytes.
