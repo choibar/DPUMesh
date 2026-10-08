@@ -30,7 +30,7 @@ LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c 
 HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
     channel_session_test comch_client_test session_server_test backend_dispatch_test dma_cleanup_test dpa_cleanup_test dpa_runtime_test \
-    rx_consumed_pos_test
+    dispatch_wake_test rx_consumed_pos_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
 .PHONY: all lib test test-native-headers test-abi examples clean
@@ -81,6 +81,9 @@ $(TESTDIR)/session_server_test: tests/session_server_test.c $(TRANSPORT)/common/
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT)/common/object.c -Wl,--gc-sections $(DOCA_LIBS) -pthread -o $@
 
 $(TESTDIR)/backend_dispatch_test: tests/backend_dispatch_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+
+$(TESTDIR)/dispatch_wake_test: tests/dispatch_wake_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/dma_cleanup_test: tests/dma_cleanup_test.c $(TRANSPORT)/dpu/dma.c $(TRANSPORT_HDRS) | $(TESTDIR)

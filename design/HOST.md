@@ -122,9 +122,12 @@ Three things have no completion doorbell, and each gets a wake:
   the session message `ARM` listing, per push flow, the next descriptor
   sequence the host has not read. The DPU sends `DOORBELL` at once if a listed
   flow already published that sequence, otherwise after its next descriptor
-  completion. At most one ARM is outstanding per channel; a DOORBELL releases
-  it and restarts the naps, since its descriptor may become visible after the
-  message. Plan and race argument: `docs/2026-09-30_host-wait-doorbell-plan.md`.
+  completion. On a DPU whose Comch sessions belong to the dispatcher (the
+  proxy), the dispatcher hands each listed flow's sequence to the flow's
+  worker, which rings through its control reply queue; the dispatcher sends
+  one DOORBELL per ARM. At most one ARM is outstanding per channel; a DOORBELL
+  releases it and restarts the naps, since its descriptor may become visible
+  after the message. Plan and race argument: `docs/2026-09-30_host-wait-doorbell-plan.md`.
 - **Control messages** (DOORBELL, CLOSED, ERROR) raise the control PE's
   notification fd once `idle_arm` requested it; the drain pass progresses it.
   The control PE runs in `DOCA_PE_EVENT_MODE_PROGRESS_ALL`: in the selective

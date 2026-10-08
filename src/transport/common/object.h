@@ -72,7 +72,9 @@ struct dmesh_session {
     } backend[DMESH_SESSION_MAX_WORKERS];
     /* Idle wake: the host ARMed before sleeping; the next push descriptor
      * completion (or one the ARM had not seen) queues a DOORBELL, sent from
-     * dmesh_sessions_advance and retried until the send is accepted. */
+     * dmesh_sessions_advance and retried until the send is accepted. A
+     * dispatcher worker keeps this state on the flow's worker-local session
+     * and rings as a reply from dmesh_dispatch_worker_flush. */
     bool armed;
     uint64_t armed_epoch, doorbell_pending_epoch, doorbell_sent_epoch;
 };
