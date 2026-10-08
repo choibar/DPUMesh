@@ -298,7 +298,7 @@ void dmesh_tx_pressure(dmesh_qp_t *c);
 void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta);
 
 /* Send an ordered zero-length FIN on the connection's forward ring. The call
- * first waits (bounded) for submitted data to leave DPU proxy custody. A drain
+ * first waits (bounded) for submitted data's DMA copies to complete. A drain
  * or ring timeout returns EBADMSG without latching fin_sent; an open transmit
  * call returns EDEADLK. The FIN remains in flight until the DPU retires the
  * old connection key, which quarantines the local port across close. */

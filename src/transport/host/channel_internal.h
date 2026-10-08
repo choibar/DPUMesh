@@ -18,6 +18,7 @@
 
 #include "channel.h"
 #include "comch_common.h"
+#include "session_protocol.h"
 
 #define CHANNEL_RING_SIZE 1024u            /* Forward ring depth of the host library */
 
@@ -33,7 +34,10 @@ struct channel_dev {
 	struct dmesh_comch_client *control;
 	struct channel_conn *flows[33];
 	uint32_t generations[33];
-	int hello_ready;
+	int hello_ready, listen_ready, listen_error;
+    struct { uint32_t token; int state, error; } backend[DMESH_SESSION_MAX_WORKERS];
+    unsigned backend_pending, backend_rejections;
+    /* state: 1=pending, 2=processing, 3=done, 4=reject pending */
 	int session_error;
 	/* Idle wake (push reverse path): one ARM at a time, released by DOORBELL */
 	int arm_outstanding;
@@ -87,7 +91,7 @@ struct channel_conn {
 	uint64_t rx_seq;                    /* Segments delivered to the carrier */
 	uint64_t consumed_seq;              /* Segments the carrier released */
 	uint32_t seg_end[CHANNEL_DESC_N]; /* End offset of delivered segment seq % N */
-	uint32_t rd_pos;                    /* Kernel read watermark last published */
+	uint32_t rx_consumed_pos;           /* End offset of the latest released prefix */
 	uint64_t rd_published_bytes;
 	uint64_t rd_published_seq;
 };

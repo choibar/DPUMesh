@@ -529,7 +529,7 @@ static void publish(struct broker_server *srv)
 		struct channel_conn *conn = srv->dev->flows[id];
 		if (conn == NULL)
 			continue;
-		int state = channel_conn_status(conn);
+		int state = channel_conn_poll(conn);
 		int error = state < 0 ? errno : 0;
 		struct broker_flow_status *f = &srv->status->flow[id];
 		changed |= f->state != state || f->error != error;

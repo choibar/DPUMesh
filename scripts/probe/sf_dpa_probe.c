@@ -16,7 +16,7 @@ int main(int argc, char **argv)
 {
     const char *ibdev = argc > 1 ? argv[1] : "mlx5_2";
     struct doca_dev *dev = NULL; struct doca_dpa *dpa = NULL; struct doca_dpa_thread *th = NULL;
-    doca_dpa_dev_uintptr_t arg = 0; struct dpa_thread_arg targ = {0};
+    doca_dpa_dev_uintptr_t arg = 0; struct dpa_thread_ctx targ = {0};
     uint16_t vhca = 0; enum doca_pci_func_type ft;
     doca_log_backend_create_standard();
     CK(open_doca_device_with_ibdev_name((const uint8_t *)ibdev, strlen(ibdev), NULL, &dev));
@@ -30,7 +30,8 @@ int main(int argc, char **argv)
     CK(doca_dpa_mem_alloc(dpa, sizeof(targ), &arg));
     CK(doca_dpa_h2d_memcpy(dpa, arg, &targ, sizeof(targ)));
     CK(doca_dpa_thread_create(dpa, &th));
-    CK(doca_dpa_thread_set_func_arg(th, run_dma_manager, arg));
+    CK(doca_dpa_thread_set_func_arg(th, run_dma_manager, 0));
+    CK(doca_dpa_thread_set_local_storage(th, arg));
     CK(doca_dpa_thread_start(th));
     printf("DPA process + thread OK on %s (not run: kernel would spin on an empty ring)\n", ibdev);
     doca_dpa_thread_destroy(th); doca_dpa_mem_free(dpa, arg); doca_dpa_destroy(dpa); doca_dev_close(dev);

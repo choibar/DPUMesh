@@ -46,7 +46,9 @@ session_get(struct objects *objs, struct doca_comch_connection *connection, bool
             free_session = s;
     }
     if (create && free_session != NULL) {
+        uint64_t epoch = free_session->epoch + 1;
         memset(free_session, 0, sizeof(*free_session));
+        free_session->epoch = epoch;
         free_session->occupied = true;
         free_session->connection = connection;
         free_session->hello_deadline_ms = session_now_ms() + 5000u;
@@ -60,6 +62,10 @@ static void session_fail(struct objects *objs, struct dmesh_session *s)
     if (s == NULL)
         return;
     s->closing = true;
+    if (objs->dispatcher) {
+        dmesh_dispatcher_session_lost(objs, s);
+        return;
+    }
     dmesh_flow_close_session(objs, s->connection);
 }
 
@@ -142,8 +148,8 @@ doca_error_t server_send_msg(struct objects *objs, const char *msg, size_t len)
     return server_send_msg_conn(objs, objs->connection, msg, len);
 }
 
-static doca_error_t
-session_send_frame(struct objects *objs, struct dmesh_session *session, uint16_t type,
+doca_error_t
+dmesh_session_send(struct objects *objs, struct dmesh_session *session, uint16_t type,
                    uint32_t flow_id, uint32_t generation, const void *payload,
                    size_t length, int32_t status)
 {
@@ -158,7 +164,9 @@ session_send_frame(struct objects *objs, struct dmesh_session *session, uint16_t
 doca_error_t server_send_flow_msg(struct dmesh_conn *conn, uint16_t type,
                                  const void *payload, size_t length, int32_t status)
 {
-    return session_send_frame(conn->objs, conn->session, type, conn->flow_id,
+    if (conn->objs->mailbox)
+        return dmesh_dispatch_reply(conn, type, payload, length, status);
+    return dmesh_session_send(conn->objs, conn->session, type, conn->flow_id,
                               conn->generation, payload, length, status);
 }
 
@@ -173,7 +181,7 @@ doca_error_t server_send_flow_msg(struct dmesh_conn *conn, uint16_t type,
 static void session_flow_error(struct objects *objs, struct dmesh_session *s,
                                const struct dmesh_session_header *h, int status)
 {
-    (void)session_send_frame(objs, s, DMESH_SESSION_ERROR, h->flow_id,
+    (void)dmesh_session_send(objs, s, DMESH_SESSION_ERROR, h->flow_id,
                              h->generation, NULL, 0, status);
 }
 
@@ -237,14 +245,19 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
         s->hello_pending = true;
         return;
     }
-    if (h.type == DMESH_SESSION_ARM && s->negotiated) {
+    if (h.type == DMESH_SESSION_ARM && s->negotiated && !objs->dispatcher) {
         session_arm(objs, s, connection, payload, h.payload_len);
         return;
     }
-    if (!s->negotiated || h.flow_id == 0 || h.flow_id > DMESH_MAX_CONNECTIONS) {
+    if (!s->negotiated || h.flow_id > DMESH_MAX_CONNECTIONS) {
         session_fail(objs, s);
         return;
     }
+    if (objs->dispatcher) {
+        dmesh_dispatcher_request(objs, s, &h, payload);
+        return;
+    }
+    if (!h.flow_id) { session_fail(objs, s); return; }
     idx = h.flow_id - 1;
     conn = dmesh_flow_get(objs, connection, h.flow_id, h.generation);
     if (h.type == DMESH_SESSION_OPEN) {
@@ -313,7 +326,7 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
                 s->close_pending[idx] = true;
             } else {
                 /* A stale identity has no resources; never touch a newer flow. */
-                (void)session_send_frame(objs, s, DMESH_SESSION_CLOSED, h.flow_id,
+                (void)dmesh_session_send(objs, s, DMESH_SESSION_CLOSED, h.flow_id,
                                          h.generation, NULL, 0, 0);
             }
         }
@@ -545,7 +558,7 @@ dmesh_doca_init_comch_server(struct dmesh_doca_objects *objs, const char *server
 	}
 
 	/* start the comch server ctx */
-	result = doca_ctx_start(ctx);
+	result = DMESH_DPA_CALL(doca_ctx_start(ctx));
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to start server context with error = %s", doca_error_get_name(result));
 		goto destroy_server;
@@ -667,7 +680,7 @@ start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool
         goto destroy_server;
     }
 
-    result = doca_ctx_start(ctx);
+    result = DMESH_DPA_CALL(doca_ctx_start(ctx));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to start server context with error = %s", doca_error_get_name(result));
         goto destroy_server;
@@ -723,29 +736,29 @@ export_dpa_comp_to_host(struct objects *objs)
 	struct dmesh_dpa_comp_msg dpa_comp_msg;
 	dpa_comp_msg.type = DMESH_MSG_EXPORT_DPA_COMP;
 
-	result = doca_comch_consumer_completion_get_dpa_handle(objs->dpa_comch->consumer_comp,
-									&dpa_comp_msg.dpa_consumer_comp);
+	result = DMESH_DPA_CALL(doca_comch_consumer_completion_get_dpa_handle(objs->dpa_comch->consumer_comp,
+									&dpa_comp_msg.dpa_consumer_comp));
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to get DPA consumer completion handle - %s",
 				doca_error_get_name(result));
 		return result;
 	}
-	result = doca_dpa_completion_get_dpa_handle(objs->dpa_comch->producer_comp,
-									&dpa_comp_msg.dpa_producer_comp);
+	result = DMESH_DPA_CALL(doca_dpa_completion_get_dpa_handle(objs->dpa_comch->producer_comp,
+									&dpa_comp_msg.dpa_producer_comp));
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to get DPA producer completion handle - %s",
 				doca_error_get_name(result));
 		return result;
 	}
-	result = doca_comch_producer_get_dpa_handle(objs->dpa_comch->recv.producer,
-									&dpa_comp_msg.dpa_producer);
+	result = DMESH_DPA_CALL(doca_comch_producer_get_dpa_handle(objs->dpa_comch->recv.producer,
+									&dpa_comp_msg.dpa_producer));
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to get DPA producer handle - %s",
 				doca_error_get_name(result));
 		return result;
 	}
-	result = doca_comch_consumer_get_dpa_handle(objs->dpa_comch->send.consumer,
-									&dpa_comp_msg.dpa_consumer);
+	result = DMESH_DPA_CALL(doca_comch_consumer_get_dpa_handle(objs->dpa_comch->send.consumer,
+									&dpa_comp_msg.dpa_consumer));
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to get DPA consumer handle - %s",
 				doca_error_get_name(result));
@@ -775,6 +788,10 @@ export_dpa_comp_to_host(struct objects *objs)
 doca_error_t
 dmesh_doca_ctrl_get_fd(struct objects *objs, int *out_fd)
 {
+    if (objs && objs->mailbox && out_fd) {
+        *out_fd = dmesh_dispatch_worker_fd(objs);
+        return DOCA_SUCCESS;
+    }
 	doca_error_t result;
 	doca_notification_handle_t handle;
 
@@ -794,6 +811,10 @@ dmesh_doca_ctrl_get_fd(struct objects *objs, int *out_fd)
 doca_error_t
 dmesh_doca_ctrl_arm(struct objects *objs)
 {
+    if (objs && objs->mailbox) {
+        dmesh_dispatch_worker_arm(objs);
+        return DOCA_SUCCESS;
+    }
 	if (objs == NULL || objs->pe == NULL)
 		return DOCA_ERROR_INVALID_VALUE;
 
@@ -803,6 +824,10 @@ dmesh_doca_ctrl_arm(struct objects *objs)
 doca_error_t
 dmesh_doca_ctrl_drain(struct objects *objs)
 {
+    if (objs && objs->mailbox) {
+        dmesh_dispatch_worker_drain(objs);
+        return DOCA_SUCCESS;
+    }
 	if (objs == NULL || objs->pe == NULL)
 		return DOCA_ERROR_INVALID_VALUE;
 
@@ -815,6 +840,7 @@ dmesh_doca_ctrl_drain(struct objects *objs)
 doca_error_t
 dmesh_doca_ctrl_clear_and_drain(struct objects *objs, int fd)
 {
+    if (objs && objs->mailbox) return dmesh_doca_ctrl_drain(objs);
 	doca_error_t result;
 
 	if (objs == NULL || objs->pe == NULL)
@@ -860,12 +886,12 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
         struct doca_ctx *cctx = doca_comch_consumer_as_ctx(conn->consumer);
 
         if (doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE) {
-            (void)doca_ctx_stop(cctx);
+            (void)DMESH_DPA_CALL(doca_ctx_stop(cctx));
             while (spins++ < 100000 &&
                    doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE)
                 doca_pe_progress(objs->consumer_pe);
         }
-        (void)doca_comch_consumer_destroy(conn->consumer);
+        (void)DMESH_DPA_CALL(doca_comch_consumer_destroy(conn->consumer));
         conn->consumer = NULL;
     }
     if (conn->consumer_mem != NULL) {
@@ -880,8 +906,8 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
 
     /* DPA buffer array over the DMA ring. */
     if (conn->buf_arr != NULL) {
-        (void)doca_buf_arr_stop(conn->buf_arr);
-        (void)doca_buf_arr_destroy(conn->buf_arr);
+        (void)DMESH_DPA_CALL(doca_buf_arr_stop(conn->buf_arr));
+        (void)DMESH_DPA_CALL(doca_buf_arr_destroy(conn->buf_arr));
         conn->buf_arr = NULL;
     }
 
@@ -925,8 +951,6 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     conn->push_pos = 0;
     conn->push_len = 0;
     conn->push_state = 0;
-    conn->push_unreported_pos = conn->push_unreported_len = 0;
-    conn->push_unreported_seq = 0;
     conn->push_shadow = NULL;
 
     /* Per-connection DMA engine (ctx, inventory, task pool, recv/pending rings). */
@@ -1018,7 +1042,7 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     if (result != DOCA_SUCCESS)
         return result;
     if (conn->buf_arr != NULL) {
-        result = doca_buf_arr_destroy(conn->buf_arr); /* also stops the array */
+        result = DMESH_DPA_CALL(doca_buf_arr_destroy(conn->buf_arr)); /* also stops the array */
         if (result != DOCA_SUCCESS)
             return result;
         conn->buf_arr = NULL;
@@ -1118,7 +1142,7 @@ static uint64_t session_now_ms(void)
 /* The physical connection belongs to the channel session. Flow cleanup must
  * never disconnect a sibling flow. Keep failed-session records occupied while
  * quarantined exported buffers still belong to them. */
-static void sessions_advance(struct objects *objs)
+void dmesh_sessions_advance(struct objects *objs)
 {
     uint64_t now = session_now_ms();
     for (int n = 0; n < DMESH_MAX_SESSIONS; ++n) {
@@ -1126,22 +1150,23 @@ static void sessions_advance(struct objects *objs)
         bool live = false, closing_flow = false;
         if (!s->occupied)
             continue;
-        if (!s->negotiated && !s->closing && now >= s->hello_deadline_ms)
+        if ((!s->negotiated || s->hello_pending) && !s->closing && now >= s->hello_deadline_ms)
             session_fail(objs, s);
         if (!s->closing) {
             if (s->hello_pending &&
-                session_send_frame(objs, s, DMESH_SESSION_HELLO_ACK, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)
+                (!objs->dispatcher || dmesh_dispatcher_accepting(objs)) &&
+                dmesh_session_send(objs, s, DMESH_SESSION_HELLO_ACK, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)
                 s->hello_pending = false;
             if (s->doorbell_pending_epoch != s->doorbell_sent_epoch) {
                 uint8_t epoch[DMESH_SESSION_DOORBELL_SIZE];
                 dmesh_session_put_u64(epoch, s->doorbell_pending_epoch);
-                if (session_send_frame(objs, s, DMESH_SESSION_DOORBELL, 0, 0, epoch,
+                if (dmesh_session_send(objs, s, DMESH_SESSION_DOORBELL, 0, 0, epoch,
                                        sizeof(epoch), 0) == DOCA_SUCCESS)
                     s->doorbell_sent_epoch = s->doorbell_pending_epoch;
             }
             for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
                 if (s->close_pending[i] &&
-                    session_send_frame(objs, s, DMESH_SESSION_CLOSED, i + 1, s->generation[i],
+                    dmesh_session_send(objs, s, DMESH_SESSION_CLOSED, i + 1, s->generation[i],
                                        NULL, 0, s->close_status[i]) == DOCA_SUCCESS)
                     s->close_pending[i] = false;
             continue;
@@ -1153,6 +1178,8 @@ static void sessions_advance(struct objects *objs)
                 closing_flow |= conn->state == DMESH_CONN_CLOSING;
             }
         }
+        if (objs->dispatcher)
+            live = closing_flow = dmesh_dispatcher_session_busy(objs, s);
         if (closing_flow || s->sends_pending != 0)
             continue;
         if (s->connection != NULL) {
@@ -1163,8 +1190,11 @@ static void sessions_advance(struct objects *objs)
              * NOT_CONNECTED is terminal, never a send-queue retry condition. */
             session_peer_detached(objs, s);
         }
-        if (!live)
+        if (!live) {
+            uint64_t epoch = s->epoch;
             memset(s, 0, sizeof(*s));
+            s->epoch = epoch;
+        }
     }
 }
 
@@ -1315,8 +1345,6 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 					conn->push_seq = 0;
 					conn->push_pos = 0;
 					conn->push_state = 0;
-					conn->push_unreported_pos = conn->push_unreported_len = 0;
-					conn->push_unreported_seq = 0;
 				}
 				conn->reverse_exported = true;   /* nothing to export */
 				DOCA_LOG_INFO("Push channel ready (mode %u) for %u.%u.%u.%u:%u",
@@ -1365,7 +1393,7 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 				struct doca_ctx *cctx = doca_comch_consumer_as_ctx(conn->consumer);
 
 				if (doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE) {
-					(void)doca_ctx_stop(cctx);
+					(void)DMESH_DPA_CALL(doca_ctx_stop(cctx));
 					while (spins++ < 100000 &&
 					       doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE)
 						doca_pe_progress(objs->consumer_pe);
@@ -1378,7 +1406,7 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			 * the DPA thread itself is kept (that destroy is the flexio
 			 * hazard) - the slot leaks its pool thread, as parking always did. */
 			if (conn->consumer != NULL) {
-				(void)doca_comch_consumer_destroy(conn->consumer);
+				(void)DMESH_DPA_CALL(doca_comch_consumer_destroy(conn->consumer));
 				conn->consumer = NULL;
 			}
 			if (conn->consumer_mem != NULL) {
@@ -1471,9 +1499,11 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 		/* DMA engines are per connection now (created in DMESH_CONN_NEW) */
 
 		objs->phase = DMESH_DOCA_STATE_RUNNING;
+
+        if (objs->mailbox) dmesh_dispatch_worker_ready(objs);
 	}
 
-    sessions_advance(objs);
+    if (!objs->mailbox) dmesh_sessions_advance(objs);
 
 	/* Serve every bound connection; each has its own state machine. */
 	for (i = 0; i < DMESH_MAX_CONNECTIONS; i++) {
@@ -1481,7 +1511,8 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 			dmesh_doca_conn_advance(&objs->conns[i]);
 	}
 
-    sessions_advance(objs);
+    if (objs->mailbox) dmesh_dispatch_worker_flush(objs);
+    else dmesh_sessions_advance(objs);
 
 	*out_state = objs->phase;
 	return DOCA_SUCCESS;

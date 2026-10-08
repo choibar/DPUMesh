@@ -134,8 +134,8 @@ bool RelayChannel::pop(const uint8_t **seg, uint32_t *len) {
             log_warn("slot %d: recv segment out of range (pos=%u len=%u)", slot_, pos, l);
             continue;
         }
-        rx_wm_ = pos + l;
-        rx_wm_dirty_ = true;
+        dpu_rx_consumed_pos_ = pos + l;
+        dpu_rx_consumed_pos_changed_ = true;
         *seg = rx_base_ + pos;
         *len = l;
         if (is_backend_) {
@@ -180,9 +180,9 @@ size_t RelayChannel::l4_pump_recv() {
 
 void RelayChannel::pump_send() {
     wire();
-    if (rx_wm_dirty_) {
-        rx_wm_dirty_ = false;
-        dmesh_doca_conn_rx_watermark(objs_, slot_, rx_wm_);
+    if (dpu_rx_consumed_pos_changed_) {
+        dpu_rx_consumed_pos_changed_ = false;
+        dmesh_doca_conn_update_dpu_rx_consumed_pos(objs_, slot_, dpu_rx_consumed_pos_);
     }
     for (;;) {
         uint32_t pos = 0;
