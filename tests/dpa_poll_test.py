@@ -107,10 +107,10 @@ int main(void) {
  complete_to(6);poll_desc_ring(&a);
  assert(ring.consumer_head==6 && ring.completed_bytes==96 && a.dma_submitted==6);
  for(unsigned i=0;i<6;i++)assert(dst[i*16]==i+1);
- a.rd_fc=1;a.pos=a.buf_size-8;a.rd_pos=0;
+ a.rd_fc=1;a.pos=a.buf_size-8;a.rx_consumed_pos=0;
  descriptor(6,4,16);ring.producer_tail=7;credit_limit=7;
  poll_desc_ring(&a);assert(copies==6); /* byte backpressure */
- a.rd_pos=a.pos;poll_desc_ring(&a);
+ a.rx_consumed_pos=a.pos;poll_desc_ring(&a);
  assert(copies==7 && a.pos==16 && ring.consumer_head==6);
  a.stop=1;poll_desc_ring(&a);
  assert(!finished && !a.stopped); /* kernel cannot exit with pending DMA */

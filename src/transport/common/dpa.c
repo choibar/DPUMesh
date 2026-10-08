@@ -21,7 +21,7 @@
 
 DOCA_LOG_REGISTER(DPA);
 
-/* DPU-side staging flow control opt-in (set by apps that publish rd_pos). */
+/* DPU-side staging flow control opt-in (set by apps that publish rx_consumed_pos). */
 int dmesh_staging_fc = 0;
 
 _Static_assert(DMESH_DPA_MAX_INFLIGHT <= CC_DPA_MAX_MSG_NUM,
@@ -1227,7 +1227,7 @@ dmesh_fill_dpa_thread_ctx(struct dmesh_conn *conn, struct dpa_thread_ctx *arg,
         .src_addr = (uint64_t)(uintptr_t)conn->dma_buffer,
         .buf_size = 1024 * 1024,
         .pos = 0,
-        .rd_pos = 0,
+        .rx_consumed_pos = 0,
         .rd_fc = (uint32_t)dmesh_staging_fc,
 #endif
     };

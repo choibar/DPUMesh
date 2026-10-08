@@ -99,7 +99,7 @@ static void poll_desc_ring(struct dpa_thread_ctx *a)
             continue;
         }
         if (a->rd_fc) {
-            uint32_t unread = (a->pos + a->buf_size - a->rd_pos) % a->buf_size;
+            uint32_t unread = (a->pos + a->buf_size - a->rx_consumed_pos) % a->buf_size;
             if (a->buf_size - unread < 3u * 8064u)
                 continue;
         }

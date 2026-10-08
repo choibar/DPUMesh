@@ -33,7 +33,7 @@ struct dpa_thread_ctx {
     uint32_t pos; /* next destination staging offset */
 
     /* CPU -> DPA consumed position; rd_fc enables staging flow control. */
-    volatile uint32_t rd_pos;
+    volatile uint32_t rx_consumed_pos;
     volatile uint32_t rd_fc;
 
     /* Stop admission, drain producer CQ, then publish stopped. A nonzero

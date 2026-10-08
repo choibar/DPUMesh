@@ -40,7 +40,7 @@
  * thread with the same poll_desc_ring kernel the DPU uses, and that thread
  * copies tx_staging into the window's data area, delivering one fused msgq
  * completion per descriptor (dpa.c's recv callback queues it in recv_segs).
- * The application's releases feed the kernel's staging gate (rd_pos) so it
+ * The application's releases feed the kernel's staging gate (rx_consumed_pos) so it
  * never overwrites bytes the host still holds.
  */
 
@@ -60,7 +60,7 @@ _Static_assert(CHANNEL_MODE_BACKEND_HOST_DPA == DMESH_FLOW_MODE_BACKEND_PULL, "b
 
 #define CHANNEL_RING_SIZE 1024u            /* Forward ring depth of the host library */
 #define CHANNEL_REV_READY_MS 5000          /* Wait for the DPU's EXPORT_RCV_RING */
-#define CHANNEL_RD_POS_BATCH (64u * 1024u) /* Pull: bytes released between rd_pos publications */
+#define CHANNEL_RX_CONSUMED_POS_BATCH (64u * 1024u) /* Pull: bytes released between rx_consumed_pos publications */
 #define CHANNEL_DEFAULT_REV_PCI "0b:00.0"  /* Pull: the host PF that runs the DPA process */
 #define CHANNEL_CTX_STOP_SPINS 100000      /* Bound on progressing a stopping ctx to IDLE */
 
@@ -113,7 +113,7 @@ struct channel_conn {
 	uint64_t rx_seq;                    /* Segments delivered to the carrier */
 	uint64_t consumed_seq;              /* Segments the carrier released */
 	uint32_t seg_end[CHANNEL_DESC_N]; /* End offset of delivered segment seq % N */
-	uint32_t rd_pos;           /* End offset of the latest released prefix */
+	uint32_t rx_consumed_pos;           /* End offset of the latest released prefix */
 	uint64_t rd_published_bytes;
 	uint64_t rd_published_seq;
 };
@@ -891,7 +891,7 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 		.dpu_mmap = cfg->rx->dpa_rev,        /* DMA destination: host RX region */
 		.src_addr = (uint64_t)(uintptr_t)dst, /* destination base */
 		.buf_size = (uint32_t)conn->data_size,
-		.rd_pos = 0,
+		.rx_consumed_pos = 0,
 		.rd_fc = 1,                          /* the application's releases gate reuse */
 		.dpa_dev = (uint64_t)dpa_dev,
 	};
@@ -1305,7 +1305,7 @@ int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos
  * order; the kernel wraps a copy that would cross the end, so bytes do not map
  * linearly to offsets). The device-side write is coalesced: the kernel gates
  * only when fewer than 3 x 8064 B of the 1 MiB ring look free, so publishing
- * every CHANNEL_RD_POS_BATCH bytes keeps it far from the gate.
+ * every CHANNEL_RX_CONSUMED_POS_BATCH bytes keeps it far from the gate.
  *
  * @conn [in]: Connection
  * @seq [in]: Newest released batch
@@ -1316,16 +1316,16 @@ static void host_dpa_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64
 	if (seq <= conn->consumed_seq)
 		return;
 	conn->consumed_seq = seq;
-	conn->rd_pos = conn->seg_end[seq % CHANNEL_DESC_N] % (uint32_t)conn->data_size;
+	conn->rx_consumed_pos = conn->seg_end[seq % CHANNEL_DESC_N] % (uint32_t)conn->data_size;
 
-	if (bytes - conn->rd_published_bytes < CHANNEL_RD_POS_BATCH &&
+	if (bytes - conn->rd_published_bytes < CHANNEL_RX_CONSUMED_POS_BATCH &&
 	    seq - conn->rd_published_seq < CHANNEL_DESC_N / 2)
 		return;
 	conn->rd_published_bytes = bytes;
 	conn->rd_published_seq = seq;
 	(void)doca_dpa_h2d_memcpy(conn->reverse->dpa_thread->dpa,
-				  conn->reverse->dpa_thread->local_storage + offsetof(struct dpa_thread_ctx, rd_pos),
-				  &conn->rd_pos, sizeof(conn->rd_pos));
+				  conn->reverse->dpa_thread->local_storage + offsetof(struct dpa_thread_ctx, rx_consumed_pos),
+				  &conn->rx_consumed_pos, sizeof(conn->rx_consumed_pos));
 }
 
 void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes)

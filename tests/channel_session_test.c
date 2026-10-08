@@ -254,7 +254,7 @@ static void test_checked_close(void)
         (void)channel_conn_progress(a);
         /* A late application RX release must not write a freed thread arg. */
         if (phase != FAIL_QUIESCE)
-            channel_conn_rx_consumed(a, CHANNEL_DESC_N / 2, CHANNEL_RD_POS_BATCH);
+            channel_conn_rx_consumed(a, CHANNEL_DESC_N / 2, CHANNEL_RX_CONSUMED_POS_BATCH);
         assert(channel_conn_close(a) == 0);
         assert(!dev.flows[1] && dev.flows[2] == b && dev.control == control);
         assert(closes == before_close + 1 && ring_frees == before_free + 1);

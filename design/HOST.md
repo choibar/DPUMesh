@@ -85,7 +85,7 @@ process per function) and its vhca needs a DPA EU partition on the DPU
 exports on that device, gets one DPA thread + msgq (its own progress engine)
 and the same `poll_desc_ring` kernel the DPU runs forward; completions arrive
 as msgq messages and the application's releases feed the kernel's staging gate
-(`rd_pos`, published every 64 KiB). The dpacc host stub is compiled with
+(`rx_consumed_pos`, published every 64 KiB). The dpacc host stub is compiled with
 `-fPIC` so `dpa_kernel.a` links into the shared library (root `Makefile`).
 A host SF cannot create the DPA process itself (refused by the firmware), but
 `DPUMESH_HOST_DPA_DEV=<ibdev of the SF>` runs the official extended-context flow:
