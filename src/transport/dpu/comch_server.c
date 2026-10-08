@@ -32,21 +32,6 @@ struct session_send {
 
 static uint64_t session_now_ms(void);
 
-/* The decimal suffix of a comch server name (DPUMesh3 -> 3), or -1. A worker
- * that serves its own comch server DPUMesh<k> takes DPA pool k's EU range
- * whatever order the workers start in (dispatcher workers use their index). */
-static int
-server_name_index(const char *name)
-{
-	size_t n = strlen(name), i = n;
-
-	while (i > 0 && name[i - 1] >= '0' && name[i - 1] <= '9')
-		i--;
-	if (i == n || n - i > 6)
-		return -1;
-	return atoi(name + i);
-}
-
 static struct dmesh_session *
 session_get(struct objects *objs, struct doca_comch_connection *connection, bool create)
 {
@@ -621,7 +606,6 @@ start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool
         goto destroy_pe;
     }
     objs->is_server = true;
-    objs->dpa_pool_index = server_name_index(server_name);
 
     ctx = doca_comch_server_as_ctx(objs->cc_server);
 

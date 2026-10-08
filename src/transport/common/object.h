@@ -229,11 +229,6 @@ struct objects {
     struct dmesh_worker_mailbox *mailbox;
     struct dmesh_comch_client legacy_client; /* compatibility adapter, not used by native channels */
     int worker_idx;                 /* index of the owning worker thread */
-    /* DPA pool of a worker that serves its own comch server: the decimal
-     * suffix of the server name (DPUMesh<k> -> k), or -1 when the name has
-     * none. Picks the pool's EU range in dmesh_dpa_thread_pool_init; a
-     * dispatcher worker uses worker_idx instead. */
-    int dpa_pool_index;
     struct doca_dev *dev;
     struct doca_dev_rep *rep_dev;
     struct doca_pe *pe;
