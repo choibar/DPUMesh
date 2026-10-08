@@ -27,11 +27,14 @@
 set -e
 
 # This script uses the dpacc tool (located in /opt/mellanox/doca/tools/dpacc) to compile DPA kernels device code.
-# This script takes 4 arguments:
+# This script takes 6 required arguments, followed by optional device sources:
 # arg1: The project's build path (for the DPA Device build)
-# arg2: Absolute paths of all DPA (kernel) device source code *files* (our code)
-# arg3: The sample name
-# arg4: The output DPACC sample program name
+# arg2: The transport source directory
+# arg3: The primary DPA device source file
+# arg4: The output DPACC program name
+# arg5: The DPA target CPU
+# arg6: The DOCA library directory
+# arg7...: Additional DPA device source files linked into the same app
 
 ####################
 ## Configurations ##
@@ -39,10 +42,12 @@ set -e
 
 PROJECT_BUILD_DIR=$1
 PROJECT_SRC_DIR=$2
-DPA_KERNELS_DEVICE_SRC=$3
+DPA_KERNELS_DEVICE_SRC=("$3")
 PROGRAM_NAME=$4
 DPACC_MCPU_FLAG=$5
 DOCA_LIB_DIR=$6
+shift 6
+DPA_KERNELS_DEVICE_SRC+=("$@")
 
 # DOCA Configurations
 DOCA_DIR="/opt/mellanox/doca"
@@ -66,12 +71,12 @@ DPA_APP_NAME="DPU_mesh_dpa_app"
 # Build directory for the DPA device (kernel) code
 DEVICE_BUILD_DIR="${PROJECT_BUILD_DIR}/device"
 
-rm -rf ${DEVICE_BUILD_DIR}
-mkdir -p ${DEVICE_BUILD_DIR}
+rm -rf "${DEVICE_BUILD_DIR}"
+mkdir -p "${DEVICE_BUILD_DIR}"
 
 # Compile the DPA (kernel) device source code using the DPACC
-$DOCA_DPACC $DPA_KERNELS_DEVICE_SRC \
-	-o ${DEVICE_BUILD_DIR}/${PROGRAM_NAME}.a \
+"$DOCA_DPACC" "${DPA_KERNELS_DEVICE_SRC[@]}" \
+	-o "${DEVICE_BUILD_DIR}/${PROGRAM_NAME}.a" \
 	-mcpu=${DPACC_MCPU_FLAG} \
 	-hostcc=gcc \
 	-hostcc-options="${HOST_CC_FLAGS}" \

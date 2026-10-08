@@ -42,7 +42,7 @@ int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot, uint32_t *o
                                  uint32_t *out_len);
 int32_t dmesh_doca_conn_tx_staging(struct objects *objs, int32_t slot, uintptr_t *out_base,
                                    size_t *out_len);
-int32_t dmesh_doca_conn_rx_watermark(struct objects *objs, int32_t slot, uint32_t pos);
+int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t slot, uint32_t pos);
 int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot, uint32_t pos, uint32_t len);
 void dmesh_doca_stats_get(struct objects *objs, int64_t *sent, int64_t *recv, int64_t *recv_bytes,
                           int64_t *dma_pending, int64_t *dma_dropped);

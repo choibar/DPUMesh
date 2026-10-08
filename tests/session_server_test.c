@@ -334,7 +334,7 @@ static void reader_fence_test(void)
     session_fail(objs, s);
     reset_cleanup();
     dmesh_flow_close_advance(conn);
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(conn->state == DMESH_CONN_CLOSING && !conn->quarantined);
     assert(cleanup_count == 0 && disconnect_attempts == disconnects);
     assert(dmesh_flow_readers_detached(objs, (int)(conn - objs->conns)) == DOCA_SUCCESS);
@@ -360,15 +360,15 @@ static void physical_disconnect_test(void)
     unsigned disconnects = disconnect_attempts;
     server_disconnection_event_callback(NULL, peer, 1);
     assert(s->closing && !s->connection && !objs->connection);
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(s->occupied && disconnect_attempts == disconnects);
     s->sends_pending = 0;
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(!s->occupied && disconnect_attempts == disconnects);
     /* A delayed receive cannot resurrect a retired physical registration. */
     deliver(peer, DMESH_SESSION_HELLO, 0, 0, NULL, 0);
     assert(session_get(objs, peer, false) == NULL);
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(disconnect_attempts == disconnects);
 
     /* Race fallback: local close finds the peer already absent, without a
@@ -377,9 +377,9 @@ static void physical_disconnect_test(void)
     s->closing = true;
     s->negotiated = true;
     disconnect_result = DOCA_ERROR_NOT_CONNECTED;
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(!s->occupied && disconnect_attempts == disconnects + 1);
-    for (int i = 0; i < 4; ++i) sessions_advance(objs);
+    for (int i = 0; i < 4; ++i) dmesh_sessions_advance(objs);
     assert(disconnect_attempts == disconnects + 1);
 
     /* Terminal peer retirement does not release quarantined DMA resources,
@@ -396,7 +396,7 @@ static void physical_disconnect_test(void)
     assert(conn->state == DMESH_CONN_CLOSING && !conn->connection);
     reset_cleanup();
     dmesh_flow_close_advance(conn);
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(conn->quarantined && conn->ring_mmap && s->occupied && !s->connection);
     assert(other->connection == other_peer && !other->closing);
     assert(disconnect_attempts == disconnects + 1 && release_count == 0);
@@ -471,7 +471,7 @@ static void checked_close_test(void)
     assert(s->closed[0] && s->close_pending[0] && s->close_status[0] == 0);
     assert(release_count == 1 && sibling->state == DMESH_CONN_RUNNING);
     unsigned disconnects = disconnect_attempts;
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(attempted_response.type == DMESH_SESSION_CLOSED && attempted_response.status == 0);
     assert(s->close_pending[0]); /* Full SDK send queue: ACK must retry. */
     assert(disconnect_attempts == disconnects);
@@ -502,10 +502,10 @@ static void checked_close_test(void)
     dmesh_flow_close_advance(sibling); /* Explicitly closed sibling may drain. */
     assert(sibling->state == DMESH_CONN_FREE);
     disconnect_result = DOCA_ERROR_AGAIN;
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(s->connection == peer && conn->connection == peer);
     disconnect_result = DOCA_SUCCESS;
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(s->occupied && !s->connection && !conn->connection);
     assert(conn->quarantined && conn->ring_mmap);
     struct dmesh_session *replacement = session_get(objs, peer, true);
@@ -516,7 +516,7 @@ static void checked_close_test(void)
     struct dmesh_session *unnegotiated = session_get(objs, peer2, true);
     unnegotiated->hello_deadline_ms = 0;
     disconnects = disconnect_attempts;
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(disconnect_attempts == disconnects + 1 && !unnegotiated->occupied);
     free(objs);
     callback_objects = NULL;
@@ -564,7 +564,7 @@ static void idle_wake_test(void)
     unsigned before = response_attempts;
     deliver_arm(peer, 11, seen, 2);
     assert(s->armed && s->armed_epoch == 11 && !s->closing);
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(response_attempts == before);
 
     /* The next completion rings once; later completions do not re-ring. */
@@ -572,21 +572,21 @@ static void idle_wake_test(void)
     assert(!s->armed && s->doorbell_pending_epoch == 11);
     dmesh_session_push_published(s);
     assert(s->doorbell_pending_epoch == 11);
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     expect_doorbell(before, peer);
     /* A rejected send (the mock's full queue) is retried, never dropped. */
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     expect_doorbell(before + 1, peer);
     s->doorbell_sent_epoch = s->doorbell_pending_epoch;   /* model an accepted send */
     before = response_attempts;
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(response_attempts == before);
 
     /* A descriptor the ARM had not accounted for rings at once. */
     struct dmesh_session_arm_flow behind[] = {{1, 3, 4}};
     deliver_arm(peer, 12, behind, 1);
     assert(!s->armed && s->doorbell_pending_epoch == 12);
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     expect_doorbell(before, peer);
     s->doorbell_sent_epoch = 12;
 
@@ -595,7 +595,7 @@ static void idle_wake_test(void)
     before = response_attempts;
     deliver_arm(peer, 13, stale, 2);
     assert(s->armed && s->armed_epoch == 13);
-    sessions_advance(objs);
+    dmesh_sessions_advance(objs);
     assert(response_attempts == before);
 
     /* An ARM with no push flow still arms the session. */

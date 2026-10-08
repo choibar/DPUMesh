@@ -1,0 +1,1389 @@
+{
+  "summary": {
+    "rps": 15956.929345908244,
+    "p50_ms": 16.086948,
+    "p99_ms": 20.706781,
+    "dpu_worker_pct": 99.52180104389035,
+    "client_cpu_pct": 87.97643851701137,
+    "server_cpu_pct": 87.04710994112746,
+    "rps_min": 15929.42617534087,
+    "rps_max": 15975.71573718666,
+    "historical_rps": 17956.9,
+    "change_vs_historical_pct": -11.137616482197698,
+    "rpc_errors": 0,
+    "cleanup_ok": true
+  },
+  "conditions": {
+    "warm": 10,
+    "duration": 30,
+    "repeats": 3,
+    "host": "youngmin@192.168.100.1",
+    "host_root": "/tmp/dmesh-worker-backend-host",
+    "host_clock_offset_ns": 159223132,
+    "clock_rtt_ns": 322639166,
+    "client_target": "direct endpoint 10.81.1.1:8080",
+    "flow_placement": "round-robin",
+    "host_client_cpus": "0-7",
+    "host_server_cpus": "8-15",
+    "client_gomaxprocs": 8,
+    "server_gomaxprocs": 8,
+    "online_cpus": "0-11"
+  },
+  "live_config": [
+    {
+      "pid": 3280569,
+      "exe": "/tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-server",
+      "cpu_affinity": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "env": {
+        "DPUMESH_REVERSE": "dpu-dma",
+        "GOMAXPROCS": "8",
+        "DPUMESH_SERVICE": "10.81.1.1:8080"
+      }
+    },
+    {
+      "pid": 3280645,
+      "exe": "/tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-client",
+      "cpu_affinity": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "env": {
+        "DPUMESH_REVERSE": "dpu-dma",
+        "GOMAXPROCS": "8",
+        "DPUMESH_SERVICE_IP": "10.81.1.1",
+        "DPUMESH_SERVICE_PORT": "8080",
+        "BENCH_P": "4",
+        "BENCH_M": "64",
+        "BENCH_PAYLOAD": "64",
+        "BENCH_WARM": "10",
+        "BENCH_DUR": "30"
+      }
+    }
+  ],
+  "binary_sha256": "763bfb586943f0bb16a6ade8016949d50aa173386b0075588db5467c4cb1cb3a  /home/youngmin/DPUMesh/linkerd2-proxy/target/release/linkerd2-proxy\n5b056f4581e9c0954714920d6986166c3d9af71024b7e60057037f35c745bd05  /tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-client\n4562f4605d67cf78b60347e143cff7ffc9059295b62417a060c1a79aff412a60  /tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-server\n4586465510dcb4739f03cb2c342356ca35e982c63b33e4a74965f317b99aee46  /tmp/dmesh-worker-backend-host/build/lib/libdpumesh.so\n",
+  "measurements": [
+    {
+      "repeat": 1,
+      "rps": 15975.71573718666,
+      "p50_ms": 16.055302,
+      "p99_ms": 20.763209,
+      "errors": 0,
+      "dpu_worker_pct": 99.48546097145233,
+      "client_cpu_pct": 87.01024488477978,
+      "server_cpu_pct": 85.08280275125612
+    },
+    {
+      "repeat": 2,
+      "rps": 15929.42617534087,
+      "p50_ms": 16.101386,
+      "p99_ms": 20.706781,
+      "errors": 0,
+      "dpu_worker_pct": 99.52544014481171,
+      "client_cpu_pct": 87.97643851701137,
+      "server_cpu_pct": 87.04710994112746
+    },
+    {
+      "repeat": 3,
+      "rps": 15956.929345908244,
+      "p50_ms": 16.086948,
+      "p99_ms": 20.69229,
+      "errors": 0,
+      "dpu_worker_pct": 99.52180104389035,
+      "client_cpu_pct": 88.839589998671,
+      "server_cpu_pct": 87.22182140900132
+    }
+  ],
+  "raw_runs": [
+    {
+      "end_ns": 1791252579564497339,
+      "errors": 0,
+      "flows": 4,
+      "inflight_per_flow": 64,
+      "p50_us": 16055.302,
+      "p99_us": 20763.209,
+      "payload": 64,
+      "rps": 15975.71573718666,
+      "start_ns": 1791252549563462774,
+      "total": 479288,
+      "client_pid": 3280645,
+      "server_pids": [
+        3280569
+      ],
+      "exit": 0,
+      "workers": 1,
+      "replicas": 1,
+      "repeat": 1,
+      "case": "w1-r1-f4",
+      "host_cpu": {
+        "process_pct": {
+          "3280569": 85.08280275125612,
+          "3280645": 87.01024488477978
+        },
+        "tasks": {
+          "3280569": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              12
+            ]
+          },
+          "3280570": {
+            "name": "bench-server",
+            "pct": 0.13767443810882876,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280571": {
+            "name": "bench-server",
+            "pct": 8.329303505584143,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280572": {
+            "name": "bench-server",
+            "pct": 9.706047886672428,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280573": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              15
+            ]
+          },
+          "3280574": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              9
+            ]
+          },
+          "3280581": {
+            "name": "bench-server",
+            "pct": 6.7116288578054055,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280582": {
+            "name": "bench-server",
+            "pct": 6.986977734023061,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280583": {
+            "name": "bench-server",
+            "pct": 9.465117619981978,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280656": {
+            "name": "bench-server",
+            "pct": 8.983257086601078,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              15
+            ]
+          },
+          "3280657": {
+            "name": "bench-server",
+            "pct": 9.189768743764322,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280658": {
+            "name": "bench-server",
+            "pct": 9.46511761998198,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280660": {
+            "name": "bench-server",
+            "pct": 9.258605962818736,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280668": {
+            "name": "bench-server",
+            "pct": 6.849303295914233,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14
+            ]
+          },
+          "3280645": {
+            "name": "bench-client",
+            "pct": 6.8837219054414405,
+            "cpus": [
+              0,
+              1,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280647": {
+            "name": "bench-client",
+            "pct": 0.17209304763603595,
+            "cpus": [
+              0,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280648": {
+            "name": "bench-client",
+            "pct": 9.740466496199636,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280649": {
+            "name": "bench-client",
+            "pct": 6.298605543478918,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280650": {
+            "name": "bench-client",
+            "pct": 6.229768324424504,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              7
+            ]
+          },
+          "3280651": {
+            "name": "bench-client",
+            "pct": 0.0,
+            "cpus": [
+              2
+            ]
+          },
+          "3280652": {
+            "name": "bench-client",
+            "pct": 10.015815372417297,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280653": {
+            "name": "bench-client",
+            "pct": 9.499536229509184,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280654": {
+            "name": "bench-client",
+            "pct": 9.327443181873152,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280655": {
+            "name": "bench-client",
+            "pct": 9.706047886672428,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280659": {
+            "name": "bench-client",
+            "pct": 9.361861791400356,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3280718": {
+            "name": "bench-client",
+            "pct": 9.74046649619964,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              5,
+              6,
+              7
+            ]
+          }
+        }
+      },
+      "dpu_cpu": {
+        "process_pct": {
+          "2006490": 99.98413496128421
+        },
+        "tasks": {
+          "2006490": {
+            "name": "linkerd2-proxy",
+            "pct": 0.03561957070227438,
+            "cpus": [
+              11
+            ]
+          },
+          "2006491": {
+            "name": "dmesh-routes",
+            "pct": 0.03561957070227438,
+            "cpus": [
+              11
+            ]
+          },
+          "2006492": {
+            "name": "dmesh-control",
+            "pct": 0.3918152777250182,
+            "cpus": [
+              11
+            ]
+          },
+          "2006493": {
+            "name": "dmesh-shard-0",
+            "pct": 99.48546097145233,
+            "cpus": [
+              11
+            ]
+          },
+          "2006494": {
+            "name": "admin",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006495": {
+            "name": "dmesh-shard-0",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006496": {
+            "name": "dmesh-shard-0",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          }
+        }
+      },
+      "client_flows_by_worker": {
+        "0": 4
+      },
+      "backend_flows_by_worker": {
+        "0": 1
+      },
+      "flow_audit": {
+        "10.81.1.1:8080/0/1/1/1": {
+          "worker": 0,
+          "requests": 638996,
+          "cross_worker": 0,
+          "cross_thread": 0
+        }
+      }
+    },
+    {
+      "end_ns": 1791252623631104751,
+      "errors": 0,
+      "flows": 4,
+      "inflight_per_flow": 64,
+      "p50_us": 16101.386,
+      "p99_us": 20706.781,
+      "payload": 64,
+      "rps": 15929.42617534087,
+      "start_ns": 1791252593630651830,
+      "total": 477890,
+      "client_pid": 3281121,
+      "server_pids": [
+        3280569
+      ],
+      "exit": 0,
+      "workers": 1,
+      "replicas": 1,
+      "repeat": 2,
+      "case": "w1-r1-f4",
+      "host_cpu": {
+        "process_pct": {
+          "3280569": 87.04710994112746,
+          "3281121": 87.97643851701137
+        },
+        "tasks": {
+          "3280569": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              12
+            ]
+          },
+          "3280570": {
+            "name": "bench-server",
+            "pct": 0.13767830753835897,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280571": {
+            "name": "bench-server",
+            "pct": 9.224446605070053,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280572": {
+            "name": "bench-server",
+            "pct": 9.809579412108077,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280573": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              15
+            ]
+          },
+          "3280574": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              9
+            ]
+          },
+          "3280581": {
+            "name": "bench-server",
+            "pct": 4.612223302535026,
+            "cpus": [
+              8,
+              10,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280582": {
+            "name": "bench-server",
+            "pct": 9.70632068145431,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280583": {
+            "name": "bench-server",
+            "pct": 9.534222797031362,
+            "cpus": [
+              8,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280656": {
+            "name": "bench-server",
+            "pct": 8.983509566877924,
+            "cpus": [
+              8,
+              9,
+              10,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280657": {
+            "name": "bench-server",
+            "pct": 8.604894221147438,
+            "cpus": [
+              8,
+              9,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280658": {
+            "name": "bench-server",
+            "pct": 9.258866181954641,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280660": {
+            "name": "bench-server",
+            "pct": 9.43096406637759,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280668": {
+            "name": "bench-server",
+            "pct": 7.709985222148106,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              13,
+              14,
+              15
+            ]
+          },
+          "3281121": {
+            "name": "bench-client",
+            "pct": 9.87841856587726,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281123": {
+            "name": "bench-client",
+            "pct": 0.1720978844229487,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ]
+          },
+          "3281124": {
+            "name": "bench-client",
+            "pct": 9.809579412108079,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281125": {
+            "name": "bench-client",
+            "pct": 9.430964066377589,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281127": {
+            "name": "bench-client",
+            "pct": 9.878418565877258,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281126": {
+            "name": "bench-client",
+            "pct": 9.775159835223489,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281128": {
+            "name": "bench-client",
+            "pct": 0.0,
+            "cpus": [
+              2
+            ]
+          },
+          "3281129": {
+            "name": "bench-client",
+            "pct": 9.63748152768513,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281130": {
+            "name": "bench-client",
+            "pct": 8.776992105570386,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281131": {
+            "name": "bench-client",
+            "pct": 7.7444047990326945,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281132": {
+            "name": "bench-client",
+            "pct": 2.9256640351901284,
+            "cpus": [
+              0,
+              2,
+              4,
+              5,
+              7
+            ]
+          },
+          "3281147": {
+            "name": "bench-client",
+            "pct": 10.016096873415613,
+            "cpus": [
+              0,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          }
+        }
+      },
+      "dpu_cpu": {
+        "process_pct": {
+          "2006490": 99.9725136492632
+        },
+        "tasks": {
+          "2006490": {
+            "name": "linkerd2-proxy",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006491": {
+            "name": "dmesh-routes",
+            "pct": 0.0687805391463799,
+            "cpus": [
+              11
+            ]
+          },
+          "2006492": {
+            "name": "dmesh-control",
+            "pct": 0.4126832348782794,
+            "cpus": [
+              11
+            ]
+          },
+          "2006493": {
+            "name": "dmesh-shard-0",
+            "pct": 99.52544014481171,
+            "cpus": [
+              11
+            ]
+          },
+          "2006494": {
+            "name": "admin",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006495": {
+            "name": "dmesh-shard-0",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006496": {
+            "name": "dmesh-shard-0",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          }
+        }
+      },
+      "client_flows_by_worker": {
+        "0": 4
+      },
+      "backend_flows_by_worker": {},
+      "flow_audit": {
+        "10.81.1.1:8080/0/1/1/1": {
+          "worker": 0,
+          "requests": 637879,
+          "cross_worker": 0,
+          "cross_thread": 0
+        }
+      }
+    },
+    {
+      "end_ns": 1791252667694034367,
+      "errors": 0,
+      "flows": 4,
+      "inflight_per_flow": 64,
+      "p50_us": 16086.948,
+      "p99_us": 20692.29,
+      "payload": 64,
+      "rps": 15956.929345908244,
+      "start_ns": 1791252637693901537,
+      "total": 478710,
+      "client_pid": 3281414,
+      "server_pids": [
+        3280569
+      ],
+      "exit": 0,
+      "workers": 1,
+      "replicas": 1,
+      "repeat": 3,
+      "case": "w1-r1-f4",
+      "host_cpu": {
+        "process_pct": {
+          "3280569": 87.22182140900132,
+          "3281414": 88.839589998671
+        },
+        "tasks": {
+          "3280569": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              12
+            ]
+          },
+          "3280570": {
+            "name": "bench-server",
+            "pct": 0.17210304145422511,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              15
+            ]
+          },
+          "3280571": {
+            "name": "bench-server",
+            "pct": 9.77545275459999,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280572": {
+            "name": "bench-server",
+            "pct": 9.637770321436609,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280573": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              15
+            ]
+          },
+          "3280574": {
+            "name": "bench-server",
+            "pct": 0.0,
+            "cpus": [
+              9
+            ]
+          },
+          "3280581": {
+            "name": "bench-server",
+            "pct": 9.60334971314576,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280582": {
+            "name": "bench-server",
+            "pct": 9.706611538018297,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280583": {
+            "name": "bench-server",
+            "pct": 7.538113215695063,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280656": {
+            "name": "bench-server",
+            "pct": 9.19030241365562,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280657": {
+            "name": "bench-server",
+            "pct": 9.603349713145763,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280658": {
+            "name": "bench-server",
+            "pct": 9.706611538018297,
+            "cpus": [
+              8,
+              9,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280660": {
+            "name": "bench-server",
+            "pct": 9.603349713145763,
+            "cpus": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3280668": {
+            "name": "bench-server",
+            "pct": 2.684807446685911,
+            "cpus": [
+              9,
+              10,
+              12,
+              13,
+              14,
+              15
+            ]
+          },
+          "3281414": {
+            "name": "bench-client",
+            "pct": 9.947555796054212,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281416": {
+            "name": "bench-client",
+            "pct": 0.13768243316338008,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281417": {
+            "name": "bench-client",
+            "pct": 9.981976404345058,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281418": {
+            "name": "bench-client",
+            "pct": 9.22472302194647,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              7
+            ]
+          },
+          "3281419": {
+            "name": "bench-client",
+            "pct": 7.434851390822529,
+            "cpus": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281420": {
+            "name": "bench-client",
+            "pct": 0.0,
+            "cpus": [
+              1
+            ]
+          },
+          "3281421": {
+            "name": "bench-client",
+            "pct": 9.878714579472522,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281428": {
+            "name": "bench-client",
+            "pct": 4.509099686100699,
+            "cpus": [
+              0,
+              1,
+              3,
+              4,
+              5,
+              7
+            ]
+          },
+          "3281429": {
+            "name": "bench-client",
+            "pct": 9.706611538018297,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281430": {
+            "name": "bench-client",
+            "pct": 9.60334971314576,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281431": {
+            "name": "bench-client",
+            "pct": 8.846096330747171,
+            "cpus": [
+              0,
+              1,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          },
+          "3281447": {
+            "name": "bench-client",
+            "pct": 9.53450849656407,
+            "cpus": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ]
+          }
+        }
+      },
+      "dpu_cpu": {
+        "process_pct": {
+          "2006490": 100.00324721341852
+        },
+        "tasks": {
+          "2006490": {
+            "name": "linkerd2-proxy",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006491": {
+            "name": "dmesh-routes",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006492": {
+            "name": "dmesh-control",
+            "pct": 0.447057157418996,
+            "cpus": [
+              11
+            ]
+          },
+          "2006493": {
+            "name": "dmesh-shard-0",
+            "pct": 99.52180104389035,
+            "cpus": [
+              11
+            ]
+          },
+          "2006494": {
+            "name": "admin",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006495": {
+            "name": "dmesh-shard-0",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          },
+          "2006496": {
+            "name": "dmesh-shard-0",
+            "pct": 0.0,
+            "cpus": [
+              11
+            ]
+          }
+        }
+      },
+      "client_flows_by_worker": {
+        "0": 4
+      },
+      "backend_flows_by_worker": {},
+      "flow_audit": {
+        "10.81.1.1:8080/0/1/1/1": {
+          "worker": 0,
+          "requests": 638664,
+          "cross_worker": 0,
+          "cross_thread": 0
+        }
+      }
+    }
+  ],
+  "raw_directory": "/tmp/dmesh-direct-recheck-20261005",
+  "harness": "/tmp/dmesh-onecore-regression-20261003/harness-direct-g8.py"
+}

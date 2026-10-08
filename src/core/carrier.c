@@ -31,8 +31,7 @@
 #define SLOTS 32                       /* DPUMesh connections per worker */
 #define TICKETS 1024                   /* forward ring depth */
 #define UPORT_BASE 32768u
-#define BACKEND_POOL_DEFAULT 8        /* spare BACKEND flows kept open */
-#define BACKEND_MAX_DEFAULT 16         /* spare + claimed BACKEND flows */
+#define BACKEND_MAX_DEFAULT SLOTS      /* demand-created flows, shared per DPU worker */
 static int trace_enabled = -1;
 #define TRACE(...) do { if (trace_enabled < 0) trace_enabled = getenv("DPUMESH_CARRIER_TRACE") != NULL; \
     if (trace_enabled) { fprintf(stderr, "carrier: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -57,9 +56,10 @@ struct dmesh_native_transport {
     struct channel_mem *tx, *rx;
     char server[64], workload[64];
     uint32_t pod_ip;
-    int pod_id, service_id, backend_pool, backend_max;
+    int pod_id, service_id, backend_max;
     uint16_t next_uport;
     pthread_mutex_t lock;
+    uint32_t active_stripes;
     struct slot slots[SLOTS];
     uint16_t port_slot[65536];         /* port -> slot index + 1 */
 };
@@ -75,7 +75,7 @@ static int slot_index(const struct dmesh_native_transport *t, const struct slot 
 
 /* Opens one flow on a free slot. Caller holds t->lock. */
 static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t mode,
-                     uint16_t port, int service_id)
+                     uint16_t port, int service_id, uint32_t worker, uint32_t token)
 {
     uint32_t dst_ip; uint16_t dst_port;
     if (dmesh_target_addr(service_id, &dst_ip, &dst_port) != 0) return -1;
@@ -85,7 +85,8 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
     struct channel_conn_config cfg = {
         .flow_id = (uint32_t)slot_index(t, s) + 1, .workload = t->workload,
         .src_ip = t->pod_ip, .dst_ip = dst_ip, .src_port = port, .dst_port = dst_port,
-        .mode = mode, .tx = t->tx, .rx = t->rx,
+        .mode = mode, .backend_worker = worker, .backend_token = token,
+        .tx = t->tx, .rx = t->rx,
         .rx_offset = (size_t)slot_index(t, s) * CHANNEL_WINDOW,
     };
     struct channel_conn *c = NULL;
@@ -106,6 +107,7 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
      * the connection it describes. Dials can run beside another EQ's drain. */
     __atomic_store_n(&s->state, SLOT_OPEN, __ATOMIC_RELEASE);
     t->port_slot[port] = (uint16_t)(slot_index(t, s) + 1);
+    __atomic_fetch_or(&t->active_stripes, UINT32_C(1) << slot_index(t, s), __ATOMIC_RELEASE);
     TRACE("slot %d open mode %u port %u peer %u service %d", slot_index(t, s), mode, port, s->peer, service_id);
     return 0;
 }
@@ -127,6 +129,7 @@ static void slot_free(struct dmesh_native_transport *t, struct slot *s)
     if (t->port_slot[s->port] == slot_index(t, s) + 1) t->port_slot[s->port] = 0;
     s->backend = 0; s->port = 0;
     __atomic_store_n(&s->state, SLOT_FREE, __ATOMIC_RELEASE);
+    __atomic_fetch_and(&t->active_stripes, ~(UINT32_C(1) << slot_index(t, s)), __ATOMIC_RELEASE);
 }
 static uint16_t next_uport(struct dmesh_native_transport *t)
 {
@@ -137,28 +140,30 @@ static uint16_t next_uport(struct dmesh_native_transport *t)
     }
     return 0;
 }
-/* A backend flow serves one inbound stream. The DPU claims a spare flow when a
- * stream arrives, so the pool keeps `backend_pool` unclaimed flows open, each
- * under a fresh upstream port, up to `backend_max` flows in total. */
-static void backend_maintain(struct dmesh_native_transport *t)
+/* Listener-only startup; service one DPU request per progress pass. The
+ * session callback queues work and never recursively opens a flow. */
+static void backend_progress(struct dmesh_native_transport *t)
 {
+    uint32_t worker, token;
+    if (!channel_backend_next(t->dev, &worker, &token)) return;
     pthread_mutex_lock(&t->lock);
-    for (;;) {
-        int spare = 0, total = 0;
-        struct slot *free_slot = NULL;
-        for (int i = 0; i < SLOTS; ++i) {
-            struct slot *s = &t->slots[i];
-            if (s->state == SLOT_FREE) { if (!free_slot) free_slot = s; continue; }
-            if (s->backend) { ++total; if (s->state == SLOT_OPEN && !s->claimed) ++spare; }
-        }
-        if (spare >= t->backend_pool || total >= t->backend_max || !free_slot) break;
+    int total = 0, error = 0;
+    struct slot *free_slot = NULL;
+    for (int i = 0; i < SLOTS; ++i) {
+        struct slot *s = &t->slots[i];
+        if (s->state == SLOT_FREE) { if (!free_slot) free_slot = s; }
+        else if (s->backend) ++total;
+    }
+    if (t->service_id == DMESH_SVC_NONE) error = ECONNREFUSED;
+    else if (!free_slot || total >= t->backend_max) error = ENOSPC;
+    else {
         uint16_t up = next_uport(t);
-        if (!up || slot_open(t, free_slot, CHANNEL_MODE_BACKEND_DPU_DMA, up, t->service_id) != 0) {
-            fprintf(stderr, "dpumesh: backend flow not opened (%s)\n", strerror(errno));
-            break;
-        }
+        if (!up) error = ENOSPC;
+        else if (slot_open(t, free_slot, CHANNEL_MODE_BACKEND_DPU_DMA,
+                          up, t->service_id, worker, token) != 0) error = errno;
     }
     pthread_mutex_unlock(&t->lock);
+    channel_backend_finish(t->dev, worker, token, error);
 }
 static struct slot *slot_of_port(struct dmesh_native_transport *t, uint16_t port)
 {
@@ -181,8 +186,7 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     snprintf(t->server, sizeof(t->server), "%s", server && *server ? server : "DPUMesh0");
     snprintf(t->workload, sizeof(t->workload), "%s", workload ? workload : "");
     t->pod_id = env_int("DPUMESH_POD_ID", 0, 0, 126);
-    t->backend_pool = env_int("DPUMESH_BACKEND_POOL", BACKEND_POOL_DEFAULT, 1, SLOTS);
-    t->backend_max = env_int("DPUMESH_BACKEND_MAX", BACKEND_MAX_DEFAULT, t->backend_pool, SLOTS);
+    t->backend_max = env_int("DPUMESH_BACKEND_MAX", BACKEND_MAX_DEFAULT, 1, SLOTS);
     t->next_uport = UPORT_BASE;
     t->service_id = DMESH_SVC_NONE;
     /* The served address is resolved once: every BACKEND flow carries it. */
@@ -200,10 +204,9 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     if (channel_mem_alloc(t->dev, cfg->bytes, &t->tx) != 0) goto fail;
     if (channel_mem_alloc(t->dev, (size_t)SLOTS * CHANNEL_WINDOW, &t->rx) != 0) goto fail;
     if (t->service_id != DMESH_SVC_NONE) {
-        backend_maintain(t);
-        int opened = 0;
-        for (int i = 0; i < SLOTS; ++i) opened += t->slots[i].state == SLOT_OPEN;
-        if (!opened) { errno = EIO; goto fail; }
+        uint32_t ip; uint16_t port;
+        if (dmesh_target_addr(t->service_id, &ip, &port) != 0 ||
+            channel_session_listen(t->dev, ip, port) != 0) goto fail;
     }
     cfg->tx = channel_mem_base(t->tx); cfg->rx = channel_mem_base(t->rx);
     cfg->rx_bytes = (size_t)SLOTS * CHANNEL_WINDOW;
@@ -237,7 +240,7 @@ int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int se
     struct slot *s = NULL;
     for (int i = 0; i < SLOTS; ++i) if (t->slots[i].state == SLOT_FREE) { s = &t->slots[i]; break; }
     if (!s) { pthread_mutex_unlock(&t->lock); errno = ENOSPC; return -1; }
-    int rc = slot_open(t, s, CHANNEL_MODE_CLIENT_DPU_DMA, port, service_id);
+    int rc = slot_open(t, s, CHANNEL_MODE_CLIENT_DPU_DMA, port, service_id, 0, 0);
     pthread_mutex_unlock(&t->lock);
     return rc;
 }
@@ -301,9 +304,11 @@ static void fill_ack(struct slot *s, struct dmesh_native_event *e, uint16_t seq)
     e->kind = DMESH_NATIVE_ACK; e->port = s->port; e->seq = seq; e->seq_count = 1;
     TRACE("ack port %u seq %u", s->port, seq);
 }
-void dmesh_native_progress(struct dmesh_native_transport *t)
+uint32_t dmesh_native_progress(struct dmesh_native_transport *t)
 {
-    (void)channel_dev_progress(t->dev);
+    if (channel_dev_progress(t->dev) == 0 && t->service_id != DMESH_SVC_NONE)
+        backend_progress(t);
+    return __atomic_load_n(&t->active_stripes, __ATOMIC_ACQUIRE);
 }
 int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e)
 {
@@ -313,9 +318,9 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
     pthread_mutex_lock(&s->lock);
     int n = 0;
     if (s->state == SLOT_OPEN) {
-        int gone = channel_conn_status(s->conn);
+        int gone = channel_conn_poll(s->conn);
         uint64_t consumed = channel_conn_consumed(s->conn);
-        if (s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {
+        if (gone >= 0 && s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {
             fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1;
         } else if (gone && !s->peer_gone_reported) {
             s->peer_gone_reported = 1;
@@ -333,7 +338,6 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
                 if (s->backend && !s->claimed) {
                     s->claimed = 1;
                     pthread_mutex_unlock(&s->lock);
-                    backend_maintain(t);            /* keep spares for the next stream */
                     return n;
                 }
             }
@@ -346,10 +350,8 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
         if (s->t_head != s->t_tail) { fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1; }
         else if (s->fin_pending) {
             s->fin_pending = 0; fill_ack(s, e, s->fin_seq); n = 1;
-            int backend = s->backend;
             pthread_mutex_unlock(&s->lock);
             pthread_mutex_lock(&t->lock); slot_free(t, s); pthread_mutex_unlock(&t->lock);
-            if (backend) backend_maintain(t);
             return n;
         }
     }

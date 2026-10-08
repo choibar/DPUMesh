@@ -1,0 +1,308 @@
+{
+  "mode": "dpu-dma",
+  "workers": 4,
+  "policy": "least-flows",
+  "client_processes_per_case": 1,
+  "backend_connections": 1,
+  "build": "development",
+  "flows": [
+    {
+      "session": 1,
+      "session_epoch": 1,
+      "flow": 1,
+      "generation": 1,
+      "worker": 0,
+      "slot": 0,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 1,
+      "flow": 1,
+      "generation": 1,
+      "worker": 1,
+      "slot": 0,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 1,
+      "flow": 2,
+      "generation": 1,
+      "worker": 2,
+      "slot": 0,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 1,
+      "flow": 3,
+      "generation": 1,
+      "worker": 3,
+      "slot": 0,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 1,
+      "flow": 4,
+      "generation": 1,
+      "worker": 0,
+      "slot": 1,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 2,
+      "flow": 1,
+      "generation": 1,
+      "worker": 1,
+      "slot": 0,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 2,
+      "flow": 2,
+      "generation": 1,
+      "worker": 2,
+      "slot": 0,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 2,
+      "flow": 3,
+      "generation": 1,
+      "worker": 3,
+      "slot": 0,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 2,
+      "flow": 4,
+      "generation": 1,
+      "worker": 0,
+      "slot": 1,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 2,
+      "flow": 5,
+      "generation": 1,
+      "worker": 1,
+      "slot": 1,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 2,
+      "flow": 6,
+      "generation": 1,
+      "worker": 2,
+      "slot": 1,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 2,
+      "flow": 7,
+      "generation": 1,
+      "worker": 3,
+      "slot": 1,
+      "ownership_epoch": 1
+    },
+    {
+      "session": 2,
+      "session_epoch": 2,
+      "flow": 8,
+      "generation": 1,
+      "worker": 0,
+      "slot": 2,
+      "ownership_epoch": 1
+    }
+  ],
+  "results": [
+    {
+      "event": "result",
+      "ok": true,
+      "connections": 4,
+      "concurrency": 16,
+      "concurrency_per_conn": [
+        4,
+        4,
+        4,
+        4
+      ],
+      "payload_bytes": 64,
+      "warmup_seconds": 1,
+      "duration_seconds": 5,
+      "elapsed_secs": 5,
+      "client_process_cpu_pct": 15.896695896452293,
+      "client_cpu_sample_seconds": 5.000127103,
+      "measurement_start": "2026-10-01T07:43:10.079680141+09:00",
+      "measurement_end": "2026-10-01T07:43:15.079680141+09:00",
+      "completed": 5411,
+      "total_completed_including_warmup_and_drain": 6476,
+      "rpc_errors": 0,
+      "native_dials": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "reconnects": 0,
+      "qps": 1082.2,
+      "latency_mean_us": 14773.092179634079,
+      "latency_p50_us": 14484.175,
+      "latency_p99_us": 21031.06
+    },
+    {
+      "event": "result",
+      "ok": true,
+      "connections": 8,
+      "concurrency": 32,
+      "concurrency_per_conn": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "payload_bytes": 64,
+      "warmup_seconds": 1,
+      "duration_seconds": 5,
+      "elapsed_secs": 5,
+      "client_process_cpu_pct": 15.627633291821251,
+      "client_cpu_sample_seconds": 4.999778184,
+      "measurement_start": "2026-10-01T07:43:19.70189871+09:00",
+      "measurement_end": "2026-10-01T07:43:24.70189871+09:00",
+      "completed": 6144,
+      "total_completed_including_warmup_and_drain": 7347,
+      "rpc_errors": 0,
+      "native_dials": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "reconnects": 0,
+      "qps": 1228.8,
+      "latency_mean_us": 26043.23347672526,
+      "latency_p50_us": 26299.336,
+      "latency_p99_us": 36319.063
+    }
+  ],
+  "processes": [
+    {
+      "role": "server",
+      "pid": 456706,
+      "start_ticks": 40272456,
+      "command": [
+        "taskset",
+        "-c",
+        "8-15",
+        "/tmp/dmesh-flow-lb-20260930/channel-bench",
+        "-mode",
+        "server"
+      ]
+    },
+    {
+      "role": "client-4",
+      "pid": 456713,
+      "start_ticks": 40272496,
+      "command": [
+        "taskset",
+        "-c",
+        "0-7",
+        "/tmp/dmesh-flow-lb-20260930/channel-bench",
+        "-mode",
+        "client",
+        "-connections",
+        "4",
+        "-concurrency",
+        "16",
+        "-warmup",
+        "1s",
+        "-duration",
+        "5s",
+        "-rpc-timeout",
+        "10s",
+        "-timeout",
+        "45s"
+      ]
+    },
+    {
+      "role": "client-8",
+      "pid": 456735,
+      "start_ticks": 40273394,
+      "command": [
+        "taskset",
+        "-c",
+        "0-7",
+        "/tmp/dmesh-flow-lb-20260930/channel-bench",
+        "-mode",
+        "client",
+        "-connections",
+        "8",
+        "-concurrency",
+        "32",
+        "-warmup",
+        "1s",
+        "-duration",
+        "5s",
+        "-rpc-timeout",
+        "10s",
+        "-timeout",
+        "45s"
+      ]
+    }
+  ],
+  "cleanup": {
+    "ok": true,
+    "processes": [
+      {
+        "role": "proxy",
+        "pid": 2350507,
+        "sigterm_sent": true,
+        "stopped": true,
+        "exit": 0,
+        "ok": true
+      },
+      {
+        "role": "mock-policy",
+        "pid": 2350504,
+        "sigterm_sent": true,
+        "stopped": true,
+        "exit": -15,
+        "ok": true
+      },
+      {
+        "role": "mock-destination",
+        "pid": 2350503,
+        "sigterm_sent": true,
+        "stopped": true,
+        "exit": -15,
+        "ok": true
+      },
+      {
+        "role": "mock-identity",
+        "pid": 2350501,
+        "sigterm_sent": true,
+        "stopped": true,
+        "exit": -15,
+        "ok": true
+      }
+    ]
+  },
+  "dpa_status": "root_device: 1\nnumber_of_partitions: 0\nnumber_of_root_groups: 0\nprocesses: 0\n"
+}

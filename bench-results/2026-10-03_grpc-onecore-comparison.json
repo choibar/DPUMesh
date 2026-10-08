@@ -1,0 +1,62 @@
+{
+  "conditions": {
+    "workers": 1,
+    "replicas": 1,
+    "client_flows": 4,
+    "inflight_per_flow": 64,
+    "payload": 64,
+    "warmup_seconds": 5,
+    "measurement_seconds": 20,
+    "repeats": 3,
+    "client_gomaxprocs": 8,
+    "dpu_worker_cpu": 11
+  },
+  "results": [
+    {
+      "case": "g4",
+      "rps_median": 14118.852940651403,
+      "rps": [
+        14064.93920727468,
+        14118.852940651403,
+        14228.4622459591
+      ],
+      "p99_us_median": 23017.661,
+      "rpc_errors": 0,
+      "cleanup_ok": true,
+      "cross_worker": 0,
+      "cross_thread": 0,
+      "binary_sha256": "763bfb586943f0bb16a6ade8016949d50aa173386b0075588db5467c4cb1cb3a  /home/youngmin/DPUMesh/linkerd2-proxy/target/release/linkerd2-proxy\n5b056f4581e9c0954714920d6986166c3d9af71024b7e60057037f35c745bd05  /tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-client\n4562f4605d67cf78b60347e143cff7ffc9059295b62417a060c1a79aff412a60  /tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-server\n4586465510dcb4739f03cb2c342356ca35e982c63b33e4a74965f317b99aee46  /tmp/dmesh-worker-backend-host/build/lib/libdpumesh.so\n"
+    },
+    {
+      "case": "g8",
+      "rps_median": 14421.693043647449,
+      "rps": [
+        14421.693043647449,
+        14371.940667819745,
+        14514.507627496281
+      ],
+      "p99_us_median": 22647.763,
+      "rpc_errors": 0,
+      "cleanup_ok": true,
+      "cross_worker": 0,
+      "cross_thread": 0,
+      "binary_sha256": "763bfb586943f0bb16a6ade8016949d50aa173386b0075588db5467c4cb1cb3a  /home/youngmin/DPUMesh/linkerd2-proxy/target/release/linkerd2-proxy\n5b056f4581e9c0954714920d6986166c3d9af71024b7e60057037f35c745bd05  /tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-client\n4562f4605d67cf78b60347e143cff7ffc9059295b62417a060c1a79aff412a60  /tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-server\n4586465510dcb4739f03cb2c342356ca35e982c63b33e4a74965f317b99aee46  /tmp/dmesh-worker-backend-host/build/lib/libdpumesh.so\n"
+    },
+    {
+      "case": "direct-g8",
+      "rps_median": 16042.403179770692,
+      "rps": [
+        16079.253171084758,
+        16030.811608499698,
+        16042.403179770692
+      ],
+      "p99_us_median": 20730.7,
+      "rpc_errors": 0,
+      "cleanup_ok": true,
+      "cross_worker": 0,
+      "cross_thread": 0,
+      "binary_sha256": "763bfb586943f0bb16a6ade8016949d50aa173386b0075588db5467c4cb1cb3a  /home/youngmin/DPUMesh/linkerd2-proxy/target/release/linkerd2-proxy\n5b056f4581e9c0954714920d6986166c3d9af71024b7e60057037f35c745bd05  /tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-client\n4562f4605d67cf78b60347e143cff7ffc9059295b62417a060c1a79aff412a60  /tmp/dmesh-worker-backend-host/integrations/grpc/go/bin/bench-server\n4586465510dcb4739f03cb2c342356ca35e982c63b33e4a74965f317b99aee46  /tmp/dmesh-worker-backend-host/build/lib/libdpumesh.so\n"
+    }
+  ],
+  "note": "Fresh proxy per case; same binaries; g4/g8 use Service VIP, direct-g8 targets replica endpoint. No data path source changes."
+}
