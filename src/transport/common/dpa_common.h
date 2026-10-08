@@ -32,9 +32,9 @@ struct dpa_thread_ctx {
     uint32_t buf_size;
     uint32_t pos; /* next destination staging offset */
 
-    /* CPU -> DPA consumed position; rd_fc enables staging flow control. */
+    /* CPU -> DPA consumed position for host or DPU RX staging.
+     * Every native DMA submission must respect this reuse boundary. */
     volatile uint32_t rx_consumed_pos;
-    volatile uint32_t rd_fc;
 
     /* Stop admission, drain producer CQ, then publish stopped. A nonzero
      * dma_error prevents CPU cleanup from treating exit as a successful fence. */

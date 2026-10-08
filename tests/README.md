@@ -18,7 +18,7 @@
 | `session_server_test` | Production DPU session progress: HELLO timeout, distinct OPEN metadata, stale requests, close failure/retry, reader detachment, no-teardown and quarantine |
 | `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression, TX completion cursors and descriptor-publication failure |
 | `dpa_cleanup_test` | DPA issued/completed close fence, kernel error retention, MsgQ/context/thread cleanup failures and retryable ownership |
-| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, credit starvation, wrap and consume/resume, shutdown, errors and TLS across retriggers |
+| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, descriptor-sized RX space checks including wrap padding and the full/empty boundary, CQ draining while RX is full, consume/resume, shutdown, errors and TLS across retriggers |
 
 The session tests do not open a device. They exercise production control and cleanup code with mock SDK objects.
 Real DMA completion, hardware context teardown and sibling traffic during close

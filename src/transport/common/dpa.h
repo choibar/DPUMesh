@@ -187,8 +187,6 @@ void dmesh_doca_dpa_comch_stop(struct dmesh_conn *conn);
 void
 dmesh_doca_dpa_thread_quiesce(struct dmesh_doca_dpa_thread *dpa_thread);
 
-extern int dmesh_staging_fc;
-
 void
 dmesh_doca_dpa_thread_stop_only(struct dmesh_doca_dpa_thread *dpa_thread);
 

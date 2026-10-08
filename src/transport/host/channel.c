@@ -892,7 +892,6 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 		.src_addr = (uint64_t)(uintptr_t)dst, /* destination base */
 		.buf_size = (uint32_t)conn->data_size,
 		.rx_consumed_pos = 0,
-		.rd_fc = 1,                          /* the application's releases gate reuse */
 		.dpa_dev = (uint64_t)dpa_dev,
 	};
 
@@ -1303,9 +1302,10 @@ int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos
  *
  * The position is the end of the newest released segment (copies land in
  * order; the kernel wraps a copy that would cross the end, so bytes do not map
- * linearly to offsets). The device-side write is coalesced: the kernel gates
- * only when fewer than 3 x 8064 B of the 1 MiB ring look free, so publishing
- * every CHANNEL_RX_CONSUMED_POS_BATCH bytes keeps it far from the gate.
+ * linearly to offsets). The kernel requires space for the next descriptor,
+ * any skipped tail on wrap, and one byte to distinguish full from empty.
+ * Device-side writes are coalesced below; unpublished releases conservatively
+ * remain occupied from the kernel's perspective.
  *
  * @conn [in]: Connection
  * @seq [in]: Newest released batch

@@ -107,7 +107,7 @@ int main(void) {
  complete_to(6);poll_desc_ring(&a);
  assert(ring.consumer_head==6 && ring.completed_bytes==96 && a.dma_submitted==6);
  for(unsigned i=0;i<6;i++)assert(dst[i*16]==i+1);
- a.rd_fc=1;a.pos=a.buf_size-8;a.rx_consumed_pos=0;
+ a.pos=a.buf_size-8;a.rx_consumed_pos=0;
  descriptor(6,4,16);ring.producer_tail=7;credit_limit=7;
  poll_desc_ring(&a);assert(copies==6); /* byte backpressure */
  a.rx_consumed_pos=a.pos;poll_desc_ring(&a);
@@ -117,6 +117,58 @@ int main(void) {
  complete_to(7);poll_desc_ring(&a);
  assert(finished==1 && a.stopped && a.dma_submitted==7);
  assert(ring.consumer_head==7 && ring.completed_bytes==112 && dst[0]==7);
+
+ /* A slow reader must stop submissions even with CQ and receive credits.
+  * Zero-initialized TLS needs no opt-in. CQEs still drain while RX is full. */
+ a=reset(16);a.buf_size=64*1024;
+ for(unsigned i=0;i<10;i++)descriptor(i,16,8064);
+ ring.producer_tail=10;poll_desc_ring(&a);
+ assert(copies==8 && a.pos==8*8064 && ring.consumer_head==0);
+ complete_to(8);poll_desc_ring(&a);
+ assert(copies==8 && ring.consumer_head==8 && ring.completed_bytes==8*8064);
+ poll_desc_ring(&a);assert(copies==8 && dst[0]==1); /* completion is not consumption */
+ a.rx_consumed_pos=8064;poll_desc_ring(&a);
+ assert(copies==8 && a.pos==8*8064); /* wrap + copy would consume the last byte */
+ a.rx_consumed_pos=2*8064;poll_desc_ring(&a);
+ assert(copies==9 && a.pos==8064 && pending[8].dst==(uintptr_t)dst);
+ complete_to(9);poll_desc_ring(&a);
+ assert(copies==9 && ring.consumer_head==9 && dst[0]==9 && dst[2*8064]==3);
+ a.stop=1;poll_desc_ring(&a);assert(a.stopped && finished==1);
+
+ /* Contiguous copy: exactly enough space is full, one extra byte permits it.
+  * Small descriptors work even with far less than the old fixed headroom. */
+ a=reset(4);a.buf_size=1024;a.pos=128;a.rx_consumed_pos=256;
+ descriptor(0,4,128);ring.producer_tail=1;
+ poll_desc_ring(&a);assert(!copies && a.pos==128);
+ a.rx_consumed_pos=257;poll_desc_ring(&a);
+ assert(copies==1 && a.pos==256 && pending[0].dst==(uintptr_t)(dst+128));
+ complete_to(1);poll_desc_ring(&a);assert(ring.consumer_head==1);
+
+ /* Total free bytes may fit the payload but not the skipped tail + payload.
+  * Neither a failed space check nor missing receive credit may move pos. */
+ a=reset(4);a.buf_size=1024;a.pos=896;a.rx_consumed_pos=128;
+ descriptor(0,4,256);ring.producer_tail=1;dst[256]=0x7e;
+ poll_desc_ring(&a);assert(!copies && a.pos==896); /* free=256, required=384 */
+ a.rx_consumed_pos=256;poll_desc_ring(&a);
+ assert(!copies && a.pos==896); /* free=384: would look empty after submission */
+ a.rx_consumed_pos=257;credit_limit=0;poll_desc_ring(&a);
+ assert(!copies && a.pos==896);
+ credit_limit=1;poll_desc_ring(&a);
+ assert(copies==1 && a.pos==256 && pending[0].dst==(uintptr_t)dst && pending[0].len==256);
+ complete_to(1);poll_desc_ring(&a);
+ assert(ring.consumer_head==1 && ring.completed_bytes==256 && dst[256]==0x7e);
+
+ /* A copy ending exactly at the buffer end needs no wrap padding. The CPU
+  * may publish buf_size itself as the end offset of that consumed segment. */
+ a=reset(4);a.buf_size=1024;a.pos=896;a.rx_consumed_pos=0;
+ descriptor(0,4,128);ring.producer_tail=1;
+ poll_desc_ring(&a);assert(!copies && a.pos==896);
+ a.rx_consumed_pos=1;poll_desc_ring(&a);
+ assert(copies==1 && a.pos==0 && pending[0].dst==(uintptr_t)(dst+896));
+ complete_to(1);poll_desc_ring(&a);
+ a.rx_consumed_pos=a.buf_size;descriptor(1,4,128);ring.producer_tail=2;
+ poll_desc_ring(&a);assert(copies==2 && a.pos==128 && pending[1].dst==(uintptr_t)dst);
+ complete_to(2);poll_desc_ring(&a);assert(ring.consumer_head==2);
 
  a=reset(256);
  for(unsigned i=0;i<256;i++)descriptor(i,256,16);

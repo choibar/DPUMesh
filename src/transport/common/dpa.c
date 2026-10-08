@@ -21,9 +21,6 @@
 
 DOCA_LOG_REGISTER(DPA);
 
-/* DPU-side staging flow control opt-in (set by apps that publish rx_consumed_pos). */
-int dmesh_staging_fc = 0;
-
 _Static_assert(DMESH_DPA_MAX_INFLIGHT <= CC_DPA_MAX_MSG_NUM,
                "DPA inflight window must fit the producer SQ and CQ");
 _Static_assert(sizeof(struct dpa_thread_ctx) == 96, "native DPA TLS layout");
@@ -1228,7 +1225,6 @@ dmesh_fill_dpa_thread_ctx(struct dmesh_conn *conn, struct dpa_thread_ctx *arg,
         .buf_size = 1024 * 1024,
         .pos = 0,
         .rx_consumed_pos = 0,
-        .rd_fc = (uint32_t)dmesh_staging_fc,
 #endif
     };
 

@@ -98,11 +98,6 @@ static void poll_desc_ring(struct dpa_thread_ctx *a)
             __dpa_thread_window_writeback();
             continue;
         }
-        if (a->rd_fc) {
-            uint32_t unread = (a->pos + a->buf_size - a->rx_consumed_pos) % a->buf_size;
-            if (a->buf_size - unread < 3u * 8064u)
-                continue;
-        }
         const struct dma_desc *d = (void *)doca_dpa_dev_buf_get_external_ptr(
             doca_dpa_dev_buf_array_get_buf(a->dpa_buf_arr, (submit & ring_mask) + 1));
         if (d->size == 0 || d->size > 8064u || d->size > a->buf_size) {
@@ -111,9 +106,20 @@ static void poll_desc_ring(struct dpa_thread_ctx *a)
             continue;
         }
         uint32_t len = (uint32_t)d->size;
+        /* RX staging remains owned until the CPU reader consumes it, even
+         * after DMA completion. A copy stays contiguous: wrapping reserves
+         * both the unused tail and the copy itself. Leave at least one byte
+         * free so equal producer/consumer offsets can only mean empty. */
+        uint32_t unread = (a->pos + a->buf_size - a->rx_consumed_pos) % a->buf_size;
+        uint32_t free_space = a->buf_size - unread;
+        uint32_t remaining = a->buf_size - a->pos;
+        uint32_t wrap_padding = len > remaining ? remaining : 0;
+        if (free_space <= wrap_padding + len)
+            continue;
         if (doca_dpa_dev_comch_producer_is_consumer_empty(a->dpa_producer, 1))
             continue;
-        if (a->pos + len > a->buf_size)
+
+        if (wrap_padding != 0)
             a->pos = 0;
         struct comch_dma_comp_msg msg = {
             .type = COMCH_MSG_TYPE_DMA_COMPLETED, .pos = a->pos,
