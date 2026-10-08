@@ -43,7 +43,6 @@ import "C"
 
 import (
 	"fmt"
-	"os"
 	"syscall"
 	"time"
 	"unsafe"
@@ -51,7 +50,7 @@ import (
 
 // cgoNative drives libdpumesh: one channel and one EQ for the process.
 type cgoNative struct {
-	serving bool // the channel serves DPUMESH_SERVICE
+	serving bool // the channel serves a target (serviceAddr)
 	ch      *C.dmesh_channel_t
 	eq      *C.dmesh_eq_t
 	eqFD    C.int
@@ -62,8 +61,9 @@ type cgoNative struct {
 // openCgoNative opens the process channel and EQ. On failure a non-nil native
 // holds resources whose cleanup failed; close retries it.
 func openCgoNative() (*cgoNative, error) {
-	// dmesh_create_channel serves DPUMESH_SERVICE when it is set.
-	n := &cgoNative{eqFD: -1, serving: os.Getenv("DPUMESH_SERVICE") != ""}
+	// dmesh_create_channel serves DPUMESH_SERVICE, or DPUMESH_PORT on the Pod IP.
+	_, err := serviceAddr()
+	n := &cgoNative{eqFD: -1, serving: err == nil}
 	n.events = C.dmesh_go_events_alloc()
 	if n.events == nil {
 		return nil, fmt.Errorf("dmesh: allocate EQ events: %w", syscall.ENOMEM)

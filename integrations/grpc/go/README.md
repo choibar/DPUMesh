@@ -24,7 +24,7 @@ buffers and DPA resources remain per flow.
 - Concurrent Read/Write, deadlines and Close follow the Go networking
   contract. Close wakes blocked calls, returns queued leases and reports the
   native close result once.
-- A channel that serves `DPUMESH_SERVICE` is polled for the transport's whole
+- A channel that serves a target is polled for the transport's whole
   life. Streams that arrive before the first `Listen` are held for it. Once a
   listener has closed, new streams are aborted at once instead of left
   hanging.
@@ -59,17 +59,18 @@ limits, concurrent calls, deadline and cancellation resets, GracefulStop,
 client close and keepalive pings. The fake poisons released buffers and
 checks for double releases and leaked leases.
 
-Configure `DPUMESH_POD_IP` and `DPUMESH_SERVER` before opening a connection,
-and either `DPUMESH_PCI_ADDR` (the process opens the DOCA device itself) or a
-running `dpumesh_broker` that owns the device for it (`DPUMESH_BROKER`, default
-`/run/dpumesh/broker.sock`). A server additionally sets `DPUMESH_SERVICE` to its
-`<host>:<port>` [service target](../../../design/API.md#naming).
+Configure `DPUMESH_SERVER` (and, outside a Pod, `DPUMESH_POD_IP`) before
+opening a connection, and either `DPUMESH_PCI_ADDR` (the process opens the DOCA
+device itself) or a running `dpumesh_broker` that owns the device for it
+(`DPUMESH_BROKER`, default `/run/dpumesh/broker.sock`). A server additionally
+sets `DPUMESH_PORT`, the port it serves on its Pod IP, or a `DPUMESH_SERVICE`
+`<host>:<port>` [service target](../../../design/API.md#naming) to serve instead.
 [Root configuration](../../../README.md#configuration) defines these values. The older `Dial`/`Listen` signatures accept only labels
 that agree with this process configuration; they do not create separate
 physical registrations.
 
 The `dmeshgo/dmeshgrpc` package switches a program by configuration alone:
-with `DPUMESH_ENABLE=1`, `dmeshgrpc.Listen(tcpAddr)` serves `DPUMESH_SERVICE`
+with `DPUMESH_ENABLE=1`, `dmeshgrpc.Listen(tcpAddr)` serves the process's target
 and `dmeshgrpc.DialOptions()` routes `"<ip>:<port>"` targets over DPUMesh;
 otherwise they return a TCP listener and no options. `cmd/health-bench` loads
 any server's standard gRPC health `Check` and reports calls/s and latency per
@@ -78,9 +79,9 @@ target, over DPUMesh with `DPUMESH_ENABLE=1` and over TCP otherwise.
 Use `DialContext(ctx, serviceIP, port)` in `grpc.WithContextDialer` and
 `ListenService()` with `grpc.Server.Serve`. A service address is a Service
 ClusterIP and port; the DPU chooses its native backend. `ListenService` serves
-`DPUMESH_SERVICE`, which the native library resolves when it opens the channel,
-so a server names no ClusterIP; its `Addr` is the Service port, with the IP only
-when the target is an IPv4 literal. `ListenAddress(serviceIP, port)` is
+`DPUMESH_PORT` on the Pod IP, or `DPUMESH_SERVICE`, which the native library
+resolves when it opens the channel, so a server names no address; its `Addr` is
+the port, with the IP only when a `DPUMESH_SERVICE` target is an IPv4 literal. `ListenAddress(serviceIP, port)` is
 deprecated: it also checks that the target resolves to that address. The
 examples in `cmd/echo-client` and `cmd/echo-server` run the standard gRPC
 health RPC; the client dials `DPUMESH_SERVICE_IP:DPUMESH_SERVICE_PORT`.

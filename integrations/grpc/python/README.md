@@ -11,7 +11,8 @@ behaves as stock grpcio until a DPUMesh channel or listener is used.
 - A channel target `dpumesh:<host>:<port>` gets its own EventEngine that
   delegates everything but `Connect()`, which opens a DPUMesh stream; gRPC
   keeps its connection management and reconnects.
-- A server takes the streams the DPU routes to `DPUMESH_SERVICE` through a
+- A server takes the streams the DPU routes to `DPUMESH_PORT` on the Pod IP (or
+  `DPUMESH_SERVICE`) through a
   C-core passive listener.
 - Received bytes become gRPC slices without a further copy; writes fill native
   transmit space directly (`dms_stream_post`).

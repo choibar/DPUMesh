@@ -1,7 +1,8 @@
 # Node.js gRPC
 
 `@dpumesh/grpc-js` serves a `@grpc/grpc-js` server (1.10 or later) over
-DPUMesh: the streams the DPU routes to `DPUMESH_SERVICE` become the server's
+DPUMesh: the streams the DPU routes to the process's target (`DPUMESH_PORT` on
+the Pod IP, or `DPUMESH_SERVICE`) become the server's
 HTTP/2 connections through grpc-js's connection injector. An N-API addon
 binds the [stream C ABI](../README.md), loaded with `dlopen`.
 

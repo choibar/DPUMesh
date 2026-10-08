@@ -2586,9 +2586,9 @@ dmesh_channel_t *dmesh_create_channel(void) {
     if (!s) 
         return NULL;
 
-    /* $DPUMESH_SERVICE names the Kubernetes Service this Pod serves. The static provider
-     * maps it to a registered service identifier. An
-     * unset value creates a pure-client channel. */
+    /* $DPUMESH_SERVICE names the "<host>:<port>" target this process serves.
+     * Unset, the transport serves "<pod ip>:$DPUMESH_PORT" when the port is
+     * set; with neither, the channel is a pure client. */
     if (dpumesh_init(&s->ctx, getenv("DPUMESH_SERVICE"), &cfg) != 0 || !s->ctx) {
         int saved_errno = errno != 0 ? errno : EIO;
         free(s);

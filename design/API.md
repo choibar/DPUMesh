@@ -30,14 +30,17 @@ A service target is `"<host>:<port>"`: host is a Service DNS name (`"name"` in
 the calling Pod's namespace, `"name.namespace"`, or a full name) or an IPv4
 literal, and port is the Service port. The cluster DNS answers every name; the
 library stores no address. `dmesh_create_qp(eq, target)` connects to a
-target, and a server's `DPUMESH_SERVICE` is the target it serves.
+target. A server serves `<pod ip>:$DPUMESH_PORT`, the endpoint Kubernetes lists
+for a Service whose `targetPort` is that port, or the `DPUMESH_SERVICE` target
+when that is set. The pod IP is `DPUMESH_POD_IP`, or in a Pod the source
+address of the route toward `KUBERNETES_SERVICE_HOST`.
 
 - `dmesh_create_qp` fails with `EINVAL` for a malformed target, `ENOENT` for a
   name without an IPv4 address, `EAGAIN` while DNS gives no answer, and
   `ENOSPC` once the process has used 1024 distinct addresses.
 - Answers are cached per target for five seconds, the default record TTL of
   CoreDNS. A QP keeps the address it opened with.
-- A server resolves `DPUMESH_SERVICE` once, when its channel is created; every
+- A server resolves its target once, when its channel is created; every
   backend flow it offers the DPU carries that address.
 - The preload shim carries a `connect()` over DPUmesh when its destination is
   the current address of a target in `DPUMESH_TARGETS` (separated by commas or
@@ -70,7 +73,7 @@ memory.
 
 ## Event loop
 
-A server sets `DPUMESH_SERVICE` before creating its channel. An event loop
+A server sets `DPUMESH_PORT` (or `DPUMESH_SERVICE`) before creating its channel. An event loop
 drains `dmesh_poll_eq` until empty, then waits on `dmesh_eq_fd` and drains the
 eventfd on wake, bounding the wait by `dmesh_eq_next_deadline_ns` (`-1` when
 no tail needs service). Poll one EQ from one thread.

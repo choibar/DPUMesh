@@ -32,8 +32,8 @@ exports rcv_ring + tx_staging instead of pushing).
 
 | API | Carrier |
 |---|---|
-| `dmesh_create_channel` | Opens the PCI device and one Comch client/PE, completes HELLO, registers one TX pool and one RX region (32 windows of 1 MiB). A server channel resolves its `DPUMESH_SERVICE` target and registers a listener without data flows. The DPU requests a BACKEND flow on first use of each `(worker, replica)` pair; the Host opens it with the requested worker/token. Client flows on that worker share its H2 connection. `DPUMESH_BACKEND_MAX` limits total backend flows within the shared 32-slot channel. |
-| `dmesh_create_qp` | Sends flow-tagged OPEN on the channel session and waits for READY. Opens an `INGRESS_PUSH` flow: source `DPUMESH_POD_IP` and the QP port, destination the address DNS gives for the `<host>:<port>` target ([naming](API.md#naming)), `DPUMESH_WORKLOAD` as identity label. |
+| `dmesh_create_channel` | Opens the PCI device and one Comch client/PE, completes HELLO, registers one TX pool and one RX region (32 windows of 1 MiB). A server channel resolves its target (`<pod ip>:DPUMESH_PORT`, or `DPUMESH_SERVICE`) and registers a listener without data flows. The DPU requests a BACKEND flow on first use of each `(worker, replica)` pair; the Host opens it with the requested worker/token. Client flows on that worker share its H2 connection. `DPUMESH_BACKEND_MAX` limits total backend flows within the shared 32-slot channel. |
+| `dmesh_create_qp` | Sends flow-tagged OPEN on the channel session and waits for READY. Opens an `INGRESS_PUSH` flow: source the pod IP (`DPUMESH_POD_IP`, or in a Pod the route source toward `KUBERNETES_SERVICE_HOST`) and the QP port, destination the address DNS gives for the `<host>:<port>` target ([naming](API.md#naming)), `DPUMESH_WORKLOAD` as identity label. |
 | inbound stream | The first push batch on a BACKEND flow enters the core's accept queue under that flow's upstream port. After the stream closes, the flow reopens under a new port. |
 | `dmesh_post_send` | The descriptor's TX-pool range is posted to the flow's forward ring as one or two DPUMesh descriptors (a multiple of 128 bytes plus a remainder of at most 128 bytes, each at most 8064 bytes). |
 | custody ACK | The DPA's `consumer_head` passing a descriptor's ticket. |
@@ -225,8 +225,9 @@ unset and `/run/dpumesh/broker.sock` exists, and maps the memory the broker
 registered. Otherwise the application opens the device itself at
 `DPUMESH_PCI_ADDR` (the direct path); `DPUMESH_BROKER=off` forces that, and the
 host-dpa path always takes it. `DPUMESH_SERVER` (default `DPUMesh0`),
-`DPUMESH_POD_IP`, `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
-`DPUMESH_SERVICE` (the `<host>:<port>` target a server serves),
+`DPUMESH_POD_IP` (found in a Pod when unset), `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
+`DPUMESH_PORT` (the port a server serves on its pod IP), `DPUMESH_SERVICE`
+(a `<host>:<port>` target served instead),
 `DPUMESH_TARGETS` (the targets the preload shim carries),
 `DPUMESH_BACKEND_MAX`
 (demand-created flows, default 32; outgoing flows share the same capacity).

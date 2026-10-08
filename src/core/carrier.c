@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #define SLOTS 32                       /* DPUMesh connections per worker */
@@ -70,6 +71,44 @@ static int env_int(const char *name, int fallback, int lo, int hi)
     if (!s || !*s) return fallback;
     int v = atoi(s);
     return v < lo || v > hi ? fallback : v;
+}
+/* The Pod's IPv4 address, network order: $DPUMESH_POD_IP, or else the address
+ * this network namespace sends from toward the Kubernetes API Service
+ * ($KUBERNETES_SERVICE_HOST, which kubelet sets in every container), which is
+ * the Pod IP. Connecting a UDP socket only picks the route; nothing is sent. */
+static int pod_ip_lookup(uint32_t *out)
+{
+    const char *env = getenv("DPUMESH_POD_IP"), *api = getenv("KUBERNETES_SERVICE_HOST");
+    if (env && *env) {
+        if (inet_pton(AF_INET, env, out) == 1) return 0;
+        fprintf(stderr, "dpumesh: DPUMESH_POD_IP '%s' is not an IPv4 address\n", env);
+        errno = EINVAL;
+        return -1;
+    }
+    struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(443) }, src;
+    socklen_t len = sizeof(src);
+    if (api && inet_pton(AF_INET, api, &dst.sin_addr) == 1) {
+        int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+        int found = fd >= 0 && connect(fd, (struct sockaddr *)&dst, sizeof(dst)) == 0 &&
+                    getsockname(fd, (struct sockaddr *)&src, &len) == 0;
+        if (fd >= 0) close(fd);
+        if (found) { *out = src.sin_addr.s_addr; return 0; }
+    }
+    fprintf(stderr, "dpumesh: set DPUMESH_POD_IP; outside a Pod there is no route to find it by\n");
+    errno = EINVAL;
+    return -1;
+}
+/* The target a channel serves: $DPUMESH_SERVICE, or with only $DPUMESH_PORT
+ * set, "<pod ip>:<port>", the endpoint Kubernetes lists for a Service whose
+ * targetPort it is. NULL for a client-only channel. */
+static const char *served_target(char *buf, size_t len, const char *service, uint32_t pod_ip, int port)
+{
+    if (service && *service) return service;
+    if (port < 0) return NULL;
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &pod_ip, ip, sizeof(ip));
+    snprintf(buf, len, "%s:%u", ip, (unsigned)(uint16_t)port);
+    return buf;
 }
 static int slot_index(const struct dmesh_native_transport *t, const struct slot *s) { return (int)(s - t->slots); }
 
@@ -180,11 +219,11 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     pthread_mutex_init(&t->lock, NULL);
     for (int i = 0; i < SLOTS; ++i) { pthread_mutex_init(&t->slots[i].lock, NULL); t->slots[i].epfd = -1; }
     for (int i = 0; i < SLOTS; ++i) if ((t->slots[i].epfd = epoll_create1(EPOLL_CLOEXEC)) < 0) goto fail;
-    const char *pci = getenv("DPUMESH_PCI_ADDR"), *server = getenv("DPUMESH_SERVER");
-    const char *pod_ip = getenv("DPUMESH_POD_IP"), *workload = getenv("DPUMESH_WORKLOAD");
     /* Only a channel that opens the device in this process (no broker, or the
      * host-dpa path) needs the PCI address; channel_dev_open checks it. */
-    if (!pod_ip || inet_pton(AF_INET, pod_ip, &t->pod_ip) != 1) { errno = EINVAL; goto fail; }
+    const char *pci = getenv("DPUMESH_PCI_ADDR"), *server = getenv("DPUMESH_SERVER");
+    const char *workload = getenv("DPUMESH_WORKLOAD");
+    if (pod_ip_lookup(&t->pod_ip) != 0) goto fail;
     snprintf(t->server, sizeof(t->server), "%s", server && *server ? server : "DPUMesh0");
     snprintf(t->workload, sizeof(t->workload), "%s", workload ? workload : "");
     t->pod_id = env_int("DPUMESH_POD_ID", 0, 0, 126);
@@ -192,11 +231,14 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     t->next_uport = UPORT_BASE;
     t->service_id = DMESH_SVC_NONE;
     /* The served address is resolved once: every BACKEND flow carries it. */
-    if (cfg->service_name && *cfg->service_name) {
-        t->service_id = dmesh_target_resolve(cfg->service_name);
+    char served_buf[INET_ADDRSTRLEN + 6];
+    const char *served = served_target(served_buf, sizeof(served_buf), cfg->service_name, t->pod_ip,
+                                       dmesh_config_listen_port());
+    if (served) {
+        t->service_id = dmesh_target_resolve(served);
         if (t->service_id < 0) {
             int saved = errno;
-            fprintf(stderr, "dpumesh: DPUMESH_SERVICE '%s' did not resolve (%s)\n", cfg->service_name, strerror(saved));
+            fprintf(stderr, "dpumesh: served target '%s' did not resolve (%s)\n", served, strerror(saved));
             errno = saved;
             goto fail;
         }

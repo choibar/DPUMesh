@@ -6,9 +6,10 @@
 // goroutine. A connection's state has its own lock; the transport lock guards
 // only the connection table, so no connection waits for another's I/O.
 //
-// Configure DPUMESH_PCI_ADDR, DPUMESH_SERVER, DPUMESH_POD_IP and, for a
-// listener (ListenService), the DPUMESH_SERVICE "<host>:<port>" target before
-// starting Go.
+// Configure DPUMESH_PCI_ADDR, DPUMESH_SERVER and, for a listener
+// (ListenService), DPUMESH_PORT, which the native library serves on the Pod IP,
+// or a DPUMESH_SERVICE "<host>:<port>" target before starting Go. Outside a Pod
+// also set DPUMESH_POD_IP.
 package dmeshgo
 
 import (
@@ -828,8 +829,15 @@ func (c *Conn) SetWriteDeadline(d time.Time) error { return c.setDeadlines(false
 
 // servesAt checks that the process's DPUMESH_SERVICE target resolves to
 // ip:port, the address the native library serves once the channel is open.
+// Without a target only DPUMESH_PORT is checked: the library finds the Pod IP.
 func servesAt(ip string, port int) error {
 	target := os.Getenv("DPUMESH_SERVICE")
+	if target == "" {
+		if addr, err := serviceAddr(); err != nil || addr.Port != port {
+			return fmt.Errorf("dmesh: DPUMESH_PORT %q is not port %d", os.Getenv("DPUMESH_PORT"), port)
+		}
+		return nil
+	}
 	host, p, err := net.SplitHostPort(target)
 	if err != nil || p != strconv.Itoa(port) {
 		return fmt.Errorf("dmesh: DPUMESH_SERVICE %q is not a target on port %d", target, port)
@@ -901,10 +909,18 @@ func Listen(server, svcIP string, svcPort int, workload string) (*Listener, erro
 	return listen(&net.TCPAddr{IP: net.ParseIP(svcIP), Port: svcPort})
 }
 
-// serviceAddr is the listener address of the DPUMESH_SERVICE target: the
-// Service port, and the IP only when the target is an IPv4 literal.
+// serviceAddr is the listener address of the target the process serves: the
+// DPUMESH_SERVICE port, and the IP only when the target is an IPv4 literal, or
+// without a target DPUMESH_PORT, which the native library serves on the Pod IP.
 func serviceAddr() (*net.TCPAddr, error) {
 	target := os.Getenv("DPUMESH_SERVICE")
+	if target == "" {
+		port, err := strconv.Atoi(os.Getenv("DPUMESH_PORT"))
+		if err != nil || port < 1 || port > 65535 {
+			return nil, errors.New("dmesh: a listener needs DPUMESH_PORT or a DPUMESH_SERVICE \"<host>:<port>\" target")
+		}
+		return &net.TCPAddr{Port: port}, nil
+	}
 	host, p, err := net.SplitHostPort(target)
 	port, perr := strconv.Atoi(p)
 	if err != nil || host == "" || perr != nil || port < 1 || port > 65535 {
@@ -913,9 +929,10 @@ func serviceAddr() (*net.TCPAddr, error) {
 	return &net.TCPAddr{IP: net.ParseIP(host).To4(), Port: port}, nil
 }
 
-// ListenService serves the process's DPUMESH_SERVICE target. The native
-// library resolves the target when it opens the channel, so the caller names
-// no address, as a server behind a sidecar binds only its own port.
+// ListenService serves the process's target: DPUMESH_SERVICE, or DPUMESH_PORT
+// on the Pod IP. The native library resolves it when it opens the channel, so
+// the caller names no address, as a server behind a sidecar binds only its own
+// port.
 func ListenService() (*Listener, error) {
 	addr, err := serviceAddr()
 	if err != nil {

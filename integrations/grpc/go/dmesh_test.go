@@ -728,6 +728,7 @@ func TestListenerAddressMatchesServiceTarget(t *testing.T) {
 		{"", "10.96.0.15", 9095, false},
 	} {
 		t.Setenv("DPUMESH_SERVICE", c.target)
+		t.Setenv("DPUMESH_PORT", "")
 		if err := servesAt(c.ip, c.port); (err == nil) != c.ok {
 			t.Errorf("servesAt(%s, %d) with DPUMESH_SERVICE=%q: %v", c.ip, c.port, c.target, err)
 		}
@@ -748,9 +749,40 @@ func TestServiceListenerNeedsNoAddress(t *testing.T) {
 		{"", "", false},
 	} {
 		t.Setenv("DPUMESH_SERVICE", c.target)
+		t.Setenv("DPUMESH_PORT", "")
 		addr, err := serviceAddr()
 		if (err == nil) != c.ok || err == nil && addr.String() != c.addr {
 			t.Errorf("serviceAddr() with DPUMESH_SERVICE=%q: %v, %v", c.target, addr, err)
 		}
+	}
+}
+
+// In a Pod a server sets only DPUMESH_PORT: the native library serves it on
+// the Pod IP, which the adapter does not need to know.
+func TestServicePortServesPodIP(t *testing.T) {
+	for _, c := range []struct {
+		service, port, addr string
+		ok                  bool
+	}{
+		{"", "8080", ":8080", true},
+		{"", "0", "", false},
+		{"", "65536", "", false},
+		{"", "http", "", false},
+		{"10.96.0.15:9095", "8080", "10.96.0.15:9095", true}, // a target wins
+	} {
+		t.Setenv("DPUMESH_SERVICE", c.service)
+		t.Setenv("DPUMESH_PORT", c.port)
+		addr, err := serviceAddr()
+		if (err == nil) != c.ok || err == nil && addr.String() != c.addr {
+			t.Errorf("serviceAddr() with DPUMESH_SERVICE=%q DPUMESH_PORT=%q: %v, %v", c.service, c.port, addr, err)
+		}
+	}
+	t.Setenv("DPUMESH_SERVICE", "")
+	t.Setenv("DPUMESH_PORT", "8080")
+	if err := servesAt("10.244.1.7", 8080); err != nil {
+		t.Errorf("servesAt on DPUMESH_PORT: %v", err)
+	}
+	if err := servesAt("10.244.1.7", 8081); err == nil {
+		t.Error("servesAt accepted a port other than DPUMESH_PORT")
 	}
 }

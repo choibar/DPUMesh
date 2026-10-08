@@ -15,7 +15,8 @@ Check each returned status before using the value. The complete
 [server](../../../examples/grpc/hello_grpc_server.cc) show bootstrap,
 error handling and an ordinary generated service. The channel target is a
 `<host>:<port>` [service target](../../../design/API.md#naming); the server
-serves its `DPUMESH_SERVICE` target and attaches its gRPC passive listener to
+serves `DPUMESH_PORT` on the Pod IP (or its `DPUMESH_SERVICE` target) and
+attaches its gRPC passive listener to
 the runtime.
 
 Build the native library, then configure against the exact gRPC source tree:
@@ -61,7 +62,7 @@ the same ABI over an in-process loopback for their tests. Both export only
 `dpumesh_stream_test` covers the ABI over native doubles and
 `dpumesh_stream_loopback_test` a 1 MiB echo through the loopback, with the
 receive credit held and resumed. `dpumesh_stream_smoke` is the manual device
-test: `server` echoes the streams routed to `DPUMESH_SERVICE`, and
+test: `server` echoes the streams routed to the process's target, and
 `client <target> <count> <size>` checks every echoed byte and prints the
 round-trip times.
 [Configuration](../../../README.md#configuration) applies to both processes.
