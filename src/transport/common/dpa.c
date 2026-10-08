@@ -12,6 +12,7 @@
 
 #include "object.h"
 #include "dpa_common.h"
+#include "dpa_bench.h"
 #include "ring.h"
 #include "dma.h"
 #include <arpa/inet.h>
@@ -23,12 +24,14 @@ DOCA_LOG_REGISTER(DPA);
 /* DPU-side staging flow control opt-in (set by apps that publish rd_pos). */
 int dmesh_staging_fc = 0;
 
-
 _Static_assert(DMESH_DPA_MAX_INFLIGHT <= CC_DPA_MAX_MSG_NUM,
                "DPA inflight window must fit the producer SQ and CQ");
+_Static_assert(sizeof(struct dpa_thread_arg) == 96, "native DPA argument layout");
+_Static_assert(offsetof(struct dpa_bench_state, dma) == 0, "shared cleanup prefix");
 
 /* Kernel function declaration */
 extern doca_dpa_func_t run_dma_manager;
+extern doca_dpa_func_t run_dpa_benchmark;
 extern doca_dpa_func_t thread_init_rpc;
 
 extern struct doca_dpa_app *DPU_mesh_dpa_app;
@@ -221,6 +224,14 @@ init_dpa_objects(struct objects *objs)
     return DOCA_SUCCESS;
 }
 
+static doca_error_t dpa_pool_thread_create(struct dmesh_doca_dpa_thread *thread)
+{
+    const char *env = getenv("DMESH_DPA_BENCH_MODE");
+    int mode = env ? atoi(env) : 0;
+    return mode > 0 ? dmesh_doca_dpa_bench_thread_create(thread, (uint32_t)mode)
+                    : dmesh_doca_dpa_thread_create(thread);
+}
+
 doca_error_t
 dmesh_dpa_thread_pool_init(struct objects *objs)
 {
@@ -235,7 +246,7 @@ dmesh_dpa_thread_pool_init(struct objects *objs)
 
     for (i = pool->size; i < DPA_THREAD_POOL_SIZE; i++) {
         pool->threads[i].dpa = pool->dpa;
-        result = dmesh_doca_dpa_thread_create(&pool->threads[i]);
+        result = dpa_pool_thread_create(&pool->threads[i]);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to create DPA pool thread %d: %s", i, doca_error_get_name(result));
             return result;
@@ -272,7 +283,7 @@ dmesh_dpa_thread_pool_alloc(struct objects *objs, struct dmesh_conn *conn)
                 if (dmesh_doca_dpa_thread_destroy_checked(&pool->threads[i]) != DOCA_SUCCESS)
                     return NULL;
                 pool->threads[i].dpa = pool->dpa;
-                if (dmesh_doca_dpa_thread_create(&pool->threads[i]) != DOCA_SUCCESS) {
+                if (dpa_pool_thread_create(&pool->threads[i]) != DOCA_SUCCESS) {
                     DOCA_LOG_ERR("Failed to recreate DPA pool thread %d", i);
                     return NULL;
                 }
@@ -307,14 +318,16 @@ dmesh_dpa_thread_pool_release(struct objects *objs, struct dmesh_conn *conn)
     }
 }
 
-doca_error_t
-dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
+static doca_error_t
+dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, uint32_t bench_mode)
 {
     doca_error_t result;
 
     if (dpa_thread->thread != NULL || dpa_thread->arg != 0 || dpa_thread->buf != 0)
         return DOCA_ERROR_BAD_STATE; /* preserve partial creation for cleanup */
-    result = DMESH_DPA_CALL(doca_dpa_mem_alloc(dpa_thread->dpa, sizeof(struct dpa_thread_arg), &dpa_thread->arg));
+    dpa_thread->bench_mode = bench_mode;
+    size_t state_size = bench_mode ? sizeof(struct dpa_bench_state) : sizeof(struct dpa_thread_arg);
+    result = DMESH_DPA_CALL(doca_dpa_mem_alloc(dpa_thread->dpa, state_size, &dpa_thread->arg));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to alloc dpa mem: %s",
             doca_error_get_descr(result));
@@ -348,7 +361,8 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
         return result;
     }
     
-    result = DMESH_DPA_CALL(doca_dpa_thread_set_func_arg(dpa_thread->thread, run_dma_manager, dpa_thread->arg));
+    result = DMESH_DPA_CALL(doca_dpa_thread_set_func_arg(dpa_thread->thread,
+        bench_mode ? run_dpa_benchmark : run_dma_manager, dpa_thread->arg));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set DPA thread func: %s",
             doca_error_get_descr(result));
@@ -364,6 +378,19 @@ dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread)
 
     dpa_thread->started = true;
     return DOCA_SUCCESS;
+}
+
+doca_error_t
+dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *thread)
+{
+    return dpa_thread_create(thread, 0);
+}
+
+doca_error_t
+dmesh_doca_dpa_bench_thread_create(struct dmesh_doca_dpa_thread *thread, uint32_t mode)
+{
+    if (mode < 1 || mode > 5) return DOCA_ERROR_INVALID_VALUE;
+    return dpa_thread_create(thread, mode);
 }
 
 doca_error_t
@@ -1051,7 +1078,7 @@ dmesh_doca_dpa_thread_quiesce(struct dmesh_doca_dpa_thread *dpa_thread)
     if (dpa_thread == NULL || dpa_thread->thread == NULL)
         return;
 
-    /* A thread that was created but never run (arg == 0) has nothing polling. */
+    /* No state was allocated for a partially initialized thread. */
     if (dpa_thread->arg == 0)
         return;
 
@@ -1072,7 +1099,7 @@ dmesh_doca_dpa_thread_quiesce(struct dmesh_doca_dpa_thread *dpa_thread)
         DOCA_LOG_WARN("DPA thread did not acknowledge stop within bound; destroying anyway");
 }
 
-/* Destroy a pool DPA thread and free its arg memory, so the slot can be
+/* Destroy a pool DPA thread and free its argument memory, so the slot can be
  * recreated fresh for the next connection (dmesh_dpa_thread_pool_alloc).
  * The thread must already be quiesced (dmesh_doca_dpa_thread_quiesce) and its
  * completion contexts destroyed (dmesh_doca_dpa_comch_destroy) first. */
@@ -1114,19 +1141,19 @@ dmesh_doca_dpa_thread_destroy(struct dmesh_doca_dpa_thread *dpa_thread)
 }
 
 /*
- * Fills the DPA thread argument with the relevant DPA handles to be later copied to the DPA thread
+ * Fills the DPA thread state with the relevant DPA handles to be later copied to the DPA thread
  *
- * @arg [out]: The returned thread argument that was filled
+ * @arg [out]: CPU state image to copy into the thread's DPA argument allocation
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
 static doca_error_t 
-dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
+dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg,
+                          doca_dpa_dev_comch_consumer_t *consumer)
 {
     struct objects *objs = conn->objs;
     (void)objs;
     doca_error_t result;
     struct dmesh_doca_dpa_comch *comch;
-    doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
 	doca_dpa_dev_completion_t dpa_producer_comp;
 	doca_dpa_dev_comch_producer_t dpa_producer;
 	doca_dpa_dev_comch_consumer_t dpa_consumer;
@@ -1137,12 +1164,6 @@ dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
 
     comch = conn->dpa_comch;
 
-    result = DMESH_DPA_CALL(doca_comch_consumer_completion_get_dpa_handle(comch->consumer_comp, &dpa_consumer_comp));
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get consumer completion DPA handle: %s",
-                doca_error_get_name(result));
-        return result;
-    }
     result = DMESH_DPA_CALL(doca_dpa_completion_get_dpa_handle(comch->producer_comp, &dpa_producer_comp));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to get producer completion DPA handle: %s",
@@ -1188,16 +1209,14 @@ dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
 #endif
 
     *arg = (struct dpa_thread_arg) {
-        .dpa_consumer_comp = dpa_consumer_comp,
         .dpa_producer_comp = dpa_producer_comp,
-        .dpa_consumer = dpa_consumer,
         .dpa_producer = dpa_producer,
 #ifdef DOCA_ARCH_DPU
         .dpa_buf_arr = dpa_buf_arr,
         .buf_arr_size = DMA_RING_SIZE,
         .host_mmap = host_mmap,
         .dpu_mmap = dpu_mmap,
-        .src_addr = conn->dma_buffer,
+        .src_addr = (uint64_t)(uintptr_t)conn->dma_buffer,
         .buf_size = 1024 * 1024,
         .pos = 0,
         .rd_pos = 0,
@@ -1205,43 +1224,36 @@ dmesh_fill_dpa_thread_arg(struct dmesh_conn *conn, struct dpa_thread_arg *arg)
 #endif
     };
 
-#ifdef DOCA_ARCH_DPU
-    /* producer_dma_copy microbenchmark: DMESH_DPA_BENCH_MODE=1 (throughput) or
-     * 2 (latency) makes the DPA thread run the bench loop before the normal
-     * ring-polling datapath. Source is this connection's host sndbuf. */
-    {
-        const char *env = getenv("DMESH_DPA_BENCH_MODE");
 
-        if (env != NULL && atoi(env) > 0) {
-            arg->bench_mode = (uint32_t)atoi(env);
-            if (arg->bench_mode >= 3 && arg->bench_mode <= 5) {
-                if (!conn->dpa_thread->buf) {
-                    result = DMESH_DPA_CALL(doca_dpa_mem_alloc(conn->dpa_thread->dpa,
-                        DMESH_DPA_BENCH_SCRATCH_SIZE, &conn->dpa_thread->buf));
-                    if (result != DOCA_SUCCESS) return result;
-                }
-                arg->bench_scratch = conn->dpa_thread->buf;
-            }
-            arg->bench_msg_size = 4096;
-            arg->bench_num_ops = 100000;
-            if ((env = getenv("DMESH_DPA_BENCH_SIZE")) != NULL && atoi(env) > 0)
-                arg->bench_msg_size = (uint32_t)atoi(env);
-            if ((env = getenv("DMESH_DPA_BENCH_OPS")) != NULL && atoi(env) > 0)
-                arg->bench_num_ops = (uint32_t)atoi(env);
-            arg->bench_host_addr = (uint64_t)conn->sndbuf.buf;
-            arg->bench_host_size = (uint32_t)conn->sndbuf.size;
-            DOCA_LOG_INFO("DPA bench enabled: mode=%u size=%u ops=%u",
-                          arg->bench_mode, arg->bench_msg_size, arg->bench_num_ops);
-        }
+    *consumer = dpa_consumer;
+    DOCA_LOG_INFO("dpa_producer_comp: 0x%lx, dpa_producer: 0x%lx",
+                  arg->dpa_producer_comp, arg->dpa_producer);
+
+    return DOCA_SUCCESS;
+}
+
+/* Benchmark settings never occupy the native kernel argument. The mode was
+ * fixed when its thread/argument allocation and entry point were created. */
+static doca_error_t fill_dpa_bench_state(struct dmesh_conn *conn, struct dpa_bench_state *arg)
+{
+    const char *env;
+    arg->mode = conn->dpa_thread->bench_mode;
+    arg->msg_size = 4096;
+    arg->num_ops = 100000;
+    if ((env = getenv("DMESH_DPA_BENCH_SIZE")) != NULL && atoi(env) > 0)
+        arg->msg_size = (uint32_t)atoi(env);
+    if ((env = getenv("DMESH_DPA_BENCH_OPS")) != NULL && atoi(env) > 0)
+        arg->num_ops = (uint32_t)atoi(env);
+    arg->host_addr = (uint64_t)conn->sndbuf.buf;
+    arg->host_size = (uint32_t)conn->sndbuf.size;
+    if (arg->mode >= 3 && !conn->dpa_thread->buf) {
+        doca_error_t result = DMESH_DPA_CALL(doca_dpa_mem_alloc(conn->dpa_thread->dpa,
+            DMESH_DPA_BENCH_SCRATCH_SIZE, &conn->dpa_thread->buf));
+        if (result != DOCA_SUCCESS) return result;
     }
-#endif
-
-    DOCA_LOG_INFO("dpa_consumer_comp: 0x%lx, dpa_producer_comp: 0x%lx, dpa_consumer: 0x%lx, dpa_producer: 0x%lx",
-        arg->dpa_consumer_comp,
-        arg->dpa_producer_comp,
-        arg->dpa_consumer,
-        arg->dpa_producer);
-
+    arg->scratch = conn->dpa_thread->buf;
+    DOCA_LOG_INFO("DPA bench enabled: mode=%u size=%u ops=%u",
+                  arg->mode, arg->msg_size, arg->num_ops);
     return DOCA_SUCCESS;
 }
 
@@ -1254,13 +1266,22 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
 {
     struct dmesh_doca_dpa_thread *dpa_thread = conn->dpa_thread;
     doca_error_t result;
-    struct dpa_thread_arg arg;
+    struct dpa_bench_state storage = {0};
+    struct dpa_thread_arg *arg = &storage.dma;
+    size_t state_size = sizeof(*arg);
+    doca_dpa_dev_comch_consumer_t consumer;
 
-    result = dmesh_fill_dpa_thread_arg(conn, &arg);
+    result = dmesh_fill_dpa_thread_arg(conn, arg, &consumer);
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to fill dpa thread argument - %s",
+        DOCA_LOG_ERR("Failed to fill DPA thread state - %s",
             doca_error_get_name(result));
         return result;
+    }
+
+    if (dpa_thread->bench_mode) {
+        result = fill_dpa_bench_state(conn, &storage);
+        if (result != DOCA_SUCCESS) return result;
+        state_size = sizeof(storage);
     }
 
     uint64_t rpc_ret;
@@ -1268,7 +1289,7 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
     result = DMESH_DPA_CALL(doca_dpa_rpc(dpa_thread->dpa,
                         thread_init_rpc,
                         &rpc_ret,
-                        arg.dpa_consumer,
+                        consumer,
                         num_msg,
                         (uint64_t)0));
     if (result != DOCA_SUCCESS) {
@@ -1283,9 +1304,9 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
     }
 
     result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->arg,
-                                &arg, sizeof(struct dpa_thread_arg)));
+                                arg, state_size));
     if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to update DPA thread argument - %s",
+		DOCA_LOG_ERR("Failed to update DPA thread state - %s",
 			     doca_error_get_name(result));
 		return result;
 	}

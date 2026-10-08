@@ -13,7 +13,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / 'src/transport/device/dpa_kernel.c').read_text()
-region = source[source.index('static void stop_desc_ring('):source.index('static void run_dma_copy_bench(')]
+region = source[source.index('static void stop_desc_ring('):source.index('__dpa_global__ void run_dma_manager')]
 prefix = r'''
 #include <assert.h>
 #include <stdint.h>

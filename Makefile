@@ -15,6 +15,7 @@ DOCA_INC := /opt/mellanox/doca/include
 DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch doca-dma doca-dpa libflexio)
 DPACC := $(TRANSPORT)/build_dpacc.sh
 DPA_KERNEL := $(BUILD)/dpa/device/dpa_kernel.a
+DPA_BENCH := $(TRANSPORT)/device/benchmarks/dpa_bench.c
 HOST_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -DDOCA_ALLOW_EXPERIMENTAL_API \
     -Iinclude -I. -I$(TRANSPORT)/common -I$(TRANSPORT)/dpu -I$(TRANSPORT)/host -I$(DOCA_INC)
 # Transport sources the host library needs: the common set, the DPA
@@ -41,9 +42,9 @@ $(LIBDIR) $(TESTDIR) $(BINDIR):
 
 # The DPA kernel + its (PIC) host stub, compiled by dpacc: the host-dpa reverse path runs
 # the same poll_desc_ring kernel on a host-owned DPA thread.
-$(DPA_KERNEL): $(TRANSPORT)/device/dpa_kernel.c $(TRANSPORT)/device/*.h $(TRANSPORT)/common/dpa_common.h $(DPACC)
+$(DPA_KERNEL): $(TRANSPORT)/device/dpa_kernel.c $(DPA_BENCH) $(TRANSPORT)/device/*.h $(TRANSPORT)/device/benchmarks/*.h $(TRANSPORT)/common/dpa_common.h $(TRANSPORT)/common/dpa_bench.h $(DPACC)
 	$(DPACC) $(abspath $(BUILD)/dpa) $(abspath $(TRANSPORT)) $(abspath $<) dpa_kernel nv-dpa-bf3 \
-	    $$(pkg-config --variable=libdir doca-dpa)
+	    $$(pkg-config --variable=libdir doca-dpa) $(abspath $(DPA_BENCH))
 
 $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/*.h src/core/*.h $(TRANSPORT_HDRS) | $(LIBDIR)
 	$(CC) $(HOST_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \

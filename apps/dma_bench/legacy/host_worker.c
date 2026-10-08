@@ -10,6 +10,7 @@
 #include "dma.h"
 #include "dpa.h"
 #include "dpa_common.h"
+#include "dpa_bench.h"
 #include "ring.h"
 
 #include "common.h"
@@ -59,7 +60,6 @@ setup_reverse_dpa(struct objects *objs)
     doca_error_t result;
     struct dmesh_conn *conn;
     struct dpa_thread_arg arg = {0};
-    doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
     doca_dpa_dev_completion_t dpa_producer_comp;
     doca_dpa_dev_comch_producer_t dpa_producer;
     doca_dpa_dev_comch_consumer_t dpa_consumer;
@@ -159,9 +159,7 @@ setup_reverse_dpa(struct objects *objs)
         return DOCA_ERROR_NO_MEMORY;
 
     /* DPA handles (all on the reverse device) */
-    result = doca_comch_consumer_completion_get_dpa_handle(conn->dpa_comch->consumer_comp, &dpa_consumer_comp);
-    if (result == DOCA_SUCCESS)
-        result = doca_dpa_completion_get_dpa_handle(conn->dpa_comch->producer_comp, &dpa_producer_comp);
+    result = doca_dpa_completion_get_dpa_handle(conn->dpa_comch->producer_comp, &dpa_producer_comp);
     if (result == DOCA_SUCCESS)
         result = doca_comch_consumer_get_dpa_handle(conn->dpa_comch->send.consumer, &dpa_consumer);
     if (result == DOCA_SUCCESS)
@@ -178,9 +176,7 @@ setup_reverse_dpa(struct objects *objs)
     }
 
     arg = (struct dpa_thread_arg) {
-        .dpa_consumer_comp = dpa_consumer_comp,
         .dpa_producer_comp = dpa_producer_comp,
-        .dpa_consumer = dpa_consumer,
         .dpa_producer = dpa_producer,
         .dpa_buf_arr = dpa_buf_arr,
         .buf_arr_size = DMA_RING_SIZE,
@@ -188,11 +184,10 @@ setup_reverse_dpa(struct objects *objs)
         .dpu_mmap = dst_mmap,                /* DMA destination: reverse rcvbuf */
         .src_addr = (uint64_t)objs->rev_rcvbuf.buf,   /* destination base */
         .buf_size = (uint32_t)objs->rev_rcvbuf.size,
-        .bench_mode = 0,
     };
 
     result = doca_dpa_rpc(conn->dpa_thread->dpa, thread_init_rpc, &rpc_ret,
-                          arg.dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM, (uint64_t)0);
+                          dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM, (uint64_t)0);
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("reverse: init RPC failed: %s", doca_error_get_descr(result));
         return result;
@@ -984,8 +979,7 @@ run_host_dpa_bench(const struct global_config *gcfg)
     long total_recv;
     struct dmesh_conn *conns[HOST_BENCH_MAX_THREADS] = {0};
     struct dmesh_doca_dpa_thread *dpa_threads[HOST_BENCH_MAX_THREADS] = {0};
-    struct dpa_thread_arg arg = {0};
-    doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
+    struct dpa_bench_state arg = {0};
     doca_dpa_dev_completion_t dpa_producer_comp;
     doca_dpa_dev_comch_producer_t dpa_producer;
     doca_dpa_dev_comch_consumer_t dpa_consumer;
@@ -1073,7 +1067,7 @@ run_host_dpa_bench(const struct global_config *gcfg)
         conns[i] = conn;
 
         dpa_thread->dpa = objs->dpa_pool->dpa;
-        result = dmesh_doca_dpa_thread_create(dpa_thread);
+        result = dmesh_doca_dpa_bench_thread_create(dpa_thread, bench_mode);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("host bench: failed to create DPA thread %u: %s", i, doca_error_get_descr(result));
             return;
@@ -1097,9 +1091,7 @@ run_host_dpa_bench(const struct global_config *gcfg)
             return;
         }
 
-        result = doca_comch_consumer_completion_get_dpa_handle(conn->dpa_comch->consumer_comp, &dpa_consumer_comp);
-        if (result == DOCA_SUCCESS)
-            result = doca_dpa_completion_get_dpa_handle(conn->dpa_comch->producer_comp, &dpa_producer_comp);
+        result = doca_dpa_completion_get_dpa_handle(conn->dpa_comch->producer_comp, &dpa_producer_comp);
         if (result == DOCA_SUCCESS)
             result = doca_comch_consumer_get_dpa_handle(conn->dpa_comch->send.consumer, &dpa_consumer);
         if (result == DOCA_SUCCESS)
@@ -1111,25 +1103,24 @@ run_host_dpa_bench(const struct global_config *gcfg)
             return;
         }
 
-        arg = (struct dpa_thread_arg) {
-            .dpa_consumer_comp = dpa_consumer_comp,
-            .dpa_producer_comp = dpa_producer_comp,
-            .dpa_consumer = dpa_consumer,
-            .dpa_producer = dpa_producer,
-            .dpa_buf_arr = 0,               /* bench-only: no descriptor ring */
-            .host_mmap = src_mmap,          /* DMA source: shared sndbuf */
-            .dpu_mmap = dst_mmap,           /* DMA destination: staging */
-            .src_addr = (uint64_t)conn->dma_buffer,
-            .buf_size = BUFFER_SIZE,
-            .bench_host_addr = (uint64_t)objs->sndbuf.buf,
-            .bench_host_size = (uint32_t)objs->sndbuf.size,
-            .bench_mode = bench_mode,
-            .bench_msg_size = bench_size,
-            .bench_num_ops = bench_ops,
+        arg = (struct dpa_bench_state) {
+            .dma = {
+                .dpa_producer_comp = dpa_producer_comp,
+                .dpa_producer = dpa_producer,
+                .host_mmap = src_mmap, /* shared host sndbuf */
+                .dpu_mmap = dst_mmap,  /* per-thread staging destination */
+                .src_addr = (uint64_t)conn->dma_buffer,
+                .buf_size = BUFFER_SIZE,
+            },
+            .host_addr = (uint64_t)objs->sndbuf.buf,
+            .host_size = (uint32_t)objs->sndbuf.size,
+            .mode = bench_mode,
+            .msg_size = bench_size,
+            .num_ops = bench_ops,
         };
 
         result = doca_dpa_rpc(dpa_thread->dpa, thread_init_rpc, &rpc_ret,
-                              arg.dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM, (uint64_t)0);
+                              dpa_consumer, (uint32_t)CC_DPA_MAX_MSG_NUM, (uint64_t)0);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("host bench: init RPC failed for thread %u: %s", i, doca_error_get_descr(result));
             return;

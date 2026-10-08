@@ -113,7 +113,7 @@ struct channel_conn {
 	uint64_t rx_seq;                    /* Segments delivered to the carrier */
 	uint64_t consumed_seq;              /* Segments the carrier released */
 	uint32_t seg_end[CHANNEL_DESC_N]; /* End offset of delivered segment seq % N */
-	uint32_t rd_pos;                    /* Kernel read watermark last published */
+	uint32_t rd_pos;           /* End offset of the latest released prefix */
 	uint64_t rd_published_bytes;
 	uint64_t rd_published_seq;
 };
@@ -852,7 +852,6 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 	struct channel_dev *dev = conn->dev;
 	struct dmesh_dpa_endpoint *rc = conn->reverse;
 	struct dpa_thread_arg arg;
-	doca_dpa_dev_comch_consumer_completion_t consumer_comp;
 	doca_dpa_dev_completion_t producer_comp;
 	doca_dpa_dev_comch_producer_t producer;
 	doca_dpa_dev_comch_consumer_t consumer;
@@ -865,9 +864,7 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 	doca_error_t result;
 
 	/* DPA handles */
-	result = doca_comch_consumer_completion_get_dpa_handle(rc->dpa_comch->consumer_comp, &consumer_comp);
-	if (result == DOCA_SUCCESS)
-		result = doca_dpa_completion_get_dpa_handle(rc->dpa_comch->producer_comp, &producer_comp);
+	result = doca_dpa_completion_get_dpa_handle(rc->dpa_comch->producer_comp, &producer_comp);
 	if (result == DOCA_SUCCESS)
 		result = doca_comch_consumer_get_dpa_handle(rc->dpa_comch->send.consumer, &consumer);
 	if (result == DOCA_SUCCESS)
@@ -886,9 +883,7 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 	/* destination: this connection's window data area, same layout as push */
 	dst = (uint8_t *)cfg->rx->buf + cfg->rx_offset + CHANNEL_DATA_OFF;
 	arg = (struct dpa_thread_arg) {
-		.dpa_consumer_comp = consumer_comp,
 		.dpa_producer_comp = producer_comp,
-		.dpa_consumer = consumer,
 		.dpa_producer = producer,
 		.dpa_buf_arr = buf_arr,
 		.buf_arr_size = DMA_RING_SIZE,
@@ -901,7 +896,7 @@ static doca_error_t host_dpa_run_thread(struct channel_conn *conn, const struct 
 		.dpa_dev = (uint64_t)dpa_dev,
 	};
 
-	result = doca_dpa_rpc(rc->dpa_thread->dpa, thread_init_rpc, &rpc_ret, arg.dpa_consumer,
+	result = doca_dpa_rpc(rc->dpa_thread->dpa, thread_init_rpc, &rpc_ret, consumer,
 			      (uint32_t)CC_DPA_MAX_MSG_NUM, arg.dpa_dev);
 	if (result == DOCA_SUCCESS)
 		result = doca_dpa_h2d_memcpy(rc->dpa_thread->dpa, rc->dpa_thread->arg, &arg, sizeof(arg));
@@ -1304,9 +1299,9 @@ int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos
 }
 
 /**
- * Host-dpa reverse path: publish the kernel's read watermark
+ * Host-dpa reverse path: update the kernel's RX consumed position
  *
- * The watermark is the end of the newest released segment (copies land in
+ * The position is the end of the newest released segment (copies land in
  * order; the kernel wraps a copy that would cross the end, so bytes do not map
  * linearly to offsets). The device-side write is coalesced: the kernel gates
  * only when fewer than 3 x 8064 B of the 1 MiB ring look free, so publishing
@@ -1337,7 +1332,7 @@ void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t 
 {
 	if (conn->dev->host_dpa) {
 		/* RX credits may outlive a failed close. A completed DMA fence or a
-		 * partially destroyed thread no longer needs a device watermark. */
+		 * partially destroyed thread no longer needs a consumed-position update. */
 		if (conn->reverse != NULL && conn->reverse->dpa_thread != NULL &&
 		    conn->reverse->dpa_thread->running && !conn->reverse->dpa_thread->quiesced)
 			host_dpa_rx_consumed(conn, seq, bytes);

@@ -10,7 +10,7 @@
 #ifndef HPACK_TERM_H
 #define HPACK_TERM_H
 
-#include "hpack_walk.h"
+#include "../hpack_walk.h"
 
 #define HT_NAME_CAP 24
 #define HT_VAL_CAP  128

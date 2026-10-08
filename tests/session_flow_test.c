@@ -14,6 +14,8 @@ void run_dma_manager(void)
     abort();
 }
 
+void run_dpa_benchmark(void) { abort(); }
+
 static void test_flow_identity(void)
 {
     struct objects *objs = calloc(1, sizeof(*objs));

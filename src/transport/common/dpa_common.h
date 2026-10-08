@@ -10,60 +10,38 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* Below both the producer SQ and completion CQ capacities (512). */
 #define DMESH_DPA_MAX_INFLIGHT 128u
 
-#define DMESH_DPA_BENCH_SCRATCH_SIZE (64u * 1024u)
-
+/* Native DMA per-thread state shared by CPU setup/teardown and the DPA.
+ * Fixed-width fields are naturally aligned on both processors. */
 struct dpa_thread_arg {
-	uint64_t dpa_consumer_comp;
-	uint64_t dpa_producer_comp;
-	uint64_t dpa_producer;
-	uint64_t dpa_consumer;
-	doca_dpa_dev_buf_arr_t dpa_buf_arr;
-	uint32_t buf_arr_size;
+    /* Comch handles and descriptor source. */
+    uint64_t dpa_producer_comp;
+    uint64_t dpa_producer;
+    doca_dpa_dev_buf_arr_t dpa_buf_arr;
 
-    doca_dpa_dev_mmap_t host_mmap;
+    uint64_t src_addr; /* destination staging base (legacy field name) */
+    uint64_t dpa_dev;  /* extended context device; 0 selects the base context */
 
-	doca_dpa_dev_mmap_t dpu_mmap;
-	uint64_t src_addr;
-	uint32_t buf_size;
-	uint32_t pos;
+    /* Progress survives kernel retriggers. CPU cleanup additionally drains
+     * dma_submitted matching receive messages before releasing mappings. */
+    volatile uint64_t dma_submitted;
+    uint64_t submit_head;
 
-	/* producer_dma_copy microbenchmark (DMESH_DPA_BENCH_* env vars on the DPU
-	 * app; bench_mode 0 = off -> normal ring-polling datapath) */
-	uint64_t bench_host_addr;   /* host sndbuf base VA (DMA source) */
-	uint32_t bench_host_size;   /* host sndbuf length */
-	uint32_t bench_mode;        /* 0=off, 1=throughput, 2=latency */
-	uint32_t bench_msg_size;    /* bytes per copy (max 8192 on this platform) */
-	uint32_t bench_num_ops;     /* copies per run */
+    uint32_t buf_arr_size;
+    doca_dpa_dev_mmap_t host_mmap; /* DMA source mapping */
+    doca_dpa_dev_mmap_t dpu_mmap;  /* DMA destination mapping */
+    uint32_t buf_size;
+    uint32_t pos; /* next destination staging offset */
 
-	/* Cooperative shutdown stops admission in the kernel and finishes the
-	 * polling thread. CPU cleanup must also compare dma_submitted with the
-	 * received DMA completion count before freeing any mapping. */
-	volatile uint32_t stop;     /* host -> DPA: leave the poll loop */
-	volatile uint32_t stopped;  /* DPA -> host: poll loop has exited */
+    /* CPU -> DPA consumed position; rd_fc enables staging flow control. */
+    volatile uint32_t rd_pos;
+    volatile uint32_t rd_fc;
 
-	/* DPU-side staging flow control. rd_pos: offset up to which the DPU
-	 * reader (proxy) has consumed the staging ring, published by the DPU app
-	 * via h2d_memcpy on its tick. rd_fc: 1 = the DPU app publishes rd_pos,
-	 * so the kernel must not copy past it (opt-in: apps that never publish
-	 * keep the legacy free-running behavior). */
-	volatile uint32_t rd_pos;
-	volatile uint32_t rd_fc;
-
-	/* Extended DPA context (host PF process extended to an SF): the handle
-	 * from doca_dpa_get_dpa_handle(extended ctx); the kernel switches to it
-	 * with doca_dpa_dev_device_set() before touching that device's objects
-	 * (the official extended-context flow). 0 = base context, no switch. */
-	uint64_t dpa_dev;
-
-	/* Published before stopped: number of copies requiring CPU DMA-completed
-	 * messages. Kernel exit alone does not retire producer DMA operations. */
-	volatile uint64_t dma_submitted;
-	uint64_t submit_head;
-	volatile uint32_t dma_error;
-
-    uint64_t bench_scratch; /* optional per-thread HPACK scratch in DPA heap */
-
-} __attribute__((__packed__, aligned(8)));
+    /* Stop admission, drain producer CQ, then publish stopped. A nonzero
+     * dma_error prevents CPU cleanup from treating exit as a successful fence. */
+    volatile uint32_t stop;
+    volatile uint32_t stopped;
+    volatile uint32_t dma_error;
+};
 
 enum comch_msg_type {
 	COMCH_MSG_TYPE_DMA_REQ = 1,
