@@ -2,6 +2,7 @@
 
 #include <errno.h>
 
+#include <cstdlib>
 #include <memory>
 #include <utility>
 
@@ -19,9 +20,24 @@ DmeshRuntime::DmeshRuntime(
       post_max_(post_max),
       callback_executor_(std::move(callback_executor)) {}
 
+absl::StatusOr<DmeshRuntime::Options> DmeshRuntime::OptionsFromEnvironment() {
+  Options options;
+  const char* value = std::getenv("DPUMESH_REACTORS");
+  if (value == nullptr || *value == '\0') return options;
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long count = std::strtoul(value, &end, 10);
+  if (errno != 0 || *end != '\0' || count == 0 || count > kMaxReactors) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "DPUMESH_REACTORS must be 1..", kMaxReactors, ", got \"", value, "\""));
+  }
+  options.reactor_count = count;
+  return options;
+}
+
 absl::StatusOr<std::shared_ptr<DmeshRuntime>> DmeshRuntime::Create(
     std::unique_ptr<DmeshApiOps> ops) {
-  return Create(std::move(ops), nullptr, Options());
+  return Create(std::move(ops), std::shared_ptr<Executor>());
 }
 
 absl::StatusOr<std::shared_ptr<DmeshRuntime>> DmeshRuntime::Create(
@@ -32,7 +48,9 @@ absl::StatusOr<std::shared_ptr<DmeshRuntime>> DmeshRuntime::Create(
 absl::StatusOr<std::shared_ptr<DmeshRuntime>> DmeshRuntime::Create(
     std::unique_ptr<DmeshApiOps> ops,
     std::shared_ptr<Executor> callback_executor) {
-  return Create(std::move(ops), std::move(callback_executor), Options());
+  auto options = OptionsFromEnvironment();
+  if (!options.ok()) return options.status();
+  return Create(std::move(ops), std::move(callback_executor), *options);
 }
 
 absl::StatusOr<std::shared_ptr<DmeshRuntime>> DmeshRuntime::Create(

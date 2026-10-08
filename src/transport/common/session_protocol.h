@@ -3,14 +3,15 @@
 
 /* Host/DPU control protocol. The public native ABI and DMA descriptor format
  * are independent of this version. Integers in the envelope are little endian;
- * v2 adds listener registration and worker-pinned backend requests. DMA
- * metadata payloads retain the existing LP64 host/DPU layout. */
+ * v2 adds listener registration and worker-pinned backend requests, v4 the
+ * ARM/DOORBELL idle wake. DMA metadata payloads retain the existing LP64
+ * host/DPU layout. */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #define DMESH_SESSION_MAGIC UINT32_C(0x444d5348)
-#define DMESH_SESSION_VERSION 3u /* completion-fenced ring/source ownership */
+#define DMESH_SESSION_VERSION 4u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake */
 #define DMESH_SESSION_HEADER_SIZE 24u
 #define DMESH_SESSION_MAX_PAYLOAD 2048u
 #define DMESH_SESSION_MAX_FRAME (DMESH_SESSION_HEADER_SIZE + DMESH_SESSION_MAX_PAYLOAD)
@@ -31,6 +32,24 @@ enum dmesh_session_message_type {
     DMESH_SESSION_BACKEND_REQUEST = 11, /* flow=0, generation=request token, worker */
     DMESH_SESSION_BACKEND_OPEN = 12, /* worker + request token + DMA metadata */
     DMESH_SESSION_BACKEND_REJECT = 13, /* flow=0, generation=request token, worker */
+    /* Session messages (flow_id 0, generation 0) that let an idle host sleep.
+     * ARM: the host is about to block; it lists, per push flow, the next
+     * descriptor sequence it has not seen. DOORBELL: the DPU published a
+     * descriptor the ARM did not account for, or one after the ARM. */
+    DMESH_SESSION_ARM = 14,
+    DMESH_SESSION_DOORBELL = 15,
+};
+
+/* ARM payload: u64 epoch, u32 count, u32 zero, then count entries of
+ * u32 flow_id, u32 generation, u64 expected_seq. DOORBELL payload: u64 epoch. */
+#define DMESH_SESSION_ARM_HEADER_SIZE 16u
+#define DMESH_SESSION_ARM_FLOW_SIZE 16u
+#define DMESH_SESSION_DOORBELL_SIZE 8u
+
+struct dmesh_session_arm_flow {
+    uint32_t flow_id;
+    uint32_t generation;
+    uint64_t expected_seq;
 };
 
 struct dmesh_session_header {
@@ -53,11 +72,30 @@ static inline void dmesh_session_put_u32(uint8_t *p, uint32_t v)
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
     p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
+static inline uint64_t dmesh_session_get_u64(const uint8_t *p)
+{
+    return (uint64_t)dmesh_session_get_u32(p) | (uint64_t)dmesh_session_get_u32(p + 4) << 32;
+}
+static inline void dmesh_session_put_u64(uint8_t *p, uint64_t v)
+{
+    dmesh_session_put_u32(p, (uint32_t)v);
+    dmesh_session_put_u32(p + 4, (uint32_t)(v >> 32));
+}
 static inline int dmesh_session_header_valid(const struct dmesh_session_header *h)
 {
     if (h->magic != DMESH_SESSION_MAGIC || h->version != DMESH_SESSION_VERSION ||
         h->payload_len > DMESH_SESSION_MAX_PAYLOAD || h->status < 0)
         return 0;
+    if (h->type == DMESH_SESSION_ARM || h->type == DMESH_SESSION_DOORBELL) {
+        if (h->flow_id != 0 || h->generation != 0 || h->status != 0)
+            return 0;
+        if (h->type == DMESH_SESSION_DOORBELL)
+            return h->payload_len == DMESH_SESSION_DOORBELL_SIZE;
+        return h->payload_len >= DMESH_SESSION_ARM_HEADER_SIZE &&
+               h->payload_len <= DMESH_SESSION_ARM_HEADER_SIZE +
+                                     DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE &&
+               (h->payload_len - DMESH_SESSION_ARM_HEADER_SIZE) % DMESH_SESSION_ARM_FLOW_SIZE == 0;
+    }
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 &&
                (h->type == DMESH_SESSION_HELLO_ACK || h->status == 0);
@@ -140,6 +178,51 @@ static inline size_t dmesh_session_encode(void *output, size_t capacity,
     if (payload_len)
         memcpy(p + DMESH_SESSION_HEADER_SIZE, payload, payload_len);
     return len;
+}
+
+/* Returns the ARM payload length, or 0 when count exceeds the flow limit or
+ * the output is too small. */
+static inline size_t dmesh_session_arm_encode(uint8_t *out, size_t capacity, uint64_t epoch,
+                                             const struct dmesh_session_arm_flow *flows,
+                                             uint32_t count)
+{
+    size_t len = DMESH_SESSION_ARM_HEADER_SIZE + (size_t)count * DMESH_SESSION_ARM_FLOW_SIZE;
+    if (!out || count > DMESH_SESSION_MAX_FLOWS || (count && !flows) || capacity < len)
+        return 0;
+    dmesh_session_put_u64(out, epoch);
+    dmesh_session_put_u32(out + 8, count);
+    dmesh_session_put_u32(out + 12, 0);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t *e = out + DMESH_SESSION_ARM_HEADER_SIZE + (size_t)i * DMESH_SESSION_ARM_FLOW_SIZE;
+        dmesh_session_put_u32(e, flows[i].flow_id);
+        dmesh_session_put_u32(e + 4, flows[i].generation);
+        dmesh_session_put_u64(e + 8, flows[i].expected_seq);
+    }
+    return len;
+}
+
+/* Decode a validated ARM payload into flows[DMESH_SESSION_MAX_FLOWS]. */
+static inline int dmesh_session_arm_decode(const uint8_t *payload, uint32_t len, uint64_t *epoch,
+                                          struct dmesh_session_arm_flow *flows, uint32_t *count)
+{
+    if (!payload || !epoch || !flows || !count || len < DMESH_SESSION_ARM_HEADER_SIZE)
+        return -1;
+    uint32_t n = dmesh_session_get_u32(payload + 8);
+    if (n > DMESH_SESSION_MAX_FLOWS || dmesh_session_get_u32(payload + 12) != 0 ||
+        len != DMESH_SESSION_ARM_HEADER_SIZE + n * DMESH_SESSION_ARM_FLOW_SIZE)
+        return -1;
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t *e = payload + DMESH_SESSION_ARM_HEADER_SIZE + (size_t)i * DMESH_SESSION_ARM_FLOW_SIZE;
+        flows[i].flow_id = dmesh_session_get_u32(e);
+        flows[i].generation = dmesh_session_get_u32(e + 4);
+        flows[i].expected_seq = dmesh_session_get_u64(e + 8);
+        if (flows[i].flow_id == 0 || flows[i].flow_id > DMESH_SESSION_MAX_FLOWS ||
+            flows[i].generation == 0)
+            return -1;
+    }
+    *epoch = dmesh_session_get_u64(payload);
+    *count = n;
+    return 0;
 }
 
 #endif

@@ -39,12 +39,21 @@ void dmesh_native_release(struct dmesh_native_transport *, int byte_offset);
 int dmesh_native_stripe_fd(struct dmesh_native_transport *, int stripe);
 /* The stripe carrying a port's stream, or -1. */
 int dmesh_native_stripe_of(struct dmesh_native_transport *, uint16_t port);
-/* Arms the doorbell before the stripe's consumer sleeps. Returns 1 when the
- * stripe also needs periodic polling (traffic without a doorbell, or custody
- * ACKs outstanding), 0 when the doorbell alone wakes the consumer. */
+/* Arms the stripe's doorbell before its consumer sleeps. Returns 1 while the
+ * stripe still needs polling (custody ACKs outstanding: they have no doorbell),
+ * 0 when dmesh_native_idle_arm plus the doorbell suffice. */
 int dmesh_native_stripe_arm(struct dmesh_native_transport *, int stripe);
 /* Acknowledges a signalled doorbell; the stripe is then polled. */
 void dmesh_native_stripe_clear(struct dmesh_native_transport *, int stripe);
+/* Channel-wide idle wake: the fd (or -1) is raised by control messages once
+ * dmesh_native_idle_arm succeeded, which also asks the DPU to ring for
+ * receives without a doorbell. A failed arm means the consumer must keep
+ * polling. dmesh_native_wake_clear acknowledges a raised fd. */
+int dmesh_native_wake_fd(struct dmesh_native_transport *);
+int dmesh_native_idle_arm(struct dmesh_native_transport *);
+void dmesh_native_wake_clear(struct dmesh_native_transport *);
+/* ARM messages sent and DOORBELLs received, for diagnostics. */
+void dmesh_native_wake_counters(struct dmesh_native_transport *, uint64_t *arms, uint64_t *doorbells);
 int dmesh_native_resolve(struct dmesh_native_transport *, const char *name, uint32_t addr, uint16_t port);
 /* A client port's stream exists from connect until its FIN or disconnect. */
 int dmesh_native_connect(struct dmesh_native_transport *, uint16_t port, int service_id);

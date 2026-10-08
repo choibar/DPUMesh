@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -28,7 +29,7 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
-#include "dmesh_endpoint.h"
+#include "endpoint_transport.h"
 
 namespace dpumesh::grpc {
 namespace {
@@ -99,7 +100,7 @@ class DmeshReactor::Impl final
     // endpoint takes its own state lock first, so the reverse order deadlocks.
     std::mutex tx_mu;
     dmesh_qp_t* qp = nullptr;
-    std::weak_ptr<DmeshEndpointDriver> driver;
+    std::weak_ptr<ConnectionSink> driver;
     std::deque<QueuedReceive> prebind_receives;
     size_t prebind_bytes = 0;
     // Receives whose credit is withheld while the endpoint queue is above its
@@ -123,7 +124,7 @@ class DmeshReactor::Impl final
 
     ~Transport() override { Close(); }
 
-    void BindDriver(std::weak_ptr<DmeshEndpointDriver> driver) override {
+    void BindSink(std::weak_ptr<ConnectionSink> driver) override {
       if (auto impl = impl_.lock()) {
         impl->AttachDriver(connection_, std::move(driver));
       }
@@ -214,6 +215,8 @@ class DmeshReactor::Impl final
     accepting_.store(true, std::memory_order_release);
     try {
       owner_thread_ = std::thread([self = shared_from_this()] {
+        // Named so per-thread CPU shows the EQ owner.
+        pthread_setname_np(pthread_self(), "dmesh-reactor");
         self->ThreadMain();
       });
     } catch (const std::system_error& error) {
@@ -283,8 +286,8 @@ class DmeshReactor::Impl final
   }
 
   void AttachDriver(std::shared_ptr<Connection> connection,
-                    std::weak_ptr<DmeshEndpointDriver> driver) {
-    std::weak_ptr<DmeshEndpointDriver> driver_on_failure = driver;
+                    std::weak_ptr<ConnectionSink> driver) {
+    std::weak_ptr<ConnectionSink> driver_on_failure = driver;
     if (!Enqueue([self = shared_from_this(), connection = std::move(connection),
                   driver = std::move(driver)]() mutable {
           self->AttachDriverOwner(connection, std::move(driver));
@@ -488,7 +491,7 @@ class DmeshReactor::Impl final
   }
 
   void AttachDriverOwner(const std::shared_ptr<Connection>& connection,
-                         std::weak_ptr<DmeshEndpointDriver> driver) {
+                         std::weak_ptr<ConnectionSink> driver) {
     connection->driver = std::move(driver);
     auto bound_driver = connection->driver.lock();
     if (bound_driver == nullptr) return;

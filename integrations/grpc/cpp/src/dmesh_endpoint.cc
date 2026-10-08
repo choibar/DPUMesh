@@ -312,18 +312,31 @@ PumpOutcome RunPumpLoop(const std::shared_ptr<DmeshEndpointState>& state,
   }
 }
 
+// Requires state->mu. Completes a pending read or queues the slice; returns
+// true when the queue is above its high-water mark.
+bool QueueReceiveLocked(DmeshEndpointState* state, Slice slice,
+                        std::optional<Completion>* completion) {
+  if (state->pending_read.has_value()) {
+    state->pending_read->buffer->Append(std::move(slice));
+    *completion = Completion{std::move(state->pending_read->callback),
+                             absl::OkStatus()};
+    state->pending_read.reset();
+    return false;
+  }
+  state->queued_bytes += slice.size();
+  state->receive_queue.push_back(std::move(slice));
+  if (state->queued_bytes > kReceiveHighWaterBytes) {
+    state->receive_paused = true;
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 DmeshEndpointDriver::DmeshEndpointDriver(
     std::shared_ptr<DmeshEndpointState> state)
     : state_(std::move(state)) {}
-
-ReceiveOutcome DmeshEndpointDriver::OnIncomingData(
-    absl::Span<const uint8_t> bytes) {
-  return OnIncomingData(bytes.size(), [bytes](uint8_t* destination) {
-    std::memcpy(destination, bytes.data(), bytes.size());
-  });
-}
 
 ReceiveOutcome DmeshEndpointDriver::OnIncomingData(
     size_t length, absl::FunctionRef<void(uint8_t*)> fill) {
@@ -358,20 +371,7 @@ ReceiveOutcome DmeshEndpointDriver::OnIncomingData(
       close_transport = true;
     } else {
       fill(GRPC_SLICE_START_PTR(raw));
-      Slice slice(raw);
-      if (state_->pending_read.has_value()) {
-        state_->pending_read->buffer->Append(std::move(slice));
-        completion = Completion{std::move(state_->pending_read->callback),
-                                absl::OkStatus()};
-        state_->pending_read.reset();
-      } else {
-        state_->queued_bytes += slice.size();
-        state_->receive_queue.push_back(std::move(slice));
-        if (state_->queued_bytes > kReceiveHighWaterBytes) {
-          state_->receive_paused = true;
-          outcome.hold_credit = true;
-        }
-      }
+      outcome.hold_credit = QueueReceiveLocked(state_.get(), Slice(raw), &completion);
     }
   }
 
@@ -380,6 +380,32 @@ ReceiveOutcome DmeshEndpointDriver::OnIncomingData(
   DeliverIfPresent(std::move(write_completion));
   return outcome;
 }
+
+ReceiveOutcome DmeshEndpointDriver::OnIncomingBuffer(uint8_t* data,
+                                                     size_t length,
+                                                     void (*release)(void*),
+                                                     void* arg) {
+  if (length == 0) {
+    release(arg);
+    return ReceiveOutcome{absl::OkStatus(), false};
+  }
+  Slice slice(grpc_slice_new_with_user_data(data, length, release, arg));
+  std::optional<Completion> completion;
+  ReceiveOutcome outcome{absl::OkStatus(), false};
+  {
+    std::lock_guard<std::mutex> lock(state_->mu);
+    if (state_->life != DmeshEndpointState::Life::kOpen) {
+      return ReceiveOutcome{
+          absl::FailedPreconditionError(
+              "received DPUmesh data after endpoint input closed"),
+          false};
+    }
+    outcome.hold_credit = QueueReceiveLocked(state_.get(), std::move(slice), &completion);
+  }
+  DeliverIfPresent(std::move(completion));
+  return outcome;
+}
+
 
 void DmeshEndpointDriver::OnWritable() {
   bool schedule = false;
@@ -461,7 +487,7 @@ DmeshEndpoint::DmeshEndpoint(
       state_->callback_executor == nullptr || !state_->allocator.IsValid()) {
     std::abort();
   }
-  state_->transport->BindDriver(driver_);
+  state_->transport->BindSink(driver_);
 }
 
 DmeshEndpoint::~DmeshEndpoint() {

@@ -79,6 +79,10 @@ struct channel_dev {
     unsigned backend_pending, backend_rejections;
     /* state: 1=pending, 2=processing, 3=done, 4=reject pending */
 	int session_error;
+	/* Idle wake (push reverse path): one ARM at a time, released by DOORBELL */
+	int arm_outstanding;
+	uint64_t arm_epoch;
+	uint64_t arms_sent, doorbells;
 	int host_dpa;                       /* Nonzero: the host-dpa reverse path */
     struct doca_dev *reverse_dev;       /* base PF or optional SF */
     struct doca_dpa *reverse_dpa;       /* base context or SF extension */
@@ -104,6 +108,7 @@ struct channel_conn {
 	volatile struct dmesh_push_cursor *cursor;
 	size_t data_size;
 	uint64_t expected;                  /* Push: next batch sequence */
+	int rx_ended;                       /* Push: end of stream or a malformed batch was read */
 	uint32_t flow_id, generation;
 	int open_sent, ready, peer_closed, error, close_sent, close_error;
 	/* host-dpa reverse path */
@@ -207,6 +212,12 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
 	const uint8_t *payload;
 	if (dmesh_session_decode(data, len, &h, &payload) != 0) {
 		dev->session_error = EPROTO;
+		return;
+	}
+	if (h.type == DMESH_SESSION_DOORBELL) {
+		/* The DPU published after our ARM; the drain pass that follows reads it. */
+		dev->arm_outstanding = 0;
+		dev->doorbells++;
 		return;
 	}
 	if (h.type == DMESH_SESSION_HELLO_ACK && h.flow_id == 0 && h.generation == 0) {
@@ -1121,6 +1132,94 @@ int channel_conn_poll(struct channel_conn *conn)
 	return gone;
 }
 
+int channel_dev_fd(struct channel_dev *dev)
+{
+	doca_notification_handle_t handle;
+	if (dev->control == NULL ||
+	    doca_pe_get_notification_handle(dev->control->pe, &handle) != DOCA_SUCCESS)
+		return -1;
+	return (int)handle;
+}
+
+int channel_dev_arm(struct channel_dev *dev)
+{
+	pthread_mutex_lock(&dev->session_lock);
+	int rc = 0, saved = 0;
+	if (dev->control == NULL || !dev->hello_ready || dev->session_error) {
+		saved = dev->session_error ? dev->session_error : ENOTCONN;
+		rc = -1;
+		goto out;
+	}
+	/* Push batches have no completion doorbell: list, per flow, the next
+	 * descriptor this host has not read. The DPU rings at once if it already
+	 * published one, otherwise on its next publication. */
+	if (!dev->host_dpa && !dev->arm_outstanding) {
+		struct dmesh_session_arm_flow flows[DMESH_SESSION_MAX_FLOWS];
+		uint8_t payload[DMESH_SESSION_ARM_HEADER_SIZE +
+				DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE];
+		uint32_t count = 0;
+		for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id) {
+			struct channel_conn *conn = dev->flows[id];
+			if (conn == NULL || !conn->ready || conn->descs == NULL ||
+			    conn->rx_ended || conn->peer_closed || conn->error)
+				continue;
+			flows[count++] = (struct dmesh_session_arm_flow){id, conn->generation, conn->expected};
+		}
+		if (count != 0) {
+			size_t len = dmesh_session_arm_encode(payload, sizeof(payload), dev->arm_epoch + 1,
+							      flows, count);
+			if (session_send_locked(dev, DMESH_SESSION_ARM, 0, 0, payload, len) != 0) {
+				saved = errno;
+				rc = -1;
+				goto out;
+			}
+			dev->arm_epoch++;
+			dev->arms_sent++;
+			dev->arm_outstanding = 1;
+		}
+	}
+	/* Control messages (DOORBELL, CLOSED, ERROR) now raise the fd. Progress
+	 * after arming, per the DOCA flow, so an event that landed before the
+	 * request is handled here instead of being slept through. */
+	/* The control PE runs in PROGRESS_ALL mode (comch_client.c): every
+	 * progress call delivers all events, and a new request clears the last
+	 * notification, so the handle needs no clear before progressing. */
+	doca_error_t result = doca_pe_request_notification(dev->control->pe);
+	if (result != DOCA_SUCCESS) {
+		saved = error_number(result);
+		rc = -1;
+		goto out;
+	}
+	(void)doca_pe_progress(dev->control->pe);
+out:
+	pthread_mutex_unlock(&dev->session_lock);
+	if (rc != 0) errno = saved;
+	return rc;
+}
+
+void channel_dev_clear(struct channel_dev *dev)
+{
+	doca_notification_handle_t handle;
+	pthread_mutex_lock(&dev->session_lock);
+	/* A raised handle stays readable until the next request; clear it so an
+	 * EQ that keeps polling does not see its fd stay readable. */
+	if (dev->control != NULL &&
+	    doca_pe_get_notification_handle(dev->control->pe, &handle) == DOCA_SUCCESS) {
+		struct pollfd ready = { .fd = (int)handle, .events = POLLIN };
+		if (poll(&ready, 1, 0) > 0 && (ready.revents & POLLIN))
+			(void)doca_pe_clear_notification(dev->control->pe, handle);
+	}
+	pthread_mutex_unlock(&dev->session_lock);
+}
+
+void channel_dev_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells)
+{
+	pthread_mutex_lock(&dev->session_lock);
+	*arms_sent = dev->arms_sent;
+	*doorbells = dev->doorbells;
+	pthread_mutex_unlock(&dev->session_lock);
+}
+
 int channel_conn_progress(struct channel_conn *conn)
 {
 	(void)channel_dev_progress(conn->dev);
@@ -1287,8 +1386,10 @@ int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos
 		return 0;
 	p = desc->pos;
 	n = desc->len;
-	if (n == 0 || (size_t)p + n > conn->data_size)
+	if (n == 0 || (size_t)p + n > conn->data_size) {
+		conn->rx_ended = 1;         /* nothing follows; leave it out of ARM */
 		return -1;
+	}
 
 	*seq = conn->expected;
 	*pos = p;

@@ -25,13 +25,15 @@
 #define DOCA_LOG_WARN DOCA_LOG_ERR
 /* Reverse stripes a carrier may expose; each has a lock and a doorbell. */
 #define DMESH_MAX_STRIPES 32
-/* Period of the fallback poll an EQ arms while it sleeps on a stripe whose
- * traffic has no doorbell (custody ACKs, dpu-dma batches). */
-#define DMESH_TICK_US_DEFAULT 50
-/* An EQ that runs empty keeps its fd readable for this long before arming the
- * doorbells: an armed completion queue raises a hardware event per completion,
- * so a consumer that is about to find more work spins instead of sleeping. */
-#define DMESH_SPIN_US_DEFAULT 1000
+/* Idle wake (dpumesh_eq_arm). After work, an empty EQ re-polls on a one-shot
+ * timer that doubles from NAP_MIN to NAP_CAP, then keeps polling every NAP_CAP
+ * until LINGER has passed since its last work, then arms every doorbell and
+ * sleeps with only the BACKSTOP timer. Custody ACKs have no doorbell, so an EQ
+ * with custody outstanding keeps polling. docs/2026-09-30_host-wait-doorbell-plan.md */
+#define DMESH_NAP_MIN_US_DEFAULT  10
+#define DMESH_NAP_CAP_US_DEFAULT  100
+#define DMESH_LINGER_US_DEFAULT   1000
+#define DMESH_BACKSTOP_MS_DEFAULT 200
 #define DPA_DMA_COPY_ALIGN 128u
 static int core_trace = -1;
 #define CTRACE(...) do { if (core_trace < 0) core_trace = getenv("DPUMESH_CORE_TRACE") != NULL; \
@@ -283,9 +285,11 @@ struct dpumesh_ctx {
     unsigned int stripe_lock[DMESH_MAX_STRIPES];
     struct dmesh_eq *stripe_owner[DMESH_MAX_STRIPES];
     int spare_epfd;
-    long tick_ns;                      /* fallback poll period while a sleeping EQ has
-                                        * doorbell-less traffic outstanding */
-    long spin_ns;                      /* empty-poll window before the doorbells are armed */
+    /* Idle wake policy (dpumesh_eq_arm), nanoseconds; nap_min 0 = no naps. */
+    uint64_t nap_min_ns, nap_cap_ns, linger_ns, backstop_ns;
+    atomic_int live_eqs;               /* registered EQs, for the oversubscription guard */
+    atomic_int allowed_cpus;           /* sched_getaffinity, re-read every 100 ms */
+    atomic_uint_fast64_t cpus_checked_ns;
 
     /* EQ registry. An ESTABLISHED conn's delivery wakes only its own EQ (psl->eq),
      * which is what lets N threads receive in parallel. The registry serves the ONE
@@ -1132,7 +1136,9 @@ static int drain_rev_rings_span(dpumesh_ctx_t *ctx, uint32_t budget)
 }
 
 /* Tags of the fds nested in an EQ's epoll fd. */
-enum { EQ_TAG_EFD = 1, EQ_TAG_TICK, EQ_TAG_TAIL, EQ_TAG_SPARE, EQ_TAG_STRIPE };
+enum { EQ_TAG_EFD = 1, EQ_TAG_TICK, EQ_TAG_TAIL, EQ_TAG_SPARE, EQ_TAG_STRIPE, EQ_TAG_WAKE };
+/* Which of an EQ's wake sources fired since it last armed. */
+enum { EQ_FIRED_EFD = 1, EQ_FIRED_TICK = 2, EQ_FIRED_TAIL = 4, EQ_FIRED_STRIPE = 8, EQ_FIRED_WAKE = 16 };
 #define EQ_TAG(tag, stripe) ((uint64_t)(tag) << 32 | (uint32_t)(stripe))
 
 static int epoll_nest(int epfd, int fd, uint64_t tag)
@@ -1148,12 +1154,13 @@ static void epoll_unnest(int epfd, int fd)
 }
 
 /* Acknowledge every doorbell that woke this EQ: the stripes it owns, the
- * spare stripes, its own eventfd and its fallback tick. A doorbell stays
- * readable until acknowledged, so this precedes the drain. */
-static void eq_ack_doorbells(struct dmesh_eq *eq)
+ * spare stripes, the channel's wake fd, its own eventfd and its timer. A
+ * doorbell stays readable until acknowledged. Returns the EQ_FIRED_* set. */
+static unsigned eq_ack_doorbells(struct dmesh_eq *eq)
 {
     dpumesh_ctx_t *ctx = eq->ch->ctx;
     struct epoll_event evs[DMESH_MAX_STRIPES + 3];
+    unsigned fired = 0;
     int n = eq->epfd >= 0 ? epoll_wait(eq->epfd, evs, DMESH_MAX_STRIPES + 3, 0) : 0;
     for (int i = 0; i < n; ++i) {
         uint32_t tag = (uint32_t)(evs[i].data.u64 >> 32), stripe = (uint32_t)evs[i].data.u64;
@@ -1161,25 +1168,121 @@ static void eq_ack_doorbells(struct dmesh_eq *eq)
         switch (tag) {
         case EQ_TAG_EFD:
             if (read(eq->notify_efd, &v, sizeof(v)) < 0) {}
+            fired |= EQ_FIRED_EFD;
             break;
         case EQ_TAG_TICK:
             if (read(eq->tick_fd, &v, sizeof(v)) < 0) {}
+            fired |= EQ_FIRED_TICK;
             break;
         case EQ_TAG_TAIL:
             if (read(eq->tail_fd, &v, sizeof(v)) < 0) {}
+            fired |= EQ_FIRED_TAIL;
             break;
         case EQ_TAG_SPARE: {
-            struct epoll_event spare[DMESH_MAX_STRIPES];
-            int m = epoll_wait(ctx->spare_epfd, spare, DMESH_MAX_STRIPES, 0);
-            for (int j = 0; j < m; ++j)
-                dmesh_native_stripe_clear(ctx->transport, (int)(uint32_t)spare[j].data.u64);
+            struct epoll_event spare[DMESH_MAX_STRIPES + 1];
+            int m = epoll_wait(ctx->spare_epfd, spare, DMESH_MAX_STRIPES + 1, 0);
+            for (int j = 0; j < m; ++j) {
+                if ((uint32_t)(spare[j].data.u64 >> 32) == EQ_TAG_WAKE) {
+                    dmesh_native_wake_clear(ctx->transport);
+                    fired |= EQ_FIRED_WAKE;
+                } else {
+                    dmesh_native_stripe_clear(ctx->transport, (int)(uint32_t)spare[j].data.u64);
+                    fired |= EQ_FIRED_STRIPE;
+                }
+            }
             break;
         }
         case EQ_TAG_STRIPE:
             dmesh_native_stripe_clear(ctx->transport, (int)stripe);
+            fired |= EQ_FIRED_STRIPE;
             break;
         }
     }
+    return fired;
+}
+
+/* Process-wide idle-wake counters, written to $DPUMESH_WAIT_STATS/dpumesh-wait.<pid>
+ * at most once a second when that directory is set. */
+static struct {
+    atomic_uint_fast64_t naps, lingers, busy, arms, arm_failures, backstop_wakes, backstop_work;
+    atomic_uint_fast64_t fired[5];       /* EQ_FIRED_* bit i, per empty poll */
+    atomic_uint_fast64_t next_dump_ns;
+} wait_stats;
+static const char *wait_stats_dir;
+
+static void wait_stats_dump(dpumesh_ctx_t *ctx, uint64_t now, int force)
+{
+    if (wait_stats_dir == NULL || !*wait_stats_dir) return;
+    uint64_t due = atomic_load_explicit(&wait_stats.next_dump_ns, memory_order_relaxed);
+    if (!force && (now < due || !atomic_compare_exchange_strong(&wait_stats.next_dump_ns, &due,
+                                                                now + 1000000000ull)))
+        return;
+    uint64_t arm_msgs = 0, doorbells = 0;
+    dmesh_native_wake_counters(ctx->transport, &arm_msgs, &doorbells);
+    char path[512], line[512];
+    snprintf(path, sizeof(path), "%s/dpumesh-wait.%d", wait_stats_dir, (int)getpid());
+    int len = snprintf(line, sizeof(line),
+        "naps=%llu lingers=%llu busy=%llu arms=%llu arm_failures=%llu backstop_wakes=%llu "
+        "backstop_work=%llu arm_msgs=%llu doorbells=%llu fired_efd=%llu fired_timer=%llu "
+        "fired_tail=%llu fired_stripe=%llu fired_wake=%llu\n",
+        (unsigned long long)atomic_load(&wait_stats.naps), (unsigned long long)atomic_load(&wait_stats.lingers),
+        (unsigned long long)atomic_load(&wait_stats.busy), (unsigned long long)atomic_load(&wait_stats.arms),
+        (unsigned long long)atomic_load(&wait_stats.arm_failures),
+        (unsigned long long)atomic_load(&wait_stats.backstop_wakes),
+        (unsigned long long)atomic_load(&wait_stats.backstop_work),
+        (unsigned long long)arm_msgs, (unsigned long long)doorbells,
+        (unsigned long long)atomic_load(&wait_stats.fired[0]), (unsigned long long)atomic_load(&wait_stats.fired[1]),
+        (unsigned long long)atomic_load(&wait_stats.fired[2]), (unsigned long long)atomic_load(&wait_stats.fired[3]),
+        (unsigned long long)atomic_load(&wait_stats.fired[4]));
+    FILE *f = fopen(path, "w");
+    if (f) { fwrite(line, 1, (size_t)len, f); fclose(f); }
+}
+
+static void eq_timer(struct dmesh_eq *eq, uint64_t ns, int backstop)
+{
+    if (eq->tick_fd < 0) return;
+    struct itimerspec its = {0};
+    its.it_value.tv_sec = (time_t)(ns / 1000000000ull);
+    its.it_value.tv_nsec = (long)(ns % 1000000000ull);
+    if (its.it_value.tv_sec == 0 && its.it_value.tv_nsec == 0) its.it_value.tv_nsec = 1;
+    (void)timerfd_settime(eq->tick_fd, 0, &its, NULL);
+    eq->timer_backstop = backstop;
+}
+
+/* More live EQs than CPUs this process may run on: a nap then lands in the
+ * RTT of a queued thread, and the doorbell wake wins. */
+static int eq_oversubscribed(dpumesh_ctx_t *ctx, uint64_t now)
+{
+    uint64_t checked = atomic_load_explicit(&ctx->cpus_checked_ns, memory_order_relaxed);
+    if (now - checked >= 100000000ull || checked == 0) {
+        cpu_set_t cpus;
+        int n = sched_getaffinity(0, sizeof(cpus), &cpus) == 0 ? CPU_COUNT(&cpus) : 1;
+        atomic_store_explicit(&ctx->allowed_cpus, n > 0 ? n : 1, memory_order_relaxed);
+        atomic_store_explicit(&ctx->cpus_checked_ns, now, memory_order_relaxed);
+    }
+    return atomic_load_explicit(&ctx->live_eqs, memory_order_relaxed) >
+           atomic_load_explicit(&ctx->allowed_cpus, memory_order_relaxed);
+}
+
+/* Work was found for this EQ on its own thread: naps restart from the minimum. */
+static void eq_note_work(struct dmesh_eq *eq)
+{
+    eq->nap_ns = eq->ch->ctx->nap_min_ns;
+    eq->work_since_arm = 1;
+    atomic_store_explicit(&eq->last_work_ns, monotonic_ns(), memory_order_relaxed);
+}
+
+void dpumesh_eq_note_work(struct dmesh_eq *eq)
+{
+    if (eq != NULL && eq->ch != NULL && eq->ch->ctx != NULL) eq_note_work(eq);
+}
+
+/* The EQ's thread is polling again: submitters need not wake it. Not cleared
+ * by the re-check drain that follows an arm, which still counts as asleep. */
+void dpumesh_eq_awake(struct dmesh_eq *eq)
+{
+    if (eq != NULL && atomic_load_explicit(&eq->asleep, memory_order_relaxed))
+        atomic_store_explicit(&eq->asleep, 0, memory_order_relaxed);
 }
 
 /* In-line drain by an awake EQ thread: interprets whatever reverse entries
@@ -1194,50 +1297,89 @@ int dpumesh_eq_drain(struct dmesh_eq *eq)
     dmesh_eq_suppress_notify(eq, 1);
     int drained = drain_rev_rings_span(ctx, 256);
     dmesh_eq_suppress_notify(eq, -1);
-    if (drained > 0) eq->spin_since = 0;   /* work found: the spin window restarts */
+    if (drained > 0) eq_note_work(eq);
     return drained;
 }
 
 /* Before the EQ's thread sleeps on its fd (an empty dmesh_poll_eq): settle
- * the doorbells that fired, re-arm those of the stripes this EQ owns and of
- * the spare stripes, and run the fallback tick while any of them has traffic
- * no doorbell reports. Poll-only EQs (fd never handed out) skip this: they
- * never sleep on the fd. A doorbell that fires after the settle stays
- * readable, so the sleep returns at once and the next empty poll settles it. */
+ * the sources that fired and choose the next wake. Poll-only EQs (fd never
+ * handed out) skip this: they never sleep on the fd.
+ *   nap     work was recent: the one-shot timer re-polls after nap_ns, which
+ *           doubles up to the cap;
+ *   linger  keep polling every nap_cap until linger has passed since the last
+ *           work (a send counts: its reply is expected);
+ *   sleep   set asleep, arm the stripes' doorbells, and unless custody is
+ *           outstanding ask the channel to ring (idle_arm); only the backstop
+ *           timer remains. dmesh_poll_eq drains once more after this, so a
+ *           completion that landed before the arm is not slept through. */
 void dpumesh_eq_arm(struct dmesh_eq *eq)
 {
     if (eq == NULL || eq->ch == NULL || eq->ch->ctx == NULL ||
         !atomic_load_explicit(&eq->wants_notify, memory_order_acquire))
         return;
     dpumesh_ctx_t *ctx = eq->ch->ctx;
-    /* Spin window: the first empty poll signals the eventfd and leaves it
-     * unread, so the caller's sleep returns at once and it polls again; the
-     * doorbells are armed only once the EQ has stayed empty for spin_ns. */
-    uint64_t now = monotonic_ns();
-    if (ctx->spin_ns > 0) {
-        if (eq->spin_since == 0) {
-            eq->spin_since = now;
-            uint64_t one = 1;
-            if (eq->notify_efd >= 0 && write(eq->notify_efd, &one, sizeof(one)) < 0) {}
-            return;
+    unsigned fired = eq_ack_doorbells(eq);
+    for (int i = 0; i < 5; ++i)
+        if (fired & (1u << i)) atomic_fetch_add_explicit(&wait_stats.fired[i], 1, memory_order_relaxed);
+    if (eq->timer_backstop && fired == EQ_FIRED_TICK) {
+        /* Nothing but the backstop woke a sleeping EQ. Work found then was a
+         * missed wake: count it, the regression tests require zero. */
+        atomic_fetch_add(&wait_stats.backstop_wakes, 1);
+        if (eq->work_since_arm) {
+            atomic_fetch_add(&wait_stats.backstop_work, 1);
+            CTRACE("backstop found work: a wake was missed");
         }
-        if (now - eq->spin_since < (uint64_t)ctx->spin_ns) return;
     }
-    eq_ack_doorbells(eq);
-    int tick = 0;
+    eq->timer_backstop = 0;
+    if (fired & EQ_FIRED_WAKE) {
+        /* A DOORBELL's descriptor may become visible after the message: poll
+         * again soon. Other control events (send completions) need no nap. */
+        uint64_t arm_msgs, doorbells;
+        dmesh_native_wake_counters(ctx->transport, &arm_msgs, &doorbells);
+        if (doorbells != eq->seen_doorbells) {
+            eq->seen_doorbells = doorbells;
+            eq->nap_ns = ctx->nap_min_ns;
+        }
+    }
+    if (atomic_exchange_explicit(&eq->kick, 0, memory_order_relaxed))
+        eq->nap_ns = ctx->nap_min_ns;   /* a send: its reply follows */
+    eq->work_since_arm = 0;
+
+    uint64_t now = monotonic_ns();
+    if (!eq_oversubscribed(ctx, now)) {
+        if (eq->nap_ns != 0 && eq->nap_ns <= ctx->nap_cap_ns) {
+            eq_timer(eq, eq->nap_ns, 0);
+            eq->nap_ns *= 2;
+            atomic_fetch_add(&wait_stats.naps, 1);
+            goto out;
+        }
+        uint64_t last = atomic_load_explicit(&eq->last_work_ns, memory_order_relaxed);
+        if (ctx->linger_ns != 0 && now - last < ctx->linger_ns) {
+            eq_timer(eq, ctx->nap_cap_ns, 0);
+            atomic_fetch_add(&wait_stats.lingers, 1);
+            goto out;
+        }
+    }
+    /* Sleep. The flag is set before custody is read under each slot lock; a
+     * submitter publishes custody before reading the flag. So either this
+     * sees the custody or the submitter wakes the EQ (eq_note_tx). */
+    atomic_store_explicit(&eq->asleep, 1, memory_order_seq_cst);
+    int busy = 0;
     for (int stripe = 0; stripe < ctx->landing_stripes; ++stripe) {
         struct dmesh_eq *owner = __atomic_load_n(&ctx->stripe_owner[stripe], __ATOMIC_ACQUIRE);
         if (owner == NULL || owner == eq)
-            tick |= dmesh_native_stripe_arm(ctx->transport, stripe);
+            busy |= dmesh_native_stripe_arm(ctx->transport, stripe);
     }
-    if (eq->tick_fd < 0 || tick == eq->tick_armed) return;
-    struct itimerspec its = {0};
-    if (tick) {
-        its.it_interval.tv_sec = ctx->tick_ns / 1000000000L;
-        its.it_interval.tv_nsec = ctx->tick_ns % 1000000000L;
-        its.it_value = its.it_interval;
+    if (busy || dmesh_native_idle_arm(ctx->transport) != 0) {
+        atomic_store_explicit(&eq->asleep, 0, memory_order_relaxed);
+        eq_timer(eq, ctx->nap_cap_ns ? ctx->nap_cap_ns : 100000ull, 0);
+        atomic_fetch_add(busy ? &wait_stats.busy : &wait_stats.arm_failures, 1);
+        goto out;
     }
-    if (timerfd_settime(eq->tick_fd, 0, &its, NULL) == 0) eq->tick_armed = tick;
+    eq_timer(eq, ctx->backstop_ns, 1);
+    atomic_fetch_add(&wait_stats.arms, 1);
+out:
+    wait_stats_dump(ctx, now, 0);
 }
 
 /* Stripe ownership: the stripe's doorbell moves from spare_epfd to the owning
@@ -1403,12 +1545,31 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
         if (epoll_nest(ctx->spare_epfd, dmesh_native_stripe_fd(ctx->transport, stripe),
                        EQ_TAG(EQ_TAG_STRIPE, stripe)) != 0)
             goto fail;
-    ctx->tick_ns = DMESH_TICK_US_DEFAULT * 1000L;
-    { const char *env = getenv("DPUMESH_TICK_US");
-      if (env && *env) { long v = atol(env); if (v >= 1 && v <= 100000) ctx->tick_ns = v * 1000L; } }
-    ctx->spin_ns = DMESH_SPIN_US_DEFAULT * 1000L;
-    { const char *env = getenv("DPUMESH_SPIN_US");
-      if (env && *env) { long v = atol(env); if (v >= 0 && v <= 100000000) ctx->spin_ns = v * 1000L; } }
+    /* The channel's wake fd is raised by control messages (DOORBELL, CLOSED,
+     * ERROR) once idle_arm succeeded; like a spare stripe, it wakes any EQ. */
+    { int wfd = dmesh_native_wake_fd(ctx->transport);
+      if (wfd >= 0 && epoll_nest(ctx->spare_epfd, wfd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0) goto fail; }
+    { struct { const char *name; uint64_t *out; long lo, hi, unit_ns; uint64_t def; } knobs[] = {
+          { "DPUMESH_NAP_US", &ctx->nap_min_ns, 0, 5000, 1000, DMESH_NAP_MIN_US_DEFAULT },
+          { "DPUMESH_NAP_CAP_US", &ctx->nap_cap_ns, 1, 5000, 1000, DMESH_NAP_CAP_US_DEFAULT },
+          { "DPUMESH_LINGER_US", &ctx->linger_ns, 0, 1000000, 1000, DMESH_LINGER_US_DEFAULT },
+          { "DPUMESH_BACKSTOP_MS", &ctx->backstop_ns, 1, 10000, 1000000, DMESH_BACKSTOP_MS_DEFAULT },
+      };
+      for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); ++k) {
+          const char *env = getenv(knobs[k].name);
+          long v = env && *env ? atol(env) : -1;
+          *knobs[k].out = (uint64_t)(v >= knobs[k].lo && v <= knobs[k].hi ? (uint64_t)v : knobs[k].def) *
+                          (uint64_t)knobs[k].unit_ns;
+      }
+      if (ctx->nap_cap_ns < ctx->nap_min_ns) ctx->nap_cap_ns = ctx->nap_min_ns;
+      static int warned;
+      if (!warned && ((getenv("DPUMESH_SPIN_US") && *getenv("DPUMESH_SPIN_US")) ||
+                      (getenv("DPUMESH_TICK_US") && *getenv("DPUMESH_TICK_US")))) {
+          warned = 1;
+          DOCA_LOG_WARN("DPUMESH_SPIN_US and DPUMESH_TICK_US are ignored; the idle wake uses "
+                        "DPUMESH_NAP_US, DPUMESH_NAP_CAP_US, DPUMESH_LINGER_US and DPUMESH_BACKSTOP_MS");
+      }
+      wait_stats_dir = getenv("DPUMESH_WAIT_STATS"); }
     ctx->dma_buffer = native.tx;
     ctx->rx_dma_buffer = native.rx;
     ctx->rx_dma_buf_size = native.rx_bytes ? native.rx_bytes : configured_bytes;
@@ -2056,6 +2217,19 @@ static inline void tx_reclaim_ack(dpumesh_ctx_t *ctx, uint16_t port, uint16_t se
     }
 }
 
+/* A unit was handed to the transport: its custody ACK has no doorbell and a
+ * reply is likely, so the owner EQ lingers and, if asleep, is woken. The
+ * custody was published under the slot lock before the flag is read. */
+static void eq_note_tx(dpumesh_ctx_t *ctx, uint16_t port)
+{
+    struct dmesh_eq *eq = __atomic_load_n(&ctx->ports[port].eq, __ATOMIC_ACQUIRE);
+    if (eq == NULL) return;
+    atomic_store_explicit(&eq->last_work_ns, monotonic_ns(), memory_order_relaxed);
+    atomic_store_explicit(&eq->kick, 1, memory_order_relaxed);
+    if (atomic_load_explicit(&eq->asleep, memory_order_seq_cst))
+        eq_notify(eq);
+}
+
 /* Fail-safe bound, not a flow-control knob: a cell frees in microseconds while
  * any consumer exists, so only a ring with no consumer reaches it, and it
  * reports an error instead of hanging. */
@@ -2072,7 +2246,10 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc)
     sw_descriptor_t wire = *desc;
     wire.src_pod = ctx->pod_id;
     wire.src_service = ctx->service_id;
-    return dmesh_native_submit(ctx->transport, &wire);
+    if (dmesh_native_submit(ctx->transport, &wire) != 0)
+        return -1;
+    eq_note_tx(ctx, desc->src_port);
+    return 0;
 }
 
 /* ====================================================================
@@ -2496,9 +2673,13 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
         return NULL;
     }
     eq->reg_idx = idx;
+    /* Born idle: the first empty poll sleeps rather than naps. */
+    eq->nap_ns = ctx->nap_cap_ns + 1;
+    atomic_fetch_add(&ctx->live_eqs, 1);
     /* The readiness fd is an epoll set: this EQ's eventfd (wakes from other
-     * threads: deliveries, accepts), its fallback tick, its tail deadline, the
-     * spare stripes' doorbells and, once bound, its own stripes' doorbells. */
+     * threads: deliveries, accepts), its nap/backstop timer, its tail
+     * deadline, the spare set (unowned stripes and the channel wake fd) and,
+     * once bound, its own stripes' doorbells. */
     eq->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     eq->tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     eq->tail_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -2527,9 +2708,12 @@ int dmesh_destroy_eq(dmesh_eq_t *eq) {
     }
     dpumesh_ctx_t *ctx = eq->ch->ctx;
     pthread_mutex_lock(&ctx->eq_lock);
-    if (ctx->eqs[eq->reg_idx] == eq)
+    if (ctx->eqs[eq->reg_idx] == eq) {
         ctx->eqs[eq->reg_idx] = NULL;
+        atomic_fetch_sub(&ctx->live_eqs, 1);
+    }
     pthread_mutex_unlock(&ctx->eq_lock);
+    wait_stats_dump(ctx, monotonic_ns(), 1);
     if (eq->epfd >= 0) close(eq->epfd);
     if (eq->tick_fd >= 0) close(eq->tick_fd);
     if (eq->tail_fd >= 0) close(eq->tail_fd);

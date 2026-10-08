@@ -55,6 +55,16 @@ bench-results/*
 !bench-results/2026-09-26_grpc-go-64b-host-dpa-pf01.md
 !bench-results/2026-09-26_grpc-go-64b-w16-k4-no-eu-partitions.csv
 !bench-results/2026-09-26_grpc-go-64b-w16-k4-no-eu-partitions.md
+!bench-results/2026-09-29_grpc-go-adapter-rework.md
+!bench-results/2026-09-29_preload-gather-write.md
+!bench-results/2026-09-29_online-boutique-e2e.md
+!bench-results/2026-09-29_online-boutique-e2e.csv
+!bench-results/2026-09-30_online-boutique-fixes.csv
+!bench-results/2026-09-30_online-boutique-fixes.json
+!bench-results/2026-09-30_host-idle-wake.md
+!bench-results/2026-09-30_host-idle-wake.csv
+# gRPC 64-byte echo records of every language
+!bench-results/*_grpc-*64b*
 
 # local test binary
 apps/dmesh-router-cpp/test/test_transcode
@@ -144,3 +154,7 @@ __pycache__/
 !bench-results/2026-10-05_grpc-direct-replica-1core.json
 !bench-results/2026-10-05_grpc-multiprocess-w16-k4-recheck.csv
 !bench-results/2026-10-05_grpc-multiprocess-w16-k4-recheck.json
+
+# gRPC benchmark runs
+/bench/grpc/results/
+/bench/grpc/dpu/run/
