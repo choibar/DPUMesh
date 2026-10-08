@@ -26,10 +26,6 @@ struct dmesh_doca_dpa_thread {
     struct doca_dpa *dpa;           /* DOCA DPA */
     struct doca_dpa_thread *thread; /* DPA thread */
     bool started;                  /* SDK start succeeded; partial creation is not allocatable */
-    /* Fixed EU from the pool's DPUMESH_DPA_EU_* range; unpinned otherwise. */
-    bool eu_pinned;
-    unsigned int eu_id;
-    struct doca_dpa_eu_affinity *eu_affinity;
     bool running, quiesced;        /* run attempted; explicit DMA close fence completed */
     /* Stop handshake of the current run, advanced by dmesh_doca_dpa_quiesce_step(). */
     bool stop_sent, submitted_known;
@@ -48,11 +44,6 @@ struct dmesh_dpa_thread_pool {
     struct doca_dpa *dpa;                          /* borrowed shared context */
     struct dmesh_dpa_runtime *runtime;             /* worker lease */
     int size;                                      /* number of usable slots */
-    /* Fixed EU range (dpa_pool_eu_range); eu_width 0 leaves threads unpinned. */
-    bool eu_resolved;                              /* range computed once */
-    unsigned int index;                            /* which pool (see dpa_pool_index) */
-    unsigned int eu_first, eu_width;               /* EUs in this pool's range */
-    bool eu_shared_warned;                         /* more streams than EUs, logged */
     struct dmesh_doca_dpa_thread threads[DPA_THREAD_POOL_SIZE];
     struct dmesh_conn *owner[DPA_THREAD_POOL_SIZE]; /* NULL = free */
 };

@@ -229,123 +229,6 @@ static doca_error_t dpa_pool_thread_create(struct dmesh_doca_dpa_thread *thread)
                     : dmesh_doca_dpa_thread_create(thread);
 }
 
-static const char *
-eu_env(const char *name)
-{
-    const char *value = getenv(name);
-    return value != NULL && *value != '\0' ? value : NULL;
-}
-
-/* Which pool's EU range this worker takes. A dispatcher worker is pool
- * worker_idx: its Comch names are control endpoints, not placement. A worker
- * that serves its own Comch server DPUMesh<k> is pool k; anything else takes
- * creation order. */
-static unsigned int
-dpa_pool_index(const struct objects *objs)
-{
-    static unsigned int pools_created;
-    if (objs->mailbox != NULL)
-        return (unsigned int)objs->worker_idx;
-    if (objs->dpa_pool_index >= 0)
-        return (unsigned int)objs->dpa_pool_index;
-    return __atomic_fetch_add(&pools_created, 1, __ATOMIC_RELAXED);
-}
-
-/* Optional fixed EU ranges, one per DPU worker pool. Without any
- * DPUMESH_DPA_EU_* variable the pool keeps the scheduler's placement
- * (eu_width 0). A pool's threads stay inside its range: a thread past the
- * width shares an EU with an earlier thread of the same pool rather than
- * with another worker's. */
-static doca_error_t
-dpa_pool_eu_range(struct objects *objs, struct dmesh_dpa_thread_pool *pool)
-{
-    const char *base_env = eu_env("DPUMESH_DPA_EU_BASE");
-    const char *stride_env = eu_env("DPUMESH_DPA_EU_STRIDE");
-    const char *end_env = eu_env("DPUMESH_DPA_EU_END");
-    const char *offsets_env = eu_env("DPUMESH_DPA_EU_OFFSETS");
-    unsigned int eus, eu_base = 0, eu_end, stride = 0;
-    doca_error_t result;
-    char *end;
-
-    if (pool->eu_resolved)
-        return DOCA_SUCCESS;
-    if (!base_env && !stride_env && !end_env && !offsets_env) {
-        pool->eu_resolved = true;
-        return DOCA_SUCCESS;
-    }
-    result = DMESH_DPA_CALL(doca_dpa_get_total_num_eus_available(pool->dpa, &eus));
-    if (result != DOCA_SUCCESS || eus == 0)
-        return result != DOCA_SUCCESS ? result : DOCA_ERROR_BAD_STATE;
-    if (base_env) {
-        unsigned long value = strtoul(base_env, &end, 10);
-        if (*end != '\0' || value >= eus)
-            return DOCA_ERROR_INVALID_VALUE;
-        eu_base = (unsigned int)value;
-    }
-    /* DPUMESH_DPA_EU_STRIDE: pool k uses the `stride` EUs from k * stride
-     * after the base. 0 (default) lets every pool span the whole range. */
-    if (stride_env) {
-        unsigned long value = strtoul(stride_env, &end, 10);
-        if (*end != '\0' || value >= eus - eu_base)
-            return DOCA_ERROR_INVALID_VALUE;
-        stride = (unsigned int)value;
-    }
-    /* DPUMESH_DPA_EU_END: first EU the pools must not use (default: every
-     * EU the device reports). Each pool creates all its threads up front, so
-     * a stride needs this to keep every thread on an EU that accepts one. */
-    eu_end = eus;
-    if (end_env) {
-        unsigned long value = strtoul(end_env, &end, 10);
-        if (*end != '\0' || value <= eu_base || value > eus)
-            return DOCA_ERROR_INVALID_VALUE;
-        eu_end = (unsigned int)value;
-    }
-    unsigned int pool_index = dpa_pool_index(objs);
-    unsigned int span = eu_end - eu_base;
-    unsigned int offset = 0, width = span;
-    if (stride > 0) {
-        offset = stride * pool_index;
-        width = stride;
-    }
-    /* DPUMESH_DPA_EU_OFFSETS: "o0,o1,...", increasing, the start of pool k
-     * from the base; pool k ends where pool k+1 starts (the last one at the
-     * end). Pools past the list use the stride. Lets a worker with many
-     * connections get a wider range than the rest. */
-    if (offsets_env) {
-        const char *p = offsets_env;
-        unsigned long prev = 0;
-        for (unsigned int k = 0; *p != '\0'; k++) {
-            unsigned long value = strtoul(p, &end, 10);
-            if (end == p || (*end != ',' && *end != '\0') || value >= span || (k > 0 && value <= prev))
-                return DOCA_ERROR_INVALID_VALUE;
-            if (k == pool_index) {
-                offset = (unsigned int)value;
-                width = span - offset;
-            } else if (k == pool_index + 1) {
-                width = (unsigned int)value - offset;
-                break;
-            }
-            prev = value;
-            p = *end == ',' ? end + 1 : end;
-        }
-    }
-    if (offset >= span) {
-        DOCA_LOG_ERR("DPA pool %u starts at EU offset %u, past the %u EUs from base %u to end %u",
-                     pool_index, offset, span, eu_base, eu_end);
-        return DOCA_ERROR_INVALID_VALUE;
-    }
-    if (width > span - offset)
-        width = span - offset;
-    pool->index = pool_index;
-    pool->eu_first = eu_base + offset;
-    pool->eu_width = width;
-    pool->eu_shared_warned = false;
-    pool->eu_resolved = true;
-    DOCA_LOG_INFO("DPA pool %u: fixed EUs %u..%u (%u available, base %u, end %u)",
-                  pool_index, pool->eu_first, pool->eu_first + width - 1, eus, eu_base, eu_end);
-    return DOCA_SUCCESS;
-}
-
 doca_error_t
 dmesh_dpa_thread_pool_init(struct objects *objs)
 {
@@ -357,17 +240,9 @@ dmesh_dpa_thread_pool_init(struct objects *objs)
         DOCA_LOG_ERR("DPA thread pool: init_dpa_objects must run first");
         return DOCA_ERROR_BAD_STATE;
     }
-    result = dpa_pool_eu_range(objs, pool);
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("DPA thread pool: invalid DPUMESH_DPA_EU_* range: %s", doca_error_get_name(result));
-        return result;
-    }
 
     for (i = pool->size; i < DPA_THREAD_POOL_SIZE; i++) {
         pool->threads[i].dpa = pool->dpa;
-        pool->threads[i].eu_pinned = pool->eu_width != 0;
-        if (pool->threads[i].eu_pinned)
-            pool->threads[i].eu_id = pool->eu_first + (unsigned int)i % pool->eu_width;
         result = dpa_pool_thread_create(&pool->threads[i]);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to create DPA pool thread %d: %s", i, doca_error_get_name(result));
@@ -411,19 +286,7 @@ dmesh_dpa_thread_pool_alloc(struct objects *objs, struct dmesh_conn *conn)
                 }
             }
             pool->owner[i] = conn;
-            if (pool->threads[i].eu_pinned) {
-                DOCA_LOG_INFO("Assigned DPA pool thread %d (EU %u) to connection %p", i,
-                              pool->threads[i].eu_id, (void *)conn);
-                /* DPA threads are not preempted: two busy streams on one EU
-                 * starve each other. Size each range for its worker's streams. */
-                if ((unsigned int)i >= pool->eu_width && !pool->eu_shared_warned) {
-                    DOCA_LOG_WARN("DPA pool %u: more streams than its %u EUs; streams now share EUs and may stall",
-                                  pool->index, pool->eu_width);
-                    pool->eu_shared_warned = true;
-                }
-            } else {
-                DOCA_LOG_INFO("Assigned DPA pool thread %d to connection %p", i, (void *)conn);
-            }
+            DOCA_LOG_INFO("Assigned DPA pool thread %d to connection %p", i, (void *)conn);
             return &pool->threads[i];
         }
     }
@@ -457,8 +320,7 @@ dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, uint32_t bench_mode)
 {
     doca_error_t result;
 
-    if (dpa_thread->thread != NULL || dpa_thread->local_storage != 0 || dpa_thread->buf != 0 ||
-        dpa_thread->eu_affinity != NULL)
+    if (dpa_thread->thread != NULL || dpa_thread->local_storage != 0 || dpa_thread->buf != 0)
         return DOCA_ERROR_BAD_STATE; /* preserve partial creation for cleanup */
     dpa_thread->bench_mode = bench_mode;
     size_t state_size = bench_mode ? sizeof(struct dpa_bench_state) : sizeof(struct dpa_thread_ctx);
@@ -510,19 +372,6 @@ dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, uint32_t bench_mode)
         DOCA_LOG_ERR("Failed to set DPA thread local storage: %s",
                      doca_error_get_descr(result));
         return result; /* Checked cleanup retains ownership on partial setup. */
-    }
-
-    if (dpa_thread->eu_pinned) {
-        result = DMESH_DPA_CALL(doca_dpa_eu_affinity_create(dpa_thread->dpa, &dpa_thread->eu_affinity));
-        if (result == DOCA_SUCCESS)
-            result = DMESH_DPA_CALL(doca_dpa_eu_affinity_set(dpa_thread->eu_affinity, dpa_thread->eu_id));
-        if (result == DOCA_SUCCESS)
-            result = DMESH_DPA_CALL(doca_dpa_thread_set_affinity(dpa_thread->thread, dpa_thread->eu_affinity));
-        if (result != DOCA_SUCCESS) {
-            DOCA_LOG_ERR("Failed to pin DPA thread to EU %u: %s", dpa_thread->eu_id,
-                         doca_error_get_descr(result));
-            return result; /* Checked cleanup retains ownership on partial setup. */
-        }
     }
 
     result = DMESH_DPA_CALL(doca_dpa_thread_start(dpa_thread->thread));
@@ -1087,12 +936,6 @@ dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *thread)
         thread->started = false;
         thread->running = false;
     }
-    if (thread->eu_affinity != NULL) {
-        result = DMESH_DPA_CALL(doca_dpa_eu_affinity_destroy(thread->eu_affinity));
-        if (result != DOCA_SUCCESS)
-            return result;
-        thread->eu_affinity = NULL;
-    }
     if (thread->local_storage != 0) {
         result = DMESH_DPA_CALL(doca_dpa_mem_free(thread->dpa, thread->local_storage));
         if (result != DOCA_SUCCESS)
@@ -1296,8 +1139,6 @@ dmesh_doca_dpa_thread_destroy(struct dmesh_doca_dpa_thread *dpa_thread)
     if (DMESH_DPA_CALL(doca_dpa_thread_destroy(dpa_thread->thread)) != DOCA_SUCCESS) return;
     dpa_thread->thread = NULL;
     dpa_thread->started = false;
-    if (dpa_thread->eu_affinity && DMESH_DPA_CALL(doca_dpa_eu_affinity_destroy(dpa_thread->eu_affinity)) == DOCA_SUCCESS)
-        dpa_thread->eu_affinity = NULL;
     if (dpa_thread->local_storage && DMESH_DPA_CALL(doca_dpa_mem_free(dpa_thread->dpa, dpa_thread->local_storage)) == DOCA_SUCCESS)
         dpa_thread->local_storage = 0;
     if (dpa_thread->buf && DMESH_DPA_CALL(doca_dpa_mem_free(dpa_thread->dpa, dpa_thread->buf)) == DOCA_SUCCESS)
