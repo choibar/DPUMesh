@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Only control messages cross these queues. In particular no DMA descriptor,
@@ -59,22 +60,48 @@ struct dmesh_dispatcher {
 };
 
 /* Read-only membership snapshots for Rust routing before any backend exists.
- * Retired endpoints remain known until dispatcher shutdown, preventing a
- * registered DMA destination from falling through to TCP after disconnect. */
+ * A retired endpoint stays known for DMESH_LISTENER_GRACE_MS, so a restarting
+ * DMA server is refused rather than dialled over TCP, then is forgotten: its
+ * address may belong to a different, TCP workload by then (Pod IPs are
+ * reused). */
+#define LISTENER_GRACE_MS_DEFAULT 30000u
 struct listener_membership {
     struct dmesh_dispatcher *dispatcher;
     uint32_t ip;
     uint16_t port;
+    uint64_t retired_ms;      /* 0 while a session listens */
     struct listener_membership *next;
 };
 static pthread_mutex_t membership_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct listener_membership *memberships;
+static uint64_t membership_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+static uint64_t listener_grace_ms(void)
+{
+    static uint64_t grace = UINT64_MAX;
+    if (grace == UINT64_MAX) {
+        const char *env = getenv("DMESH_LISTENER_GRACE_MS");
+        char *end = NULL;
+        unsigned long long v = env && *env ? strtoull(env, &end, 10) : 0;
+        grace = env && *env && end && !*end ? (uint64_t)v : LISTENER_GRACE_MS_DEFAULT;
+    }
+    return grace;
+}
 int dmesh_dispatch_listener_known(uint32_t ip, uint16_t port)
 {
+    uint64_t now = membership_now_ms(), grace = listener_grace_ms();
     pthread_mutex_lock(&membership_lock);
     int known = 0;
-    for (struct listener_membership *m = memberships; m; m = m->next)
-        if (m->ip == ip && m->port == port) { known = 1; break; }
+    for (struct listener_membership **p = &memberships; *p;) {
+        struct listener_membership *m = *p;
+        if (m->retired_ms && now - m->retired_ms >= grace) { *p = m->next; free(m); continue; }
+        if (m->ip == ip && m->port == port) known = 1;
+        p = &m->next;
+    }
     pthread_mutex_unlock(&membership_lock);
     return known;
 }
@@ -83,15 +110,24 @@ static int remember_listener(struct dmesh_dispatcher *d, uint32_t ip, uint16_t p
     pthread_mutex_lock(&membership_lock);
     for (struct listener_membership *m = memberships; m; m = m->next)
         if (m->dispatcher == d && m->ip == ip && m->port == port) {
+            m->retired_ms = 0;
             pthread_mutex_unlock(&membership_lock); return 0;
         }
     struct listener_membership *m = malloc(sizeof(*m));
     if (m) {
-        *m = (struct listener_membership){d, ip, port, memberships};
+        *m = (struct listener_membership){d, ip, port, 0, memberships};
         memberships = m;
     }
     pthread_mutex_unlock(&membership_lock);
     return m ? 0 : ENOMEM;
+}
+static void retire_listener(struct dmesh_dispatcher *d, uint32_t ip, uint16_t port)
+{
+    pthread_mutex_lock(&membership_lock);
+    for (struct listener_membership *m = memberships; m; m = m->next)
+        if (m->dispatcher == d && m->ip == ip && m->port == port && !m->retired_ms)
+            m->retired_ms = membership_now_ms();
+    pthread_mutex_unlock(&membership_lock);
 }
 static void forget_listeners(struct dmesh_dispatcher *d)
 {
@@ -192,6 +228,14 @@ static struct dmesh_session *listener(struct dmesh_dispatcher *d, uint32_t ip, u
     return NULL;
 }
 
+/* A listening session is closing: its address starts its grace period unless
+ * another session already listens there. Idempotent. */
+static void retire_session_listener(struct dmesh_dispatcher *d, struct dmesh_session *s)
+{
+    if (s->listen_port && !listener(d, s->listen_ip, s->listen_port))
+        retire_listener(d, s->listen_ip, s->listen_port);
+}
+
 static void backend_demand(struct dmesh_dispatcher *d, size_t worker, const struct message *m)
 {
     uint32_t ip = dmesh_session_get_u32(m->payload);
@@ -223,6 +267,7 @@ static void flush_listeners(struct dmesh_dispatcher *d)
         struct objects *o = d->controls[w];
         for (unsigned i = 0; i < DMESH_MAX_SESSIONS; ++i) {
             struct dmesh_session *s = &o->sessions[i];
+            if (s->occupied && s->closing) retire_session_listener(d, s);
             if (!s->occupied || s->closing) continue;
             if (s->listen_pending && dmesh_session_send(o, s, DMESH_SESSION_LISTEN_ACK,
                     0, 1, NULL, 0, s->listen_status) == DOCA_SUCCESS) s->listen_pending = false;
@@ -404,6 +449,7 @@ void dmesh_dispatcher_session_lost(struct objects *o, struct dmesh_session *s)
     struct dmesh_dispatcher *d = o->dispatcher;
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i)
         if (d->flows[i].used && d->flows[i].session == s) d->flows[i].lost_pending = true;
+    retire_session_listener(d, s);
 }
 bool dmesh_dispatcher_session_busy(struct objects *o, struct dmesh_session *s)
 {
