@@ -232,7 +232,7 @@ account token). A client registers at most `--client-mem-mib` (256) of pinned
 memory, and `--max-clients` (64) are served at once. A lost Comch session or
 broker reaches the application as a transport loss (`design/API.md`).
 `DPUMESH_SERVER` (default `DPUMesh0`),
-`DPUMESH_POD_IP` (found in a Pod when unset), `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
+`DPUMESH_POD_IP` (when unset: the address a verifying broker established, else the Pod's route source), `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
 `DPUMESH_PORT` (the port a server serves on its pod IP), `DPUMESH_SERVICE`
 (a `<host>:<port>` target served instead),
 `DPUMESH_TARGETS` (the targets the preload shim carries),

@@ -81,21 +81,23 @@ static void test_custody_polling(void)
 }
 
 /* A Pod needs neither DPUMESH_POD_IP nor DPUMESH_SERVICE: its address is the
- * source of the route toward KUBERNETES_SERVICE_HOST, and DPUMESH_PORT alone
- * makes it serve that address. */
+ * one a verifying broker established, or the source of the route toward
+ * KUBERNETES_SERVICE_HOST, and DPUMESH_PORT alone makes it serve that address. */
 static void test_pod_identity_from_environment(void)
 {
     uint32_t ip = 0;
     char buf[INET_ADDRSTRLEN + 6];
     unsetenv("DPUMESH_POD_IP");
     unsetenv("KUBERNETES_SERVICE_HOST");
-    assert(pod_ip_lookup(&ip) == -1 && errno == EINVAL);
+    assert(pod_ip_lookup(&ip, 0) == -1 && errno == EINVAL);
+    assert(pod_ip_lookup(&ip, htonl(0x0af40108)) == 0 && ip == htonl(0x0af40108));   /* the broker's */
     setenv("KUBERNETES_SERVICE_HOST", "127.0.0.1", 1);
-    assert(pod_ip_lookup(&ip) == 0 && ip == htonl(INADDR_LOOPBACK));
+    assert(pod_ip_lookup(&ip, 0) == 0 && ip == htonl(INADDR_LOOPBACK));
+    assert(pod_ip_lookup(&ip, htonl(0x0af40108)) == 0 && ip == htonl(0x0af40108));   /* over the route */
     setenv("DPUMESH_POD_IP", "10.244.1.7", 1);        /* the override wins */
-    assert(pod_ip_lookup(&ip) == 0 && ip == htonl(0x0af40107));
+    assert(pod_ip_lookup(&ip, htonl(0x0af40108)) == 0 && ip == htonl(0x0af40107));
     setenv("DPUMESH_POD_IP", "pod", 1);
-    assert(pod_ip_lookup(&ip) == -1 && errno == EINVAL);
+    assert(pod_ip_lookup(&ip, 0) == -1 && errno == EINVAL);
     unsetenv("DPUMESH_POD_IP");
     unsetenv("KUBERNETES_SERVICE_HOST");
 

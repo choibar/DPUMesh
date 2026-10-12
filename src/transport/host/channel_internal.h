@@ -116,6 +116,7 @@ void channel_shared_free(void *buf, size_t bytes, int fd);
 int channel_broker_attach(const char *path, struct channel_dev **out);
 void channel_broker_detach(struct channel_dev *dev);
 int channel_broker_session_open(struct channel_dev *dev, const char *server);
+uint32_t channel_broker_verified_addr(const struct channel_dev *dev);
 int channel_broker_session_close(struct channel_dev *dev);
 int channel_broker_session_listen(struct channel_dev *dev, uint32_t ip, uint16_t port);
 /* Backend requests the broker published in the status page, each taken once. */

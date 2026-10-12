@@ -154,6 +154,11 @@ static int wait_ctx_idle(struct doca_ctx *ctx, struct doca_pe *pe)
 	return doca_ctx_get_state(ctx, &state) == DOCA_SUCCESS && state == DOCA_CTX_STATE_IDLE ? 0 : -1;
 }
 
+uint32_t channel_dev_verified_addr(const struct channel_dev *dev)
+{
+	return dev->broker ? channel_broker_verified_addr(dev) : 0;
+}
+
 int channel_dev_host_dpa(const struct channel_dev *dev)
 {
 	return dev != NULL && dev->host_dpa;

@@ -395,7 +395,8 @@ static void *fake_broker_main(void *arg)
     assert(broker_ipc_recv(f->sock, &req, sizeof(req), NULL, 0) == 0 && req.type == BROKER_HELLO);
     assert(strcmp(req.name, "unit-broker") == 0);
     struct broker_reply rep = {.type = BROKER_REPLY, .version = BROKER_IPC_VERSION,
-                               .fd_count = BROKER_HELLO_FDS, .bytes = sizeof(struct broker_status)};
+                               .fd_count = BROKER_HELLO_FDS, .bytes = sizeof(struct broker_status),
+                               .id = 0x0700f40a /* the client's verified 10.244.0.7 */};
     memcpy(rep.magic, BROKER_IPC_MAGIC, sizeof(rep.magic));
     int fds[BROKER_HELLO_FDS] = {f->status_fd, f->arm_fd, f->wake_fd, f->kick_fd};
     assert(broker_ipc_send(f->sock, &rep, sizeof(rep), fds, BROKER_HELLO_FDS) == 0);
@@ -444,6 +445,7 @@ static void test_broker_client_wake(void)
     struct channel_dev *dev;
     assert(channel_broker_attach(path, &dev) == 0);
     assert(channel_session_open(dev, "unit-broker") == 0 && dev->hello_ready);
+    assert(channel_dev_verified_addr(dev) == 0x0700f40a);   /* the broker states the address */
     assert(pthread_join(thread, NULL) == 0);
 
     int wake = channel_dev_fd(dev);

@@ -68,6 +68,11 @@ int channel_session_close(struct channel_dev *dev);
 int channel_session_listen(struct channel_dev *, uint32_t ip, uint16_t port);
 int channel_backend_next(struct channel_dev *, uint32_t *worker, uint32_t *token);
 void channel_backend_finish(struct channel_dev *, uint32_t worker, uint32_t token, int error);
+/* This process's IPv4 address (network byte order) as a verifying broker
+ * established it after channel_session_open: the only address it may LISTEN on
+ * or send from. 0 when the device is opened in-process or the broker verifies
+ * none. */
+uint32_t channel_dev_verified_addr(const struct channel_dev *dev);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);
 /* Idle wake. The fd is readable after channel_dev_arm when a control message

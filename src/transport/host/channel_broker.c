@@ -73,6 +73,7 @@ struct channel_broker {
 	int dead;                                       /* errno once the broker connection failed */
 	uint64_t backend_seen;                          /* status->backend_requests with none left untaken */
 	uint32_t backend_taken[BROKER_WORKERS];         /* Newest token taken per DPU worker (session_lock) */
+	uint32_t verified_addr;                         /* This process's address as the broker verified it */
 };
 
 static int push_mode(uint32_t mode)
@@ -248,8 +249,14 @@ int channel_broker_session_open(struct channel_dev *dev, const char *server)
 		errno = EPROTO;
 		return -1;
 	}
+	b->verified_addr = rep.id;
 	dev->hello_ready = 1;
 	return 0;
+}
+
+uint32_t channel_broker_verified_addr(const struct channel_dev *dev)
+{
+	return dev->broker->verified_addr;
 }
 
 int channel_broker_session_close(struct channel_dev *dev)
