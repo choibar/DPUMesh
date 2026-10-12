@@ -17,7 +17,7 @@ static int next_close_status;
 static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
 /* Idle wake: the last ARM the host sent, and the control PE notification. */
-static unsigned arms_seen, notify_requests, notify_clears;
+static unsigned arms_seen, pings_seen, notify_requests, notify_clears;
 static uint64_t arm_epoch_seen;
 static uint32_t arm_count_seen;
 static struct dmesh_session_arm_flow arm_flows_seen[DMESH_SESSION_MAX_FLOWS];
@@ -77,6 +77,10 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
         break;
     case DMESH_SESSION_HELLO:
         reply(DMESH_SESSION_HELLO_ACK, 0, 0, 0);
+        break;
+    case DMESH_SESSION_PING:
+        assert(h.flow_id == 0 && h.generation == 0 && h.payload_len == 0);
+        ++pings_seen;
         break;
     case DMESH_SESSION_LISTEN:
         assert(h.flow_id == 0 && h.payload_len == 8);
@@ -415,6 +419,12 @@ static void test_backend_requests(struct channel_dev *dev)
     channel_backend_finish(dev, 3, 10, ENOSPC);
     assert(dev->backend_rejections == 1);
     assert(channel_dev_progress(dev) == 0 && dev->backend_rejections == 0);
+    /* A session silent for CHANNEL_KEEPALIVE_MS PINGs once; a fresh send defers it. */
+    unsigned pings = pings_seen;
+    assert(channel_dev_progress(dev) == 0 && pings_seen == pings);
+    dev->last_send_ms -= CHANNEL_KEEPALIVE_MS;
+    assert(channel_dev_progress(dev) == 0 && pings_seen == pings + 1);
+    assert(channel_dev_progress(dev) == 0 && pings_seen == pings + 1);
     session_message(dev, frame, n);
     assert(channel_backend_next(dev, &worker, &token) == 0); /* replay cannot allocate again */
 }

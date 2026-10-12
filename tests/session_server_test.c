@@ -194,6 +194,8 @@ static void receive_test(void)
     deliver(peer_a, DMESH_SESSION_HELLO, 0, 0, NULL, 0);
     assert(sa->negotiated && sa->hello_pending && !sa->closing);
     assert(live_flows(objs) == 0 && response_attempts == 0);
+    deliver(peer_a, DMESH_SESSION_PING, 0, 0, NULL, 0);   /* keepalive: no reply, no failure */
+    assert(!sa->closing && live_flows(objs) == 0 && response_attempts == 0);
 
     struct dmesh_export_metadata_msg first = {0}, second = {0};
     first.type = second.type = DMESH_MSG_EXPORT_METADATA;

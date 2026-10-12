@@ -49,6 +49,12 @@ callbacks then arrive from that many threads.
 A process should close its DPUMesh channel before it exits. A channel that
 vanishes mid-stream stalls the DPU proxy for several seconds.
 
+If the DPU proxy restarts, the channel's session is gone for good. The library
+then ends the process with exit status 75 as soon as a poll or dial sees it,
+in every binding, so a supervisor such as kubelet restarts it onto the new
+proxy. `DPUMESH_EXIT_ON_LOSS=0` keeps the process; RPCs and accepts then fail
+with the transport error instead.
+
 ## Online Boutique
 
 [jukebox03/microservices-demo](https://github.com/jukebox03/microservices-demo),
