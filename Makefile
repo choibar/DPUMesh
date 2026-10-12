@@ -28,10 +28,10 @@ TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c co
 TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
-HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_core_transport_test \
+HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_loss_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
     channel_session_test comch_client_test session_server_test backend_dispatch_test dma_cleanup_test dpa_cleanup_test dpa_runtime_test \
-    dispatch_wake_test rx_consumed_pos_test broker_ipc_test
+    dispatch_wake_test rx_consumed_pos_test broker_ipc_test broker_peer_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
 .PHONY: all lib broker test test-native-headers test-abi examples clean
@@ -56,8 +56,8 @@ $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/
 # The host broker: owns the DOCA device for applications (docs/2026-09-29_host-broker-plan.md).
 broker: $(BINDIR)/dpumesh_broker
 
-$(BINDIR)/dpumesh_broker: src/broker/dpumesh_broker.c $(TRANSPORT_SRCS) $(DPA_KERNEL) $(TRANSPORT_HDRS) | $(BINDIR)
-	$(CC) $(HOST_CFLAGS) $< $(TRANSPORT_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
+$(BINDIR)/dpumesh_broker: src/broker/dpumesh_broker.c src/broker/peer_identity.c src/broker/peer_identity.h $(TRANSPORT_SRCS) $(DPA_KERNEL) $(TRANSPORT_HDRS) | $(BINDIR)
+	$(CC) $(HOST_CFLAGS) -Isrc/broker $< src/broker/peer_identity.c $(TRANSPORT_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
 
 $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR)
 	$(CC) $(HOST_CFLAGS) -U_FILE_OFFSET_BITS -fPIC -shared $< -L$(LIBDIR) -ldpumesh -ldl -pthread -o $@
@@ -83,6 +83,9 @@ $(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/
 
 $(TESTDIR)/broker_ipc_test: tests/broker_ipc_test.c $(TRANSPORT)/host/broker_ipc.c $(TRANSPORT)/host/broker_ipc.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) $< $(TRANSPORT)/host/broker_ipc.c -o $@
+
+$(TESTDIR)/broker_peer_test: tests/broker_peer_test.c src/broker/peer_identity.c src/broker/peer_identity.h | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -Isrc/broker $< src/broker/peer_identity.c -o $@
 
 $(TESTDIR)/comch_client_test: tests/comch_client_test.c $(TRANSPORT)/host/comch_client.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
@@ -125,6 +128,9 @@ $(TESTDIR)/native_writable_test: tests/native_writable_test.c src/core/dmesh_cor
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread -o $@
 
 $(TESTDIR)/native_polling_test: tests/native_polling_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
+
+$(TESTDIR)/native_loss_test: tests/native_loss_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
 
 $(TESTDIR)/native_core_transport_test: tests/native_core_transport_test.c tests/support/native_memory_transport.c src/core/dmesh_core.c src/core/service_resolve.c src/facade/dmesh_api.c src/core/native_transport.h | $(TESTDIR)

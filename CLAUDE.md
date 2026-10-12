@@ -36,7 +36,9 @@ Three trees at the repo root:
   `host/broker_ipc.h`, data path on the memfds it hands over, idle-wake
   ARM/DOORBELL relayed through an arm page and two eventfds, the DPU's backend
   requests published in the status page; client and server in
-  `host/channel_broker.c`). Otherwise — `DPUMESH_BROKER=off`, no broker, or
+  `host/channel_broker.c`; `--verify addr|pod` checks clients' addresses
+  and stamps their Pod identity, `src/broker/peer_identity.c`). Otherwise —
+  `DPUMESH_BROKER=off`, no broker, or
   the host-dpa path — the application opens the device in-process (the direct
   path). Plan: `docs/2026-09-29_host-broker-plan.md`.
 - `linkerd2-proxy/` — a git submodule (Rust), a fork carrying a `dmesh_doca`

@@ -4,14 +4,14 @@
 /* Host/DPU control protocol. The public native ABI and DMA descriptor format
  * are independent of this version. Integers in the envelope are little endian;
  * v2 adds listener registration and worker-pinned backend requests, v4 the
- * ARM/DOORBELL idle wake. DMA metadata payloads retain the existing LP64
- * host/DPU layout. */
+ * ARM/DOORBELL idle wake, v5 the PING keepalive. DMA metadata payloads retain
+ * the existing LP64 host/DPU layout. */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #define DMESH_SESSION_MAGIC UINT32_C(0x444d5348)
-#define DMESH_SESSION_VERSION 4u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake */
+#define DMESH_SESSION_VERSION 5u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING */
 #define DMESH_SESSION_HEADER_SIZE 24u
 #define DMESH_SESSION_MAX_PAYLOAD 2048u
 #define DMESH_SESSION_MAX_FRAME (DMESH_SESSION_HEADER_SIZE + DMESH_SESSION_MAX_PAYLOAD)
@@ -38,6 +38,10 @@ enum dmesh_session_message_type {
      * descriptor the ARM did not account for, or one after the ARM. */
     DMESH_SESSION_ARM = 14,
     DMESH_SESSION_DOORBELL = 15,
+    /* PING: the host sends it on an idle session. The DPU ignores it; a dead
+     * DPU proxy fails the send, and only a send notices one: the Comch
+     * client gets no event when its server process exits. */
+    DMESH_SESSION_PING = 16,
 };
 
 /* ARM payload: u64 epoch, u32 count, u32 zero, then count entries of
@@ -96,6 +100,8 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
                                      DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE &&
                (h->payload_len - DMESH_SESSION_ARM_HEADER_SIZE) % DMESH_SESSION_ARM_FLOW_SIZE == 0;
     }
+    if (h->type == DMESH_SESSION_PING)
+        return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 && h->status == 0;
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 &&
                (h->type == DMESH_SESSION_HELLO_ACK || h->status == 0);

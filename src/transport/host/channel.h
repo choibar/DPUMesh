@@ -128,7 +128,9 @@ void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t 
 /* Broker: serves one client connection (dpumesh_broker's per-client child)
  * with the device at `pci`, until the client disconnects or SIGTERM/SIGINT;
  * `unblock` (may be NULL) is unblocked once those handlers are installed.
- * Closing the connection closes every flow the client left open. */
-int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock);
+ * Every request is checked against `rules` (broker_ipc.h; NULL trusts the
+ * client). Closing the connection closes every flow the client left open. */
+struct broker_peer_rules;
+int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock, const struct broker_peer_rules *rules);
 
 #endif // CHANNEL_H

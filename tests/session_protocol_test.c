@@ -11,7 +11,7 @@
 static void test_wire_layout(void)
 {
     static const uint8_t golden[] = {
-        0x48, 0x53, 0x4d, 0x44, 0x04, 0x00, 0x03, 0x00,
+        0x48, 0x53, 0x4d, 0x44, 0x05, 0x00, 0x03, 0x00,
         0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
         0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
         0xa5, 0x00, 0x7e,
@@ -28,7 +28,7 @@ static void test_wire_layout(void)
     assert(memcmp(frame, golden, sizeof(golden)) == 0);
     assert(storage[0] == 0xcc && storage[sizeof(storage) - 1] == 0xcc);
     assert(dmesh_session_decode(frame, sizeof(golden), &h, &payload) == 0);
-    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 4);
+    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 5);
     assert(h.type == DMESH_SESSION_OPEN && h.flow_id == 2);
     assert(h.generation == UINT32_C(0x12345678) && h.status == 0);
     assert(h.payload_len == 3 && payload == frame + 24);
@@ -103,6 +103,11 @@ static void test_message_shapes(void)
         {DMESH_SESSION_ARM,            0, 1, 0,     16, 0},
         {DMESH_SESSION_ARM,            0, 0, EIO,   16, 0},
         {DMESH_SESSION_DOORBELL,       0, 0, 0,      8, 1},
+        {DMESH_SESSION_PING,           0, 0, 0,      0, 1},
+        {DMESH_SESSION_PING,           1, 0, 0,      0, 0},
+        {DMESH_SESSION_PING,           0, 1, 0,      0, 0},
+        {DMESH_SESSION_PING,           0, 0, 0,      8, 0},
+        {DMESH_SESSION_PING,           0, 0, EIO,    0, 0},
         {DMESH_SESSION_DOORBELL,       0, 0, 0,      0, 0},
         {DMESH_SESSION_DOORBELL,       0, 0, 0,      9, 0},
         {DMESH_SESSION_DOORBELL,       1, 1, 0,      8, 0},

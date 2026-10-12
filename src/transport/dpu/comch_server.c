@@ -245,6 +245,8 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
         s->hello_pending = true;
         return;
     }
+    if (h.type == DMESH_SESSION_PING && s->negotiated)
+        return; /* its delivery is all the host asked for */
     if (h.type == DMESH_SESSION_ARM && s->negotiated && !objs->dispatcher) {
         session_arm(objs, s, connection, payload, h.payload_len);
         return;

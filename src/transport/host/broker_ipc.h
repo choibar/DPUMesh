@@ -16,6 +16,11 @@
  *   LISTEN         register the served endpoint with the DPU
  *   BACKEND_FINISH report how a backend request ended
  *
+ * The broker may verify the caller (dpumesh_broker --verify): LISTEN and
+ * CONN_OPEN addresses must then be local to the caller's network namespace, and
+ * the workload a flow carries is the one the broker established for the
+ * caller's Pod, not the request's. A HELLO reply carries that address in `id`.
+ *
  * No data bytes cross the socket: the application maps the memfds and runs the
  * forward ring and the push window on shared memory. Flow outcomes the DPU
  * reports asynchronously (CLOSED, errors) are published in the status page,
@@ -34,7 +39,7 @@
 #include <stdint.h>
 
 #define BROKER_IPC_MAGIC "DPMBRK01"
-#define BROKER_IPC_VERSION 3
+#define BROKER_IPC_VERSION 4
 #define BROKER_DEFAULT_SOCKET "/run/dpumesh/broker.sock"
 #define BROKER_FLOWS 33          /* flow ids 1..32, the channel's slots */
 #define BROKER_WORKERS 128       /* DPU workers that can request a backend flow */
@@ -85,7 +90,9 @@ struct broker_reply {
 	uint8_t version;
 	uint16_t fd_count;
 	int32_t status;               /* 0 or an errno */
-	uint32_t id;                  /* MEM_ALLOC: region id; CONN_OPEN: flow generation */
+	uint32_t id;                  /* MEM_ALLOC: region id; CONN_OPEN: flow generation;
+				       * HELLO: the caller's verified IPv4 address (network
+				       * byte order), 0 when the broker verifies none or several */
 	uint32_t dpa;                 /* MEM_ALLOC: the region's DPA handle on the forward device */
 	uint64_t bytes;               /* size of the memfd sent with the reply */
 	uint64_t base;                /* MEM_ALLOC: the broker's address of the region */
@@ -112,6 +119,10 @@ struct broker_status {
 	 * (0 none), stored before `backend_requests` counts it. */
 	uint64_t backend_requests;
 	uint32_t backend_token[BROKER_WORKERS];
+	/* The Comch session with the DPU failed (its proxy restarted): sticky,
+	 * every flow and request of this channel is dead. */
+	int32_t session_error;
+	uint32_t reserved;
 };
 
 /* Written by the application, read by the broker. `seq` is a seqlock (odd
@@ -128,6 +139,27 @@ struct broker_arm_page {
 	uint64_t reserved;
 	struct broker_arm_flow flow[BROKER_FLOWS];
 };
+
+/* What the broker established about a client, applied by its child to every
+ * request (dpumesh_broker.c fills it from peer_identity.h). */
+enum broker_verify {
+	BROKER_VERIFY_NONE,           /* the client's claims are trusted */
+	BROKER_VERIFY_ADDR,           /* LISTEN and source addresses must be in addrs */
+	BROKER_VERIFY_POD,            /* ADDR, and flows carry `workload`, not the client's */
+};
+
+struct broker_peer_rules {
+	enum broker_verify verify;
+	const uint32_t *addrs;        /* the client's own IPv4 addresses, network byte order */
+	int naddrs;
+	const char *workload;         /* POD: the client's mesh identity, "" when unknown */
+	uint64_t mem_limit;           /* bytes the client may register, 0 for no limit */
+	int refuse;                   /* nonzero: answer every request with this errno */
+};
+
+/* The errno a request fails with under `rules`, or 0. A CONN_OPEN under
+ * BROKER_VERIFY_POD gets the established workload written over its name. */
+int broker_check_request(const struct broker_peer_rules *rules, struct broker_request *req);
 
 /* Sends one message with up to BROKER_MAX_FDS descriptors (still owned by the caller). */
 int broker_ipc_send(int sock, const void *msg, size_t len, const int *fds, int nfds);

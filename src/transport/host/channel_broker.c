@@ -452,6 +452,10 @@ int channel_broker_dev_progress(struct channel_dev *dev)
 			broker_fail(b, ECONNRESET);
 	}
 	if (broker_dead(b)) { errno = broker_dead(b); return -1; }
+	/* The broker's session with the DPU failed (its proxy restarted): every
+	 * flow and request of this channel is dead for good. */
+	int lost = b->status != NULL ? __atomic_load_n(&b->status->session_error, __ATOMIC_ACQUIRE) : 0;
+	if (lost) { errno = lost; return -1; }
 	return 0;
 }
 
@@ -557,6 +561,8 @@ struct broker_server {
 	struct broker_arm_page *arm;                    /* Written by the client */
 	int arm_fd;
 	int wake_fd, kick_fd;                           /* Idle wake eventfds, shared with the client */
+	const struct broker_peer_rules *rules;          /* What the broker established about the client */
+	uint64_t mem_used;                              /* Bytes registered for the client */
 };
 
 static volatile sig_atomic_t serve_stop;
@@ -600,6 +606,13 @@ static void publish(struct broker_server *srv)
 		return;
 	if (channel_dev_progress(srv->dev) == 0) /* a session error reaches every flow's status */
 		changed |= channel_broker_backend_publish(srv->dev, srv->status) > 0;
+	else if (!srv->status->session_error) {
+		/* No flow may be open to say so: the channel itself reports it. */
+		int error = errno ? errno : EIO;
+		DOCA_LOG_WARN("Comch session with the DPU lost: %s", strerror(error));
+		__atomic_store_n(&srv->status->session_error, error, __ATOMIC_RELEASE);
+		changed = 1;
+	}
 	for (uint32_t id = 1; id < BROKER_FLOWS; ++id) {
 		struct channel_conn *conn = srv->dev->flows[id];
 		if (conn == NULL)
@@ -692,6 +705,8 @@ static int serve_hello(struct broker_server *srv, const struct broker_request *r
 	srv->pe_doorbell = doca_pe_set_event_mode(srv->dev->control->pe, DOCA_PE_EVENT_MODE_PROGRESS_ALL) ==
 			   DOCA_SUCCESS;
 	rep->bytes = sizeof(*srv->status);
+	if (srv->rules != NULL && srv->rules->verify != BROKER_VERIFY_NONE && srv->rules->naddrs == 1)
+		rep->id = srv->rules->addrs[0];
 	fds[BROKER_FD_STATUS] = srv->status_fd;
 	fds[BROKER_FD_ARM] = srv->arm_fd;
 	fds[BROKER_FD_WAKE] = srv->wake_fd;
@@ -709,8 +724,16 @@ static int serve_mem_alloc(struct broker_server *srv, const struct broker_reques
 	while (id < BROKER_MEMS && srv->mems[id] != NULL) ++id;
 	if (id == BROKER_MEMS) return ENOSPC;
 	if (req->bytes == 0 || req->bytes > BROKER_MAX_REGION) return EINVAL;
+	/* Registered memory is pinned and charged to the broker: one client must
+	 * not exhaust it for every other application on the node. */
+	if (srv->rules != NULL && srv->rules->mem_limit && req->bytes > srv->rules->mem_limit - srv->mem_used) {
+		DOCA_LOG_WARN("Client region of %lu bytes over its limit (%lu of %lu in use)", (unsigned long)req->bytes,
+			      (unsigned long)srv->mem_used, (unsigned long)srv->rules->mem_limit);
+		return ENOMEM;
+	}
 	if (channel_mem_alloc(srv->dev, req->bytes, &mem) != 0) return errno;
 	srv->mems[id] = mem;
+	srv->mem_used += req->bytes;
 	rep->id = id;
 	rep->dpa = mem->dpa;
 	rep->bytes = mem->bytes;
@@ -788,9 +811,11 @@ static int serve_request(struct broker_server *srv, int sock)
 	if (memcmp(req.magic, BROKER_IPC_MAGIC, sizeof(req.magic)) != 0 || req.version != BROKER_IPC_VERSION ||
 	    !name_ok(req.name))
 		status = EPROTO;
-	else if (req.type != BROKER_HELLO && srv->dev == NULL)
+	else
+		status = broker_check_request(srv->rules, &req); /* the broker's view of the client */
+	if (status == 0 && req.type != BROKER_HELLO && srv->dev == NULL)
 		status = ENOTCONN;
-	else {
+	else if (status == 0) {
 		switch (req.type) {
 		case BROKER_HELLO: status = serve_hello(srv, &req, &rep, fds, &nfds); break;
 		case BROKER_MEM_ALLOC: status = serve_mem_alloc(srv, &req, &rep, fds, &nfds); break;
@@ -812,9 +837,10 @@ static int serve_request(struct broker_server *srv, int sock)
 	return broker_ipc_send(sock, &rep, sizeof(rep), fds, rep.fd_count) == 0 ? 0 : -1;
 }
 
-int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock)
+int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock, const struct broker_peer_rules *rules)
 {
-	struct broker_server srv = { .pci = pci, .status_fd = -1, .arm_fd = -1, .wake_fd = -1, .kick_fd = -1 };
+	struct broker_server srv = { .pci = pci, .status_fd = -1, .arm_fd = -1, .wake_fd = -1, .kick_fd = -1,
+				     .rules = rules };
 	struct sigaction action = { .sa_handler = serve_on_signal };
 	int rc = 0;
 

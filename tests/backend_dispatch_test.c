@@ -17,6 +17,7 @@ doca_error_t dmesh_session_send(struct objects *o, struct dmesh_session *s, uint
 }
 int main(void)
 {
+    setenv("DMESH_LISTENER_GRACE_MS", "50", 1);
     struct dmesh_dispatcher d = {.count = 2, .policy = dmesh_placement_least_flows};
     d.fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     d.controls = calloc(d.count, sizeof(*d.controls));
@@ -93,10 +94,25 @@ int main(void)
     d.loads[0].assigned = DMESH_MAX_CONNECTIONS;
     dmesh_dispatcher_request(d.controls[0], s, &h, open);
     assert(!find(&d, s, 5) && d.loads[1].assigned == 1);
-    /* Listener loss removes admission while preserving DMA membership. */
+    /* Listener loss removes admission while preserving DMA membership for
+     * the grace period; a new listener keeps it; then it is forgotten. */
     s->closing = true;
     assert(listener(&d, s->listen_ip, s->listen_port) == NULL);
+    flush_listeners(&d);
     assert(dmesh_dispatch_listener_known(s->listen_ip, s->listen_port));
+    struct dmesh_session *next = &d.controls[1]->sessions[0];
+    next->occupied = next->negotiated = true;
+    dmesh_dispatcher_request(d.controls[1], next, &(struct dmesh_session_header){
+        .type = DMESH_SESSION_LISTEN, .generation = 1, .payload_len = 8}, addr);
+    assert(next->listen_status == 0 && listener(&d, s->listen_ip, 8080) == next);
+    flush_listeners(&d);   /* the closed session must not retire the new listener */
+    usleep(80000);
+    assert(dmesh_dispatch_listener_known(s->listen_ip, 8080));
+    next->closing = true;
+    dmesh_dispatcher_session_lost(d.controls[1], next);
+    assert(dmesh_dispatch_listener_known(s->listen_ip, 8080));
+    usleep(80000);
+    assert(!dmesh_dispatch_listener_known(s->listen_ip, 8080));
     for (unsigned w = 0; w < d.count; ++w) {
         close(d.workers[w].fd);
         pthread_mutex_destroy(&d.workers[w].requests.lock);
@@ -106,5 +122,5 @@ int main(void)
     forget_listeners(&d);
     assert(!dmesh_dispatch_listener_known(0x0100510a, 8080));
     close(d.fd); free(d.controls); free(d.workers); free(d.loads); free(d.flows);
-    puts("backend dispatcher: lazy allocation, pinned owner, dedup, backpressure, stale fencing: PASS");
+    puts("backend dispatcher: lazy allocation, pinned owner, dedup, backpressure, stale fencing, listener grace: PASS");
 }

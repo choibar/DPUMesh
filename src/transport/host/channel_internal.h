@@ -39,6 +39,7 @@ struct channel_dev {
     unsigned backend_pending, backend_rejections;
     /* state: 1=pending, 2=processing, 3=done, 4=reject pending */
 	int session_error;
+	uint64_t last_send_ms;              /* Last control message submitted (keepalive) */
 	/* Idle wake (push reverse path): one ARM at a time, released by DOORBELL */
 	int arm_outstanding;
 	uint64_t arm_epoch;

@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "src/transport/host/broker_ipc.h"
+#include "src/transport/host/channel.h"
 
 static int sealed_memfd(size_t bytes, int seals)
 {
@@ -165,8 +166,43 @@ static void test_connect_listen(void)
     unlink(file); unlink(path); rmdir(dir);
 }
 
+/* What a verifying broker lets a client do with its own and other addresses. */
+static void test_request_checks(void)
+{
+    const uint32_t own[] = { 0x0700f40a };            /* 10.244.0.7 */
+    struct broker_peer_rules rules = { .verify = BROKER_VERIFY_NONE, .addrs = own, .naddrs = 1,
+                                       .workload = "web.shop.serviceaccount.identity.linkerd.cluster.local" };
+    struct broker_request listen = { .type = BROKER_LISTEN, .dst_ip = 0x0800f40a, .dst_port = 8080 };
+    struct broker_request open = { .type = BROKER_CONN_OPEN, .mode = CHANNEL_MODE_CLIENT_DPU_DMA,
+                                   .src_ip = own[0], .dst_ip = 0x0a00600a, .src_port = 32768, .dst_port = 80 };
+    snprintf(open.name, sizeof(open.name), "%s", "admin.kube-system.serviceaccount.identity.linkerd.cluster.local");
+
+    assert(broker_check_request(NULL, &listen) == 0);
+    assert(broker_check_request(&rules, &listen) == 0);          /* trusted: anything goes */
+    rules.verify = BROKER_VERIFY_ADDR;
+    assert(broker_check_request(&rules, &listen) == EACCES);     /* another Pod's address */
+    listen.dst_ip = own[0];
+    assert(broker_check_request(&rules, &listen) == 0);
+    assert(broker_check_request(&rules, &open) == 0);            /* a client may dial any Service */
+    assert(strncmp(open.name, "admin.", 6) == 0);                /* ADDR leaves the claim */
+    open.src_ip = 0x0800f40a;
+    assert(broker_check_request(&rules, &open) == EACCES);       /* a borrowed source */
+    open.src_ip = own[0];
+    open.mode = CHANNEL_MODE_BACKEND_DPU_DMA;
+    assert(broker_check_request(&rules, &open) == EACCES);       /* serving someone else's address */
+    open.dst_ip = own[0];
+    assert(broker_check_request(&rules, &open) == 0);
+    rules.verify = BROKER_VERIFY_POD;
+    assert(broker_check_request(&rules, &open) == 0 && strcmp(open.name, rules.workload) == 0);
+    struct broker_request hello = { .type = BROKER_HELLO };
+    assert(broker_check_request(&rules, &hello) == 0);
+    rules.refuse = EPERM;
+    assert(broker_check_request(&rules, &hello) == EPERM);       /* an unestablished client */
+}
+
 int main(void)
 {
+    test_request_checks();
     test_roundtrip();
     test_hello_fds();
     test_memfd_checks();

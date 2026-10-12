@@ -124,7 +124,7 @@ int64_t dmesh_eq_next_deadline_ns(dmesh_eq_t *eq);
  * DNS name ("name" in this Pod's namespace, "name.namespace", or a full name)
  * or an IPv4 literal, port the Service port. Returns EINVAL (malformed target),
  * ENOENT (no such name), EAGAIN (DNS temporarily unavailable — retry), ENOSPC,
- * or ENOMEM. */
+ * ENOMEM, or the session's errno after a transport loss (see dmesh_poll_eq). */
 dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *target);
 
 /* Flush, send FIN, release RX credit, and destroy the QP. The pointer is invalid
@@ -181,7 +181,9 @@ void dmesh_get_tx_stats(dmesh_channel_t *s, dmesh_tx_stats_t *out);
 /* Nonblocking single-consumer poll. Returns up to max_events events, 0 when empty,
  * or EINVAL. Per-connection order is preserved across partial batches. A
  * TX_ERROR event has no RX buffer and makes later TX calls fail with the
- * latched transport error. */
+ * latched transport error. A lost transport session ends the process (exit
+ * status 75); with DPUMESH_EXIT_ON_LOSS=0 this returns -1 with the session's
+ * errno instead, once the events that landed before the loss are drained. */
 int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events);
 
 /* Release the zero-copy RX buffer held by a RECV event and invalidate event->buf.
