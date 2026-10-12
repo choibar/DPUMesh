@@ -224,7 +224,14 @@ the channel is its client when `DPUMESH_BROKER` names the socket, or when it is
 unset and `/run/dpumesh/broker.sock` exists, and maps the memory the broker
 registered. Otherwise the application opens the device itself at
 `DPUMESH_PCI_ADDR` (the direct path); `DPUMESH_BROKER=off` forces that, and the
-host-dpa path always takes it. `DPUMESH_SERVER` (default `DPUMesh0`),
+host-dpa path always takes it. The broker trusts its clients' addresses and
+workload unless `--verify addr` (LISTEN and source addresses must be the
+client's own network namespace's) or `--verify pod` (also: the client runs in a
+Pod, and its flows carry the Pod's mesh identity from the kubelet's service
+account token). A client registers at most `--client-mem-mib` (256) of pinned
+memory, and `--max-clients` (64) are served at once. A lost Comch session or
+broker reaches the application as a transport loss (`design/API.md`).
+`DPUMESH_SERVER` (default `DPUMesh0`),
 `DPUMESH_POD_IP`, `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
 `DPUMESH_SERVICE` (the `<host>:<port>` target a server serves),
 `DPUMESH_TARGETS` (the targets the preload shim carries),

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE /* F_SEAL_*, MSG_CMSG_CLOEXEC */
 #endif
 #include "broker_ipc.h"
+#include "channel.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -168,4 +169,33 @@ int broker_ipc_listen(const char *path)
 		return -1;
 	}
 	return fd;
+}
+
+static int rules_own(const struct broker_peer_rules *rules, uint32_t addr)
+{
+	for (int i = 0; i < rules->naddrs; ++i)
+		if (rules->addrs[i] == addr) return 1;
+	return 0;
+}
+
+int broker_check_request(const struct broker_peer_rules *rules, struct broker_request *req)
+{
+	if (rules == NULL) return 0;
+	if (rules->refuse) return rules->refuse;
+	if (rules->verify == BROKER_VERIFY_NONE) return 0;
+	switch (req->type) {
+	case BROKER_LISTEN:
+		/* Serving another Pod's address would take its traffic. */
+		return rules_own(rules, req->dst_ip) ? 0 : EACCES;
+	case BROKER_CONN_OPEN:
+		if (!rules_own(rules, req->src_ip)) return EACCES;
+		if ((req->mode == CHANNEL_MODE_BACKEND_DPU_DMA || req->mode == CHANNEL_MODE_BACKEND_HOST_DPA) &&
+		    !rules_own(rules, req->dst_ip))
+			return EACCES;
+		if (rules->verify == BROKER_VERIFY_POD)
+			snprintf(req->name, sizeof(req->name), "%s", rules->workload ? rules->workload : "");
+		return 0;
+	default:
+		return 0;
+	}
 }
