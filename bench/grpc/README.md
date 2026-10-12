@@ -26,7 +26,7 @@ The DPU needs a DPUMesh checkout with this directory, built by
 H=bench/grpc
 # Go over DPUMesh, L7 proxy, the default set (1-4 connections x 64, 4 x 256, 1 x 1; 3 rounds)
 bash $H/matrix.sh go-l7 "$PWD/bin/channel-bench" "$PWD/bin/channel-bench" \
-    --l7 --env GOMAXPROCS=8 --dpu-env DPUMESH_DPA_EU_BASE=64
+    --l7 --env GOMAXPROCS=8
 # The same fixture over kernel TCP
 bash $H/matrix.sh go-tcp "$PWD/bin/channel-bench" "$PWD/bin/channel-bench" \
     --transport tcp --env GOMAXPROCS=8
@@ -53,7 +53,5 @@ measurement window: the client's own, the server process, the DPU proxy
   `03:00.0`/`94:00.0`) and the host function by `--pci`.
 - `PROXY_CPUS` and `MOCK_CPUS` (`--dpu-env`) pin the proxy and the mocks;
   pick cores no other job uses.
-- When the other PF runs another DPA job, set `DPUMESH_DPA_EU_BASE` to a
-  disjoint range (64 on rapids4).
 - `--l7` keeps the proxy's HTTP/2 termination; without it the policy is
   opaque (L4).

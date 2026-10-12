@@ -112,7 +112,12 @@ int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t 
     } else push(t, ack);
     pthread_mutex_unlock(&lock); return 0;
 }
-void dmesh_native_progress(struct dmesh_native_transport *t) { (void)t; }
+uint32_t dmesh_native_progress(struct dmesh_native_transport *t)
+{ return (UINT32_C(1) << t->stripes) - 1; }
+/* A test fails the session of every channel with test_native_lose. */
+static int lost_errno;
+void test_native_lose(int error) { lost_errno = error; }
+int dmesh_native_lost(struct dmesh_native_transport *t) { (void)t; return lost_errno; }
 int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e) {
     pthread_mutex_lock(&lock);
     struct event_node *n = t->first[stripe];
@@ -173,6 +178,8 @@ void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms
     *doorbells = wake_clears;
 }
 int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int service_id) {
-    (void)t; (void)port; (void)service_id; return 0;
+    (void)t; (void)port; (void)service_id;
+    if (lost_errno) { errno = lost_errno; return -1; }
+    return 0;
 }
 int dmesh_native_disconnect(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return 0; }

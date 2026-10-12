@@ -76,8 +76,8 @@ static int dmesh_drain_tx_upto_locked(dmesh_qp_t *, int, uint64_t);
  * timer sleeps until the earliest deadline in the context, clamped to the wait
  * range below. */
 #define TX_TAIL_DELAY_NS        500000ull
-/* Close publishes FIN only after every submitted unit has left DPU proxy
- * custody, bounded by this deadline. */
+/* Close publishes FIN only after every submitted unit's DMA has completed,
+ * bounded by this deadline. */
 #define TX_CLOSE_DRAIN_DEADLINE_NS 5000000000ull
 #define TX_CLOSE_DRAIN_MIN_WAIT_NS       1000L
 #define TX_CLOSE_DRAIN_MAX_WAIT_NS      50000L
@@ -312,6 +312,8 @@ struct dpumesh_ctx {
                                         * process ever allocates. Doubles (to
                                         * DMESH_UPORT_BASE) only when the window is full. */
     int32_t service_id;                /* this node's service id (SVC_NONE if client-only) */
+    atomic_int lost;                   /* errno once the transport's session failed */
+    int exit_on_loss;                  /* DPUMESH_EXIT_ON_LOSS: end the process at loss */
 };
 
 /* ====================================================================
@@ -648,6 +650,29 @@ static void notify_all_eqs(dpumesh_ctx_t *ctx)
     for (int i = 0; i < ctx->n_eqs; i++)
         if (ctx->eqs[i]) eq_notify(ctx->eqs[i]);
     pthread_mutex_unlock(&ctx->eq_lock);
+}
+
+/* A failed session never recovers: no flow, dial or accept of this channel
+ * can work again, and a server would otherwise wait for streams forever. By
+ * default the process ends so its supervisor restarts it onto a live session;
+ * with DPUMESH_EXIT_ON_LOSS=0 every EQ wakes and reports the error instead. */
+static void transport_check(dpumesh_ctx_t *ctx)
+{
+    int error = dmesh_native_lost(ctx->transport), none = 0;
+    if (!error || !atomic_compare_exchange_strong(&ctx->lost, &none, error))
+        return;
+    if (ctx->exit_on_loss) {
+        fprintf(stderr, "dpumesh: transport lost (%s); exiting for a restart "
+                "(DPUMESH_EXIT_ON_LOSS=0 keeps the process)\n", strerror(error));
+        _exit(DMESH_EXIT_LOST);
+    }
+    DOCA_LOG_ERR("transport lost (%s)", strerror(error));
+    notify_all_eqs(ctx);
+}
+
+int dpumesh_lost(dpumesh_ctx_t *ctx)
+{
+    return ctx ? atomic_load(&ctx->lost) : 0;
 }
 
 /* Ready-list MPSC: any draining EQ pushes a ready conn's port; that conn's EQ
@@ -1106,10 +1131,10 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
 static int drain_rev_rings_span(dpumesh_ctx_t *ctx, uint32_t budget)
 {
     uint32_t drained = 0;
-    /* The Comch session belongs to the channel, not to an individual flow.
-     * Progress it once per pass before reading each flow's status. */
-    dmesh_native_progress(ctx->transport);
+    uint32_t active = dmesh_native_progress(ctx->transport);
+    transport_check(ctx);
     for (int stripe = 0; stripe < ctx->landing_stripes && drained < budget; ++stripe) {
+        if (!(active & (UINT32_C(1) << stripe))) continue;
         if (__atomic_exchange_n(&ctx->stripe_lock[stripe], 1u, __ATOMIC_ACQUIRE))
             continue;
         struct dmesh_native_event ev;
@@ -1319,6 +1344,15 @@ void dpumesh_eq_arm(struct dmesh_eq *eq)
         !atomic_load_explicit(&eq->wants_notify, memory_order_acquire))
         return;
     dpumesh_ctx_t *ctx = eq->ch->ctx;
+    if (atomic_load(&ctx->lost)) {
+        /* Nothing can arrive any more: keep the fd readable so the caller
+         * comes back to dmesh_poll_eq and reads the error, instead of
+         * re-polling on a nap timer forever. */
+        uint64_t one = 1;
+        ssize_t w = write(eq->notify_efd, &one, sizeof(one));
+        (void)w;
+        return;
+    }
     unsigned fired = eq_ack_doorbells(eq);
     for (int i = 0; i < 5; ++i)
         if (fired & (1u << i)) atomic_fetch_add_explicit(&wait_stats.fired[i], 1, memory_order_relaxed);
@@ -1570,7 +1604,9 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
           DOCA_LOG_WARN("DPUMESH_SPIN_US and DPUMESH_TICK_US are ignored; the idle wake uses "
                         "DPUMESH_NAP_US, DPUMESH_NAP_CAP_US, DPUMESH_LINGER_US and DPUMESH_BACKSTOP_MS");
       }
-      wait_stats_dir = getenv("DPUMESH_WAIT_STATS"); }
+      wait_stats_dir = getenv("DPUMESH_WAIT_STATS");
+      const char *exit_env = getenv("DPUMESH_EXIT_ON_LOSS");
+      ctx->exit_on_loss = !(exit_env && strcmp(exit_env, "0") == 0); }
     ctx->dma_buffer = native.tx;
     ctx->rx_dma_buffer = native.rx;
     ctx->rx_dma_buf_size = native.rx_bytes ? native.rx_bytes : configured_bytes;
@@ -2803,6 +2839,8 @@ dmesh_qp_t *dmesh_accept(dmesh_eq_t *eq) {
  * name-taking public wrapper below. Purely local — no round trip. */
 dmesh_qp_t *dmesh_qp_open(dmesh_eq_t *eq, int dst_service_id) {
     dmesh_channel_t *s = eq->ch;
+    int lost = atomic_load(&s->ctx->lost);
+    if (lost) { errno = lost; return NULL; }
     dmesh_qp_t *c = (dmesh_qp_t *)calloc(1, sizeof(*c));
     if (!c) { errno = ENOMEM; return NULL; }
     /* c = the port's handle, eq = the ready list its inbound edges arm */
@@ -2811,7 +2849,9 @@ dmesh_qp_t *dmesh_qp_open(dmesh_eq_t *eq, int dst_service_id) {
     if (dmesh_native_connect(s->ctx->transport, pc, dst_service_id) != 0) {
         int saved = errno;
         dpumesh_free_port(s->ctx, pc); free(c);
-        errno = saved; return NULL;
+        transport_check(s->ctx);
+        lost = atomic_load(&s->ctx->lost);
+        errno = lost ? lost : saved; return NULL;
     }
     pthread_mutex_lock(&s->ctx->port_lock);
     stripe_bind(s->ctx, &s->ctx->ports[pc], pc, eq);
@@ -2917,7 +2957,7 @@ static int dmesh_tx_inflight_locked(const struct dmesh_port_slot *psl) {
     return head != tail;
 }
 
-/* Wait until every previously submitted unit has left DPU proxy custody before
+/* Wait until every previously submitted unit has completed its DMA copy before
  * publishing FIN. tx_reclaim_ack() only advances su_tail across the contiguous
  * completed prefix, so an empty FIFO is the exact data-before-FIN fence. The
  * ACKs are polled here, since no other thread drains for a sleeping caller.
@@ -2929,7 +2969,7 @@ static int dmesh_wait_tx_reclaimed_locked(dpumesh_ctx_t *ctx, const struct dmesh
 
     while (dmesh_tx_inflight_locked(psl)) {
         if (drain_rev_rings_span(ctx, 256) > 0) continue;
-        if (monotonic_ns() >= deadline) {
+        if (monotonic_ns() >= deadline || atomic_load(&ctx->lost)) {
             errno = EBADMSG;
             return -1;
         }
@@ -3221,9 +3261,8 @@ static int dmesh_release_qp(dmesh_qp_t *c, int graceful) {
      * unsent committed bytes unless its flush failed; a live, un-posted reservation
      * is never application data owned by the transport and is discarded either way. */
     dpumesh_tx_discard_unsent(ctx, c->local_port);
-    /* A data ACK releases DPU proxy custody rather than reporting a DMA copy, so
-     * an empty submitted FIFO is the stream-order fence that keeps the
-     * zero-copy FIN behind the payload. */
+    /* A data ACK proves DMA no longer reads its source. Drain that prefix
+     * before FIN; this does not imply the proxy/application consumed the data. */
     if (!reset && dmesh_wait_tx_reclaimed_locked(ctx, psl) != 0) {
         reset = 1;
         if (close_result == 0) {
