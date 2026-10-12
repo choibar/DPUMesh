@@ -34,7 +34,7 @@
 #include <stdint.h>
 
 #define BROKER_IPC_MAGIC "DPMBRK01"
-#define BROKER_IPC_VERSION 3
+#define BROKER_IPC_VERSION 4
 #define BROKER_DEFAULT_SOCKET "/run/dpumesh/broker.sock"
 #define BROKER_FLOWS 33          /* flow ids 1..32, the channel's slots */
 #define BROKER_WORKERS 128       /* DPU workers that can request a backend flow */
@@ -112,6 +112,10 @@ struct broker_status {
 	 * (0 none), stored before `backend_requests` counts it. */
 	uint64_t backend_requests;
 	uint32_t backend_token[BROKER_WORKERS];
+	/* The Comch session with the DPU failed (its proxy restarted): sticky,
+	 * every flow and request of this channel is dead. */
+	int32_t session_error;
+	uint32_t reserved;
 };
 
 /* Written by the application, read by the broker. `seq` is a seqlock (odd

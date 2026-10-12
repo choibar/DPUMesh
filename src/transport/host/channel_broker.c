@@ -452,6 +452,10 @@ int channel_broker_dev_progress(struct channel_dev *dev)
 			broker_fail(b, ECONNRESET);
 	}
 	if (broker_dead(b)) { errno = broker_dead(b); return -1; }
+	/* The broker's session with the DPU failed (its proxy restarted): every
+	 * flow and request of this channel is dead for good. */
+	int lost = b->status != NULL ? __atomic_load_n(&b->status->session_error, __ATOMIC_ACQUIRE) : 0;
+	if (lost) { errno = lost; return -1; }
 	return 0;
 }
 
@@ -600,6 +604,13 @@ static void publish(struct broker_server *srv)
 		return;
 	if (channel_dev_progress(srv->dev) == 0) /* a session error reaches every flow's status */
 		changed |= channel_broker_backend_publish(srv->dev, srv->status) > 0;
+	else if (!srv->status->session_error) {
+		/* No flow may be open to say so: the channel itself reports it. */
+		int error = errno ? errno : EIO;
+		DOCA_LOG_WARN("Comch session with the DPU lost: %s", strerror(error));
+		__atomic_store_n(&srv->status->session_error, error, __ATOMIC_RELEASE);
+		changed = 1;
+	}
 	for (uint32_t id = 1; id < BROKER_FLOWS; ++id) {
 		struct channel_conn *conn = srv->dev->flows[id];
 		if (conn == NULL)

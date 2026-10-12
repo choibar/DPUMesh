@@ -514,6 +514,14 @@ static void test_broker_client_wake(void)
     assert(channel_backend_next(dev, &worker, &token) == 1 && worker == 5 && token == 9);
     assert(channel_backend_next(dev, &worker, &token) == 0);
 
+    /* The broker's session with the DPU failed (its proxy restarted): the
+     * channel is dead though the broker lives. */
+    assert(channel_dev_progress(dev) == 0);
+    f.status->session_error = ECONNRESET;
+    assert(channel_dev_progress(dev) == -1 && errno == ECONNRESET);
+    assert(channel_dev_arm(dev) == -1 && errno == ECONNRESET);
+    f.status->session_error = 0;
+
     /* The liveness check runs every 20 ms (BROKER_CHECK_NS). */
     close(f.sock);
     const struct timespec pause = {.tv_nsec = 30 * 1000 * 1000};
