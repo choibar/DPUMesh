@@ -5,7 +5,7 @@
  * data plane uses: the shim (linkerd/doca/src/shim.c) over the comch_server.c
  * state machine. It runs one Comch server, the shared DPA pool / consumer PE /
  * DMA engine, and per connection the zero-copy staging reader, the rx
- * watermark and the reverse sender. The host peer is dpumesh_host.
+ * consumed position and the reverse sender. The host peer is dpumesh_host.
  *
  * Modes (DMESH_MODE):
  *   sink   count every forward DMA completion (host -> DPU) and drop the bytes
@@ -64,7 +64,7 @@ int32_t dmesh_doca_conn_recv_pop(struct objects *objs, int32_t slot, uint32_t *o
                                  uint32_t *out_len);
 int32_t dmesh_doca_conn_tx_staging(struct objects *objs, int32_t slot, uintptr_t *out_base,
                                    size_t *out_len);
-int32_t dmesh_doca_conn_rx_watermark(struct objects *objs, int32_t slot, uint32_t pos);
+int32_t dmesh_doca_conn_update_dpu_rx_consumed_pos(struct objects *objs, int32_t slot, uint32_t pos);
 int32_t dmesh_doca_conn_send_staged(struct objects *objs, int32_t slot, uint32_t pos, uint32_t len);
 void dmesh_doca_stats_get(struct objects *objs, int64_t *sent, int64_t *recv, int64_t *recv_bytes,
                           int64_t *dma_pending, int64_t *dma_dropped);
@@ -151,8 +151,8 @@ struct slot {
     int32_t state;              /* last dmesh_doca_conn_state_get value */
     const uint8_t *rx_base;     /* forward staging (DPA writes, we read) */
     size_t rx_len;
-    uint32_t rx_wm;             /* bytes consumed up to here; published to the DPA gate */
-    int rx_wm_dirty;
+    uint32_t dpu_rx_consumed_pos; /* end offset of the last fully consumed segment */
+    int dpu_rx_consumed_pos_changed;
     struct tx_ring tx;          /* reverse staging (we write, the channel layer sends) */
     uint64_t segs, bytes;       /* forward completions consumed by this slot */
     uint64_t pushes, push_bytes;/* reverse batches published (echo) */
@@ -199,7 +199,7 @@ static void slot_publish(struct objects *objs, int idx, struct slot *s)
 /* Consumes the forward completions queued for the slot.
  *
  * Echo: a segment is popped only when tx_staging can take it whole, so no
- * byte is ever dropped; when staging is full the rx watermark stops
+ * byte is ever dropped; when staging is full the DPU RX consumed position stops
  * advancing, the DPA's staging gate holds the host's forward ring, and the
  * backpressure reaches the host application, exactly as on the proxy path.
  * Sink: every segment is popped and only counted. */
@@ -220,12 +220,12 @@ static void slot_pump(struct objects *objs, int idx, struct slot *s, int echo)
         s->segs++;
         s->bytes += len;
         if (echo) tx_push(&s->tx, s->rx_base + pos, len);
-        s->rx_wm = pos + len;
-        s->rx_wm_dirty = 1;
+        s->dpu_rx_consumed_pos = pos + len;
+        s->dpu_rx_consumed_pos_changed = 1;
     }
-    if (s->rx_wm_dirty) {
-        s->rx_wm_dirty = 0;
-        dmesh_doca_conn_rx_watermark(objs, idx, s->rx_wm);
+    if (s->dpu_rx_consumed_pos_changed) {
+        s->dpu_rx_consumed_pos_changed = 0;
+        dmesh_doca_conn_update_dpu_rx_consumed_pos(objs, idx, s->dpu_rx_consumed_pos);
     }
     if (echo) slot_publish(objs, idx, s);
 }

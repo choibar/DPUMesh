@@ -61,9 +61,9 @@ class RelayChannel {
     void wire();
     bool rx_ready() const { return rx_base_ != nullptr; }
     // Pop the next received segment (consumed at pop time: the DPA may reuse it
-    // once the watermark is published in pump_send). False when empty.
+    // once the consumed position is published in pump_send). False when empty.
     bool pop(const uint8_t **seg, uint32_t *len);
-    // Publish staged bytes as DMA descriptors and the rx watermark to the DPA.
+    // Publish staged bytes as DMA descriptors and the DPU RX consumed position to the DPA.
     void pump_send();
 
     // l4 byte relay
@@ -95,8 +95,8 @@ class RelayChannel {
     TxRing tx_;
     std::vector<uint8_t> pending_; // l4: bytes the peer staging could not take yet
     size_t pending_off_ = 0;
-    uint32_t rx_wm_ = 0;
-    bool rx_wm_dirty_ = false;
+    uint32_t dpu_rx_consumed_pos_ = 0;
+    bool dpu_rx_consumed_pos_changed_ = false;
     RelayStats stats_;
 };
 

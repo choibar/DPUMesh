@@ -1,0 +1,2069 @@
+{
+  "mode": "dpu-dma",
+  "sharded": false,
+  "busy_poll": true,
+  "driver_count": 1,
+  "client_processes": 1,
+  "server_processes": 1,
+  "payload_bytes": 64,
+  "concurrency_per_connection": 64,
+  "warmup_seconds": 3,
+  "measurement_seconds": 10,
+  "repeats_per_case": 3,
+  "complete": true,
+  "completed_total": 5413470,
+  "cases": [
+    {
+      "case": "c1-k1",
+      "arm_cores": 1,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 1,
+      "start_unix": 1790638818.454152,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790638867.518066
+    },
+    {
+      "case": "c1-k2",
+      "arm_cores": 1,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 2,
+      "start_unix": 1790638867.518698,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790638917.3957527
+    },
+    {
+      "case": "c1-k4",
+      "arm_cores": 1,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 4,
+      "start_unix": 1790638917.3964014,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790638968.856443
+    },
+    {
+      "case": "c2-k1",
+      "arm_cores": 2,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 1,
+      "start_unix": 1790638968.8571684,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790639017.9553936
+    },
+    {
+      "case": "c2-k2",
+      "arm_cores": 2,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 2,
+      "start_unix": 1790639017.9561377,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790639067.84891
+    },
+    {
+      "case": "c2-k4",
+      "arm_cores": 2,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 4,
+      "start_unix": 1790639067.8497715,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790639119.3658361
+    },
+    {
+      "case": "c4-k1",
+      "arm_cores": 4,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 1,
+      "start_unix": 1790639119.366654,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790639168.5004377
+    },
+    {
+      "case": "c4-k2",
+      "arm_cores": 4,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 2,
+      "start_unix": 1790639168.5013428,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790639218.3983746
+    },
+    {
+      "case": "c4-k4",
+      "arm_cores": 4,
+      "drivers": 1,
+      "client_processes": 1,
+      "server_processes": 1,
+      "connections": 4,
+      "start_unix": 1790639218.3992317,
+      "runs": [
+        {
+          "repeat": 1,
+          "exit": 0
+        },
+        {
+          "repeat": 2,
+          "exit": 0
+        },
+        {
+          "repeat": 3,
+          "exit": 0
+        }
+      ],
+      "traffic_ok": true,
+      "host_stop_rc": 0,
+      "proxy_stop_rc": 0,
+      "dpa_context_created": 1,
+      "dpa_context_destroyed": 1,
+      "bad_proxy_log": false,
+      "host_exit": [
+        0
+      ],
+      "ok": true,
+      "end_unix": 1790639269.93781
+    }
+  ],
+  "aggregates": [
+    {
+      "case": "c1-k1",
+      "arm_cores": 1,
+      "connections": 1,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 12726.6,
+      "p50_ms_median": 5.062808,
+      "p99_ms_median": 6.766316,
+      "mean_ms_median": 5.029828855947386,
+      "proxy_cpu_pct_median": 99.99980442031354,
+      "client_cpu_pct_median": 124.99981510036443,
+      "server_cpu_pct_median": 123.49981731916006,
+      "qps_min": 12687.1,
+      "qps_max": 12738.4,
+      "per_core_util_median": {
+        "15": 100.0
+      }
+    },
+    {
+      "case": "c1-k2",
+      "arm_cores": 1,
+      "connections": 2,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 16620.5,
+      "p50_ms_median": 7.834157,
+      "p99_ms_median": 10.523736999999999,
+      "mean_ms_median": 7.698095706446859,
+      "proxy_cpu_pct_median": 99.99838139629567,
+      "client_cpu_pct_median": 139.89600409427675,
+      "server_cpu_pct_median": 144.993634214056,
+      "qps_min": 16591.4,
+      "qps_max": 16739.9,
+      "per_core_util_median": {
+        "15": 100.0
+      }
+    },
+    {
+      "case": "c1-k4",
+      "arm_cores": 1,
+      "connections": 4,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 19376.5,
+      "p50_ms_median": 13.386505,
+      "p99_ms_median": 17.284186000000002,
+      "mean_ms_median": 13.212489424958067,
+      "proxy_cpu_pct_median": 99.99999325984436,
+      "client_cpu_pct_median": 149.79916901940388,
+      "server_cpu_pct_median": 159.2991634245227,
+      "qps_min": 19179.5,
+      "qps_max": 19416.7,
+      "per_core_util_median": {
+        "15": 100.0
+      }
+    },
+    {
+      "case": "c2-k1",
+      "arm_cores": 2,
+      "connections": 1,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 16136.5,
+      "p50_ms_median": 4.084246,
+      "p99_ms_median": 5.959499,
+      "mean_ms_median": 3.9656138150032536,
+      "proxy_cpu_pct_median": 167.00590380912612,
+      "client_cpu_pct_median": 158.997152487856,
+      "server_cpu_pct_median": 159.59714174252716,
+      "qps_min": 16030.9,
+      "qps_max": 16192.2,
+      "per_core_util_median": {
+        "14": 96.99481865284974,
+        "15": 77.67548906789413
+      }
+    },
+    {
+      "case": "c2-k2",
+      "arm_cores": 2,
+      "connections": 2,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 21308,
+      "p50_ms_median": 6.126612,
+      "p99_ms_median": 8.872879000000001,
+      "mean_ms_median": 6.006313153177211,
+      "proxy_cpu_pct_median": 176.2041364625744,
+      "client_cpu_pct_median": 174.1947744703343,
+      "server_cpu_pct_median": 180.59458248761408,
+      "qps_min": 21259.6,
+      "qps_max": 21338.5,
+      "per_core_util_median": {
+        "14": 96.56964656964658,
+        "15": 87.22466960352423
+      }
+    },
+    {
+      "case": "c2-k4",
+      "arm_cores": 2,
+      "connections": 4,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 25615.7,
+      "p50_ms_median": 9.970242,
+      "p99_ms_median": 14.983972,
+      "mean_ms_median": 9.992949079790307,
+      "proxy_cpu_pct_median": 184.20910322696358,
+      "client_cpu_pct_median": 181.2983406126184,
+      "server_cpu_pct_median": 201.19815847357322,
+      "qps_min": 25450.7,
+      "qps_max": 25618.4,
+      "per_core_util_median": {
+        "14": 94.46185997910136,
+        "15": 94.7970863683663
+      }
+    },
+    {
+      "case": "c4-k1",
+      "arm_cores": 4,
+      "connections": 1,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 17124.8,
+      "p50_ms_median": 3.732459,
+      "p99_ms_median": 5.556039,
+      "mean_ms_median": 3.736580546931935,
+      "proxy_cpu_pct_median": 265.8937470298931,
+      "client_cpu_pct_median": 157.0036431908147,
+      "server_cpu_pct_median": 163.28933643890014,
+      "qps_min": 17044.3,
+      "qps_max": 17159.8,
+      "per_core_util_median": {
+        "12": 72.55965292841648,
+        "13": 66.55629139072848,
+        "14": 66.01092896174863,
+        "15": 68.5022026431718
+      }
+    },
+    {
+      "case": "c4-k2",
+      "arm_cores": 4,
+      "connections": 2,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 23344.9,
+      "p50_ms_median": 5.486441,
+      "p99_ms_median": 8.219427,
+      "mean_ms_median": 5.4827419485240885,
+      "proxy_cpu_pct_median": 299.21856803815797,
+      "client_cpu_pct_median": 180.89943076370184,
+      "server_cpu_pct_median": 189.59940338749513,
+      "qps_min": 23286,
+      "qps_max": 23373,
+      "per_core_util_median": {
+        "12": 75.70806100217865,
+        "13": 81.203007518797,
+        "14": 79.00432900432901,
+        "15": 78.15217391304347
+      }
+    },
+    {
+      "case": "c4-k4",
+      "arm_cores": 4,
+      "connections": 4,
+      "valid_repeats": 3,
+      "lifecycle_ok": true,
+      "qps_median": 28278.3,
+      "p50_ms_median": 9.050767,
+      "p99_ms_median": 13.675766,
+      "mean_ms_median": 9.05082914936895,
+      "proxy_cpu_pct_median": 320.8852502950302,
+      "client_cpu_pct_median": 188.3011489570351,
+      "server_cpu_pct_median": 212.80129844958614,
+      "qps_min": 28212.6,
+      "qps_max": 28496.2,
+      "per_core_util_median": {
+        "12": 83.51293103448276,
+        "13": 84.3073593073593,
+        "14": 83.27939590075513,
+        "15": 85.72961373390558
+      }
+    }
+  ],
+  "runs": [
+    {
+      "case": "c1-k1",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 126871,
+      "qps": 12687.1,
+      "p50_ms": 5.062849,
+      "p99_ms": 6.870828,
+      "mean_ms": 5.043643433992008,
+      "proxy_cpu_pct": 99.90096033785744,
+      "client_cpu_pct": 123.80003824174828,
+      "server_cpu_pct": 123.00003799462876,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1283216,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 99.90096033785744
+        },
+        {
+          "tid": 1283221,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283222,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283223,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:40:25.508986+09:00",
+      "measurement_end": "2026-09-29T08:40:35.508986+09:00"
+    },
+    {
+      "case": "c1-k1",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 127266,
+      "qps": 12726.6,
+      "p50_ms": 5.062808,
+      "p99_ms": 6.766316,
+      "mean_ms": 5.029828855947386,
+      "proxy_cpu_pct": 99.99980442031354,
+      "client_cpu_pct": 124.99981510036443,
+      "server_cpu_pct": 123.49981731916006,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1283216,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 99.99980442031354
+        },
+        {
+          "tid": 1283221,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283222,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283223,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:40:40.830644+09:00",
+      "measurement_end": "2026-09-29T08:40:50.830644+09:00"
+    },
+    {
+      "case": "c1-k1",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 127384,
+      "qps": 12738.4,
+      "p50_ms": 5.048644,
+      "p99_ms": 6.740667,
+      "mean_ms": 5.022736712766124,
+      "proxy_cpu_pct": 100.0002151406342,
+      "client_cpu_pct": 125.09749464728132,
+      "server_cpu_pct": 123.69752268480175,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1283216,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 100.0002151406342
+        },
+        {
+          "tid": 1283221,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283222,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283223,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:40:56.140488+09:00",
+      "measurement_end": "2026-09-29T08:41:06.140488+09:00"
+    },
+    {
+      "case": "c1-k2",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 167399,
+      "qps": 16739.9,
+      "p50_ms": 7.791154000000001,
+      "p99_ms": 10.392043,
+      "mean_ms": 7.642944129498982,
+      "proxy_cpu_pct": 100.00126094575702,
+      "client_cpu_pct": 140.19384494352173,
+      "server_cpu_pct": 144.993634214056,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1283779,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 100.00126094575702
+        },
+        {
+          "tid": 1283780,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283781,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283782,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:41:14.811147+09:00",
+      "measurement_end": "2026-09-29T08:41:24.811147+09:00"
+    },
+    {
+      "case": "c1-k2",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 166205,
+      "qps": 16620.5,
+      "p50_ms": 7.854055000000001,
+      "p99_ms": 10.523736999999999,
+      "mean_ms": 7.698095706446859,
+      "proxy_cpu_pct": 99.99838139629567,
+      "client_cpu_pct": 139.89600409427675,
+      "server_cpu_pct": 144.99585842509026,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1283779,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 99.99838139629567
+        },
+        {
+          "tid": 1283780,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283781,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283782,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:41:30.334186+09:00",
+      "measurement_end": "2026-09-29T08:41:40.334186+09:00"
+    },
+    {
+      "case": "c1-k2",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 165914,
+      "qps": 16591.4,
+      "p50_ms": 7.834157,
+      "p99_ms": 10.795938,
+      "mean_ms": 7.715278086243476,
+      "proxy_cpu_pct": 99.89995399624424,
+      "client_cpu_pct": 139.4004019192483,
+      "server_cpu_pct": 143.80041460536518,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1283779,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 99.89995399624424
+        },
+        {
+          "tid": 1283780,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283781,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1283782,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:41:45.863283+09:00",
+      "measurement_end": "2026-09-29T08:41:55.863283+09:00"
+    },
+    {
+      "case": "c1-k4",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 193765,
+      "qps": 19376.5,
+      "p50_ms": 13.386505,
+      "p99_ms": 17.36289,
+      "mean_ms": 13.212489424958067,
+      "proxy_cpu_pct": 100.10481026650261,
+      "client_cpu_pct": 149.79916901940388,
+      "server_cpu_pct": 159.2991163203674,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1284337,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 100.10481026650261
+        },
+        {
+          "tid": 1284338,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1284339,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1284340,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:42:05.273871+09:00",
+      "measurement_end": "2026-09-29T08:42:15.273871+09:00"
+    },
+    {
+      "case": "c1-k4",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 194167,
+      "qps": 19416.7,
+      "p50_ms": 13.323926,
+      "p99_ms": 17.261399,
+      "mean_ms": 13.180579284167752,
+      "proxy_cpu_pct": 99.99999325984436,
+      "client_cpu_pct": 149.2992159402463,
+      "server_cpu_pct": 159.2991634245227,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1284337,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 99.99999325984436
+        },
+        {
+          "tid": 1284338,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1284339,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1284340,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:42:21.200569+09:00",
+      "measurement_end": "2026-09-29T08:42:31.200569+09:00"
+    },
+    {
+      "case": "c1-k4",
+      "arm_cores": 1,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 191795,
+      "qps": 19179.5,
+      "p50_ms": 13.481928,
+      "p99_ms": 17.284186000000002,
+      "mean_ms": 13.347929968560182,
+      "proxy_cpu_pct": 99.89555222046141,
+      "client_cpu_pct": 151.09226190039473,
+      "server_cpu_pct": 159.6918214791068,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "15": 100.0
+      },
+      "proxy_threads": [
+        {
+          "tid": 1284337,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 99.89555222046141
+        },
+        {
+          "tid": 1284338,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1284339,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1284340,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:42:37.109416+09:00",
+      "measurement_end": "2026-09-29T08:42:47.109416+09:00"
+    },
+    {
+      "case": "c2-k1",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 160309,
+      "qps": 16030.9,
+      "p50_ms": 4.118882999999999,
+      "p99_ms": 5.959499,
+      "mean_ms": 3.9929874758310513,
+      "proxy_cpu_pct": 166.59931397700865,
+      "client_cpu_pct": 159.30007716469188,
+      "server_cpu_pct": 158.70007687405274,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 95.05783385909568,
+        "15": 79.21348314606742
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285046,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285055,
+          "name": "proxy",
+          "cpu_pct": 94.69961004575462
+        },
+        {
+          "tid": 1285056,
+          "name": "proxy",
+          "cpu_pct": 71.89970393125404
+        },
+        {
+          "tid": 1285057,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285058,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285059,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:42:55.907959+09:00",
+      "measurement_end": "2026-09-29T08:43:05.907959+09:00"
+    },
+    {
+      "case": "c2-k1",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 161922,
+      "qps": 16192.2,
+      "p50_ms": 4.071165,
+      "p99_ms": 5.925366,
+      "mean_ms": 3.9515000085720287,
+      "proxy_cpu_pct": 167.19964931552977,
+      "client_cpu_pct": 158.80334006269084,
+      "server_cpu_pct": 159.70335899251717,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 96.99481865284974,
+        "15": 77.67548906789413
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285046,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285055,
+          "name": "proxy",
+          "cpu_pct": 94.49980179615767
+        },
+        {
+          "tid": 1285056,
+          "name": "proxy",
+          "cpu_pct": 72.69984751937209
+        },
+        {
+          "tid": 1285057,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285058,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285059,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:43:11.235974+09:00",
+      "measurement_end": "2026-09-29T08:43:21.235974+09:00"
+    },
+    {
+      "case": "c2-k1",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 161365,
+      "qps": 16136.5,
+      "p50_ms": 4.084246,
+      "p99_ms": 5.966992,
+      "mean_ms": 3.9656138150032536,
+      "proxy_cpu_pct": 167.00590380912612,
+      "client_cpu_pct": 158.997152487856,
+      "server_cpu_pct": 159.59714174252716,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 97.09844559585493,
+        "15": 77.62557077625571
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285046,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285055,
+          "name": "proxy",
+          "cpu_pct": 94.60334431343313
+        },
+        {
+          "tid": 1285056,
+          "name": "proxy",
+          "cpu_pct": 72.402559495693
+        },
+        {
+          "tid": 1285057,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285058,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285059,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:43:26.555429+09:00",
+      "measurement_end": "2026-09-29T08:43:36.555429+09:00"
+    },
+    {
+      "case": "c2-k2",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 213080,
+      "qps": 21308,
+      "p50_ms": 6.127386,
+      "p99_ms": 8.872879000000001,
+      "mean_ms": 6.006313153177211,
+      "proxy_cpu_pct": 176.00024302151084,
+      "client_cpu_pct": 174.1947744703343,
+      "server_cpu_pct": 180.59458248761408,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 96.4509394572025,
+        "15": 86.33879781420765
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285316,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285317,
+          "name": "proxy",
+          "cpu_pct": 93.90012965749925
+        },
+        {
+          "tid": 1285318,
+          "name": "proxy",
+          "cpu_pct": 82.10011336401159
+        },
+        {
+          "tid": 1285319,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285320,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285321,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:43:45.233644+09:00",
+      "measurement_end": "2026-09-29T08:43:55.233644+09:00"
+    },
+    {
+      "case": "c2-k2",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 212596,
+      "qps": 21259.6,
+      "p50_ms": 6.126612,
+      "p99_ms": 8.957619000000001,
+      "mean_ms": 6.020926901917251,
+      "proxy_cpu_pct": 176.2041364625744,
+      "client_cpu_pct": 173.59322897890107,
+      "server_cpu_pct": 180.3929637545723,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 96.67013527575442,
+        "15": 87.22466960352423
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285316,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285317,
+          "name": "proxy",
+          "cpu_pct": 93.90220439180328
+        },
+        {
+          "tid": 1285318,
+          "name": "proxy",
+          "cpu_pct": 82.30193207077114
+        },
+        {
+          "tid": 1285319,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285320,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285321,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:44:00.780102+09:00",
+      "measurement_end": "2026-09-29T08:44:10.780102+09:00"
+    },
+    {
+      "case": "c2-k2",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 213385,
+      "qps": 21338.5,
+      "p50_ms": 6.119034,
+      "p99_ms": 8.866703,
+      "mean_ms": 5.998038666883802,
+      "proxy_cpu_pct": 176.69763136821462,
+      "client_cpu_pct": 174.40497959346627,
+      "server_cpu_pct": 181.50518231774154,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 96.56964656964658,
+        "15": 87.23872387238724
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285316,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285317,
+          "name": "proxy",
+          "cpu_pct": 93.99873994687138
+        },
+        {
+          "tid": 1285318,
+          "name": "proxy",
+          "cpu_pct": 82.69889142134322
+        },
+        {
+          "tid": 1285319,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285320,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285321,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:44:16.301524+09:00",
+      "measurement_end": "2026-09-29T08:44:26.301524+09:00"
+    },
+    {
+      "case": "c2-k4",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 256184,
+      "qps": 25618.4,
+      "p50_ms": 9.970242,
+      "p99_ms": 14.983972,
+      "mean_ms": 9.992949079790307,
+      "proxy_cpu_pct": 184.0134959915608,
+      "client_cpu_pct": 182.3001337900046,
+      "server_cpu_pct": 201.20014766071816,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 94.46185997910136,
+        "15": 94.7970863683663
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285734,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285735,
+          "name": "proxy",
+          "cpu_pct": 92.30677000011447
+        },
+        {
+          "tid": 1285736,
+          "name": "proxy",
+          "cpu_pct": 91.70672599144633
+        },
+        {
+          "tid": 1285737,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285738,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285739,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:44:35.703753+09:00",
+      "measurement_end": "2026-09-29T08:44:45.703753+09:00"
+    },
+    {
+      "case": "c2-k4",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 254507,
+      "qps": 25450.7,
+      "p50_ms": 10.022613,
+      "p99_ms": 15.129967,
+      "mean_ms": 10.059053035181744,
+      "proxy_cpu_pct": 184.30284440135586,
+      "client_cpu_pct": 180.79931929064156,
+      "server_cpu_pct": 199.89924737942061,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 96.17768595041323,
+        "15": 93.37539432176656
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285734,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285735,
+          "name": "proxy",
+          "cpu_pct": 90.3013936486296
+        },
+        {
+          "tid": 1285736,
+          "name": "proxy",
+          "cpu_pct": 94.00145075272627
+        },
+        {
+          "tid": 1285737,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285738,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285739,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:44:51.691353+09:00",
+      "measurement_end": "2026-09-29T08:45:01.691353+09:00"
+    },
+    {
+      "case": "c2-k4",
+      "arm_cores": 2,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 256157,
+      "qps": 25615.7,
+      "p50_ms": 9.950408,
+      "p99_ms": 14.911978999999999,
+      "mean_ms": 9.992320543389406,
+      "proxy_cpu_pct": 184.20910322696358,
+      "client_cpu_pct": 181.2983406126184,
+      "server_cpu_pct": 201.19815847357322,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "14": 93.34741288278775,
+        "15": 96.15784008307374
+      },
+      "proxy_threads": [
+        {
+          "tid": 1285734,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285735,
+          "name": "proxy",
+          "cpu_pct": 90.3044626568665
+        },
+        {
+          "tid": 1285736,
+          "name": "proxy",
+          "cpu_pct": 93.90464057009706
+        },
+        {
+          "tid": 1285737,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285738,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1285739,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:45:07.614363+09:00",
+      "measurement_end": "2026-09-29T08:45:17.614363+09:00"
+    },
+    {
+      "case": "c4-k1",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 171248,
+      "qps": 17124.8,
+      "p50_ms": 3.732459,
+      "p99_ms": 5.559127,
+      "mean_ms": 3.736580546931935,
+      "proxy_cpu_pct": 266.51055474999134,
+      "client_cpu_pct": 157.0036431908147,
+      "server_cpu_pct": 163.30378938254802,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 72.55965292841648,
+        "13": 66.55629139072848,
+        "14": 69.71046770601336,
+        "15": 68.5022026431718
+      },
+      "proxy_threads": [
+        {
+          "tid": 1286137,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286138,
+          "name": "proxy",
+          "cpu_pct": 88.00348524577576
+        },
+        {
+          "tid": 1286139,
+          "name": "proxy",
+          "cpu_pct": 59.40235254089864
+        },
+        {
+          "tid": 1286140,
+          "name": "proxy",
+          "cpu_pct": 59.80236838292489
+        },
+        {
+          "tid": 1286141,
+          "name": "proxy",
+          "cpu_pct": 59.30234858039207
+        },
+        {
+          "tid": 1286142,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286143,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286144,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:45:26.433261+09:00",
+      "measurement_end": "2026-09-29T08:45:36.433261+09:00"
+    },
+    {
+      "case": "c4-k1",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 170443,
+      "qps": 17044.3,
+      "p50_ms": 3.747,
+      "p99_ms": 5.556039,
+      "mean_ms": 3.7543767637626657,
+      "proxy_cpu_pct": 265.8937470298931,
+      "client_cpu_pct": 156.00484312369085,
+      "server_cpu_pct": 162.5050449205113,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 70.41942604856513,
+        "13": 64.61538461538461,
+        "14": 65.38037486218302,
+        "15": 76.99784017278618
+      },
+      "proxy_threads": [
+        {
+          "tid": 1286137,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286138,
+          "name": "proxy",
+          "cpu_pct": 87.99793057025421
+        },
+        {
+          "tid": 1286139,
+          "name": "proxy",
+          "cpu_pct": 58.998612541420435
+        },
+        {
+          "tid": 1286140,
+          "name": "proxy",
+          "cpu_pct": 59.198607838171014
+        },
+        {
+          "tid": 1286141,
+          "name": "proxy",
+          "cpu_pct": 59.69859608004746
+        },
+        {
+          "tid": 1286142,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286143,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286144,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:45:41.778652+09:00",
+      "measurement_end": "2026-09-29T08:45:51.778652+09:00"
+    },
+    {
+      "case": "c4-k1",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 1,
+      "concurrency": 64,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 171598,
+      "qps": 17159.8,
+      "p50_ms": 3.714899,
+      "p99_ms": 5.441545,
+      "mean_ms": 3.7294546960337533,
+      "proxy_cpu_pct": 265.2997571708893,
+      "client_cpu_pct": 157.58970865138187,
+      "server_cpu_pct": 163.28933643890014,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 75.32608695652175,
+        "13": 68.96174863387978,
+        "14": 66.01092896174863,
+        "15": 67.69570011025358
+      },
+      "proxy_threads": [
+        {
+          "tid": 1286137,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286138,
+          "name": "proxy",
+          "cpu_pct": 87.89991954512313
+        },
+        {
+          "tid": 1286139,
+          "name": "proxy",
+          "cpu_pct": 58.999945997295384
+        },
+        {
+          "tid": 1286140,
+          "name": "proxy",
+          "cpu_pct": 59.09994590576538
+        },
+        {
+          "tid": 1286141,
+          "name": "proxy",
+          "cpu_pct": 59.29994572270537
+        },
+        {
+          "tid": 1286142,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286143,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286144,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:45:57.110012+09:00",
+      "measurement_end": "2026-09-29T08:46:07.110012+09:00"
+    },
+    {
+      "case": "c4-k2",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 232860,
+      "qps": 23286,
+      "p50_ms": 5.509644000000001,
+      "p99_ms": 8.166437,
+      "mean_ms": 5.497609462509663,
+      "proxy_cpu_pct": 299.0959677082264,
+      "client_cpu_pct": 180.204875712899,
+      "server_cpu_pct": 189.50512734514072,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 75.21834061135371,
+        "13": 79.02702702702703,
+        "14": 80.6941431670282,
+        "15": 78.7257019438445
+      },
+      "proxy_threads": [
+        {
+          "tid": 1286720,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286721,
+          "name": "proxy",
+          "cpu_pct": 70.49904956011355
+        },
+        {
+          "tid": 1286722,
+          "name": "proxy",
+          "cpu_pct": 70.69904686383018
+        },
+        {
+          "tid": 1286723,
+          "name": "proxy",
+          "cpu_pct": 70.79904551568849
+        },
+        {
+          "tid": 1286724,
+          "name": "proxy",
+          "cpu_pct": 87.09882576859418
+        },
+        {
+          "tid": 1286725,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286726,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286727,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:46:15.781964+09:00",
+      "measurement_end": "2026-09-29T08:46:25.781964+09:00"
+    },
+    {
+      "case": "c4-k2",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 233730,
+      "qps": 23373,
+      "p50_ms": 5.47885,
+      "p99_ms": 8.288844999999998,
+      "mean_ms": 5.475653260052197,
+      "proxy_cpu_pct": 299.41690031738983,
+      "client_cpu_pct": 181.40053554850763,
+      "server_cpu_pct": 189.60055975742586,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 75.70806100217865,
+        "13": 81.203007518797,
+        "14": 79.00432900432901,
+        "15": 78.15217391304347
+      },
+      "proxy_threads": [
+        {
+          "tid": 1286720,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286721,
+          "name": "proxy",
+          "cpu_pct": 70.7039908231111
+        },
+        {
+          "tid": 1286722,
+          "name": "proxy",
+          "cpu_pct": 70.90400211256828
+        },
+        {
+          "tid": 1286723,
+          "name": "proxy",
+          "cpu_pct": 70.80399646783968
+        },
+        {
+          "tid": 1286724,
+          "name": "proxy",
+          "cpu_pct": 87.0049109138708
+        },
+        {
+          "tid": 1286725,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286726,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286727,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:46:31.310145+09:00",
+      "measurement_end": "2026-09-29T08:46:41.310145+09:00"
+    },
+    {
+      "case": "c4-k2",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 2,
+      "concurrency": 128,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 233449,
+      "qps": 23344.9,
+      "p50_ms": 5.486441,
+      "p99_ms": 8.219427,
+      "mean_ms": 5.4827419485240885,
+      "proxy_cpu_pct": 299.21856803815797,
+      "client_cpu_pct": 180.89943076370184,
+      "server_cpu_pct": 189.59940338749513,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 76.39344262295083,
+        "13": 84.46808510638297,
+        "14": 78.35497835497836,
+        "15": 74.235807860262
+      },
+      "proxy_threads": [
+        {
+          "tid": 1286720,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286721,
+          "name": "proxy",
+          "cpu_pct": 70.60438136194503
+        },
+        {
+          "tid": 1286722,
+          "name": "proxy",
+          "cpu_pct": 70.90439997963036
+        },
+        {
+          "tid": 1286723,
+          "name": "proxy",
+          "cpu_pct": 70.60438136194503
+        },
+        {
+          "tid": 1286724,
+          "name": "proxy",
+          "cpu_pct": 87.10540533463757
+        },
+        {
+          "tid": 1286725,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286726,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1286727,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:46:46.848696+09:00",
+      "measurement_end": "2026-09-29T08:46:56.848696+09:00"
+    },
+    {
+      "case": "c4-k4",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 1,
+      "case_lifecycle_ok": true,
+      "completed": 282126,
+      "qps": 28212.6,
+      "p50_ms": 9.09665,
+      "p99_ms": 13.841893,
+      "mean_ms": 9.07764491706188,
+      "proxy_cpu_pct": 319.817544935042,
+      "client_cpu_pct": 187.7926992392449,
+      "server_cpu_pct": 211.59177400971365,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 83.51293103448276,
+        "13": 87.82051282051282,
+        "14": 83.27939590075513,
+        "15": 83.38727076591155
+      },
+      "proxy_threads": [
+        {
+          "tid": 1287533,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287534,
+          "name": "proxy",
+          "cpu_pct": 77.60425730756491
+        },
+        {
+          "tid": 1287535,
+          "name": "proxy",
+          "cpu_pct": 78.10428473867036
+        },
+        {
+          "tid": 1287536,
+          "name": "proxy",
+          "cpu_pct": 77.60425730756491
+        },
+        {
+          "tid": 1287537,
+          "name": "proxy",
+          "cpu_pct": 86.50474558124182
+        },
+        {
+          "tid": 1287538,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287543,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287553,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:47:06.266584+09:00",
+      "measurement_end": "2026-09-29T08:47:16.266584+09:00"
+    },
+    {
+      "case": "c4-k4",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 2,
+      "case_lifecycle_ok": true,
+      "completed": 282783,
+      "qps": 28278.3,
+      "p50_ms": 9.050767,
+      "p99_ms": 13.675766,
+      "mean_ms": 9.05082914936895,
+      "proxy_cpu_pct": 320.8852502950302,
+      "client_cpu_pct": 188.3011489570351,
+      "server_cpu_pct": 212.80129844958614,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 82.84473398479913,
+        "13": 83.40517241379311,
+        "14": 84.39181916038751,
+        "15": 85.72961373390558
+      },
+      "proxy_threads": [
+        {
+          "tid": 1287533,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287534,
+          "name": "proxy",
+          "cpu_pct": 77.89931379711284
+        },
+        {
+          "tid": 1287535,
+          "name": "proxy",
+          "cpu_pct": 78.09905562736184
+        },
+        {
+          "tid": 1287536,
+          "name": "proxy",
+          "cpu_pct": 77.89931379711284
+        },
+        {
+          "tid": 1287537,
+          "name": "proxy",
+          "cpu_pct": 86.98756707344266
+        },
+        {
+          "tid": 1287538,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287543,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287553,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:47:22.218485+09:00",
+      "measurement_end": "2026-09-29T08:47:32.218485+09:00"
+    },
+    {
+      "case": "c4-k4",
+      "arm_cores": 4,
+      "drivers": 1,
+      "connections": 4,
+      "concurrency": 256,
+      "repeat": 3,
+      "case_lifecycle_ok": true,
+      "completed": 284962,
+      "qps": 28496.2,
+      "p50_ms": 9.026704,
+      "p99_ms": 13.321135,
+      "mean_ms": 8.984220049287272,
+      "proxy_cpu_pct": 322.41898183768114,
+      "client_cpu_pct": 188.69690393691647,
+      "server_cpu_pct": 214.59647898708147,
+      "rpc_errors": 0,
+      "reconnects": 0,
+      "cpu_per_assigned_core": {
+        "12": 84.81561822125813,
+        "13": 84.3073593073593,
+        "14": 82.4235807860262,
+        "15": 85.97430406852249
+      },
+      "proxy_threads": [
+        {
+          "tid": 1287533,
+          "name": "linkerd2-proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287534,
+          "name": "proxy",
+          "cpu_pct": 78.40461593075125
+        },
+        {
+          "tid": 1287535,
+          "name": "proxy",
+          "cpu_pct": 78.70463359375157
+        },
+        {
+          "tid": 1287536,
+          "name": "proxy",
+          "cpu_pct": 78.50462181841802
+        },
+        {
+          "tid": 1287537,
+          "name": "proxy",
+          "cpu_pct": 86.80511049476031
+        },
+        {
+          "tid": 1287538,
+          "name": "admin",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287543,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        },
+        {
+          "tid": 1287553,
+          "name": "proxy",
+          "cpu_pct": 0.0
+        }
+      ],
+      "measurement_start": "2026-09-29T08:47:38.185132+09:00",
+      "measurement_end": "2026-09-29T08:47:48.185132+09:00"
+    }
+  ],
+  "identity": {
+    "repo_head": "b60712998e8b0747fb62f2195716aeeeab6faffb",
+    "proxy_head": "c09915bfb38cbb8401b4d9136194923a6d23edd2",
+    "working_tree_contains_uncommitted_global_dpa_context": true,
+    "sha256": {
+      "linkerd2-proxy/target/release/linkerd2-proxy": "5a778f2e443a15b0a96c2daa5e2199ae2b7417fa91474fee6b87bffb7ac09971",
+      "src/transport/build/device/dpa_kernel.a": "87116cddb3d43d9834700e077d049c73b80b6f111a1f75e6846dda12dcb4441b",
+      "/tmp/dmesh-unsharded-20260928/source.tar.gz": "299914ce997c5c37dc62182d4756565e1d7319c37f1fc38c5b35c39026f4c1ee"
+    },
+    "host_sha256": "9690669019e98104c78c44a29ccbb09207b5a89529c63426805685b80691b8db  /tmp/dmesh-unsharded-20260928/channel-bench\nefaf23c20374fcefb3955521713425775f8246b1a3a01aea2404600a2299b046  /tmp/dmesh-unsharded-20260928/source/build/lib/libdpumesh.so.5\n"
+  }
+}

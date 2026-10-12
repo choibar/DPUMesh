@@ -1,0 +1,1198 @@
+{
+  "mode": "dpu-dma",
+  "sharded": false,
+  "tokio_threads": 4,
+  "proxy_cpu_affinity": "12-15",
+  "payload_bytes": 64,
+  "concurrency_per_connection": 64,
+  "warmup_seconds": 3,
+  "measurement_seconds": 10,
+  "cases": [
+    {
+      "name": "w1-busy",
+      "drivers": 1,
+      "busy_poll": true,
+      "runs": [
+        {
+          "repeat": "1",
+          "ok": true,
+          "completed": 287475,
+          "qps": 28747.5,
+          "workers": [
+            {
+              "worker": 0,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 189.35638826928079,
+              "client_cpu_sample_seconds": 9.999080133,
+              "measurement_start": "2026-09-29T08:23:05.241917+09:00",
+              "measurement_end": "2026-09-29T08:23:15.241917+09:00",
+              "completed": 287475,
+              "total_completed_including_warmup_and_drain": 374067,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 28747.5,
+              "latency_mean_us": 8909.057236163146,
+              "latency_p50_us": 8913.333,
+              "latency_p99_us": 13331.502
+            }
+          ],
+          "cpu": {
+            "duration": 9.99954503402114,
+            "threads": [
+              {
+                "tid": 1275205,
+                "name": "linkerd2-proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1275244,
+                "name": "proxy",
+                "cpu_pct": 78.30356254569818
+              },
+              {
+                "tid": 1275246,
+                "name": "proxy",
+                "cpu_pct": 78.30356254569818
+              },
+              {
+                "tid": 1275247,
+                "name": "proxy",
+                "cpu_pct": 87.0039583841091
+              },
+              {
+                "tid": 1275248,
+                "name": "proxy",
+                "cpu_pct": 78.30356254569818
+              },
+              {
+                "tid": 1275256,
+                "name": "admin",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1275257,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1275258,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              }
+            ],
+            "total_cpu_pct": 321.9146460212037,
+            "client_exit": 0
+          }
+        },
+        {
+          "repeat": "2",
+          "ok": true,
+          "completed": 287785,
+          "qps": 28778.5,
+          "workers": [
+            {
+              "worker": 0,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 191.25711684393104,
+              "client_cpu_sample_seconds": 9.998675247,
+              "measurement_start": "2026-09-29T08:24:03.345408+09:00",
+              "measurement_end": "2026-09-29T08:24:13.345408+09:00",
+              "completed": 287785,
+              "total_completed_including_warmup_and_drain": 374498,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 28778.5,
+              "latency_mean_us": 8895.363648049759,
+              "latency_p50_us": 8919.591,
+              "latency_p99_us": 13358.305
+            }
+          ],
+          "cpu": {
+            "duration": 9.999657241016394,
+            "threads": [
+              {
+                "tid": 1275205,
+                "name": "linkerd2-proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1275244,
+                "name": "proxy",
+                "cpu_pct": 78.40268732254187
+              },
+              {
+                "tid": 1275246,
+                "name": "proxy",
+                "cpu_pct": 78.50269075024919
+              },
+              {
+                "tid": 1275247,
+                "name": "proxy",
+                "cpu_pct": 87.00298210537171
+              },
+              {
+                "tid": 1275248,
+                "name": "proxy",
+                "cpu_pct": 78.60269417795652
+              },
+              {
+                "tid": 1275256,
+                "name": "admin",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1275257,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1275258,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              }
+            ],
+            "total_cpu_pct": 322.5110543561193,
+            "client_exit": 0
+          }
+        }
+      ],
+      "runtime_env": {
+        "DMESH_SHARDED": null,
+        "DMESH_NUM_WORKERS": "1",
+        "DMESH_BUSY_POLL": "1",
+        "LINKERD2_PROXY_CORES": "4",
+        "LINKERD2_PROXY_CORES_MIN": null,
+        "LINKERD2_PROXY_CORES_MAX": null,
+        "LINKERD2_PROXY_CORES_MAX_RATIO": null
+      },
+      "process_stop": {
+        "ok": true,
+        "processes": [
+          {
+            "role": "proxy",
+            "pid": 1275205,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": 0,
+            "ok": true
+          },
+          {
+            "role": "mock-policy",
+            "pid": 1275202,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          },
+          {
+            "role": "mock-destination",
+            "pid": 1275201,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          },
+          {
+            "role": "mock-identity",
+            "pid": 1275199,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          }
+        ]
+      },
+      "shared_context_created": 1,
+      "shared_context_destroyed": 1,
+      "retained_live_resources": false,
+      "host_stop": "{\"event\": \"servers_stopped\", \"exits\": [0], \"cleanup_ok\": true, \"stopped\": true}"
+    },
+    {
+      "name": "w2-busy",
+      "drivers": 2,
+      "busy_poll": true,
+      "runs": [
+        {
+          "repeat": "1",
+          "ok": true,
+          "completed": 419562,
+          "qps": 41956.2,
+          "workers": [
+            {
+              "worker": 0,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 152.08996895190649,
+              "client_cpu_sample_seconds": 9.999655536,
+              "measurement_start": "2026-09-29T08:25:02.436661+09:00",
+              "measurement_end": "2026-09-29T08:25:12.436661+09:00",
+              "completed": 210121,
+              "total_completed_including_warmup_and_drain": 273659,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 21012.1,
+              "latency_mean_us": 12182.306480004378,
+              "latency_p50_us": 12055.059,
+              "latency_p99_us": 18657.334
+            },
+            {
+              "worker": 1,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 152.9277988475586,
+              "client_cpu_sample_seconds": 9.998114872,
+              "measurement_start": "2026-09-29T08:25:02.436661+09:00",
+              "measurement_end": "2026-09-29T08:25:12.436661+09:00",
+              "completed": 209441,
+              "total_completed_including_warmup_and_drain": 272613,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 20944.1,
+              "latency_mean_us": 12225.017596024656,
+              "latency_p50_us": 12054.658,
+              "latency_p99_us": 19077.057
+            }
+          ],
+          "cpu": {
+            "duration": 9.999884324002778,
+            "threads": [
+              {
+                "tid": 1276667,
+                "name": "linkerd2-proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1276668,
+                "name": "proxy",
+                "cpu_pct": 89.20103184183115
+              },
+              {
+                "tid": 1276669,
+                "name": "proxy",
+                "cpu_pct": 90.90105150697816
+              },
+              {
+                "tid": 1276670,
+                "name": "proxy",
+                "cpu_pct": 88.00101796055091
+              },
+              {
+                "tid": 1276671,
+                "name": "proxy",
+                "cpu_pct": 89.30103299860451
+              },
+              {
+                "tid": 1276672,
+                "name": "admin",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1276673,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1276674,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              }
+            ],
+            "total_cpu_pct": 357.40413430796474,
+            "client_exit": 0
+          }
+        },
+        {
+          "repeat": "2",
+          "ok": true,
+          "completed": 417262,
+          "qps": 41726.2,
+          "workers": [
+            {
+              "worker": 0,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 150.92230809598883,
+              "client_cpu_sample_seconds": 9.999211641,
+              "measurement_start": "2026-09-29T08:25:41.403223+09:00",
+              "measurement_end": "2026-09-29T08:25:51.403223+09:00",
+              "completed": 207247,
+              "total_completed_including_warmup_and_drain": 268495,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 20724.7,
+              "latency_mean_us": 12349.01869183631,
+              "latency_p50_us": 12154.715,
+              "latency_p99_us": 19550.197
+            },
+            {
+              "worker": 1,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 152.89347782652152,
+              "client_cpu_sample_seconds": 9.999489329,
+              "measurement_start": "2026-09-29T08:25:41.403223+09:00",
+              "measurement_end": "2026-09-29T08:25:51.403223+09:00",
+              "completed": 210015,
+              "total_completed_including_warmup_and_drain": 273147,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 21001.5,
+              "latency_mean_us": 12188.862083865437,
+              "latency_p50_us": 11990.278,
+              "latency_p99_us": 18482.462
+            }
+          ],
+          "cpu": {
+            "duration": 9.998103341000387,
+            "threads": [
+              {
+                "tid": 1276667,
+                "name": "linkerd2-proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1276668,
+                "name": "proxy",
+                "cpu_pct": 89.71701625863054
+              },
+              {
+                "tid": 1276669,
+                "name": "proxy",
+                "cpu_pct": 88.21673170581062
+              },
+              {
+                "tid": 1276670,
+                "name": "proxy",
+                "cpu_pct": 89.21692140769056
+              },
+              {
+                "tid": 1276671,
+                "name": "proxy",
+                "cpu_pct": 91.11728184126244
+              },
+              {
+                "tid": 1276672,
+                "name": "admin",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1276673,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1276674,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              }
+            ],
+            "total_cpu_pct": 358.26795121339416,
+            "client_exit": 0
+          }
+        }
+      ],
+      "runtime_env": {
+        "DMESH_SHARDED": null,
+        "DMESH_NUM_WORKERS": "2",
+        "DMESH_BUSY_POLL": "1",
+        "LINKERD2_PROXY_CORES": "4"
+      },
+      "process_stop": {
+        "ok": true,
+        "processes": [
+          {
+            "role": "proxy",
+            "pid": 1276667,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": 0,
+            "ok": true
+          },
+          {
+            "role": "mock-policy",
+            "pid": 1276664,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          },
+          {
+            "role": "mock-destination",
+            "pid": 1276663,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          },
+          {
+            "role": "mock-identity",
+            "pid": 1276661,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          }
+        ]
+      },
+      "shared_context_created": 1,
+      "shared_context_destroyed": 1,
+      "retained_live_resources": false,
+      "host_stop": "{\"event\": \"servers_stopped\", \"exits\": [0, 0], \"cleanup_ok\": true, \"stopped\": true}"
+    },
+    {
+      "name": "w2-event",
+      "drivers": 2,
+      "busy_poll": false,
+      "runs": [
+        {
+          "repeat": "1",
+          "ok": true,
+          "completed": 413425,
+          "qps": 41342.5,
+          "workers": [
+            {
+              "worker": 0,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 156.97046388157216,
+              "client_cpu_sample_seconds": 9.999167112,
+              "measurement_start": "2026-09-29T08:26:25.128272+09:00",
+              "measurement_end": "2026-09-29T08:26:35.128272+09:00",
+              "completed": 206523,
+              "total_completed_including_warmup_and_drain": 269482,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 20652.3,
+              "latency_mean_us": 12392.19409706425,
+              "latency_p50_us": 12285.238,
+              "latency_p99_us": 18986.284
+            },
+            {
+              "worker": 1,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 155.66663942098876,
+              "client_cpu_sample_seconds": 10.000399609,
+              "measurement_start": "2026-09-29T08:26:25.128272+09:00",
+              "measurement_end": "2026-09-29T08:26:35.128272+09:00",
+              "completed": 206902,
+              "total_completed_including_warmup_and_drain": 268683,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 20690.2,
+              "latency_mean_us": 12371.896627886632,
+              "latency_p50_us": 12283.349,
+              "latency_p99_us": 18920.559
+            }
+          ],
+          "cpu": {
+            "duration": 9.999609074002365,
+            "threads": [
+              {
+                "tid": 1277085,
+                "name": "linkerd2-proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1277086,
+                "name": "proxy",
+                "cpu_pct": 92.60362011625786
+              },
+              {
+                "tid": 1277087,
+                "name": "proxy",
+                "cpu_pct": 92.50361620684505
+              },
+              {
+                "tid": 1277088,
+                "name": "proxy",
+                "cpu_pct": 92.60362011625786
+              },
+              {
+                "tid": 1277089,
+                "name": "proxy",
+                "cpu_pct": 92.60362011625786
+              },
+              {
+                "tid": 1277090,
+                "name": "admin",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1277091,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1277092,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              }
+            ],
+            "total_cpu_pct": 370.3144765556186,
+            "client_exit": 0
+          }
+        },
+        {
+          "repeat": "2",
+          "ok": false,
+          "failure_results": [
+            {
+              "event": "result",
+              "ok": false,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 0,
+              "client_process_cpu_pct": 0,
+              "client_cpu_sample_seconds": 0,
+              "measurement_start": "0001-01-01T00:00:00Z",
+              "measurement_end": "0001-01-01T00:00:00Z",
+              "completed": 0,
+              "total_completed_including_warmup_and_drain": 0,
+              "rpc_errors": 1,
+              "native_dials": [
+                1
+              ],
+              "reconnects": 0,
+              "qps": 0,
+              "latency_mean_us": 0,
+              "latency_p50_us": 0,
+              "latency_p99_us": 0,
+              "error": "connection 1 preflight: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing: input/output error\""
+            },
+            {
+              "event": "result",
+              "ok": false,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 0,
+              "client_process_cpu_pct": 0,
+              "client_cpu_sample_seconds": 0,
+              "measurement_start": "0001-01-01T00:00:00Z",
+              "measurement_end": "0001-01-01T00:00:00Z",
+              "completed": 0,
+              "total_completed_including_warmup_and_drain": 0,
+              "rpc_errors": 1,
+              "native_dials": [
+                1
+              ],
+              "reconnects": 0,
+              "qps": 0,
+              "latency_mean_us": 0,
+              "latency_p50_us": 0,
+              "latency_p99_us": 0,
+              "error": "connection 1 preflight: rpc error: code = Canceled desc = context canceled while waiting for connections to become ready"
+            }
+          ]
+        }
+      ],
+      "runtime_env": {
+        "DMESH_SHARDED": null,
+        "DMESH_NUM_WORKERS": "2",
+        "DMESH_BUSY_POLL": "0",
+        "LINKERD2_PROXY_CORES": "4"
+      },
+      "process_stop": {
+        "ok": true,
+        "processes": [
+          {
+            "role": "proxy",
+            "pid": 1277085,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": 0,
+            "ok": true
+          },
+          {
+            "role": "mock-policy",
+            "pid": 1277082,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          },
+          {
+            "role": "mock-destination",
+            "pid": 1277081,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          },
+          {
+            "role": "mock-identity",
+            "pid": 1277079,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          }
+        ]
+      },
+      "shared_context_created": 1,
+      "shared_context_destroyed": 0,
+      "retained_live_resources": true,
+      "host_stop": "{\"event\": \"servers_stopped\", \"exits\": [1, 1], \"cleanup_ok\": true, \"stopped\": true}"
+    },
+    {
+      "name": "w2-event-confirm",
+      "drivers": 2,
+      "busy_poll": false,
+      "runs": [
+        {
+          "repeat": "1",
+          "ok": true,
+          "completed": 414934,
+          "qps": 41493.4,
+          "workers": [
+            {
+              "worker": 0,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 155.36091815458795,
+              "client_cpu_sample_seconds": 9.999345514,
+              "measurement_start": "2026-09-29T08:31:13.280948+09:00",
+              "measurement_end": "2026-09-29T08:31:23.280948+09:00",
+              "completed": 206460,
+              "total_completed_including_warmup_and_drain": 268799,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 20646,
+              "latency_mean_us": 12396.004418628305,
+              "latency_p50_us": 12313.962,
+              "latency_p99_us": 18883.783
+            },
+            {
+              "worker": 1,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 157.96827113547883,
+              "client_cpu_sample_seconds": 10.000836172,
+              "measurement_start": "2026-09-29T08:31:13.280948+09:00",
+              "measurement_end": "2026-09-29T08:31:23.280948+09:00",
+              "completed": 208474,
+              "total_completed_including_warmup_and_drain": 270874,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 20847.4,
+              "latency_mean_us": 12283.921161991422,
+              "latency_p50_us": 12174.619,
+              "latency_p99_us": 18779.309
+            }
+          ],
+          "cpu": {
+            "duration": 10.000027226982638,
+            "threads": [
+              {
+                "tid": 1278640,
+                "name": "linkerd2-proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1278641,
+                "name": "proxy",
+                "cpu_pct": 92.3997484233654
+              },
+              {
+                "tid": 1278642,
+                "name": "proxy",
+                "cpu_pct": 92.3997484233654
+              },
+              {
+                "tid": 1278643,
+                "name": "proxy",
+                "cpu_pct": 92.4997481510963
+              },
+              {
+                "tid": 1278644,
+                "name": "proxy",
+                "cpu_pct": 92.59974787882722
+              },
+              {
+                "tid": 1278645,
+                "name": "admin",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1278646,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1278647,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              }
+            ],
+            "total_cpu_pct": 369.8989928766543,
+            "client_exit": 0
+          }
+        },
+        {
+          "repeat": "2",
+          "ok": true,
+          "completed": 426953,
+          "qps": 42695.3,
+          "workers": [
+            {
+              "worker": 0,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 161.31193667477004,
+              "client_cpu_sample_seconds": 9.998680403,
+              "measurement_start": "2026-09-29T08:31:29.900005+09:00",
+              "measurement_end": "2026-09-29T08:31:39.900005+09:00",
+              "completed": 214328,
+              "total_completed_including_warmup_and_drain": 279275,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 21432.8,
+              "latency_mean_us": 11948.984458731476,
+              "latency_p50_us": 11799.6,
+              "latency_p99_us": 18551.142
+            },
+            {
+              "worker": 1,
+              "event": "result",
+              "ok": true,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 10,
+              "client_process_cpu_pct": 160.25677828713563,
+              "client_cpu_sample_seconds": 9.999948939,
+              "measurement_start": "2026-09-29T08:31:29.900005+09:00",
+              "measurement_end": "2026-09-29T08:31:39.900005+09:00",
+              "completed": 212625,
+              "total_completed_including_warmup_and_drain": 276578,
+              "rpc_errors": 0,
+              "native_dials": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "reconnects": 0,
+              "qps": 21262.5,
+              "latency_mean_us": 12037.10271527337,
+              "latency_p50_us": 11862.076,
+              "latency_p99_us": 18610.209
+            }
+          ],
+          "cpu": {
+            "duration": 10.000817901018308,
+            "threads": [
+              {
+                "tid": 1278640,
+                "name": "linkerd2-proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1278641,
+                "name": "proxy",
+                "cpu_pct": 91.89248410436761
+              },
+              {
+                "tid": 1278642,
+                "name": "proxy",
+                "cpu_pct": 91.99247592602634
+              },
+              {
+                "tid": 1278643,
+                "name": "proxy",
+                "cpu_pct": 91.99247592602634
+              },
+              {
+                "tid": 1278644,
+                "name": "proxy",
+                "cpu_pct": 91.99247592602634
+              },
+              {
+                "tid": 1278645,
+                "name": "admin",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1278646,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              },
+              {
+                "tid": 1278647,
+                "name": "proxy",
+                "cpu_pct": 0.0
+              }
+            ],
+            "total_cpu_pct": 367.8699118824467,
+            "client_exit": 0
+          }
+        },
+        {
+          "repeat": "3",
+          "ok": false,
+          "failure_results": [
+            {
+              "event": "result",
+              "ok": false,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 0,
+              "client_process_cpu_pct": 0,
+              "client_cpu_sample_seconds": 0,
+              "measurement_start": "0001-01-01T00:00:00Z",
+              "measurement_end": "0001-01-01T00:00:00Z",
+              "completed": 0,
+              "total_completed_including_warmup_and_drain": 0,
+              "rpc_errors": 1,
+              "native_dials": [
+                1
+              ],
+              "reconnects": 0,
+              "qps": 0,
+              "latency_mean_us": 0,
+              "latency_p50_us": 0,
+              "latency_p99_us": 0,
+              "error": "connection 1 preflight: rpc error: code = Unavailable desc = connection error: desc = \"transport: Error while dialing: input/output error\""
+            },
+            {
+              "event": "result",
+              "ok": false,
+              "connections": 4,
+              "concurrency": 256,
+              "concurrency_per_conn": [
+                64,
+                64,
+                64,
+                64
+              ],
+              "payload_bytes": 64,
+              "warmup_seconds": 3,
+              "duration_seconds": 10,
+              "elapsed_secs": 0,
+              "client_process_cpu_pct": 0,
+              "client_cpu_sample_seconds": 0,
+              "measurement_start": "0001-01-01T00:00:00Z",
+              "measurement_end": "0001-01-01T00:00:00Z",
+              "completed": 0,
+              "total_completed_including_warmup_and_drain": 0,
+              "rpc_errors": 1,
+              "native_dials": [
+                1
+              ],
+              "reconnects": 0,
+              "qps": 0,
+              "latency_mean_us": 0,
+              "latency_p50_us": 0,
+              "latency_p99_us": 0,
+              "error": "connection 1 preflight: rpc error: code = Canceled desc = context canceled while waiting for connections to become ready"
+            }
+          ]
+        }
+      ],
+      "runtime_env": {
+        "DMESH_SHARDED": null,
+        "DMESH_NUM_WORKERS": "2",
+        "DMESH_BUSY_POLL": "0",
+        "LINKERD2_PROXY_CORES": "4"
+      },
+      "process_stop": {
+        "ok": true,
+        "processes": [
+          {
+            "role": "proxy",
+            "pid": 1278640,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": 0,
+            "ok": true
+          },
+          {
+            "role": "mock-policy",
+            "pid": 1278637,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          },
+          {
+            "role": "mock-destination",
+            "pid": 1278636,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          },
+          {
+            "role": "mock-identity",
+            "pid": 1278634,
+            "sigterm_sent": true,
+            "stopped": true,
+            "exit": -15,
+            "ok": true
+          }
+        ]
+      },
+      "shared_context_created": 1,
+      "shared_context_destroyed": 0,
+      "retained_live_resources": true,
+      "host_stop": "{\"event\": \"servers_stopped\", \"exits\": [1, 1], \"cleanup_ok\": true, \"stopped\": true}"
+    }
+  ],
+  "identity": {
+    "repo_head": "b60712998e8b0747fb62f2195716aeeeab6faffb",
+    "proxy_head": "c09915bfb38cbb8401b4d9136194923a6d23edd2",
+    "working_tree_contains_uncommitted_global_dpa_context": true,
+    "sha256": {
+      "linkerd2-proxy/target/release/linkerd2-proxy": "5a778f2e443a15b0a96c2daa5e2199ae2b7417fa91474fee6b87bffb7ac09971",
+      "src/transport/build/device/dpa_kernel.a": "87116cddb3d43d9834700e077d049c73b80b6f111a1f75e6846dda12dcb4441b",
+      "/tmp/dmesh-unsharded-20260928/source.tar.gz": "299914ce997c5c37dc62182d4756565e1d7319c37f1fc38c5b35c39026f4c1ee"
+    },
+    "host_sha256": "9690669019e98104c78c44a29ccbb09207b5a89529c63426805685b80691b8db  /tmp/dmesh-unsharded-20260928/channel-bench\nefaf23c20374fcefb3955521713425775f8246b1a3a01aea2404600a2299b046  /tmp/dmesh-unsharded-20260928/source/build/lib/libdpumesh.so.5\n"
+  },
+  "successful_measurement_rpc_total": 2667396,
+  "failed_runs": [
+    {
+      "case": "w2-event",
+      "repeat": "2"
+    },
+    {
+      "case": "w2-event-confirm",
+      "repeat": "3"
+    }
+  ]
+}

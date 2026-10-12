@@ -20,9 +20,6 @@ export LINKERD2_PROXY_INBOUND_DEFAULT_POLICY=all-unauthenticated
 export LINKERD2_PROXY_DOCA_DEV_PCI_ADDR=${DPU_PCI:-03:00.0} LINKERD2_PROXY_DOCA_REP_PCI_ADDR=${REP_PCI:-94:00.0}
 export LINKERD2_PROXY_DOCA_SERVER_NAME=${DPUMESH_SERVER:-DPUMeshBench0}
 export LINKERD2_PROXY_CORES=1 DMESH_NUM_WORKERS=${DMESH_NUM_WORKERS:-1} DMESH_SHARDED=1 DMESH_BUSY_POLL=${DMESH_BUSY_POLL:-1}
-# DPA thread placement (transport default 0). A node whose other PF runs
-# another DPA job needs a disjoint range, e.g. 64.
-export DPUMESH_DPA_EU_BASE=${DPUMESH_DPA_EU_BASE:-0}
 # Service profiles stay at the dev default (127.0.0.0/24): the bench service
 # 10.99.1.60 gets no profile lookup, as in the 2026-09-25 measurement. Set
 # LINKERD2_PROXY_DESTINATION_PROFILE_NETWORKS to include it to measure that.

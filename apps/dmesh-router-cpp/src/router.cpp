@@ -277,8 +277,8 @@ int Channel::pump_recv() {
             continue;
         }
         const ssize_t rv = nghttp2_session_mem_recv(session_, rx_base_ + pos, len);
-        rx_wm_ = pos + len; // fully consumed by mem_recv: DPA may reuse staging up to here
-        rx_wm_dirty_ = true;
+        dpu_rx_consumed_pos_ = pos + len; // fully consumed by mem_recv: DPA may reuse staging up to here
+        dpu_rx_consumed_pos_changed_ = true;
         if (rv < 0) {
             log_warn("slot %d: nghttp2 recv failed: %s", slot_, nghttp2_strerror(rv));
             failed_ = true;
@@ -309,9 +309,9 @@ bool Channel::pump_send() {
         return false;
     }
     wire();
-    if (rx_wm_dirty_) {
-        rx_wm_dirty_ = false;
-        dmesh_doca_conn_rx_watermark(objs_, slot_, rx_wm_);
+    if (dpu_rx_consumed_pos_changed_) {
+        dpu_rx_consumed_pos_changed_ = false;
+        dmesh_doca_conn_update_dpu_rx_consumed_pos(objs_, slot_, dpu_rx_consumed_pos_);
     }
 
     // Publish first: anything already staged frees room for this round.

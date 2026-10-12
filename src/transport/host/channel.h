@@ -45,6 +45,7 @@ struct channel_conn_config {
 	uint16_t src_port;      /* Host order, as the DPU expects */
 	uint16_t dst_port;      /* Host order, as the DPU expects */
 	uint32_t mode;          /* CHANNEL_MODE_* */
+	uint32_t backend_worker, backend_token; /* DPU-requested backend, zero token for client */
 	struct channel_mem *tx;    /* Shared registered TX pool */
 	struct channel_mem *rx;    /* Registered RX region */
 	size_t rx_offset;       /* This connection's window inside rx */
@@ -57,10 +58,13 @@ void channel_dev_close(struct channel_dev *dev);
 int channel_session_open(struct channel_dev *dev, const char *server);
 /* Close all retained flows before stopping Comch. Failure retains DMA resources. */
 int channel_session_close(struct channel_dev *dev);
+/* Register a service without allocating backend flows. Requests are consumed
+ * outside control callbacks; completion retains errors until Comch accepts. */
+int channel_session_listen(struct channel_dev *, uint32_t ip, uint16_t port);
+int channel_backend_next(struct channel_dev *, uint32_t *worker, uint32_t *token);
+void channel_backend_finish(struct channel_dev *, uint32_t worker, uint32_t token, int error);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);
-/* Progress the channel's shared Comch control session once per drain pass. */
-int channel_dev_progress(struct channel_dev *dev);
 /* Idle wake. The fd is readable after channel_dev_arm when a control message
  * (DOORBELL, CLOSED, ERROR) arrives. channel_dev_arm first sends one ARM for
  * the push flows, so the DPU rings for descriptors this host has not read.
@@ -84,9 +88,11 @@ int channel_conn_close(struct channel_conn *conn);
 /* Progresses the control path (and the reverse completions on the host-dpa reverse path).
  * Returns 1 for CLOSED, -1 with errno for flow/session failure, otherwise 0. */
 int channel_conn_progress(struct channel_conn *conn);
-/* Read the flow status and progress its private reverse PE. Call after
- * channel_dev_progress; this never progresses the shared control PE again. */
-int channel_conn_status(struct channel_conn *conn);
+/* Batch pollers progress the shared session once, then inspect each flow and
+ * progress only its private reverse engine. Session errors remain visible to
+ * every flow even if another poller performed the shared progress. */
+int channel_dev_progress(struct channel_dev *dev);
+int channel_conn_poll(struct channel_conn *conn);
 
 /* Doorbells: private reverse-completion engines only. The shared control PE
  * is serialized and polled through the carrier fallback tick. Returns the

@@ -10,6 +10,9 @@ struct objects;
 struct dmesh_conn;
 struct doca_dma_task_memcpy;
 
+/* Source bytes may be reused only up to this successful completion prefix. */
+doca_error_t dmesh_dma_tx_completed(struct dmesh_conn *conn, uint64_t *bytes);
+
 /* Size of the local DMA buffer allocated on the DPU for PCI export. */
 #define BUFFER_SIZE (1024 * 1024)
 

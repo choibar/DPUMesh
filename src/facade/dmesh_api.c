@@ -172,7 +172,12 @@ int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
         return n;
     }
     dpumesh_eq_arm(eq);
-    if (dpumesh_eq_drain(eq) <= 0) return 0;
+    if (dpumesh_eq_drain(eq) <= 0) {
+        /* Events that landed before a loss are delivered first. */
+        int lost = dpumesh_lost(eq->ch->ctx);
+        if (lost) { errno = lost; return -1; }
+        return 0;
+    }
     return poll_eq_once(eq, events, max_events);
 }
 

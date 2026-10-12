@@ -1,12 +1,16 @@
 // gRPC echo server over the DPUMesh host API: one listener for the process's
-// DPUMESH_SERVICE target; the library keeps DPUMESH_BACKEND_POOL spare backend
-// flows for the DPU proxy to claim, one per client stream. Serves the
+// DPUMESH_SERVICE target; the DPU creates one backend flow per worker on demand,
+// shared by that worker's client streams. Serves the
 // raw-codec echo RPC (bench.MethodPing).
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -24,7 +28,22 @@ func main() {
 	s := grpc.NewServer(grpc.ForceServerCodec(bench.RawCodec{}), grpc.ConnectionTimeout(24*time.Hour))
 	bench.RegisterEcho(s)
 	log.Printf("bench-server: serving %s", service)
-	if err := s.Serve(lis); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(lis) }()
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		s.Stop()
+		err = <-done
+	}
+	s.Stop()
+	if errors.Is(err, grpc.ErrServerStopped) {
+		err = nil
+	}
+	err = errors.Join(err, lis.Close(), dmeshgo.CloseTransport())
+	if err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 }
