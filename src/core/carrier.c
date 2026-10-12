@@ -59,6 +59,7 @@ struct dmesh_native_transport {
     int pod_id, service_id, backend_max;
     uint16_t next_uport;
     pthread_mutex_t lock;
+    int lost;                          /* sticky errno of a failed session; it never recovers */
     uint32_t active_stripes;
     struct slot slots[SLOTS];
     uint16_t port_slot[65536];         /* port -> slot index + 1 */
@@ -72,6 +73,12 @@ static int env_int(const char *name, int fallback, int lo, int hi)
     return v < lo || v > hi ? fallback : v;
 }
 static int slot_index(const struct dmesh_native_transport *t, const struct slot *s) { return (int)(s - t->slots); }
+static void note_lost(struct dmesh_native_transport *t, int error)
+{
+    int none = 0;
+    (void)__atomic_compare_exchange_n(&t->lost, &none, error ? error : EIO, 0,
+                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
 
 /* Opens one flow on a free slot. Caller holds t->lock. */
 static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t mode,
@@ -242,6 +249,13 @@ int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int se
     if (!s) { pthread_mutex_unlock(&t->lock); errno = ENOSPC; return -1; }
     int rc = slot_open(t, s, CHANNEL_MODE_CLIENT_DPU_DMA, port, service_id, 0, 0);
     pthread_mutex_unlock(&t->lock);
+    if (rc != 0) {
+        /* A dial is often the first to meet a dead session: an idle client
+         * progresses nothing in between. */
+        int saved = errno;
+        if (channel_dev_progress(t->dev) != 0) note_lost(t, errno);
+        errno = saved;
+    }
     return rc;
 }
 int dmesh_native_disconnect(struct dmesh_native_transport *t, uint16_t port)
@@ -306,9 +320,13 @@ static void fill_ack(struct slot *s, struct dmesh_native_event *e, uint16_t seq)
 }
 uint32_t dmesh_native_progress(struct dmesh_native_transport *t)
 {
-    if (channel_dev_progress(t->dev) == 0 && t->service_id != DMESH_SVC_NONE)
-        backend_progress(t);
+    if (channel_dev_progress(t->dev) != 0) note_lost(t, errno);
+    else if (t->service_id != DMESH_SVC_NONE) backend_progress(t);
     return __atomic_load_n(&t->active_stripes, __ATOMIC_ACQUIRE);
+}
+int dmesh_native_lost(struct dmesh_native_transport *t)
+{
+    return __atomic_load_n(&t->lost, __ATOMIC_ACQUIRE);
 }
 int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e)
 {

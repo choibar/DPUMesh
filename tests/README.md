@@ -10,6 +10,7 @@
 | `native_core_transport_test` | Channel, EQ, QP, reservation, custody ACK, held RX buffers, FIN and teardown over the memory carrier in `support/` |
 | `native_writable_test` | Writable-buffer accounting of the core |
 | `native_polling_test` | Repeated custody ACKs permit sleeping by default; an explicit spin window remains available |
+| `native_loss_test` | A lost session ends the process with status 75 by default; with `DPUMESH_EXIT_ON_LOSS=0` polls and dials report the sticky errno and EQ fds stay readable |
 | `rx_consumed_pos_test` | Production proxy shim: DPU RX consumed-position batching under the DPA SDK lock, failed-copy retry and multiple staging wraps |
 | `carrier_logic_test` | Forward chunking to the DPUMesh copy rule and the in-order release window of the carrier |
 | `service_resolve_test` | Service target grammar, DNS answer caching and invalidation, address ids, fail-closed `DPUMESH_TARGETS` membership |
