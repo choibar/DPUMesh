@@ -32,7 +32,7 @@ exports rcv_ring + tx_staging instead of pushing).
 
 | API | Carrier |
 |---|---|
-| `dmesh_create_channel` | Opens the PCI device and one Comch client/PE, completes HELLO, registers one TX pool and one RX region (32 windows of 1 MiB). A server channel resolves its `DPUMESH_SERVICE` target once and keeps `DPUMESH_BACKEND_POOL` unclaimed BACKEND flows open, each under a fresh upstream port, up to `DPUMESH_BACKEND_MAX` flows in total; a flow is replaced as soon as a stream claims it, so the DPU connector always finds a ready backend. |
+| `dmesh_create_channel` | Opens the PCI device and one Comch client/PE, completes HELLO, registers one TX pool and one RX region (32 windows of 1 MiB). A server channel resolves its `DPUMESH_SERVICE` target and registers a listener without data flows. The DPU requests a BACKEND flow on first use of each `(worker, replica)` pair; the Host opens it with the requested worker/token. Client flows on that worker share its H2 connection. `DPUMESH_BACKEND_MAX` limits total backend flows within the shared 32-slot channel. |
 | `dmesh_create_qp` | Sends flow-tagged OPEN on the channel session and waits for READY. Opens an `INGRESS_PUSH` flow: source `DPUMESH_POD_IP` and the QP port, destination the address DNS gives for the `<host>:<port>` target ([naming](API.md#naming)), `DPUMESH_WORKLOAD` as identity label. |
 | inbound stream | The first push batch on a BACKEND flow enters the core's accept queue under that flow's upstream port. After the stream closes, the flow reopens under a new port. |
 | `dmesh_post_send` | The descriptor's TX-pool range is posted to the flow's forward ring as one or two DPUMesh descriptors (a multiple of 128 bytes plus a remainder of at most 128 bytes, each at most 8064 bytes). |
@@ -43,21 +43,19 @@ exports rcv_ring + tx_staging instead of pushing).
 
 ### DPU-side guarantees
 
-On push flows, the proxy retains its staged source bytes until both the data
-DMA and descriptor DMA have completed. The C shim reports those bytes to the
-Rust writer only then; reporting submission as completion would let a large
-write wrap around staging and overwrite a DMA source still in use. A failed
-descriptor submission fails the flow instead of silently losing accepted data.
+Submission never frees a DMA source. The forward ring's `consumer_head` (the
+custody ACK) and the proxy's reverse `completed_bytes` advance only on the
+copy's CQE, and on push flows `pushed_bytes` advances only after both the data
+DMA and the descriptor DMA have completed. The proxy writer gets its staging
+back through that completion cursor (`dmesh_doca_conn_tx_completed`), not
+through the bytes `send_staged` accepted. A failed descriptor submission fails
+the flow instead of silently losing accepted data.
 
-The DPU forward poller also releases its EU periodically using DPUmesh's
-same-EU helper and notification handoff. Descriptor head, issued DMA count and
-deferred producer reports survive rescheduling. The trigger completion detaches
-before stopping the helper; its resume handle stays alive until the helper
-stops. Failed cleanup retains resources for retry.
-An infinite polling activation violates the SDK's scheduled kernel time limit.
-`DPUMESH_DPA_EU_BASE` selects the DPU pool's first fixed EU (library default 0).
-Choose a free range when another DPA process shares the device; fixed affinity
-does not reserve EUs. The Boutique bench profile uses 64 on the test node.
+Every activation of the DPU forward poller is bounded and ends with a
+retrigger (`device/dpa_kernel.c`); an infinite polling activation violates the
+SDK's scheduled kernel time limit. DPA threads are not pinned: the DPA
+scheduler places them. The `DPUMESH_DPA_EU_*` variables of earlier builds are
+ignored.
 
 ### Readiness: no background thread
 
@@ -71,9 +69,12 @@ doorbells of the stripes it owns, and the spare set: the doorbells of the
 spare backend flows and the channel's wake fd. A stripe's doorbell is the
 carrier's per-slot epoll of the private reverse MsgQ notification fd in
 host-dpa mode; the core moves it from the spare set to the owning EQ at
-connect/accept and back at free. The shared control PE is progressed once per
-drain pass, under a channel mutex, before checking individual flow status. Its
-notification fd is the channel's wake fd. No control thread is added.
+connect/accept and back at free. A drain snapshots active stripes, including
+closed flows awaiting custody/FIN retirement, and skips unused stripes. It
+progresses the shared control PE once per pass under a channel mutex; each
+flow then observes the retained session error and advances its private
+reverse engine. The control PE's notification fd is the channel's wake fd.
+No control thread is added.
 
 Each empty poll chooses the next wake (`dpumesh_eq_arm`). After work, the EQ
 re-polls on the nap timer, doubling from `DPUMESH_NAP_US` (10) to
@@ -91,9 +92,12 @@ Three things have no completion doorbell, and each gets a wake:
   the session message `ARM` listing, per push flow, the next descriptor
   sequence the host has not read. The DPU sends `DOORBELL` at once if a listed
   flow already published that sequence, otherwise after its next descriptor
-  completion. At most one ARM is outstanding per channel; a DOORBELL releases
-  it and restarts the naps, since its descriptor may become visible after the
-  message. Plan and race argument: `docs/2026-09-30_host-wait-doorbell-plan.md`.
+  completion. On a DPU whose Comch sessions belong to the dispatcher (the
+  proxy), the dispatcher hands each listed flow's sequence to the flow's
+  worker, which rings through its control reply queue; the dispatcher sends
+  one DOORBELL per ARM. At most one ARM is outstanding per channel; a DOORBELL
+  releases it and restarts the naps, since its descriptor may become visible
+  after the message. Plan and race argument: `docs/2026-09-30_host-wait-doorbell-plan.md`.
 - **Control messages** (DOORBELL, CLOSED, ERROR) raise the control PE's
   notification fd once `idle_arm` requested it; the drain pass progresses it.
   The control PE runs in `DOCA_PE_EVENT_MODE_PROGRESS_ALL`: in the selective
@@ -115,7 +119,7 @@ process per function) and its vhca needs a DPA EU partition on the DPU
 exports on that device, gets one DPA thread + msgq (its own progress engine)
 and the same `poll_desc_ring` kernel the DPU runs forward; completions arrive
 as msgq messages and the application's releases feed the kernel's staging gate
-(`rd_pos`, published every 64 KiB). The dpacc host stub is compiled with
+(`rx_consumed_pos`, published every 64 KiB). The dpacc host stub is compiled with
 `-fPIC` so `dpa_kernel.a` links into the shared library (root `Makefile`).
 A host SF cannot create the DPA process itself (refused by the firmware), but
 `DPUMESH_HOST_DPA_DEV=<ibdev of the SF>` runs the official extended-context flow:
@@ -218,8 +222,9 @@ placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`),
 `DPUMESH_POD_IP`, `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
 `DPUMESH_SERVICE` (the `<host>:<port>` target a server serves),
 `DPUMESH_TARGETS` (the targets the preload shim carries),
-`DPUMESH_BACKEND_POOL` (spare flows, default 8), `DPUMESH_BACKEND_MAX`
-(default 16). `DPUMESH_NAP_US` (10), `DPUMESH_NAP_CAP_US` (100),
+`DPUMESH_BACKEND_MAX`
+(demand-created flows, default 32; outgoing flows share the same capacity).
+`DPUMESH_NAP_US` (10), `DPUMESH_NAP_CAP_US` (100),
 `DPUMESH_LINGER_US` (1000) and `DPUMESH_BACKSTOP_MS` (200) set the idle wake;
 `DPUMESH_SPIN_US` and `DPUMESH_TICK_US` are ignored with a warning.
 `DPUMESH_WAIT_STATS` names a directory for the idle-wake counters. `DPUMESH_CARRIER_TRACE` and `DPUMESH_CORE_TRACE` print flow,

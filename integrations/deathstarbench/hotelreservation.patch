@@ -1,0 +1,1063 @@
+diff --git a/cmd/attractions/main.go b/cmd/attractions/main.go
+index 1894b30..f97aef6 100644
+--- a/cmd/attractions/main.go
++++ b/cmd/attractions/main.go
+@@ -3,9 +3,9 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"strconv"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -17,12 +17,14 @@ import (
+ 	"github.com/rs/zerolog/log"
+ 
+ 	"time"
+-	"syscall"
+ 	// "github.com/bradfitz/gomemcache/memcache"
+ )
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -53,6 +55,9 @@ func main() {
+ 	// log.Info().Msg("Successfull")
+ 
+ 	serv_port, _ := strconv.Atoi(result["AttractionsPort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		serv_port, _ = strconv.Atoi(po)
++	}
+ 	serv_ip := result["AttractionsIP"]
+ 	log.Info().Msgf("Read target port: %v", serv_port)
+ 	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
+@@ -88,15 +93,9 @@ func main() {
+ 		MongoClient: mongo_session,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/frontend/main.go b/cmd/frontend/main.go
+index b425e98..47babb5 100644
+--- a/cmd/frontend/main.go
++++ b/cmd/frontend/main.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+ 	"strconv"
+@@ -18,6 +19,9 @@ import (
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -33,6 +37,9 @@ func main() {
+ 	json.Unmarshal([]byte(byteValue), &result)
+ 
+ 	servPort, _ := strconv.Atoi(result["FrontendPort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["FrontendIP"]
+ 	knativeDNS := result["KnativeDomainName"]
+ 
+@@ -65,5 +72,8 @@ func main() {
+ 	}
+ 
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, nil); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/geo/main.go b/cmd/geo/main.go
+index e0351ca..a82b242 100644
+--- a/cmd/geo/main.go
++++ b/cmd/geo/main.go
+@@ -3,12 +3,11 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"strconv"
+ 	"time"
+-	"syscall"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/geo"
+@@ -20,6 +19,9 @@ import (
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -40,6 +42,9 @@ func main() {
+ 	defer mongoClose()
+ 
+ 	servPort, _ := strconv.Atoi(result["GeoPort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["GeoIP"]
+ 
+ 	var (
+@@ -70,15 +75,9 @@ func main() {
+ 		MongoClient: mongoClient,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/profile/main.go b/cmd/profile/main.go
+index 6e7ab1e..5951ad6 100644
+--- a/cmd/profile/main.go
++++ b/cmd/profile/main.go
+@@ -3,12 +3,11 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"strconv"
+ 	"time"
+-	"syscall"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/profile"
+@@ -20,6 +19,9 @@ import (
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -45,6 +47,9 @@ func main() {
+ 	log.Info().Msg("Success")
+ 
+ 	servPort, _ := strconv.Atoi(result["ProfilePort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["ProfileIP"]
+ 
+ 	var (
+@@ -76,15 +81,9 @@ func main() {
+ 		MemcClient:  memcClient,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/rate/main.go b/cmd/rate/main.go
+index 7b79dab..4e31c32 100644
+--- a/cmd/rate/main.go
++++ b/cmd/rate/main.go
+@@ -3,9 +3,9 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"strconv"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -16,11 +16,13 @@ import (
+ 	"github.com/rs/zerolog/log"
+ 
+ 	"time"
+-	"syscall"
+ )
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -46,6 +48,9 @@ func main() {
+ 	log.Info().Msg("Success")
+ 
+ 	servPort, _ := strconv.Atoi(result["RatePort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["RateIP"]
+ 
+ 	var (
+@@ -77,15 +82,9 @@ func main() {
+ 		MemcClient:  memcClient,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/recommendation/main.go b/cmd/recommendation/main.go
+index 21ac20f..af57aa7 100644
+--- a/cmd/recommendation/main.go
++++ b/cmd/recommendation/main.go
+@@ -3,11 +3,10 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"time"
+-	"syscall"
+ 
+ 	"strconv"
+ 
+@@ -21,6 +20,9 @@ import (
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -41,6 +43,9 @@ func main() {
+ 	defer mongoClose()
+ 
+ 	servPort, _ := strconv.Atoi(result["RecommendPort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["RecommendIP"]
+ 
+ 	var (
+@@ -71,15 +76,9 @@ func main() {
+ 		MongoClient: mongoClient,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/reservation/main.go b/cmd/reservation/main.go
+index 6b8b8ff..1da528c 100644
+--- a/cmd/reservation/main.go
++++ b/cmd/reservation/main.go
+@@ -3,12 +3,11 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"strconv"
+ 	"time"
+-	"syscall"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/reservation"
+@@ -20,6 +19,9 @@ import (
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -45,6 +47,9 @@ func main() {
+ 	log.Info().Msg("Success")
+ 
+ 	servPort, _ := strconv.Atoi(result["ReservePort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["ReserveIP"]
+ 
+ 	var (
+@@ -76,15 +81,9 @@ func main() {
+ 		MemcClient:  memcClient,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/review/main.go b/cmd/review/main.go
+index f862b63..e6b1d59 100644
+--- a/cmd/review/main.go
++++ b/cmd/review/main.go
+@@ -3,9 +3,9 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"strconv"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -17,12 +17,14 @@ import (
+ 	"github.com/rs/zerolog/log"
+ 
+ 	"time"
+-	"syscall"
+ 	// "github.com/bradfitz/gomemcache/memcache"
+ )
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -53,6 +55,9 @@ func main() {
+ 	log.Info().Msg("Successfull")
+ 
+ 	serv_port, _ := strconv.Atoi(result["ReviewPort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		serv_port, _ = strconv.Atoi(po)
++	}
+ 	serv_ip := result["ReviewIP"]
+ 	log.Info().Msgf("Read target port: %v", serv_port)
+ 	log.Info().Msgf("Read consul address: %v", result["consulAddress"])
+@@ -89,15 +94,9 @@ func main() {
+ 		MemcClient:  memc_client,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/search/main.go b/cmd/search/main.go
+index ea005a5..0baca82 100644
+--- a/cmd/search/main.go
++++ b/cmd/search/main.go
+@@ -3,11 +3,10 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"time"
+-	"syscall"
+ 
+ 	"strconv"
+ 
+@@ -21,6 +20,9 @@ import (
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+ 	log.Info().Msg("Reading config...")
+@@ -37,6 +39,9 @@ func main() {
+ 	json.Unmarshal([]byte(byteValue), &result)
+ 
+ 	servPort, _ := strconv.Atoi(result["SearchPort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["SearchIP"]
+ 	knativeDNS := result["KnativeDomainName"]
+ 
+@@ -69,15 +74,9 @@ func main() {
+ 		Registry:   registry,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/cmd/user/main.go b/cmd/user/main.go
+index b2bb32e..0c98c36 100644
+--- a/cmd/user/main.go
++++ b/cmd/user/main.go
+@@ -3,12 +3,11 @@ package main
+ import (
+ 	"encoding/json"
+ 	"flag"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/ioutil"
+ 	"os"
+-	"os/signal"
+ 	"strconv"
+ 	"time"
+-	"syscall"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/services/user"
+@@ -20,6 +19,9 @@ import (
+ 
+ func main() {
+ 	tune.Init()
++	if err := dmesh.Validate(); err != nil {
++		log.Fatal().Err(err).Msg("invalid transport configuration")
++	}
+ 	// initializeDatabase()
+ 	log.Logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}).With().Timestamp().Caller().Logger()
+ 
+@@ -41,6 +43,9 @@ func main() {
+ 	defer mongoClose()
+ 
+ 	servPort, _ := strconv.Atoi(result["UserPort"])
++	if po := os.Getenv("DSB_PORT"); po != "" {
++		servPort, _ = strconv.Atoi(po)
++	}
+ 	servIP := result["UserIP"]
+ 
+ 	var (
+@@ -71,15 +76,9 @@ func main() {
+ 		MongoClient: mongoClient,
+ 	}
+ 
+-	sigCh := make(chan os.Signal, 1)
+-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	go func() {
+-		sig := <-sigCh
+-		log.Info().Msgf("Received signal %s, deregistering service from consul...", sig.String())
+-		srv.Shutdown()
+-		os.Exit(0)
+-	}()
+-
+ 	log.Info().Msg("Starting server...")
+-	log.Fatal().Msg(srv.Run().Error())
++	if err := dmesh.Run(srv.Run, srv.Shutdown); err != nil {
++		log.Error().Err(err).Msg("service stopped with error")
++		os.Exit(1)
++	}
+ }
+diff --git a/dialer/dialer.go b/dialer/dialer.go
+index 720824a..2580cf2 100644
+--- a/dialer/dialer.go
++++ b/dialer/dialer.go
+@@ -2,6 +2,7 @@ package dialer
+ 
+ import (
+ 	"fmt"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/tls"
+@@ -34,6 +35,7 @@ func Dial(name string, opts ...DialOption) (*grpc.ClientConn, error) {
+ 
+ 	dialopts := []grpc.DialOption{
+ 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
++			Time:                5 * time.Minute,
+ 			Timeout:             120 * time.Second,
+ 			PermitWithoutStream: true,
+ 		}),
+@@ -52,10 +54,18 @@ func Dial(name string, opts ...DialOption) (*grpc.ClientConn, error) {
+ 		dialopts = append(dialopts, opt)
+ 	}
+ 
+-	conn, err := grpc.Dial(name, dialopts...)
++	target, transportOpts, err := dmesh.DialOptions(name)
++	if err != nil {
++		return nil, err
++	}
++	dialopts = append(dialopts, transportOpts...)
++	conn, err := grpc.Dial(target, dialopts...)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to dial %s: %v", name, err)
+ 	}
+ 
++	if err := dmesh.TrackClient(conn); err != nil {
++		return nil, err
++	}
+ 	return conn, nil
+ }
+diff --git a/registry/registry.go b/registry/registry.go
+index e6ca8d4..26c5efb 100644
+--- a/registry/registry.go
++++ b/registry/registry.go
+@@ -2,6 +2,7 @@ package registry
+ 
+ import (
+ 	"fmt"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"net"
+ 	"os"
+ 
+@@ -75,6 +76,11 @@ func getLocalIP() (string, error) {
+ 
+ // Register a service with registry
+ func (c *Client) Register(name string, id string, ip string, port int) error {
++	var err error
++	ip, port, err = dmesh.Registration(name, ip, port)
++	if err != nil {
++		return err
++	}
+ 	if ip == "" {
+ 		var err error
+ 		ip, err = getLocalIP()
+@@ -88,6 +94,10 @@ func (c *Client) Register(name string, id string, ip string, port int) error {
+ 		Port:    port,
+ 		Address: ip,
+ 	}
++	if dmesh.Enabled() {
++		reg.Tags = []string{"dpumesh"}
++		reg.Meta = map[string]string{"transport": "dma", "pod_ip": os.Getenv("DPUMESH_POD_IP")}
++	}
+ 	log.Info().Msgf("Trying to register service [ name: %s, id: %s, address: %s:%d ]", name, id, ip, port)
+ 	return c.Agent().ServiceRegister(reg)
+ }
+diff --git a/services/attractions/server.go b/services/attractions/server.go
+index dae248d..b577668 100644
+--- a/services/attractions/server.go
++++ b/services/attractions/server.go
+@@ -3,7 +3,7 @@ package attractions
+ import (
+ 	"context"
+ 	"fmt"
+-	"net"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -83,12 +83,12 @@ func (s *Server) Run() error {
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 
+ 	pb.RegisterAttractionsServer(srv, s)
+ 
+ 	// listener
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-attractions", s.Port)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to listen: %v", err)
+ 	}
+@@ -99,7 +99,7 @@ func (s *Server) Run() error {
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes
+diff --git a/services/frontend/server.go b/services/frontend/server.go
+index e2a32bf..a58acbe 100644
+--- a/services/frontend/server.go
++++ b/services/frontend/server.go
+@@ -4,6 +4,7 @@ import (
+ 	"embed"
+ 	"encoding/json"
+ 	"fmt"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"io/fs"
+ 	"net/http"
+ 	"strconv"
+@@ -113,10 +114,10 @@ func (s *Server) Run() error {
+ 	if tlsconfig != nil {
+ 		log.Info().Msg("Serving https")
+ 		srv.TLSConfig = tlsconfig
+-		return srv.ListenAndServeTLS("x509/server_cert.pem", "x509/server_key.pem")
++		return dmesh.ServeHTTP(srv, "x509/server_cert.pem", "x509/server_key.pem")
+ 	} else {
+ 		log.Info().Msg("Serving http")
+-		return srv.ListenAndServe()
++		return dmesh.ServeHTTP(srv, "", "")
+ 	}
+ }
+ 
+diff --git a/services/geo/server.go b/services/geo/server.go
+--- a/services/geo/server.go
++++ b/services/geo/server.go
+@@ -3,7 +3,8 @@
+ import (
+ 	"context"
+ 	"fmt"
+-	"net"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -25,6 +26,10 @@
+ 	maxSearchRadius  = 10
+ 	maxSearchResults = 5
+ )
++
++// go-geoindex KNearest mutates a package-global longitude-distance cache.
++// Serialize searches across every Server instance in this process.
++var geoIndexMu sync.Mutex
+ 
+ // Server implements the geo service
+ type Server struct {
+@@ -68,12 +73,12 @@
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 
+ 	pb.RegisterGeoServer(srv, s)
+ 
+ 	// listener
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-geo", s.Port)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to listen: %v", err)
+ 	}
+@@ -84,7 +89,7 @@
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes
+@@ -120,6 +125,8 @@
+ 		Plon: lon,
+ 	}
+ 
++	geoIndexMu.Lock()
++	defer geoIndexMu.Unlock()
+ 	return s.index.KNearest(
+ 		center,
+ 		maxSearchResults,
+@@ -136,13 +143,13 @@
+ 	collection := client.Database("geo-db").Collection("geo")
+ 	curr, err := collection.Find(context.TODO(), bson.D{})
+ 	if err != nil {
+-		log.Error().Msgf("Failed get geo data: ", err)
++		log.Error().Msgf("Failed get geo data: %v", err)
+ 	}
+ 
+ 	var points []*point
+ 	curr.All(context.TODO(), &points)
+ 	if err != nil {
+-		log.Error().Msgf("Failed get geo data: ", err)
++		log.Error().Msgf("Failed get geo data: %v", err)
+ 	}
+ 
+ 	// add points to index
+diff --git a/services/profile/server.go b/services/profile/server.go
+index 2874bb2..cf54896 100644
+--- a/services/profile/server.go
++++ b/services/profile/server.go
+@@ -4,7 +4,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+-	"net"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"sync"
+ 	"time"
+ 
+@@ -66,13 +66,13 @@ func (s *Server) Run() error {
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 
+ 	pb.RegisterProfileServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-profile", s.Port)
+ 	if err != nil {
+-		log.Fatal().Msgf("failed to configure listener: %v", err)
++		return fmt.Errorf("listen: %w", err)
+ 	}
+ 
+ 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
+@@ -81,7 +81,7 @@ func (s *Server) Run() error {
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes
+diff --git a/services/rate/server.go b/services/rate/server.go
+index 12caacb..c3750d7 100644
+--- a/services/rate/server.go
++++ b/services/rate/server.go
+@@ -4,7 +4,7 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+-	"net"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"sort"
+ 	"strings"
+ 	"sync"
+@@ -66,13 +66,13 @@ func (s *Server) Run() error {
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 
+ 	pb.RegisterRateServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-rate", s.Port)
+ 	if err != nil {
+-		log.Fatal().Msgf("failed to listen: %v", err)
++		return fmt.Errorf("listen: %w", err)
+ 	}
+ 
+ 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
+@@ -81,7 +81,7 @@ func (s *Server) Run() error {
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes
+diff --git a/services/recommendation/server.go b/services/recommendation/server.go
+index 3f94cdd..6da6c4c 100644
+--- a/services/recommendation/server.go
++++ b/services/recommendation/server.go
+@@ -3,8 +3,8 @@ package recommendation
+ import (
+ 	"context"
+ 	"fmt"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"math"
+-	"net"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -65,13 +65,13 @@ func (s *Server) Run() error {
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 
+ 	pb.RegisterRecommendationServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-recommendation", s.Port)
+ 	if err != nil {
+-		log.Fatal().Msgf("failed to listen: %v", err)
++		return fmt.Errorf("listen: %w", err)
+ 	}
+ 
+ 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
+@@ -80,7 +80,7 @@ func (s *Server) Run() error {
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes
+diff --git a/services/reservation/server.go b/services/reservation/server.go
+index f82f52a..7eb97c9 100644
+--- a/services/reservation/server.go
++++ b/services/reservation/server.go
+@@ -3,7 +3,7 @@ package reservation
+ import (
+ 	"context"
+ 	"fmt"
+-	"net"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -65,13 +65,13 @@ func (s *Server) Run() error {
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 
+ 	pb.RegisterReservationServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-reservation", s.Port)
+ 	if err != nil {
+-		log.Fatal().Msgf("failed to listen: %v", err)
++		return fmt.Errorf("listen: %w", err)
+ 	}
+ 
+ 	log.Trace().Msgf("In reservation s.IpAddr = %s, port = %d", s.IpAddr, s.Port)
+@@ -82,7 +82,7 @@ func (s *Server) Run() error {
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes
+diff --git a/services/review/server.go b/services/review/server.go
+index dfe3265..e5054c3 100644
+--- a/services/review/server.go
++++ b/services/review/server.go
+@@ -3,12 +3,12 @@ package review
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 
+ 	"go.mongodb.org/mongo-driver/bson"
+ 	"go.mongodb.org/mongo-driver/mongo"
+ 
+ 	// "io/ioutil"
+-	"net"
+ 	// "os"
+ 	// "sort"
+ 	"time"
+@@ -72,13 +72,13 @@ func (s *Server) Run() error {
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 
+ 	pb.RegisterReviewServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-review", s.Port)
+ 	if err != nil {
+-		log.Fatal().Msgf("failed to listen: %v", err)
++		return fmt.Errorf("listen: %w", err)
+ 	}
+ 
+ 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
+@@ -87,7 +87,7 @@ func (s *Server) Run() error {
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes
+diff --git a/services/search/server.go b/services/search/server.go
+index 95956da..3103e15 100644
+--- a/services/search/server.go
++++ b/services/search/server.go
+@@ -2,7 +2,7 @@ package search
+ 
+ import (
+ 	"fmt"
+-	"net"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dialer"
+@@ -63,7 +63,7 @@ func (s *Server) Run() error {
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 	pb.RegisterSearchServer(srv, s)
+ 
+ 	// init grpc clients
+@@ -74,9 +74,9 @@ func (s *Server) Run() error {
+ 		return err
+ 	}
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-search", s.Port)
+ 	if err != nil {
+-		log.Fatal().Msgf("failed to listen: %v", err)
++		return fmt.Errorf("listen: %w", err)
+ 	}
+ 
+ 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
+@@ -85,7 +85,7 @@ func (s *Server) Run() error {
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes
+diff --git a/services/user/server.go b/services/user/server.go
+index da91ffd..a1a627c 100644
+--- a/services/user/server.go
++++ b/services/user/server.go
+@@ -3,7 +3,7 @@ package user
+ import (
+ 	"crypto/sha256"
+ 	"fmt"
+-	"net"
++	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/dmesh"
+ 	"time"
+ 
+ 	"github.com/delimitrou/DeathStarBench/tree/master/hotelReservation/registry"
+@@ -64,13 +64,13 @@ func (s *Server) Run() error {
+ 		opts = append(opts, tlsopt)
+ 	}
+ 
+-	srv := grpc.NewServer(opts...)
++	srv := dmesh.NewServer(opts...)
+ 
+ 	pb.RegisterUserServer(srv, s)
+ 
+-	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
++	lis, err := dmesh.Listen("srv-user", s.Port)
+ 	if err != nil {
+-		log.Fatal().Msgf("failed to listen: %v", err)
++		return fmt.Errorf("listen: %w", err)
+ 	}
+ 
+ 	err = s.Registry.Register(name, s.uuid, s.IpAddr, s.Port)
+@@ -79,7 +79,7 @@ func (s *Server) Run() error {
+ 	}
+ 	log.Info().Msg("Successfully registered in consul")
+ 
+-	return srv.Serve(lis)
++	return dmesh.Serve(srv, lis)
+ }
+ 
+ // Shutdown cleans up any processes

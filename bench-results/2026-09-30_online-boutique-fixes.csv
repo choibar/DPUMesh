@@ -1,0 +1,134 @@
+kind,run,mode,users,service,rate_per_s,p50,p95,p99,unit,failures,host_cores,host_ms_per_page,proxy_rpc_per_s,note
+locust,before-r4,native,8,,187,38,62,74,ms,0,6.16,38.7,2531,original host and DPU; spin 1000
+locust,before-r4,native,32,,385,75,120,140,ms,0,8.11,24.6,5171,original host and DPU; spin 1000
+locust,after-eu64-r7,native,8,,189,38,63,74,ms,2,3.30,20.4,2566,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+locust,after-eu64-r7,native,32,,383,76,120,140,ms,0,4.31,13.2,5204,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+locust,after-eu64-r7,native,128,,536,220,340,390,ms,9,4.49,9.8,7231,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,currency,719,1342,,2120,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,payment,714,1376,,2024,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,cart,732,1324,,1973,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,ad,543,1773,,2696,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,email,606,1658,,2391,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,recommendation,627,1584,,2365,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,productcatalog,792,1215,,1942,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,shipping,781,1211,,2109,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m1,after-eu64-r7,native,,checkout,768,1251,,1985,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,currency,7973,7701,,16084,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,payment,8394,7423,,14769,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,cart,8824,7286,,12126,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,ad,8844,7206,,10748,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,email,4027,15799,,19135,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,recommendation,3924,16164,,21051,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,productcatalog,9032,7038,,10284,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,shipping,8936,7173,,10075,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+m64,after-eu64-r7,native,,checkout,8832,7195,,11246,us,0,,,,final native; spin 0; device ERROR; EU base 64; complete m1/m64
+locust,after-preload-eu64-r9,preload,8,,187,39,63,74,ms,0,3.32,20.8,2541,final preload; same binaries; default EU base 64
+locust,after-preload-eu64-r9,preload,32,,388,75,120,140,ms,0,4.35,13.2,5255,final preload; same binaries; default EU base 64
+locust,after-preload-eu64-r9,preload,128,,530,220,340,400,ms,0,4.66,10.3,7144,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,currency,747,1317,,1951,us,0,,,,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,payment,743,1342,,1983,us,0,,,,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,cart,669,1483,,2175,us,0,,,,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,ad,775,1188,,2193,us,0,,,,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,email,538,1859,,2856,us,0,,,,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,recommendation,559,1796,,2555,us,0,,,,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,productcatalog,812,1147,,2078,us,0,,,,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,shipping,784,1193,,2132,us,0,,,,final preload; same binaries; default EU base 64
+m1,after-preload-eu64-r9,preload,,checkout,767,1259,,2050,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,currency,8399,7621,,11852,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,payment,8639,7397,,12382,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,cart,8552,7472,,12483,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,ad,8808,7255,,11804,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,email,3622,16633,,42041,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,recommendation,3785,16756,,21489,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,productcatalog,8928,7146,,9865,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,shipping,8770,7261,,10767,us,0,,,,final preload; same binaries; default EU base 64
+m64,after-preload-eu64-r9,preload,,checkout,8804,7247,,10646,us,0,,,,final preload; same binaries; default EU base 64
+locust,hostproxy-current,hostproxy,8,,561,14,22,27,ms,4,4.43,9.1,7588,same-day host proxy reference
+locust,hostproxy-current,hostproxy,32,,620,56,73,82,ms,4,4.59,8.5,8378,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,currency,5111,152,,595,us,0,,,,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,payment,4860,156,,626,us,0,,,,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,cart,2323,356,,1110,us,0,,,,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,ad,3574,174,,1056,us,0,,,,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,email,844,1228,,2160,us,0,,,,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,recommendation,626,1611,,2413,us,0,,,,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,productcatalog,4189,172,,740,us,0,,,,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,shipping,4472,158,,684,us,0,,,,same-day host proxy reference
+m1,hostproxy-current,hostproxy,,checkout,3765,193,,796,us,0,,,,same-day host proxy reference
+locust,tcp-current,tcp,8,,662,11,18,27,ms,7,5.87,10.2,,same-day TCP reference
+locust,tcp-current,tcp,32,,1376,21,38,51,ms,4,10.30,8.6,,same-day TCP reference
+locust,after-final-r3,native,8,,184,40,64,75,ms,4,3.28,20.9,2489,diagnostic intermediate; before cooperative yield
+locust,after-final-r3,native,32,,383,76,120,150,ms,0,4.29,13.1,5199,diagnostic intermediate; before cooperative yield
+locust,after-final-r3,native,128,,519,230,350,410,ms,0,4.66,10.5,7024,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,currency,691,1406,,2092,us,0,,,,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,payment,607,1668,,2346,us,0,,,,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,cart,786,1241,,1913,us,0,,,,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,ad,534,1800,,2702,us,0,,,,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,email,619,1626,,2359,us,0,,,,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,recommendation,513,1921,,2879,us,0,,,,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,productcatalog,740,1288,,1992,us,0,,,,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,shipping,790,1166,,2135,us,0,,,,diagnostic intermediate; before cooperative yield
+m1,after-final-r3,native,,checkout,775,1232,,1994,us,0,,,,diagnostic intermediate; before cooperative yield
+locust,after-final-r4,native,8,,186,39,63,74,ms,4,3.34,21.0,2526,diagnostic intermediate; before cooperative yield; DPA crash during m64
+locust,after-final-r4,native,32,,383,76,120,140,ms,0,4.40,13.4,5187,diagnostic intermediate; before cooperative yield; DPA crash during m64
+locust,after-final-r4,native,128,,532,220,350,400,ms,4,4.65,10.3,7202,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,currency,703,1388,,2090,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,payment,744,1304,,1985,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,cart,755,1279,,1905,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,ad,553,1717,,2645,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,email,601,1662,,2450,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,recommendation,635,1569,,2350,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,productcatalog,728,1322,,2037,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,shipping,755,1245,,2173,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m1,after-final-r4,native,,checkout,793,1175,,2114,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m64,after-final-r4,native,,currency,8170,7646,,15608,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m64,after-final-r4,native,,payment,8210,7412,,15796,us,0,,,,diagnostic intermediate; before cooperative yield; DPA crash during m64
+m64,after-final-r4,native,,cart,0,0,,0,us,128,,,,"DPA crash, no calls; diagnostic intermediate; before cooperative yield; DPA crash during m64"
+m64,after-final-r4,native,,ad,0,0,,0,us,128,,,,"DPA crash, no calls; diagnostic intermediate; before cooperative yield; DPA crash during m64"
+m64,after-final-r4,native,,email,0,0,,0,us,128,,,,"DPA crash, no calls; diagnostic intermediate; before cooperative yield; DPA crash during m64"
+m64,after-final-r4,native,,recommendation,0,0,,0,us,128,,,,"DPA crash, no calls; diagnostic intermediate; before cooperative yield; DPA crash during m64"
+m64,after-final-r4,native,,productcatalog,0,0,,0,us,128,,,,"DPA crash, no calls; diagnostic intermediate; before cooperative yield; DPA crash during m64"
+m64,after-final-r4,native,,shipping,0,0,,0,us,128,,,,"DPA crash, no calls; diagnostic intermediate; before cooperative yield; DPA crash during m64"
+m64,after-final-r4,native,,checkout,0,0,,0,us,128,,,,"DPA crash, no calls; diagnostic intermediate; before cooperative yield; DPA crash during m64"
+locust,after-yield-final-r5,native,8,,30,34,2000,5000,ms,0,1.73,67.1,407,diagnostic; yield with device INFO and EU base 0; poor performance
+locust,after-yield-final-r5,native,32,,14,1400,7400,8300,ms,0,1.51,131.1,188,diagnostic; yield with device INFO and EU base 0; poor performance
+locust,after-yield-final-r5,native,128,,17,4300,11000,11000,ms,0,1.40,105.7,264,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,currency,733,1318,,2102,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,payment,757,1278,,1949,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,cart,745,1301,,1937,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,ad,530,1834,,2720,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,email,610,1646,,2385,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,recommendation,564,1769,,2614,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,productcatalog,748,1286,,2074,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,shipping,768,1231,,2130,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m1,after-yield-final-r5,native,,checkout,773,1242,,2073,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,currency,7957,7778,,15995,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,payment,70,915665,,927321,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,cart,8780,7243,,11663,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,ad,8849,7160,,12125,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,email,3978,16027,,19130,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,recommendation,3917,16189,,21154,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,productcatalog,8565,7315,,18488,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,shipping,8920,7135,,10401,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+m64,after-yield-final-r5,native,,checkout,8904,7118,,10825,us,0,,,,diagnostic; yield with device INFO and EU base 0; poor performance
+locust,after-yield-quiet-r6,native,8,,45,34,1200,2600,ms,0,2.20,56.9,618,diagnostic; device ERROR and EU base 0; poor performance
+locust,after-yield-quiet-r6,native,32,,113,76,2000,4000,ms,0,2.63,27.2,1523,diagnostic; device ERROR and EU base 0; poor performance
+locust,after-yield-quiet-r6,native,128,,35,2600,6900,8000,ms,0,2.09,70.8,494,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,currency,684,1425,,2106,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,payment,690,1406,,2166,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,cart,790,1224,,1929,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,ad,1,908832,,909968,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,email,464,2193,,2890,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,recommendation,606,1631,,2582,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,productcatalog,759,1261,,2040,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,shipping,782,1205,,2128,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m1,after-yield-quiet-r6,native,,checkout,797,1173,,2034,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,currency,70,914846,,916580,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,payment,7142,8610,,17613,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,cart,8972,7092,,11966,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,ad,8449,7633,,12356,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,email,1714,39376,,62750,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,recommendation,3914,16218,,20477,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,productcatalog,8981,7023,,14575,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,shipping,9215,6872,,12453,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+m64,after-yield-quiet-r6,native,,checkout,8902,7137,,10351,us,0,,,,diagnostic; device ERROR and EU base 0; poor performance
+locust,placement-eu0-r8,native,8,,4,1500,5300,5300,ms,0,1.58,430.7,61,diagnostic; same final binaries as r7; EU base 0 only; poor performance

@@ -1,6 +1,6 @@
 # DPUMesh DPA process 공유 설계
 
-상태: **설계안. 구현·빌드·장비 실험은 아직 수행하지 않았다.** 현재 작업 트리와 기존 실험 기록을 기준으로 한다. POSIX preload는 범위 밖이다.
+상태: **2026-09-28 DPU 측 context 공유 구현 완료.** [구현 범위와 검증](2026-09-28_dpu-shared-dpa-context.md). 아래는 당시 설계이며, host context 공유·benchmark process 통합·broker는 여전히 미구현이다. POSIX preload는 범위 밖이다.
 
 ## 1. 결정과 범위
 

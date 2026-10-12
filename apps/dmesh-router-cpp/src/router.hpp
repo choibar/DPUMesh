@@ -121,8 +121,8 @@ class Channel {
     size_t rx_len_ = 0;
     TxRing tx_;
     bool failed_ = false;
-    uint32_t rx_wm_ = 0;
-    bool rx_wm_dirty_ = false;
+    uint32_t dpu_rx_consumed_pos_ = 0;
+    bool dpu_rx_consumed_pos_changed_ = false;
 
     static ssize_t send_cb(nghttp2_session *session, const uint8_t *data, size_t length, int flags,
                            void *user_data);
