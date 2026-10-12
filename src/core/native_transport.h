@@ -32,6 +32,9 @@ int dmesh_native_submit(struct dmesh_native_transport *, const sw_descriptor_t *
 /* Returns a snapshot of stripes needing drain, including closed flows whose
  * custody/FIN events still need retirement. New flows appear on the next pass. */
 uint32_t dmesh_native_progress(struct dmesh_native_transport *);
+/* The errno of a failed session, or 0. Sticky: a lost session never recovers,
+ * so every flow, dial and accept of the channel is dead with it. */
+int dmesh_native_lost(struct dmesh_native_transport *);
 int dmesh_native_poll(struct dmesh_native_transport *, int stripe, struct dmesh_native_event *);
 void dmesh_native_release(struct dmesh_native_transport *, int byte_offset);
 /* Doorbell of a stripe: an fd readable while the stripe has signalled work, or
