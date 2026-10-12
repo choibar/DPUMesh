@@ -63,6 +63,7 @@ _Static_assert(CHANNEL_MODE_BACKEND_HOST_DPA == DMESH_FLOW_MODE_BACKEND_PULL, "b
 #define CHANNEL_RX_CONSUMED_POS_BATCH (64u * 1024u) /* Pull: bytes released between rx_consumed_pos publications */
 #define CHANNEL_DEFAULT_REV_PCI "0b:00.0"  /* Pull: the host PF that runs the DPA process */
 #define CHANNEL_CTX_STOP_SPINS 100000      /* Bound on progressing a stopping ctx to IDLE */
+#define CHANNEL_KEEPALIVE_MS 1000          /* PING a session that sent nothing for this long */
 
 struct channel_dev {
 	struct doca_dev *dev;               /* Comch / forward device */
@@ -79,6 +80,7 @@ struct channel_dev {
     unsigned backend_pending, backend_rejections;
     /* state: 1=pending, 2=processing, 3=done, 4=reject pending */
 	int session_error;
+	uint64_t last_send_ms;              /* Last control message submitted (keepalive) */
 	/* Idle wake (push reverse path): one ARM at a time, released by DOORBELL */
 	int arm_outstanding;
 	uint64_t arm_epoch;
@@ -305,6 +307,10 @@ static void backend_flush_rejections(struct channel_dev *dev)
     }
 }
 
+static uint64_t channel_now_ms(void);
+static int session_send_locked(struct channel_dev *dev, uint16_t type,
+	uint32_t id, uint32_t generation, const void *payload, size_t bytes);
+
 static int session_progress_locked(struct channel_dev *dev)
 {
 	if (!dev->control) { errno = ENOTCONN; return -1; }
@@ -313,6 +319,11 @@ static int session_progress_locked(struct channel_dev *dev)
 	if (dev->control->peer_gone && !dev->session_error)
 		dev->session_error = ECONNRESET;
 	if (dev->session_error) { errno = dev->session_error; return -1; }
+	/* The Comch client gets no event when the DPU proxy exits; a send to it
+	 * fails (peer_gone). An idle session sends nothing else, so it PINGs. A
+	 * PING that cannot be queued is retried on the next pass. */
+	if (dev->hello_ready && channel_now_ms() - dev->last_send_ms >= CHANNEL_KEEPALIVE_MS)
+		(void)session_send_locked(dev, DMESH_SESSION_PING, 0, 0, NULL, 0);
 	return 0;
 }
 
@@ -324,6 +335,7 @@ static int session_send_locked(struct channel_dev *dev, uint16_t type,
 	if (!len) { errno = EINVAL; return -1; }
 	doca_error_t result = dmesh_comch_client_send(dev->control, (const char *)frame, len);
 	if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
+	dev->last_send_ms = channel_now_ms();
 	return 0;
 }
 

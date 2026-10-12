@@ -35,7 +35,8 @@ Host forward-ring `consumer_head` advances only on producer CQ completion;
 the proxy's reverse TX source is held until `completed_bytes` (host-DPA) or
 `pushed_bytes` (DPU-DMA) advances. The historical hardware report predates v3
 and does not validate this completion protocol on devices. v4 adds the
-ARM/DOORBELL idle wake on top of v3.
+ARM/DOORBELL idle wake on top of v3. v5 adds the PING an idle host sends, the only way it
+notices a DPU proxy that exited.
 
 `support/native_memory_transport.c` is a deterministic loopback carrier for the
 core: it implements the private carrier contract in memory, can hold custody
