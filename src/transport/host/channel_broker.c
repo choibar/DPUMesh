@@ -613,8 +613,9 @@ static void publish(struct broker_server *srv)
 		return;
 	if (channel_dev_progress(srv->dev) == 0) /* a session error reaches every flow's status */
 		changed |= channel_broker_backend_publish(srv->dev, srv->status) > 0;
-	else if (!srv->status->session_error) {
-		/* No flow may be open to say so: the channel itself reports it. */
+	else if (srv->dev->control != NULL && !srv->status->session_error) {
+		/* No flow may be open to say so: the channel itself reports it. A
+		 * session the client closed (no control) is not a loss. */
 		int error = errno ? errno : EIO;
 		DOCA_LOG_WARN("Comch session with the DPU lost: %s", strerror(error));
 		__atomic_store_n(&srv->status->session_error, error, __ATOMIC_RELEASE);
