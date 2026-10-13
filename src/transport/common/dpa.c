@@ -221,10 +221,17 @@ init_dpa_objects(struct objects *objs)
     return DOCA_SUCCESS;
 }
 
-static doca_error_t dpa_pool_thread_create(struct dmesh_doca_dpa_thread *thread)
+static doca_error_t dpa_pool_thread_create(struct objects *objs, int i)
 {
+    struct dmesh_doca_dpa_thread *thread = &objs->dpa_pool->threads[i];
     const char *env = getenv("DMESH_DPA_BENCH_MODE");
+    const char *pin = getenv("DMESH_DPA_PIN_EU_BASE");
     int mode = env ? atoi(env) : 0;
+
+    thread->dpa = objs->dpa_pool->dpa;
+    thread->pin_eu = 0;
+    if (pin != NULL && *pin != '\0')
+        thread->pin_eu = (uint32_t)(atoi(pin) + objs->worker_idx * DPA_THREAD_POOL_SIZE + i + 1);
     return mode > 0 ? dmesh_doca_dpa_bench_thread_create(thread, (uint32_t)mode)
                     : dmesh_doca_dpa_thread_create(thread);
 }
@@ -242,8 +249,7 @@ dmesh_dpa_thread_pool_init(struct objects *objs)
     }
 
     for (i = pool->size; i < DPA_THREAD_POOL_SIZE; i++) {
-        pool->threads[i].dpa = pool->dpa;
-        result = dpa_pool_thread_create(&pool->threads[i]);
+        result = dpa_pool_thread_create(objs, i);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to create DPA pool thread %d: %s", i, doca_error_get_name(result));
             return result;
@@ -279,8 +285,7 @@ dmesh_dpa_thread_pool_alloc(struct objects *objs, struct dmesh_conn *conn)
                 /* Retry cleanup of a previous partial creation before reuse. */
                 if (dmesh_doca_dpa_thread_destroy_checked(&pool->threads[i]) != DOCA_SUCCESS)
                     return NULL;
-                pool->threads[i].dpa = pool->dpa;
-                if (dpa_pool_thread_create(&pool->threads[i]) != DOCA_SUCCESS) {
+                if (dpa_pool_thread_create(objs, i) != DOCA_SUCCESS) {
                     DOCA_LOG_ERR("Failed to recreate DPA pool thread %d", i);
                     return NULL;
                 }
@@ -372,6 +377,21 @@ dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, uint32_t bench_mode)
         DOCA_LOG_ERR("Failed to set DPA thread local storage: %s",
                      doca_error_get_descr(result));
         return result; /* Checked cleanup retains ownership on partial setup. */
+    }
+
+    if (dpa_thread->pin_eu != 0) {
+        /* The affinity object stays allocated for the thread's lifetime. */
+        struct doca_dpa_eu_affinity *affinity = NULL;
+        result = DMESH_DPA_CALL(doca_dpa_eu_affinity_create(dpa_thread->dpa, &affinity));
+        if (result == DOCA_SUCCESS)
+            result = DMESH_DPA_CALL(doca_dpa_eu_affinity_set(affinity, dpa_thread->pin_eu - 1));
+        if (result == DOCA_SUCCESS)
+            result = DMESH_DPA_CALL(doca_dpa_thread_set_affinity(dpa_thread->thread, affinity));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to pin DPA thread to EU %u: %s", dpa_thread->pin_eu - 1,
+                doca_error_get_descr(result));
+            return result;
+        }
     }
 
     result = DMESH_DPA_CALL(doca_dpa_thread_start(dpa_thread->thread));

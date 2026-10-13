@@ -16,6 +16,11 @@
  * connection (each worker owns private slots in a process-wide shared DPA context) */
 #define DPA_THREAD_POOL_SIZE 64
 
+/* Measurement only (docs/2026-10-13_dpa-mux-probe.md): DMESH_DPA_PIN_EU_BASE=b
+ * pins pool thread i of worker w to EU b + w * DPA_THREAD_POOL_SIZE + i, to keep
+ * a test run off EUs another DPA process on the same chip holds. Unset, the
+ * scheduler places every thread, as in normal operation. */
+
 struct objects;
 struct doca_comch_connection;
 
@@ -34,6 +39,7 @@ struct dmesh_doca_dpa_thread {
     doca_dpa_dev_uintptr_t local_storage; /* owned DPA TLS allocation */
     doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */
     uint32_t bench_mode;           /* CPU launch selection; 0 = native kernel */
+    uint32_t pin_eu;               /* measurement only: exact EU + 1; 0 = the scheduler places it */
 	doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
 };
 
