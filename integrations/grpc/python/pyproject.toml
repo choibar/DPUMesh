@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dpumesh-grpc"
+version = "0.1.0"
+description = "gRPC over DPUMesh for grpcio built with the DPUMesh patch"
+requires-python = ">=3.9"
+dependencies = ["grpcio==1.80.0"]
+license = { text = "Apache-2.0" }
+
+[tool.setuptools]
+packages = ["dpumesh_grpc"]
