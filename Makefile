@@ -77,8 +77,8 @@ $(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/
 $(TESTDIR)/comch_client_test: tests/comch_client_test.c $(TRANSPORT)/host/comch_client.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
 
-$(TESTDIR)/session_server_test: tests/session_server_test.c $(TRANSPORT)/common/object.c $(TRANSPORT)/dpu/comch_server.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT)/common/object.c -Wl,--gc-sections $(DOCA_LIBS) -pthread -o $@
+$(TESTDIR)/session_server_test: tests/session_server_test.c $(TRANSPORT)/common/object.c $(TRANSPORT)/dpu/comch_server.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/dpu/dpa_mux.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/dpu/dpa_mux.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT)/common/object.c -Wl,--gc-sections $(DOCA_LIBS) -pthread -o $@
 
 $(TESTDIR)/backend_dispatch_test: tests/backend_dispatch_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
