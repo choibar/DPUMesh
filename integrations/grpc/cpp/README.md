@@ -31,5 +31,38 @@ ctest --test-dir build/grpc --output-on-failure
 
 Run these commands from the parent repository root. CTest uses memory
 transports and native doubles; device smoke executables are manual.
+
+## Channel benchmark
+
+`dpumesh_channel_bench` is the C++ peer of the Go
+[channel-bench](../go/cmd/channel-bench/README.md): the same wire, flags and
+JSON result, so either one can be the client or the server. It runs over the
+adapter with the normal DPUMesh environment, or over kernel TCP with
+`-tcp host:port`. `-reactors` sets the runtime's EQ reactor count (default:
+`DPUMESH_REACTORS`, else 1);
+`-start-file` is not supported. Over TCP `native_dials` stays empty, because
+gRPC C++ exposes no dial count.
+
+```sh
+build/grpc/dpumesh_channel_bench -mode server
+build/grpc/dpumesh_channel_bench -mode client -connections 4 -concurrency 64
+```
+
+## Stream C ABI
+
+The EQ reactor (`dmesh_reactor.cc`, `dmesh_runtime.cc`) needs no gRPC: it
+reports each connection's events to a `ConnectionSink`, which is either the
+gRPC endpoint driver or a stream binding. The same build produces
+`libdpumesh_stream.so`, the [stream C ABI](include/dpumesh_stream.h) that
+adapters for other runtimes use, and `libdpumesh_stream_loopback.so`,
+the same ABI over an in-process loopback for their tests. Both export only
+`dms_*`.
+
+`dpumesh_stream_test` covers the ABI over native doubles and
+`dpumesh_stream_loopback_test` a 1 MiB echo through the loopback, with the
+receive credit held and resumed. `dpumesh_stream_smoke` is the manual device
+test: `server` echoes the streams routed to `DPUMESH_SERVICE`, and
+`client <target> <count> <size>` checks every echoed byte and prints the
+round-trip times.
 [Configuration](../../../README.md#configuration) applies to both processes.
 See [gRPC ownership](../../../design/GRPC.md).

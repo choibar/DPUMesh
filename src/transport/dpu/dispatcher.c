@@ -10,12 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Only control messages cross these queues. In particular no DMA descriptor,
  * payload, data completion or credit update visits the dispatcher. */
 #define QUEUE_SIZE 128u
-enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND };
+enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, ARM };
 struct message {
     struct dmesh_flow_key key;
     struct dmesh_flow_location location;
@@ -59,22 +60,48 @@ struct dmesh_dispatcher {
 };
 
 /* Read-only membership snapshots for Rust routing before any backend exists.
- * Retired endpoints remain known until dispatcher shutdown, preventing a
- * registered DMA destination from falling through to TCP after disconnect. */
+ * A retired endpoint stays known for DMESH_LISTENER_GRACE_MS, so a restarting
+ * DMA server is refused rather than dialled over TCP, then is forgotten: its
+ * address may belong to a different, TCP workload by then (Pod IPs are
+ * reused). */
+#define LISTENER_GRACE_MS_DEFAULT 30000u
 struct listener_membership {
     struct dmesh_dispatcher *dispatcher;
     uint32_t ip;
     uint16_t port;
+    uint64_t retired_ms;      /* 0 while a session listens */
     struct listener_membership *next;
 };
 static pthread_mutex_t membership_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct listener_membership *memberships;
+static uint64_t membership_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+static uint64_t listener_grace_ms(void)
+{
+    static uint64_t grace = UINT64_MAX;
+    if (grace == UINT64_MAX) {
+        const char *env = getenv("DMESH_LISTENER_GRACE_MS");
+        char *end = NULL;
+        unsigned long long v = env && *env ? strtoull(env, &end, 10) : 0;
+        grace = env && *env && end && !*end ? (uint64_t)v : LISTENER_GRACE_MS_DEFAULT;
+    }
+    return grace;
+}
 int dmesh_dispatch_listener_known(uint32_t ip, uint16_t port)
 {
+    uint64_t now = membership_now_ms(), grace = listener_grace_ms();
     pthread_mutex_lock(&membership_lock);
     int known = 0;
-    for (struct listener_membership *m = memberships; m; m = m->next)
-        if (m->ip == ip && m->port == port) { known = 1; break; }
+    for (struct listener_membership **p = &memberships; *p;) {
+        struct listener_membership *m = *p;
+        if (m->retired_ms && now - m->retired_ms >= grace) { *p = m->next; free(m); continue; }
+        if (m->ip == ip && m->port == port) known = 1;
+        p = &m->next;
+    }
     pthread_mutex_unlock(&membership_lock);
     return known;
 }
@@ -83,15 +110,24 @@ static int remember_listener(struct dmesh_dispatcher *d, uint32_t ip, uint16_t p
     pthread_mutex_lock(&membership_lock);
     for (struct listener_membership *m = memberships; m; m = m->next)
         if (m->dispatcher == d && m->ip == ip && m->port == port) {
+            m->retired_ms = 0;
             pthread_mutex_unlock(&membership_lock); return 0;
         }
     struct listener_membership *m = malloc(sizeof(*m));
     if (m) {
-        *m = (struct listener_membership){d, ip, port, memberships};
+        *m = (struct listener_membership){d, ip, port, 0, memberships};
         memberships = m;
     }
     pthread_mutex_unlock(&membership_lock);
     return m ? 0 : ENOMEM;
+}
+static void retire_listener(struct dmesh_dispatcher *d, uint32_t ip, uint16_t port)
+{
+    pthread_mutex_lock(&membership_lock);
+    for (struct listener_membership *m = memberships; m; m = m->next)
+        if (m->dispatcher == d && m->ip == ip && m->port == port && !m->retired_ms)
+            m->retired_ms = membership_now_ms();
+    pthread_mutex_unlock(&membership_lock);
 }
 static void forget_listeners(struct dmesh_dispatcher *d)
 {
@@ -192,6 +228,14 @@ static struct dmesh_session *listener(struct dmesh_dispatcher *d, uint32_t ip, u
     return NULL;
 }
 
+/* A listening session is closing: its address starts its grace period unless
+ * another session already listens there. Idempotent. */
+static void retire_session_listener(struct dmesh_dispatcher *d, struct dmesh_session *s)
+{
+    if (s->listen_port && !listener(d, s->listen_ip, s->listen_port))
+        retire_listener(d, s->listen_ip, s->listen_port);
+}
+
 static void backend_demand(struct dmesh_dispatcher *d, size_t worker, const struct message *m)
 {
     uint32_t ip = dmesh_session_get_u32(m->payload);
@@ -223,6 +267,7 @@ static void flush_listeners(struct dmesh_dispatcher *d)
         struct objects *o = d->controls[w];
         for (unsigned i = 0; i < DMESH_MAX_SESSIONS; ++i) {
             struct dmesh_session *s = &o->sessions[i];
+            if (s->occupied && s->closing) retire_session_listener(d, s);
             if (!s->occupied || s->closing) continue;
             if (s->listen_pending && dmesh_session_send(o, s, DMESH_SESSION_LISTEN_ACK,
                     0, 1, NULL, 0, s->listen_status) == DOCA_SUCCESS) s->listen_pending = false;
@@ -237,10 +282,47 @@ static void flush_listeners(struct dmesh_dispatcher *d)
     }
 }
 
+/* The host is about to sleep. A listed flow's descriptor progress lives on its
+ * worker: hand the owner the sequence the host expects, and the owner rings
+ * through its reply queue (DOORBELL). A flow whose owner cannot take the
+ * command rings at once; the host then re-polls and arms again. */
+static void arm_flows(struct dmesh_dispatcher *d, struct objects *o, struct dmesh_session *s,
+                      const void *payload, uint32_t len)
+{
+    struct dmesh_session_arm_flow flows[DMESH_SESSION_MAX_FLOWS];
+    uint64_t epoch;
+    uint32_t count;
+    if (dmesh_session_arm_decode(payload, len, &epoch, flows, &count) != 0) {
+        s->closing = true;
+        dmesh_dispatcher_session_lost(o, s);
+        return;
+    }
+    s->armed_epoch = epoch;
+    s->armed = true;
+    for (uint32_t i = 0; i < count; ++i) {
+        struct assignment *a = find(d, s, flows[i].flow_id);
+        /* Stale generations and unknown flows are ignored, not trusted. */
+        if (!a || a->key.generation != flows[i].generation || !a->ready) continue;
+        struct message m = {.key = a->key, .location = a->location, .type = ARM, .length = 16};
+        dmesh_session_put_u64(m.payload, epoch);
+        dmesh_session_put_u64(m.payload + 8, flows[i].expected_seq);
+        if (push(&d->workers[a->location.worker].requests, &m)) {
+            wake(d->workers[a->location.worker].fd);
+        } else {
+            s->armed = false;
+            s->doorbell_pending_epoch = epoch;
+        }
+    }
+}
+
 void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
                               const struct dmesh_session_header *h, const void *payload)
 {
     struct dmesh_dispatcher *d = o->dispatcher;
+    if (h->type == DMESH_SESSION_ARM) {
+        arm_flows(d, o, s, payload, h->payload_len);
+        return;
+    }
     if (h->type == DMESH_SESSION_LISTEN) {
         const uint8_t *p = payload;
         uint32_t ip = dmesh_session_get_u32(p), port = dmesh_session_get_u32(p + 4);
@@ -367,6 +449,7 @@ void dmesh_dispatcher_session_lost(struct objects *o, struct dmesh_session *s)
     struct dmesh_dispatcher *d = o->dispatcher;
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i)
         if (d->flows[i].used && d->flows[i].session == s) d->flows[i].lost_pending = true;
+    retire_session_listener(d, s);
 }
 bool dmesh_dispatcher_session_busy(struct objects *o, struct dmesh_session *s)
 {
@@ -421,6 +504,14 @@ static void flush_replies(struct dmesh_dispatcher *d)
                     --d->loads[w].assigned;
                     if (a->opening) --d->loads[w].opening;
                     memset(a, 0, sizeof(*a));
+                } else if (m.type == DMESH_SESSION_DOORBELL) {
+                    /* One DOORBELL per ARM, from whichever worker rings first;
+                     * dmesh_sessions_advance sends it and retries until accepted. */
+                    uint64_t epoch = dmesh_session_get_u64(m.payload);
+                    if (s->armed && s->armed_epoch == epoch) {
+                        s->armed = false;
+                        s->doorbell_pending_epoch = epoch;
+                    }
                 } else if (!s->closing) {
                     doca_error_t r = dmesh_session_send(a->control, s, m.type, m.key.flow_id,
                         m.key.generation, m.payload, m.length, m.status);
@@ -438,6 +529,23 @@ static void flush_replies(struct dmesh_dispatcher *d)
             }
             (void)peek(&d->workers[w].replies, &m, true);
         }
+    }
+}
+
+/* Worker side of ARM, on the flow's worker-local session: ring at once if the
+ * flow already published the descriptor the host expects, otherwise on its
+ * next publication (dmesh_session_push_published). */
+static void arm_flow(struct dmesh_conn *c, const struct message *m)
+{
+    if (!DMESH_FLOW_USES_PUSH(c->flow.mode)) return;
+    uint64_t epoch = dmesh_session_get_u64(m->payload);
+    struct dmesh_session *s = c->session;
+    if (c->push_seq >= dmesh_session_get_u64(m->payload + 8)) {
+        s->armed = false;
+        s->doorbell_pending_epoch = epoch;
+    } else {
+        s->armed = true;
+        s->armed_epoch = epoch;
     }
 }
 
@@ -476,6 +584,7 @@ void dmesh_dispatch_worker_drain(struct objects *o)
             } else { c->error_status = ENOMEM; c->state = DMESH_CONN_ERROR; }
         } else if (same_key(&c->key, &m.key) &&
                    c->location.ownership_epoch == m.location.ownership_epoch && c->state != DMESH_CONN_FREE) {
+            if (m.type == ARM) { arm_flow(c, &m); continue; }
             if (m.type == LOST) c->session->closing = true;
             if (m.type == CLOSE) c->close_requested = true;
             c->state = DMESH_CONN_CLOSING;
@@ -507,6 +616,13 @@ void dmesh_dispatch_worker_flush(struct objects *o)
             if (dmesh_dispatch_reply(c, DMESH_SESSION_CLOSED, NULL, 0,
                                      c->session->close_status[c->flow_id - 1]) == DOCA_SUCCESS)
                 c->session->close_pending[c->flow_id - 1] = false;
+        }
+        if (c->state != DMESH_CONN_FREE &&
+            c->session->doorbell_pending_epoch != c->session->doorbell_sent_epoch) {
+            uint8_t epoch[DMESH_SESSION_DOORBELL_SIZE];
+            dmesh_session_put_u64(epoch, c->session->doorbell_pending_epoch);
+            if (dmesh_dispatch_reply(c, DMESH_SESSION_DOORBELL, epoch, sizeof(epoch), 0) == DOCA_SUCCESS)
+                c->session->doorbell_sent_epoch = c->session->doorbell_pending_epoch;
         }
     }
 }

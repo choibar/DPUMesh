@@ -28,6 +28,13 @@ class DmeshRuntime final {
     DmeshReactor::Options reactor;
   };
 
+  // The largest reactor count DPUMESH_REACTORS may ask for.
+  static constexpr size_t kMaxReactors = 64;
+
+  // Defaults, except reactor_count, which DPUMESH_REACTORS sets (1 when it
+  // is unset). The Create overloads without Options use these.
+  static absl::StatusOr<Options> OptionsFromEnvironment();
+
   static absl::StatusOr<std::shared_ptr<DmeshRuntime>> Create(
       std::unique_ptr<DmeshApiOps> ops);
   static absl::StatusOr<std::shared_ptr<DmeshRuntime>> Create(
@@ -47,6 +54,7 @@ class DmeshRuntime final {
   void Connect(std::string service, DmeshReactor::ConnectCallback callback);
   absl::Status SetAcceptCallback(DmeshReactor::AcceptCallback callback);
   int post_max() const { return post_max_; }
+  size_t reactor_count() const { return reactors_.size(); }
   // Diagnostics only: lets a benchmark read native transmit counters.
   dmesh_channel_t* channel() const { return channel_; }
   const std::shared_ptr<Executor>& callback_executor() const {

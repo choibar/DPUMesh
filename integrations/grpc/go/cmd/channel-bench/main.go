@@ -146,7 +146,21 @@ type peer struct {
 	dials atomic.Int64
 }
 
-func openPeer(index int, ip string, port int, tracker *closeTracker) (*peer, error) {
+// dialer opens one connection: a native DPUMesh stream, or TCP with -tcp.
+type dialer func(ctx context.Context) (net.Conn, error)
+
+func nativeDialer(ip string, port int) dialer {
+	return func(ctx context.Context) (net.Conn, error) { return dmeshgo.DialContext(ctx, ip, port) }
+}
+
+func tcpDialer(addr string) dialer {
+	return func(ctx context.Context) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", addr)
+	}
+}
+
+func openPeer(index int, dial dialer, tracker *closeTracker) (*peer, error) {
 	p := &peer{}
 	cc, err := grpc.NewClient(fmt.Sprintf("passthrough:///channel-bench-%d", index),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -154,7 +168,7 @@ func openPeer(index int, ip string, port int, tracker *closeTracker) (*peer, err
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
 			p.dials.Add(1)
-			conn, err := dmeshgo.DialContext(ctx, ip, port)
+			conn, err := dial(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -200,6 +214,7 @@ type config struct {
 	duration    time.Duration
 	rpcTimeout  time.Duration
 	startFile   string
+	tcp         string // host:port; empty uses the native transport
 }
 
 // Split a fixed offered concurrency across connections, e.g. 64 -> 22/21/21.
@@ -344,7 +359,7 @@ func processCPUSeconds() (float64, error) {
 	return float64(usage.Utime.Sec+usage.Stime.Sec) + float64(usage.Utime.Usec+usage.Stime.Usec)/1e6, nil
 }
 
-func runClient(ctx context.Context, ip string, port int, c config) (r result, runErr error) {
+func runClient(ctx context.Context, dial dialer, c config) (r result, runErr error) {
 	r = result{Event: "result", Connections: c.connections, Concurrency: c.concurrency,
 		ConcurrencyPerConn: distribute(c.concurrency, c.connections), PayloadBytes: payloadBytes,
 		WarmupSeconds: c.warmup.Seconds(), DurationSeconds: c.duration.Seconds()}
@@ -357,7 +372,10 @@ func runClient(ctx context.Context, ip string, port int, c config) (r result, ru
 		for _, p := range peers {
 			runErr = errors.Join(runErr, p.conn.Close())
 		}
-		runErr = errors.Join(runErr, tracker.wait(cleanupCtx), closeTransport(cleanupCtx))
+		runErr = errors.Join(runErr, tracker.wait(cleanupCtx))
+		if c.tcp == "" {
+			runErr = errors.Join(runErr, closeTransport(cleanupCtx))
+		}
 		for _, p := range peers {
 			dials := p.dials.Load()
 			r.NativeDials = append(r.NativeDials, dials)
@@ -374,7 +392,7 @@ func runClient(ctx context.Context, ip string, port int, c config) (r result, ru
 		}
 	}()
 	for i := 0; i < c.connections; i++ {
-		p, err := openPeer(i, ip, port, tracker)
+		p, err := openPeer(i, dial, tracker)
 		if err != nil {
 			return r, err
 		}
@@ -499,8 +517,14 @@ func runClient(ctx context.Context, ip string, port int, c config) (r result, ru
 	return r, runErr
 }
 
-func runServer(ctx context.Context) error {
-	listener, err := dmeshgo.ListenService()
+func runServer(ctx context.Context, tcp string) error {
+	var listener net.Listener
+	var err error
+	if tcp != "" {
+		listener, err = net.Listen("tcp", tcp)
+	} else {
+		listener, err = dmeshgo.ListenService()
+	}
 	if err != nil {
 		return err
 	}
@@ -509,7 +533,7 @@ func runServer(ctx context.Context) error {
 	s.RegisterService(&service, echoServer{})
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(observedListener{Listener: listener, tracker: tracker}) }()
-	log.Printf("CHANNEL_BENCH_SERVER_READY service=%s", os.Getenv("DPUMESH_SERVICE"))
+	log.Printf("CHANNEL_BENCH_SERVER_READY service=%s", listener.Addr())
 	select {
 	case err = <-done:
 	case <-ctx.Done():
@@ -529,7 +553,15 @@ func runServer(ctx context.Context) error {
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	return errors.Join(err, listener.Close(), tracker.wait(cleanupCtx), closeTransport(cleanupCtx))
+	// grpc.Server.Stop already closed a TCP listener.
+	if cerr := listener.Close(); !errors.Is(cerr, net.ErrClosed) {
+		err = errors.Join(err, cerr)
+	}
+	err = errors.Join(err, tracker.wait(cleanupCtx))
+	if tcp == "" {
+		err = errors.Join(err, closeTransport(cleanupCtx))
+	}
+	return err
 }
 
 func main() {
@@ -541,12 +573,13 @@ func main() {
 	flag.DurationVar(&c.duration, "duration", 10*time.Second, "measurement duration")
 	flag.DurationVar(&c.rpcTimeout, "rpc-timeout", 5*time.Second, "deadline for each verified RPC")
 	flag.StringVar(&c.startFile, "start-file", "", "optional file containing a common future load-start timestamp (RFC3339Nano)")
+	flag.StringVar(&c.tcp, "tcp", "", "use kernel TCP at host:port instead of DPUMesh (server listens, client dials)")
 	timeout := flag.Duration("timeout", 90*time.Second, "overall client deadline")
 	flag.Parse()
 	ip := os.Getenv("DPUMESH_SERVICE_IP")
 	port, err := strconv.Atoi(os.Getenv("DPUMESH_SERVICE_PORT"))
-	// Only the client dials an address; the server serves DPUMESH_SERVICE.
-	if *mode == "client" && (err != nil || ip == "" || port < 1 || port > 65535) || c.connections < 1 || c.connections > 4 ||
+	// Only the native client dials an address; the server serves DPUMESH_SERVICE.
+	if *mode == "client" && c.tcp == "" && (err != nil || ip == "" || port < 1 || port > 65535) || c.connections < 1 || c.connections > 4 ||
 		c.concurrency < c.connections || c.warmup < 0 || c.duration <= 0 || c.rpcTimeout <= 0 || *timeout <= 0 {
 		log.Fatal("set DPUMESH_SERVICE_IP/PORT for the client, connections 1..4, concurrency >= connections, and valid durations")
 	}
@@ -554,7 +587,7 @@ func main() {
 	defer stop()
 	switch *mode {
 	case "server":
-		err = runServer(ctx)
+		err = runServer(ctx, c.tcp)
 		if err == nil {
 			log.Printf("CHANNEL_BENCH_SERVER_CLOSED")
 		}
@@ -563,7 +596,11 @@ func main() {
 		ctx, cancel = context.WithTimeout(ctx, *timeout)
 		defer cancel()
 		var r result
-		r, err = runClient(ctx, ip, port, c)
+		dial := nativeDialer(ip, port)
+		if c.tcp != "" {
+			dial = tcpDialer(c.tcp)
+		}
+		r, err = runClient(ctx, dial, c)
 		err = errors.Join(err, emit(r))
 	default:
 		err = fmt.Errorf("unknown mode %q", *mode)

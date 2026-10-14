@@ -620,6 +620,42 @@ void TestEqPollFailureFailsAndClosesConnection() {
   CHECK_EQ(fixture.state->mid_batch_destroy_count(), size_t{0});
 }
 
+// Created without Options, a runtime takes its reactor count from
+// DPUMESH_REACTORS and rejects a value outside 1..kMaxReactors.
+void TestReactorCountFollowsEnvironment() {
+  const char* saved = std::getenv("DPUMESH_REACTORS");
+  const std::optional<std::string> restore =
+      saved != nullptr ? std::optional<std::string>(saved) : std::nullopt;
+  auto count = [](const char* value) -> absl::StatusOr<size_t> {
+    if (value != nullptr) {
+      setenv("DPUMESH_REACTORS", value, 1);
+    } else {
+      unsetenv("DPUMESH_REACTORS");
+    }
+    auto created =
+        DmeshRuntime::Create(MakeFakeDmeshApiOps(std::make_shared<FakeDmeshState>()));
+    if (!created.ok()) return created.status();
+    return (*created)->reactor_count();
+  };
+  const auto unset = count(nullptr);
+  const auto three = count("3");
+  const bool zero_rejected = !count("0").ok();
+  const bool too_many_rejected = !count("65").ok();
+  const bool garbage_rejected = !count("2x").ok();
+  if (restore.has_value()) {
+    setenv("DPUMESH_REACTORS", restore->c_str(), 1);
+  } else {
+    unsetenv("DPUMESH_REACTORS");
+  }
+  CHECK_TRUE(unset.ok());
+  CHECK_EQ(*unset, size_t{1});
+  CHECK_TRUE(three.ok());
+  CHECK_EQ(*three, size_t{3});
+  CHECK_TRUE(zero_rejected);
+  CHECK_TRUE(too_many_rejected);
+  CHECK_TRUE(garbage_rejected);
+}
+
 void TestUnknownServiceMapsToUnavailable() {
   ManualExecutor callbacks;
   auto state = std::make_shared<FakeDmeshState>();
@@ -892,9 +928,10 @@ void TestGrpcChannelChurnKeepsOneRuntime() {
   const auto targets = state->ClientTargets();
   CHECK_EQ(targets.size(), kCycles);
   for (const auto& target : targets) CHECK_EQ(target, std::string("greeter"));
+  const size_t reactors = runtime->reactor_count();
   runtime.reset();
   CHECK_TRUE(state->WaitForChannelDestroyCount(1, 45s));
-  CHECK_EQ(state->eq_destroy_count(), size_t{1});
+  CHECK_EQ(state->eq_destroy_count(), reactors);
   CHECK_EQ(state->channel_destroy_count(), size_t{1});
 }
 
@@ -944,8 +981,9 @@ void TestRuntimeDestroysEqBeforeChannel() {
   auto created = DmeshRuntime::Create(MakeFakeDmeshApiOps(state), UnownedExecutor(&callbacks));
   CHECK_TRUE(created.ok());
   auto runtime = std::move(*created);
+  const size_t reactors = runtime->reactor_count();
   runtime.reset();
-  CHECK_EQ(state->eq_destroy_count(), size_t{1});
+  CHECK_EQ(state->eq_destroy_count(), reactors);
   CHECK_EQ(state->channel_destroy_count(), size_t{1});
 }
 
@@ -1078,6 +1116,8 @@ int main() {
        TestLargeWriteCompletesAcrossPumpYields},
       {"EQ poll failure closes connection",
        TestEqPollFailureFailsAndClosesConnection},
+      {"reactor count follows DPUMESH_REACTORS",
+       TestReactorCountFollowsEnvironment},
       {"unknown service maps to unavailable",
        TestUnknownServiceMapsToUnavailable},
       {"unowned connection is rejected post-batch",

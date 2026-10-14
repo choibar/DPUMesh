@@ -7,8 +7,8 @@
 
 namespace dpumesh::grpc::testing {
 
-void FakeEndpointTransport::BindDriver(
-    std::weak_ptr<DmeshEndpointDriver> /*driver*/) {}
+void FakeEndpointTransport::BindSink(
+    std::weak_ptr<ConnectionSink> /*sink*/) {}
 
 void ManualExecutor::Run(absl::AnyInvocable<void()> task) {
   std::lock_guard<std::mutex> lock(mu_);

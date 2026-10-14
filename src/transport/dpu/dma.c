@@ -836,6 +836,7 @@ static void
 dmesh_dma_push_desc_done(struct dmesh_conn *conn)
 {
     conn->push_seq++;
+    dmesh_session_push_published(conn->session);
     conn->push_pos += conn->push_len;
     conn->pushed_bytes += conn->push_len;
     conn->push_len = 0;

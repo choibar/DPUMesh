@@ -3,15 +3,59 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <utility>
 
 #include "absl/functional/function_ref.h"
 #include "absl/status/status.h"
+#include "absl/types/span.h"
 
 namespace dpumesh::grpc {
 
-class DmeshEndpointDriver;
+// Queued receive bytes above which a sink asks its reactor to hold the native
+// receive credit.
+inline constexpr size_t kReceiveHighWaterBytes = 1024 * 1024;
+
+// Result of handing one native receive to a sink.
+struct ReceiveOutcome {
+  absl::Status status;
+  // True while the sink holds more queued bytes than its high-water mark. The
+  // reactor then keeps that event's receive credit until a read drains the
+  // queue, and the transport lands no further bytes on this connection.
+  bool hold_credit = false;
+};
+
+// Receives one connection's events from its reactor: the gRPC endpoint driver,
+// or a language binding through the stream C ABI. The reactor holds a sink
+// weakly and locks it for each event, and never calls it while holding the
+// connection's transmit lock.
+class ConnectionSink {
+ public:
+  virtual ~ConnectionSink() = default;
+
+  // Copies `length` bytes through `fill`, which writes exactly `length` bytes
+  // at the pointer it receives. One call carries a whole run of receives.
+  virtual ReceiveOutcome OnIncomingData(
+      size_t length, absl::FunctionRef<void(uint8_t*)> fill) = 0;
+  ReceiveOutcome OnIncomingData(absl::Span<const uint8_t> bytes) {
+    return OnIncomingData(bytes.size(), [bytes](uint8_t* destination) {
+      std::memcpy(destination, bytes.data(), bytes.size());
+    });
+  }
+  // Hands over `length` received bytes already in memory; `release(arg)`
+  // frees it once the sink is done with it. The default copies them.
+  virtual ReceiveOutcome OnIncomingBuffer(uint8_t* data, size_t length,
+                                          void (*release)(void*), void* arg) {
+    ReceiveOutcome outcome =
+        OnIncomingData(absl::Span<const uint8_t>(data, length));
+    release(arg);
+    return outcome;
+  }
+  virtual void OnWritable() = 0;
+  virtual void OnRemoteEof() = 0;
+  virtual void OnTransportError(absl::Status status) = 0;
+};
 
 enum class PostCode {
   kAccepted,
@@ -42,15 +86,15 @@ struct Reservation {
   size_t length = 0;
 };
 
-// Seam between the EventEngine endpoint state machine and the EQ reactor.
-// Post() and Flush() run on whichever thread pumps the write: initially the
-// Endpoint::Write() caller and, after native backpressure, the EQ owner that
-// delivers TX_READY. Post(), Close() and BindDriver() must not invoke
-// DmeshEndpointDriver inline; reactor events are delivered separately.
+// Seam between a connection's consumer (the EventEngine endpoint state machine
+// or a stream binding) and the EQ reactor. Post() and Flush() run on whichever
+// thread pumps the write: initially the writer and, after native backpressure,
+// the EQ owner that delivers TX_READY. Post(), Close() and BindSink() must not
+// invoke the sink inline; reactor events are delivered separately.
 class EndpointTransport {
  public:
   virtual ~EndpointTransport() = default;
-  virtual void BindDriver(std::weak_ptr<DmeshEndpointDriver> driver) = 0;
+  virtual void BindSink(std::weak_ptr<ConnectionSink> sink) = 0;
   virtual size_t MaxPostSize() const = 0;
   // Reserve `length` bytes of registered transmit space, invoke `fill` on it,
   // and submit it, holding the connection's transmit lock throughout. `fill`

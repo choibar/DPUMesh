@@ -18,35 +18,24 @@ namespace dpumesh::grpc {
 
 class DmeshEndpointState;
 
-// Queued receive bytes above which an endpoint asks its reactor to hold the
-// native receive credit.
-inline constexpr size_t kReceiveHighWaterBytes = 1024 * 1024;
-
-// Result of handing one native receive to the endpoint.
-struct ReceiveOutcome {
-  absl::Status status;
-  // True while the endpoint holds more queued bytes than its high-water mark.
-  // The reactor then keeps that event's receive credit until a read drains the
-  // queue, and the transport lands no further bytes on this connection.
-  bool hold_credit = false;
-};
-
 // A reactor locks a weak reference to this object for each EQ event. A driver
 // already locked by the reactor keeps the shared endpoint state valid for that
 // event, while the public destructor still transitions it to closing immediately.
-class DmeshEndpointDriver final {
+class DmeshEndpointDriver final : public ConnectionSink {
  public:
   explicit DmeshEndpointDriver(std::shared_ptr<DmeshEndpointState> state);
 
-  // Copies `length` bytes into one gRPC slice through `fill`, which writes
-  // exactly `length` bytes at the pointer it receives. One reactor call
-  // carries a whole batch run: one slice, one endpoint lock, one queue entry.
-  ReceiveOutcome OnIncomingData(size_t length,
-                                absl::FunctionRef<void(uint8_t*)> fill);
-  ReceiveOutcome OnIncomingData(absl::Span<const uint8_t> bytes);
-  void OnWritable();
-  void OnRemoteEof();
-  void OnTransportError(absl::Status status);
+  // Copies `length` bytes into one gRPC slice: one slice, one endpoint lock,
+  // one queue entry per reactor run.
+  using ConnectionSink::OnIncomingData;
+  ReceiveOutcome OnIncomingData(
+      size_t length, absl::FunctionRef<void(uint8_t*)> fill) override;
+  // Adopts the buffer as a gRPC slice, without a copy.
+  ReceiveOutcome OnIncomingBuffer(uint8_t* data, size_t length,
+                                  void (*release)(void*), void* arg) override;
+  void OnWritable() override;
+  void OnRemoteEof() override;
+  void OnTransportError(absl::Status status) override;
 
  private:
   std::shared_ptr<DmeshEndpointState> state_;

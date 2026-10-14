@@ -100,7 +100,7 @@ class ThreadExecutor final : public Executor {
 
 struct LinkState {
   std::mutex mu;
-  std::weak_ptr<DmeshEndpointDriver> drivers[2];
+  std::weak_ptr<ConnectionSink> drivers[2];
   bool closed[2] = {false, false};
   size_t bytes[2] = {0, 0};
   size_t posts[2] = {0, 0};
@@ -114,7 +114,7 @@ class LinkedEndpointTransport final : public EndpointTransport {
         side_(side),
         peer_inbound_executor_(peer_inbound_executor) {}
 
-  void BindDriver(std::weak_ptr<DmeshEndpointDriver> driver) override {
+  void BindSink(std::weak_ptr<ConnectionSink> driver) override {
     std::lock_guard<std::mutex> lock(state_->mu);
     state_->drivers[side_] = std::move(driver);
   }
@@ -123,7 +123,7 @@ class LinkedEndpointTransport final : public EndpointTransport {
 
   PostResult Post(size_t length,
                   absl::FunctionRef<void(Reservation)> fill) override {
-    std::shared_ptr<DmeshEndpointDriver> peer;
+    std::shared_ptr<ConnectionSink> peer;
     std::vector<uint8_t> copied;
     {
       std::lock_guard<std::mutex> lock(state_->mu);
@@ -153,7 +153,7 @@ class LinkedEndpointTransport final : public EndpointTransport {
   void ResumeReceive() override {}
 
   void Close() override {
-    std::shared_ptr<DmeshEndpointDriver> peer;
+    std::shared_ptr<ConnectionSink> peer;
     {
       std::lock_guard<std::mutex> lock(state_->mu);
       if (state_->closed[side_]) return;
@@ -327,7 +327,7 @@ struct Link {
 
   /// Half-close one side, as a peer FIN does.
   void Close(int side) {
-    std::shared_ptr<DmeshEndpointDriver> peer;
+    std::shared_ptr<ConnectionSink> peer;
     {
       std::lock_guard<std::mutex> lock(state->mu);
       if (state->closed[side]) return;

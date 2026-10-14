@@ -47,7 +47,7 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 
 /* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection.
  * This is the per-worker-thread limit; total = num_threads x this. */
-#define DMESH_MAX_CONNECTIONS 32
+#define DMESH_MAX_CONNECTIONS 64
 #define DMESH_MAX_SESSIONS 64
 
 /* A Comch peer is a channel, independently of its logical data flows. */
@@ -70,7 +70,23 @@ struct dmesh_session {
         uint32_t token;
         bool sent;
     } backend[DMESH_SESSION_MAX_WORKERS];
+    /* Idle wake: the host ARMed before sleeping; the next push descriptor
+     * completion (or one the ARM had not seen) queues a DOORBELL, sent from
+     * dmesh_sessions_advance and retried until the send is accepted. A
+     * dispatcher worker keeps this state on the flow's worker-local session
+     * and rings as a reply from dmesh_dispatch_worker_flush. */
+    bool armed;
+    uint64_t armed_epoch, doorbell_pending_epoch, doorbell_sent_epoch;
 };
+
+/* A push descriptor reached host memory: queue one DOORBELL for an ARMed host. */
+static inline void dmesh_session_push_published(struct dmesh_session *s)
+{
+    if (s != NULL && s->armed) {
+        s->armed = false;
+        s->doorbell_pending_epoch = s->armed_epoch;
+    }
+}
 
 /* Per-connection init state, advanced by dmesh_doca_ctrl_advance() */
 enum dmesh_conn_state {
@@ -113,6 +129,7 @@ struct dmesh_conn {
     struct dmesh_export_metadata_msg *pending_metadata;
 
     struct dmesh_doca_dpa_thread *dpa_thread; /* assigned from objs->dpa_pool */
+    uint32_t rx_consumed_pos_published; /* last DPU RX consumed position sent to the DPA */
     struct dmesh_doca_dpa_comch *dpa_comch;   /* msgqs bound to dpa_thread */
 
     struct local_mem_bufs *consumer_mem;

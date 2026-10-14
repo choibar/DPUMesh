@@ -1,5 +1,7 @@
 #include "thread_executor.h"
 
+#include <pthread.h>
+
 #include <utility>
 
 namespace dpumesh::grpc {
@@ -54,6 +56,7 @@ void ThreadExecutor::Push(Entry entry) {
 }
 
 void ThreadExecutor::ThreadMain(std::shared_ptr<State> state) {
+  pthread_setname_np(pthread_self(), "dmesh-callback");
   std::deque<Entry> batch;
   for (;;) {
     {

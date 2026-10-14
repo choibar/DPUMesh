@@ -1213,6 +1213,7 @@ dmesh_fill_dpa_thread_ctx(struct dmesh_conn *conn, struct dpa_thread_ctx *arg,
     }
 #endif
 
+    conn->rx_consumed_pos_published = 0;
     *arg = (struct dpa_thread_ctx) {
         .dpa_producer_comp = dpa_producer_comp,
         .dpa_producer = dpa_producer,

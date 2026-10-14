@@ -11,6 +11,13 @@ channel-bench -mode server
 channel-bench -mode client -connections 3 -concurrency 64 -warmup 3s -duration 10s
 ```
 
+`-tcp host:port` runs the same fixture over kernel TCP for a baseline: the
+server listens there and the client dials it, with no DPUMesh environment.
+The wire protocol is fixed — method `/dmesh.ChannelBench/Echo`, 64-byte raw
+request echoed unchanged, bytes 0–7 the little-endian sequence number and
+8–15 the worker ID — so a fixture in another language interoperates with
+this one in either role.
+
 `-connections` accepts 1 through 4. `-concurrency` is the total number of RPC
 loops, distributed as evenly as possible across the connections. At 64 total
 loops, 3 connections receive 22, 21, and 21 loops. Each connection completes a

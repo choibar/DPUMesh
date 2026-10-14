@@ -62,10 +62,15 @@ static void fake_reset(void) {
 }
 
 /* ---- Native API fakes required by the included production shim. ---- */
-int dmesh_config_listen_port(void) { return -1; }
+static int fake_listen_port = -1;
+static uint32_t fake_mesh_ip;       /* net order; 0 = nothing is meshed */
+static uint16_t fake_mesh_port;
+int dmesh_config_listen_port(void) { return fake_listen_port; }
 int dmesh_resolve_addr_via(dpumesh_ctx_t *ctx, uint32_t ip_net,
                            uint16_t port_host) {
-    (void)ctx; (void)ip_net; (void)port_host;
+    (void)ctx;
+    if (fake_mesh_ip && ip_net == fake_mesh_ip && port_host == fake_mesh_port)
+        return 7;
     errno = ENOENT;
     return -1;
 }
@@ -222,6 +227,138 @@ static void test_native_chunking_delegates_batching(void) {
     assert(fake_posted_len == sizeof(payload) - 1);
     assert(memcmp(fake_posted, payload, sizeof(payload) - 1) == 0);
     test_pfd_free(e);
+}
+
+/* A gather write fills each reservation across iovec boundaries: [3,5,2]
+ * bytes with a 4-byte post limit are 4+4+2, not one post per element. */
+static void test_writev_gathers_across_iovecs(void) {
+    fake_reset();
+    pfd_t *e = test_pfd();
+    struct iovec iov[] = {
+        { (void *)"abc", 3 }, { (void *)"", 0 }, { (void *)"defgh", 5 }, { (void *)"ij", 2 },
+    };
+    assert(shim_send_iov(e, iov, 4, 0) == 10);
+    assert(atomic_load(&fake_alloc_calls) == 3);
+    assert(atomic_load(&fake_post_calls) == 3);
+    assert(fake_posted_len == 10);
+    assert(memcmp(fake_posted, "abcdefghij", 10) == 0);
+    test_pfd_free(e);
+}
+
+/* A reservation refused with EAGAIN consumes no iovec bytes: the retry after
+ * TX_READY sends the whole stream exactly once, in order. */
+static void test_writev_eagain_keeps_cursor(void) {
+    fake_reset();
+    pfd_t *e = test_pfd();
+    struct iovec iov[] = { { (void *)"head", 4 }, { (void *)"payload", 7 } };
+    atomic_store(&fake_fail_allocs, 1);
+    errno = 0;
+    assert(shim_send_iov(e, iov, 2, MSG_DONTWAIT) == -1);
+    assert(errno == EAGAIN);
+    assert(fake_posted_len == 0);
+    g_eq = (dmesh_eq_t *)(uintptr_t)1;
+    fake_emit_event(DMESH_EVENT_TX_READY, &fake_qp);
+    dispatcher_drain_eq(NULL, 0);
+    assert(shim_send_iov(e, iov, 2, MSG_DONTWAIT) == 11);
+    assert(fake_posted_len == 11);
+    assert(memcmp(fake_posted, "headpayload", 11) == 0);
+    test_pfd_free(e);
+}
+
+/* Drops a table entry that a socket call installed, without a dispatcher. */
+static void untrack_fd(int fd) {
+    pfd_t *e = pfd_get(fd);
+    assert(e);
+    pthread_mutex_lock(&g_tbl_mu);
+    g_fds[fd] = NULL;
+    e->active_ops--;
+    pthread_mutex_unlock(&g_tbl_mu);
+    real_close(fd);
+    test_pfd_free(e);
+}
+
+/* A dual-stack client connects to an IPv4 service through a v4-mapped IPv6
+ * address; it is meshed like an AF_INET connect, and its names read back in
+ * the socket's own family. A native IPv6 destination stays kernel TCP. */
+static void test_connect_v4_mapped_ipv6_is_meshed(void) {
+    fake_reset();
+    g_ch = &fake_channel;
+    g_eq = (dmesh_eq_t *)(uintptr_t)1;
+    assert(inet_pton(AF_INET, "10.99.1.1", &fake_mesh_ip) == 1);
+    fake_mesh_port = 3550;
+    /* Nonblocking, so a connect that escapes to kernel TCP fails the test
+     * instead of waiting on an unroutable address. */
+    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    assert(fd >= 0);
+    struct sockaddr_in6 to = { .sin6_family = AF_INET6, .sin6_port = htons(3550) };
+    assert(inet_pton(AF_INET6, "::ffff:10.99.1.1", &to.sin6_addr) == 1);
+    assert(connect(fd, (struct sockaddr *)&to, sizeof to) == 0);
+    pfd_t *e = pfd_get(fd);
+    assert(e && e->conn == &fake_qp && e->family == AF_INET6);
+    pfd_put(e);
+    struct sockaddr_in6 peer;
+    socklen_t len = sizeof peer;
+    assert(getpeername(fd, (struct sockaddr *)&peer, &len) == 0);
+    assert(len == sizeof peer && peer.sin6_family == AF_INET6 && ntohs(peer.sin6_port) == 3550);
+    assert(IN6_IS_ADDR_V4MAPPED(&peer.sin6_addr) &&
+           memcmp(&peer.sin6_addr.s6_addr[12], &fake_mesh_ip, 4) == 0);
+    int value = 0;
+    len = sizeof value;
+    assert(getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &value, &len) == 0 && value == AF_INET6);
+    len = sizeof value;
+    assert(getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &value, &len) == 0 && value == IPPROTO_TCP);
+    untrack_fd(fd);
+
+    int kfd = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 native = { .sin6_family = AF_INET6, .sin6_port = htons(3550),
+                                   .sin6_addr = IN6ADDR_LOOPBACK_INIT };
+    (void)connect(kfd, (struct sockaddr *)&native, sizeof native);   /* refused: kernel TCP */
+    assert(pfd_get(kfd) == NULL);
+    real_close(kfd);
+    fake_mesh_ip = 0;
+}
+
+/* A server bound to [::] listens over DPUmesh like an IPv4 one, and what it
+ * accepts carries IPv6-shaped names. */
+static void test_ipv6_listener_is_converted(void) {
+    fake_reset();
+    g_ch = &fake_channel;
+    g_eq = (dmesh_eq_t *)(uintptr_t)1;
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in6 any = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_ANY_INIT };
+    assert(bind(fd, (struct sockaddr *)&any, sizeof any) == 0);
+    socklen_t len = sizeof any;
+    assert(real_getsockname(fd, (struct sockaddr *)&any, &len) == 0);
+    fake_listen_port = ntohs(any.sin6_port);
+    assert(listen(fd, 16) == 0);
+    pfd_t *l = pfd_get(fd);
+    assert(l && l->listener && l->family == AF_INET6);
+    pfd_put(l);
+    struct sockaddr_in6 name;
+    len = sizeof name;
+    assert(getsockname(fd, (struct sockaddr *)&name, &len) == 0);
+    assert(name.sin6_family == AF_INET6 && ntohs(name.sin6_port) == fake_listen_port);
+    int value = 0;
+    len = sizeof value;
+    assert(getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &value, &len) == 0 && value == 1);
+
+    pfd_t *in = pfd_new(&fake_qp);
+    assert(in);
+    in->pport = 40001;
+    accept_q_push(in);
+    struct sockaddr_in6 peer;
+    len = sizeof peer;
+    int afd = accept4(fd, (struct sockaddr *)&peer, &len, SOCK_NONBLOCK);
+    assert(afd >= 0);
+    assert(len == sizeof peer && peer.sin6_family == AF_INET6 && ntohs(peer.sin6_port) == 40001);
+    assert(IN6_IS_ADDR_V4MAPPED(&peer.sin6_addr));
+    len = sizeof value;
+    assert(getsockopt(afd, SOL_SOCKET, SO_DOMAIN, &value, &len) == 0 && value == AF_INET6);
+    untrack_fd(afd);
+    atomic_store_explicit(&g_listener, NULL, memory_order_release);
+    untrack_fd(fd);
+    fake_listen_port = -1;
 }
 
 static void test_nonblocking_eagain_and_pollout_edge(void) {
@@ -748,6 +885,10 @@ int main(void) {
     ENSURE_REAL();
     test_preload_tx_stats();
     test_native_chunking_delegates_batching();
+    test_writev_gathers_across_iovecs();
+    test_writev_eagain_keeps_cursor();
+    test_connect_v4_mapped_ipv6_is_meshed();
+    test_ipv6_listener_is_converted();
     test_nonblocking_eagain_and_pollout_edge();
     test_blocking_send_waits_for_event();
     test_send_timeout_does_not_poll_native();

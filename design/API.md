@@ -79,13 +79,20 @@ no tail needs service). Poll one EQ from one thread.
 
 - `dmesh_create_channel` establishes one shared Comch session. `dmesh_create_qp`
   opens a logical flow on it and synchronously waits for READY; it fails with
-  `ENOSPC` when the DPU worker's 32 flows are in use. Closing one flow keeps
+  `ENOSPC` when the DPU worker's 64 flows are in use. Closing one flow keeps
   sibling flows and the channel's Comch session alive.
 - `dmesh_destroy_qp` and `dmesh_abort_qp` end that connection; the peer's
   close arrives as `RECV_FIN`.
 - A QP's receive buffers are consumed in arrival order on the wire: a buffer
   held for long stalls only that QP.
 - `dmesh_msg_max` is 8192. `dmesh_pod_id` returns `DPUMESH_POD_ID`.
+- A lost Comch session (the DPU proxy restarted or the device went away)
+  never recovers. The first poll or dial that sees it ends the process with
+  exit status 75, so its supervisor restarts it onto a live session. With
+  `DPUMESH_EXIT_ON_LOSS=0` the process lives: every EQ fd stays readable,
+  `dmesh_poll_eq` returns -1 with the session's errno (`ECONNRESET` for a
+  dropped peer) after the events that landed before the loss, and
+  `dmesh_create_qp` fails with it.
 
 The [examples](../examples/README.md) show the lifecycle for each API; the
 [tests](../tests/README.md) cover the core and façades without a device.
