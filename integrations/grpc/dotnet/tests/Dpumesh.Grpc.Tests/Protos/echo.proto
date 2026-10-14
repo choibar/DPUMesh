@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package dpumesh.test;
+
+service Echo {
+  rpc Unary (Payload) returns (Payload);
+  rpc Bidi (stream Payload) returns (stream Payload);
+  // Returns the byte count of the streamed payloads.
+  rpc Sink (stream Payload) returns (Payload);
+  // Streams `count` payloads of data's length.
+  rpc Source (Payload) returns (stream Payload);
+  // Answers after delay_ms.
+  rpc Sleep (Payload) returns (Payload);
+}
+
+message Payload {
+  bytes data = 1;
+  int64 count = 2;
+  int32 delay_ms = 3;
+}
