@@ -73,6 +73,9 @@ struct dmesh_doca_dpa_msgq {
 struct dmesh_doca_dpa_comch {
     void *owner;
     void (*received)(void *owner, uint32_t pos, uint32_t len, uint32_t count);
+    /* Set instead of `received` to take every DPA message as it arrived
+     * (the mux threads' messages carry their own format). */
+    void (*raw_received)(void *owner, const void *msg, uint32_t len);
     void (*sent)(void *owner);
     uint64_t dma_completed;         /* one immediate message after each DMA copy */
     bool completion_error, stopping;
@@ -210,5 +213,8 @@ dmesh_doca_dpa_msgq_send_bulk(struct dmesh_doca_dpa_msgq *msgq, uint32_t num_msg
                                 void *msg, uint32_t msg_size);
 
 doca_error_t
-setup_dpa_buf_array(struct dmesh_conn *conn, size_t num_elem, struct doca_mmap *mmap);					
+setup_dpa_buf_array(struct dmesh_conn *conn, size_t num_elem, struct doca_mmap *mmap);
+
+/* One completed forward copy of `conn`: [pos, pos + len) of its staging. */
+void dmesh_doca_conn_received(struct dmesh_conn *conn, uint32_t pos, uint32_t len, uint32_t count);					
 #endif

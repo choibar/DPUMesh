@@ -18,6 +18,7 @@
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
 struct dmesh_dpa_thread_pool;
+struct dmesh_mux;
 struct dma_ring;
 struct objects;
 struct dmesh_conn;
@@ -131,6 +132,15 @@ struct dmesh_conn {
     struct dmesh_doca_dpa_thread *dpa_thread; /* assigned from objs->dpa_pool */
     uint32_t rx_consumed_pos_published; /* last DPU RX consumed position sent to the DPA */
     struct dmesh_doca_dpa_comch *dpa_comch;   /* msgqs bound to dpa_thread */
+
+    /* Multiplexed forward DMA (dpu/dpa_mux.h) instead of dpa_thread/dpa_comch:
+     * this flow's forward ring is slot mux_ring of the worker's thread mux_thread. */
+    bool mux, mux_close_sent;
+    uint8_t mux_thread, mux_ring;
+    uint32_t mux_gen;                 /* echoed by every message of this ring */
+    uint32_t mux_error;               /* enum dmesh_mux_ring_error the DPA reported */
+    uint64_t mux_received;            /* DMA_DONE messages taken for this flow */
+    uint64_t mux_deadline_ns;         /* CLOCK_MONOTONIC bound for the close */
 
     struct local_mem_bufs *consumer_mem;
     struct doca_comch_consumer *consumer;
@@ -275,7 +285,9 @@ struct objects {
     struct doca_buf_arr *buf_arr;
 
     doca_error_t (*release_dpa)(struct objects *); /* optional checked worker cleanup */
+    doca_error_t (*release_mux)(struct objects *); /* stops and frees the mux threads */
     struct dmesh_dpa_thread_pool *dpa_pool;   /* pre-created DPA threads */
+    struct dmesh_mux *mux;                    /* DMESH_DPA_MUX threads, NULL when off */
     struct dmesh_doca_dpa_thread *dpa_thread; /* thread assigned to the active connection */
 	struct dmesh_doca_dpa_comch *dpa_comch;
     doca_dpa_dev_comch_producer_t remote_dpa_producer;
