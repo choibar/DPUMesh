@@ -4,6 +4,13 @@
 #include <assert.h>
 #include "src/transport/dpu/dispatcher.c"
 
+/* The fast-path producer is exercised on hardware, not here. */
+doca_error_t dmesh_wake_attach(struct dmesh_conn *c, struct doca_comch_connection *connection, uint32_t consumer)
+{
+    (void)c; (void)connection; (void)consumer;
+    return DOCA_ERROR_NOT_SUPPORTED;
+}
+
 doca_error_t dmesh_session_send(struct objects *o, struct dmesh_session *s, uint16_t type,
     uint32_t id, uint32_t generation, const void *payload, size_t length, int32_t status)
 {

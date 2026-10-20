@@ -42,6 +42,13 @@ enum dmesh_session_message_type {
      * DPU proxy fails the send, and only a send notices one: the Comch
      * client gets no event when its server process exits. */
     DMESH_SESSION_PING = 16,
+    /* WAKE_READY (DPU -> host, session level): the host's Comch consumer is
+     * known, so every push flow opened from now on publishes its descriptors
+     * as fast-path messages to it (struct dmesh_wake_desc). Such a message
+     * is a completion on the host, so an idle host needs no ARM. Sent only
+     * to a host that created a consumer, so a host without one never sees
+     * this type. */
+    DMESH_SESSION_WAKE_READY = 17,
 };
 
 /* ARM payload: u64 epoch, u32 count, u32 zero, then count entries of
@@ -100,7 +107,7 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
                                      DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE &&
                (h->payload_len - DMESH_SESSION_ARM_HEADER_SIZE) % DMESH_SESSION_ARM_FLOW_SIZE == 0;
     }
-    if (h->type == DMESH_SESSION_PING)
+    if (h->type == DMESH_SESSION_PING || h->type == DMESH_SESSION_WAKE_READY)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 && h->status == 0;
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 &&

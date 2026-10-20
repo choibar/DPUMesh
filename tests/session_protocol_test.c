@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "src/transport/common/session_protocol.h"
+#include "src/transport/common/comch_common.h"
 
 /* Check the public wire format independently of the encoder: a decoder and
  * encoder with the same endian/layout mistake must not pass a round trip. */
@@ -108,6 +109,11 @@ static void test_message_shapes(void)
         {DMESH_SESSION_PING,           0, 1, 0,      0, 0},
         {DMESH_SESSION_PING,           0, 0, 0,      8, 0},
         {DMESH_SESSION_PING,           0, 0, EIO,    0, 0},
+        {DMESH_SESSION_WAKE_READY,     0, 0, 0,      0, 1},
+        {DMESH_SESSION_WAKE_READY,     1, 0, 0,      0, 0},
+        {DMESH_SESSION_WAKE_READY,     0, 1, 0,      0, 0},
+        {DMESH_SESSION_WAKE_READY,     0, 0, 0,      8, 0},
+        {DMESH_SESSION_WAKE_READY,     0, 0, EIO,    0, 0},
         {DMESH_SESSION_DOORBELL,       0, 0, 0,      0, 0},
         {DMESH_SESSION_DOORBELL,       0, 0, 0,      9, 0},
         {DMESH_SESSION_DOORBELL,       1, 1, 0,      8, 0},
@@ -273,8 +279,24 @@ static void test_arm_payload(void)
     assert(dmesh_session_arm_decode(payload, (uint32_t)len, &epoch, out, &count) == -1);
 }
 
+/* A fast-path descriptor lands in the slot ring exactly as the desc copy
+ * would: same slot, and the sequence (what the reader polls) last. */
+static void test_wake_desc(void)
+{
+    static struct dmesh_push_desc ring[DMESH_PUSH_DESC_N];
+    assert(DMESH_WAKE_IMM_LEN == 24 && DMESH_WAKE_IMM_LEN <= 96);   /* the consumer's imm cap */
+    struct dmesh_wake_desc d = {.flow_id = 3, .generation = 7, .seq = DMESH_PUSH_DESC_N + 5,
+                                .pos = 8192, .len = 300};
+    dmesh_wake_desc_publish(ring, &d);
+    assert(ring[5].seq == DMESH_PUSH_DESC_N + 5 && ring[5].pos == 8192 && ring[5].len == 300);
+    d.seq++; d.len = 0;                                             /* end of stream */
+    dmesh_wake_desc_publish(ring, &d);
+    assert(ring[6].seq == DMESH_PUSH_DESC_N + 6 && ring[6].len == 0 && ring[5].len == 300);
+}
+
 int main(void)
 {
+    test_wake_desc();
     test_wire_layout();
     test_arm_payload();
     test_message_shapes();

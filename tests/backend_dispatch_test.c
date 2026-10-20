@@ -1,6 +1,13 @@
 /* Real dispatcher policy/control queues with no DOCA device. */
 #include <assert.h>
 #include "src/transport/dpu/dispatcher.c"
+
+/* The fast-path producer is exercised on hardware, not here. */
+doca_error_t dmesh_wake_attach(struct dmesh_conn *c, struct doca_comch_connection *connection, uint32_t consumer)
+{
+    (void)c; (void)connection; (void)consumer;
+    return DOCA_ERROR_NOT_SUPPORTED;
+}
 static unsigned requests, acknowledgements;
 static uint32_t last_worker, last_token;
 static doca_error_t send_result = DOCA_SUCCESS;

@@ -74,6 +74,32 @@ struct dmesh_push_desc {
 #define DMESH_PUSH_DESC_N    128u
 #define DMESH_PUSH_DATA_OFF  4096u
 
+/* Comch fast-path wake (DMESH_SESSION_WAKE_READY): instead of DMAing the 16B
+ * descriptor into the slot ring, the DPU worker sends it as the immediate
+ * data of a producer message to the host's consumer, after the data copy has
+ * completed. The host's consumer completion writes it into the same slot
+ * ring, so the receive side reads the ring as before; the completion is also
+ * what wakes an idle host (its control PE notification), with no ARM. */
+struct dmesh_wake_desc {
+    uint32_t flow_id;           /* host flow slot, 1..32 */
+    uint32_t generation;
+    uint64_t seq;
+    uint32_t pos;
+    uint32_t len;               /* 0 = end of stream */
+};
+#define DMESH_WAKE_IMM_LEN ((uint32_t)sizeof(struct dmesh_wake_desc))
+
+/* Host side: publish a fast-path descriptor into a flow's slot ring. The
+ * sequence is stored last, so a reader that sees it also sees pos and len. */
+static inline void dmesh_wake_desc_publish(volatile struct dmesh_push_desc *ring,
+                                           const struct dmesh_wake_desc *d)
+{
+    volatile struct dmesh_push_desc *slot = &ring[d->seq % DMESH_PUSH_DESC_N];
+    slot->pos = d->pos;
+    slot->len = d->len;
+    __atomic_store_n(&slot->seq, d->seq, __ATOMIC_RELEASE);
+}
+
 /* Push flow control: the host publishes its consumption cursor at a fixed
  * offset in its rcvbuf (the reserved gap between the desc slots and the data
  * ring). The DPU pulls it with a small read-DMA between batches and refuses

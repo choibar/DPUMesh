@@ -2,6 +2,7 @@
 #include "dispatcher.h"
 #include "placement.h"
 #include "object.h"
+#include "comch_wake.h"
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
@@ -23,6 +24,10 @@ struct message {
     uint16_t type;
     int32_t status;
     size_t length;
+    /* OPEN of a session with a fast-path consumer: the worker creates its
+     * producer on this connection (under the SDK lock). */
+    struct doca_comch_connection *wake_connection;
+    uint32_t wake_consumer;
     unsigned char payload[DMESH_SESSION_MAX_PAYLOAD];
 };
 struct queue {
@@ -57,6 +62,7 @@ struct dmesh_dispatcher {
     int fd;
     pthread_t thread;
     _Atomic unsigned remaining;
+    pthread_mutex_t sdk_lock;   /* see dmesh_dispatch_sdk_lock */
 };
 
 /* Read-only membership snapshots for Rust routing before any backend exists.
@@ -430,6 +436,10 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         .backend_token = request_token};
     struct message m = {.key = a->key, .location = a->location, .type = OPEN, .length = sizeof(metadata)};
     memcpy(m.payload, &metadata, sizeof(metadata));
+    if (s->wake_consumer && s->connection && DMESH_FLOW_USES_PUSH(metadata.flow.mode)) {
+        m.wake_connection = s->connection;
+        m.wake_consumer = s->wake_consumer;
+    }
     if (!admit(&d->workers[owner], &m)) {
         memset(a, 0, sizeof(*a)); reply_error(o, s, h, EAGAIN); return;
     }
@@ -549,6 +559,10 @@ static void arm_flow(struct dmesh_conn *c, const struct message *m)
     }
 }
 
+pthread_mutex_t *dmesh_dispatch_sdk_lock(struct objects *o)
+{
+    return o && o->mailbox ? &o->mailbox->dispatcher->sdk_lock : NULL;
+}
 int dmesh_dispatch_worker_fd(struct objects *o) { return o->mailbox->fd; }
 void dmesh_dispatch_worker_arm(struct objects *o) { clear(o->mailbox->fd); }
 void dmesh_dispatch_worker_ready(struct objects *o)
@@ -582,6 +596,14 @@ void dmesh_dispatch_worker_drain(struct objects *o)
                 memcpy(c->pending_metadata, m.payload, sizeof(*c->pending_metadata));
                 c->state = DMESH_CONN_NEW;
             } else { c->error_status = ENOMEM; c->state = DMESH_CONN_ERROR; }
+            /* The host of a fast-path session no longer ARMs: a flow that
+             * cannot publish through a producer must fail rather than fall
+             * back to descriptors nobody is woken for. */
+            if (c->state == DMESH_CONN_NEW && m.wake_connection &&
+                dmesh_wake_attach(c, m.wake_connection, m.wake_consumer) != DOCA_SUCCESS) {
+                c->error_status = EIO;
+                c->state = DMESH_CONN_ERROR;
+            }
         } else if (same_key(&c->key, &m.key) &&
                    c->location.ownership_epoch == m.location.ownership_epoch && c->state != DMESH_CONN_FREE) {
             if (m.type == ARM) { arm_flow(c, &m); continue; }
@@ -658,6 +680,7 @@ static void *dispatch_main(void *arg)
     struct pollfd *fds = d->pollfds;
     while (atomic_load(&d->remaining)) {
         clear(d->fd);
+        pthread_mutex_lock(&d->sdk_lock);
         for (size_t i = 0; i < d->count; ++i) {
             (void)dmesh_doca_ctrl_arm(d->controls[i]);
             (void)dmesh_doca_ctrl_drain(d->controls[i]);
@@ -666,6 +689,7 @@ static void *dispatch_main(void *arg)
         flush_commands(d);
         flush_listeners(d);
         for (size_t i = 0; i < d->count; ++i) dmesh_sessions_advance(d->controls[i]);
+        pthread_mutex_unlock(&d->sdk_lock);
         /* Retry pending SDK sends/HELLO deadlines without busy polling. */
         (void)poll(fds, d->count + 1, 10);
     }
@@ -700,7 +724,9 @@ static void *dispatch_main(void *arg)
         pthread_mutex_destroy(&d->workers[i].requests.lock);
         pthread_mutex_destroy(&d->workers[i].replies.lock);
     }
-    close(d->fd); free(d->controls); free(d->workers); free(d->loads); free(d->flows); free(d);
+    close(d->fd); free(d->controls); free(d->workers); free(d->loads); free(d->flows);
+    pthread_mutex_destroy(&d->sdk_lock);
+    free(d);
     return NULL;
 }
 
@@ -710,6 +736,7 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
     if (!count || count > 128 || !controls || !workers || !out) return DOCA_ERROR_INVALID_VALUE;
     struct dmesh_dispatcher *d = calloc(1, sizeof(*d));
     if (!d) return DOCA_ERROR_NO_MEMORY;
+    if (pthread_mutex_init(&d->sdk_lock, NULL) != 0) { free(d); return DOCA_ERROR_NO_MEMORY; }
     d->count = count; d->fd = -1;
     d->controls = calloc(count, sizeof(*d->controls));
     d->workers = calloc(count, sizeof(*d->workers));
@@ -765,6 +792,7 @@ fail_initialized:
     }
 fail:
     if (d->fd >= 0) close(d->fd);
+    pthread_mutex_destroy(&d->sdk_lock);
     free(d->pollfds); free(d->controls); free(d->workers); free(d->loads); free(d->flows); free(d);
     return DOCA_ERROR_INITIALIZATION;
 }

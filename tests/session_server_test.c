@@ -95,6 +95,16 @@ bool dmesh_doca_dpa_failed(struct doca_dpa *dpa)
     return false;
 }
 
+/* The fast-path producer is exercised on hardware, not here. */
+bool dmesh_wake_enabled(void) { return false; }
+doca_error_t dmesh_wake_attach(struct dmesh_conn *c, struct doca_comch_connection *connection, uint32_t consumer)
+{
+    (void)c; (void)connection; (void)consumer;
+    return DOCA_ERROR_NOT_SUPPORTED;
+}
+void dmesh_wake_detach(struct dmesh_conn *c) { (void)c; }
+void dmesh_dma_push_retry_desc(struct dmesh_conn *c) { (void)c; }
+
 doca_error_t cleanup_dma_tasks(struct dmesh_conn *conn)
 {
     doca_error_t result = cleanup_phase('D');

@@ -77,6 +77,11 @@ struct dmesh_session {
      * and rings as a reply from dmesh_dispatch_worker_flush. */
     bool armed;
     uint64_t armed_epoch, doorbell_pending_epoch, doorbell_sent_epoch;
+    /* Comch fast-path wake, on the dispatcher's session: the host's consumer
+     * (0 = none) and whether WAKE_READY went out. Flows admitted after it
+     * publish through a worker producer (dpu/comch_wake.c). */
+    uint32_t wake_consumer;
+    bool wake_ready_sent;
 };
 
 /* A push descriptor reached host memory: queue one DOORBELL for an ARMed host. */
@@ -199,6 +204,12 @@ struct dmesh_conn {
      * batch and the host reads it as end of stream (dmesh_dma_push_fin). */
     bool push_fin_requested, push_fin_sent;
     struct dmesh_push_desc *push_shadow;      /* in tx_staging's reserved tail */
+    /* Comch fast-path wake: the descriptor goes as a producer message to the
+     * host's consumer instead of the desc copy. One the producer could not
+     * take yet is retried from the RUNNING advance. */
+    struct dmesh_wake_producer *wake;
+    bool wake_desc_pending;
+    struct dmesh_wake_desc wake_imm;          /* the send task points at it */
 
     /* Push flow control (see struct dmesh_push_cursor). The cursor shadow
      * lives in tx_staging's reserved tail right after push_shadow, so it is
@@ -335,6 +346,8 @@ struct objects {
     /* DPU multi-connection slots (see struct dmesh_conn) */
     struct dmesh_conn conns[DMESH_MAX_CONNECTIONS];
     struct dmesh_session sessions[DMESH_MAX_SESSIONS];
+    /* Worker: one Comch producer per session it serves fast-path flows of */
+    struct dmesh_wake_producer *wake_producers;
 };
 
 doca_error_t
