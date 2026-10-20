@@ -287,6 +287,17 @@ struct dpumesh_ctx {
     int spare_epfd;
     /* Idle wake policy (dpumesh_eq_arm), nanoseconds; nap_min 0 = no naps. */
     uint64_t nap_min_ns, nap_cap_ns, linger_ns, backstop_ns;
+    /* Every receive raises the wake fd by itself (dmesh_native_rx_signaled).
+     * Polling then only makes up for what has no signal: naps and linger
+     * default to off, a send does not wake its EQ, and outstanding custody
+     * keeps an EQ polling only while a sender waits for the space it frees
+     * (tx_waiters) or a closed flow still retires. */
+    int rx_signaled;
+    atomic_int tx_waiters;              /* QPs whose tx_wait_state is ARMED */
+    /* For measurement only: DPUMESH_CUSTODY_SLEEP=0 keeps polling open custody
+     * and DPUMESH_SEND_WAKE=1 wakes a sleeping EQ on a send, as without
+     * signaled receives. */
+    int custody_sleep, send_wake;
     atomic_int live_eqs;               /* registered EQs, for the oversubscription guard */
     atomic_int allowed_cpus;           /* sched_getaffinity, re-read every 100 ms */
     atomic_uint_fast64_t cpus_checked_ns;
@@ -875,6 +886,7 @@ static int tx_wait_make_ready(dpumesh_ctx_t *ctx, uint16_t port) {
                                                   memory_order_acq_rel,
                                                   memory_order_acquire))
         return 0;
+    atomic_fetch_sub_explicit(&ctx->tx_waiters, 1, memory_order_relaxed);
 
     pool_waiter_clear(ctx, port);   /* no-op for a per-QP reclaim waiter */
     struct dmesh_eq *eq = __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE);
@@ -899,8 +911,9 @@ static void tx_wait_cancel(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl,
     if (atomic_load_explicit(&psl->tx_wait_state, memory_order_acquire) ==
         (uint_fast32_t)DMESH_TX_WAIT_IDLE)
         return;
-    atomic_exchange_explicit(&psl->tx_wait_state, DMESH_TX_WAIT_IDLE,
-                             memory_order_acq_rel);
+    if (atomic_exchange_explicit(&psl->tx_wait_state, DMESH_TX_WAIT_IDLE,
+                                 memory_order_acq_rel) == (uint_fast32_t)DMESH_TX_WAIT_ARMED)
+        atomic_fetch_sub_explicit(&ctx->tx_waiters, 1, memory_order_relaxed);
     pool_waiter_clear(ctx, port);
     struct dmesh_eq *eq = __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE);
     if (eq) eq_tx_ready_clear(eq, port);
@@ -943,8 +956,9 @@ static void tx_wait_arm(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl,
                           memory_order_relaxed);
     atomic_store_explicit(&psl->tx_wait_reason, (uint_fast32_t)reason,
                           memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->tx_waiters, 1, memory_order_seq_cst);
     atomic_store_explicit(&psl->tx_wait_state, DMESH_TX_WAIT_ARMED,
-                          memory_order_release);
+                          memory_order_seq_cst);
 
     if (reason == DMESH_TX_WAIT_SHARED_POOL) {
         pool_waiter_set(ctx, port);
@@ -958,6 +972,21 @@ static void tx_wait_arm(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl,
             (void)tx_wait_make_ready(ctx, port);
     } else if (tx_wait_qp_retryable(ctx, psl)) {
         (void)tx_wait_make_ready(ctx, port);
+    }
+    /* The ACK that frees this space may sit with a sleeping EQ that did not
+     * poll for it (with signaled receives an EQ sleeps on open custody), so
+     * wake it. The waiter is counted before asleep is read here, and an EQ
+     * sets asleep before it weighs custody, so one of them sees the other. */
+    if (ctx->rx_signaled &&
+        atomic_load_explicit(&psl->tx_wait_state, memory_order_seq_cst) ==
+            (uint_fast32_t)DMESH_TX_WAIT_ARMED) {
+        if (reason == DMESH_TX_WAIT_SHARED_POOL) {
+            notify_all_eqs(ctx);
+        } else {
+            struct dmesh_eq *eq = __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE);
+            if (eq && atomic_load_explicit(&eq->asleep, memory_order_seq_cst))
+                eq_notify(eq);
+        }
     }
 }
 
@@ -1232,6 +1261,7 @@ static unsigned eq_ack_doorbells(struct dmesh_eq *eq)
 static struct {
     atomic_uint_fast64_t naps, lingers, busy, arms, arm_failures, backstop_wakes, backstop_work;
     atomic_uint_fast64_t fired[5];       /* EQ_FIRED_* bit i, per empty poll */
+    atomic_uint_fast64_t custody_sleeps; /* sleeps with open custody (rx_signaled) */
     atomic_uint_fast64_t next_dump_ns;
 } wait_stats;
 static const char *wait_stats_dir;
@@ -1245,12 +1275,13 @@ static void wait_stats_dump(dpumesh_ctx_t *ctx, uint64_t now, int force)
         return;
     uint64_t arm_msgs = 0, doorbells = 0;
     dmesh_native_wake_counters(ctx->transport, &arm_msgs, &doorbells);
-    char path[512], line[512];
+    char path[512], line[640];
     snprintf(path, sizeof(path), "%s/dpumesh-wait.%d", wait_stats_dir, (int)getpid());
     int len = snprintf(line, sizeof(line),
         "naps=%llu lingers=%llu busy=%llu arms=%llu arm_failures=%llu backstop_wakes=%llu "
         "backstop_work=%llu arm_msgs=%llu doorbells=%llu fired_efd=%llu fired_timer=%llu "
-        "fired_tail=%llu fired_stripe=%llu fired_wake=%llu\n",
+        "fired_tail=%llu fired_stripe=%llu fired_wake=%llu custody_sleeps=%llu rx_signaled=%d "
+        "tx_wait_window=%llu tx_wait_pool=%llu\n",
         (unsigned long long)atomic_load(&wait_stats.naps), (unsigned long long)atomic_load(&wait_stats.lingers),
         (unsigned long long)atomic_load(&wait_stats.busy), (unsigned long long)atomic_load(&wait_stats.arms),
         (unsigned long long)atomic_load(&wait_stats.arm_failures),
@@ -1259,7 +1290,9 @@ static void wait_stats_dump(dpumesh_ctx_t *ctx, uint64_t now, int force)
         (unsigned long long)arm_msgs, (unsigned long long)doorbells,
         (unsigned long long)atomic_load(&wait_stats.fired[0]), (unsigned long long)atomic_load(&wait_stats.fired[1]),
         (unsigned long long)atomic_load(&wait_stats.fired[2]), (unsigned long long)atomic_load(&wait_stats.fired[3]),
-        (unsigned long long)atomic_load(&wait_stats.fired[4]));
+        (unsigned long long)atomic_load(&wait_stats.fired[4]),
+        (unsigned long long)atomic_load(&wait_stats.custody_sleeps), ctx->rx_signaled,
+        (unsigned long long)atomic_load(&ctx->st_wait_window), (unsigned long long)atomic_load(&ctx->st_wait_pool));
     FILE *f = fopen(path, "w");
     if (f) { fwrite(line, 1, (size_t)len, f); fclose(f); }
 }
@@ -1273,6 +1306,7 @@ static void eq_timer(struct dmesh_eq *eq, uint64_t ns, int backstop)
     if (its.it_value.tv_sec == 0 && its.it_value.tv_nsec == 0) its.it_value.tv_nsec = 1;
     (void)timerfd_settime(eq->tick_fd, 0, &its, NULL);
     eq->timer_backstop = backstop;
+    eq->backstop_until_ns = backstop ? monotonic_ns() + ns : 0;
 }
 
 /* More live EQs than CPUs this process may run on: a nap then lands in the
@@ -1405,13 +1439,25 @@ void dpumesh_eq_arm(struct dmesh_eq *eq)
         if (owner == NULL || owner == eq)
             busy |= dmesh_native_stripe_arm(ctx->transport, stripe);
     }
+    /* Signaled receives: open custody is reclaimed on the next wake unless a
+     * sender waits for the space it frees. */
+    if (ctx->rx_signaled && ctx->custody_sleep && busy == DMESH_STRIPE_CUSTODY &&
+        atomic_load_explicit(&ctx->tx_waiters, memory_order_seq_cst) <= 0) {
+        busy = 0;
+        atomic_fetch_add_explicit(&wait_stats.custody_sleeps, 1, memory_order_relaxed);
+    }
     if (busy || dmesh_native_idle_arm(ctx->transport) != 0) {
         atomic_store_explicit(&eq->asleep, 0, memory_order_relaxed);
         eq_timer(eq, ctx->nap_cap_ns ? ctx->nap_cap_ns : 100000ull, 0);
         atomic_fetch_add(busy ? &wait_stats.busy : &wait_stats.arm_failures, 1);
         goto out;
     }
-    eq_timer(eq, ctx->backstop_ns, 1);
+    /* The backstop only bounds a missed wake: one still armed for at least
+     * half its period is kept rather than re-armed on every sleep. */
+    if (eq->backstop_until_ns > now + ctx->backstop_ns / 2)
+        eq->timer_backstop = 1;
+    else
+        eq_timer(eq, ctx->backstop_ns, 1);
     atomic_fetch_add(&wait_stats.arms, 1);
 out:
     wait_stats_dump(ctx, now, 0);
@@ -1567,6 +1613,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
     };
     if (dmesh_native_open(&ctx->transport, &native) != 0)
         goto fail;
+    ctx->rx_signaled = dmesh_native_rx_signaled(ctx->transport);
     if (native.stripes < 1 || native.stripes > DMESH_MAX_STRIPES) {
         DOCA_LOG_ERR("carrier exposes %d reverse stripes; at most %d supported",
                      native.stripes, DMESH_MAX_STRIPES);
@@ -1585,9 +1632,13 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
     { int wfd = dmesh_native_wake_fd(ctx->transport);
       if (wfd >= 0 && epoll_nest(ctx->spare_epfd, wfd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0) goto fail; }
     { struct { const char *name; uint64_t *out; long lo, hi, unit_ns; uint64_t def; } knobs[] = {
-          { "DPUMESH_NAP_US", &ctx->nap_min_ns, 0, 5000, 1000, DMESH_NAP_MIN_US_DEFAULT },
+          /* Naps and linger stand in for a receive signal; signaled
+           * receives need neither unless asked for. */
+          { "DPUMESH_NAP_US", &ctx->nap_min_ns, 0, 5000, 1000,
+            ctx->rx_signaled ? 0 : DMESH_NAP_MIN_US_DEFAULT },
           { "DPUMESH_NAP_CAP_US", &ctx->nap_cap_ns, 1, 5000, 1000, DMESH_NAP_CAP_US_DEFAULT },
-          { "DPUMESH_LINGER_US", &ctx->linger_ns, 0, 1000000, 1000, DMESH_LINGER_US_DEFAULT },
+          { "DPUMESH_LINGER_US", &ctx->linger_ns, 0, 1000000, 1000,
+            ctx->rx_signaled ? 0 : DMESH_LINGER_US_DEFAULT },
           { "DPUMESH_BACKSTOP_MS", &ctx->backstop_ns, 1, 10000, 1000000, DMESH_BACKSTOP_MS_DEFAULT },
       };
       for (size_t k = 0; k < sizeof(knobs) / sizeof(knobs[0]); ++k) {
@@ -1605,6 +1656,9 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
                         "DPUMESH_NAP_US, DPUMESH_NAP_CAP_US, DPUMESH_LINGER_US and DPUMESH_BACKSTOP_MS");
       }
       wait_stats_dir = getenv("DPUMESH_WAIT_STATS");
+      const char *cs_env = getenv("DPUMESH_CUSTODY_SLEEP"), *sw_env = getenv("DPUMESH_SEND_WAKE");
+      ctx->custody_sleep = !(cs_env && strcmp(cs_env, "0") == 0);
+      ctx->send_wake = sw_env && strcmp(sw_env, "1") == 0;
       const char *exit_env = getenv("DPUMESH_EXIT_ON_LOSS");
       ctx->exit_on_loss = !(exit_env && strcmp(exit_env, "0") == 0); }
     ctx->dma_buffer = native.tx;
@@ -2263,7 +2317,10 @@ static void eq_note_tx(dpumesh_ctx_t *ctx, uint16_t port)
     if (eq == NULL) return;
     atomic_store_explicit(&eq->last_work_ns, monotonic_ns(), memory_order_relaxed);
     atomic_store_explicit(&eq->kick, 1, memory_order_relaxed);
-    if (atomic_load_explicit(&eq->asleep, memory_order_seq_cst))
+    /* With signaled receives a sleeping EQ is woken by what it waits for
+     * (the reply's completion, or tx_wait_arm); the new custody alone needs
+     * no poll. */
+    if ((!ctx->rx_signaled || ctx->send_wake) && atomic_load_explicit(&eq->asleep, memory_order_seq_cst))
         eq_notify(eq);
 }
 

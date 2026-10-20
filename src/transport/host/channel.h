@@ -74,6 +74,9 @@ int channel_dev_fd(struct channel_dev *dev);
 int channel_dev_arm(struct channel_dev *dev);
 void channel_dev_clear(struct channel_dev *dev);
 void channel_dev_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells);
+/* Nonzero when the DPU publishes every push descriptor as a Comch fast-path
+ * completion (WAKE_READY): each receive raises channel_dev_fd without an ARM */
+int channel_dev_rx_signaled(const struct channel_dev *dev);
 
 /* Memory: allocates, registers and PCI-exports `bytes`; the buffer is owned by mem */
 int channel_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem **out);

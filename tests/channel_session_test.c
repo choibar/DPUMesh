@@ -431,6 +431,9 @@ static void test_backend_requests(struct channel_dev *dev)
 
 int main(void)
 {
+    /* The fakes model the ARM/DOORBELL session; the fast-path consumer is
+     * exercised on hardware. */
+    setenv("DPUMESH_COMCH_WAKE", "0", 1);
     struct channel_dev dev = {0};
     pthread_mutex_init(&dev.session_lock, NULL);
     assert(channel_session_open(&dev, "unit-session") == 0);

@@ -63,7 +63,7 @@ static void test_custody_polling(void)
     assert(arm_calls == 1); /* preserve one-shot doorbell arming */
     s->tickets[0] = (struct ticket){1, 1};
     s->t_tail = 1;               /* custody outstanding: no doorbell covers its ACK */
-    assert(dmesh_native_stripe_arm(t, 0) == 1);
+    assert(dmesh_native_stripe_arm(t, 0) == DMESH_STRIPE_CUSTODY);
     s->t_head = 1;
     assert(dmesh_native_stripe_arm(t, 0) == 0);
     s->armed = 0;
@@ -72,10 +72,10 @@ static void test_custody_polling(void)
     s->state = SLOT_CLOSED;
     assert(dmesh_native_stripe_arm(t, 0) == 0);
     s->fin_pending = 1;
-    assert(dmesh_native_stripe_arm(t, 0) == 1);
+    assert(dmesh_native_stripe_arm(t, 0) == DMESH_STRIPE_RETIRING);
     s->fin_pending = 0;
     s->t_tail = 2;
-    assert(dmesh_native_stripe_arm(t, 0) == 1);
+    assert(dmesh_native_stripe_arm(t, 0) == DMESH_STRIPE_RETIRING);
     pthread_mutex_destroy(&s->lock);
     free(t);
 }

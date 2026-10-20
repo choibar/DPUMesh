@@ -42,10 +42,17 @@ void dmesh_native_release(struct dmesh_native_transport *, int byte_offset);
 int dmesh_native_stripe_fd(struct dmesh_native_transport *, int stripe);
 /* The stripe carrying a port's stream, or -1. */
 int dmesh_native_stripe_of(struct dmesh_native_transport *, uint16_t port);
-/* Arms the stripe's doorbell before its consumer sleeps. Returns 1 while the
- * stripe still needs polling (custody ACKs outstanding: they have no doorbell),
- * 0 when dmesh_native_idle_arm plus the doorbell suffice. */
+/* Arms the stripe's doorbell before its consumer sleeps. Returns 0 when
+ * dmesh_native_idle_arm plus the doorbell suffice; otherwise what still needs
+ * polling (custody ACKs have no doorbell): DMESH_STRIPE_CUSTODY for an open
+ * flow's outstanding custody, DMESH_STRIPE_RETIRING for a closed flow whose
+ * custody or FIN still has to be retired. */
+enum { DMESH_STRIPE_CUSTODY = 1, DMESH_STRIPE_RETIRING = 2 };
 int dmesh_native_stripe_arm(struct dmesh_native_transport *, int stripe);
+/* Nonzero when every receive raises the channel wake fd by itself (the
+ * Comch fast path): an idle consumer then needs neither an ARM round trip
+ * nor polling to see receives. Fixed once the carrier is open. */
+int dmesh_native_rx_signaled(struct dmesh_native_transport *);
 /* Acknowledges a signalled doorbell; the stripe is then polled. */
 void dmesh_native_stripe_clear(struct dmesh_native_transport *, int stripe);
 /* Channel-wide idle wake: the fd (or -1) is raised by control messages once

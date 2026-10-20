@@ -409,14 +409,19 @@ int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
     struct slot *s = &t->slots[stripe];
     if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == SLOT_FREE) return 0;
     pthread_mutex_lock(&s->lock);
-    int busy = s->t_head != s->t_tail;
+    int busy = 0;
     if (s->state == SLOT_OPEN) {
+        if (s->t_head != s->t_tail) busy = DMESH_STRIPE_CUSTODY;
         if (!s->armed && channel_conn_arm(s->conn) == 0) s->armed = 1;
-    } else {
-        busy |= s->fin_pending;   /* retired by the next poll */
+    } else if (s->t_head != s->t_tail || s->fin_pending) {
+        busy = DMESH_STRIPE_RETIRING;   /* retired by the next poll */
     }
     pthread_mutex_unlock(&s->lock);
     return busy;
+}
+int dmesh_native_rx_signaled(struct dmesh_native_transport *t)
+{
+    return channel_dev_rx_signaled(t->dev);
 }
 int dmesh_native_wake_fd(struct dmesh_native_transport *t)
 {

@@ -93,6 +93,7 @@ struct dmesh_eq {
     int                timer_backstop; /* tick_fd holds the backstop, not a nap */
     int                work_since_arm; /* this EQ found work since it last armed */
     uint64_t           seen_doorbells; /* channel DOORBELLs this EQ has reacted to */
+    uint64_t           backstop_until_ns; /* tick_fd holds a backstop expiring then; 0 if not */
     atomic_int         asleep;      /* doorbells armed: a submit on this EQ must wake it */
     atomic_int         kick;        /* a send on this EQ: naps restart */
     atomic_uint_fast64_t last_work_ns; /* last work or send, for the linger */
