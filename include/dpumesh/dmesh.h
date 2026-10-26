@@ -104,13 +104,6 @@ int dmesh_post_max(dmesh_channel_t *s);    /* max length of one alloc/post (bloc
 /* Create an EQ for one polling thread. Returns EINVAL, ENOMEM or EMFILE on failure. */
 dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch);
 
-/* Create a connection EQ: it is woken by and drains only the QPs bound to it,
- * takes no inbound connections and does not progress the channel session.
- * With DPUMESH_FLOW_WAKE=1 its fd is raised by its QPs' own completions. A
- * process that uses one keeps an ordinary EQ polled for the session (accepts,
- * control messages, loss). Errors as dmesh_create_eq. */
-dmesh_eq_t *dmesh_create_conn_eq(dmesh_channel_t *ch);
-
 /* Destroy an idle EQ. Returns EBUSY while a QP remains. Safe on NULL. */
 int dmesh_destroy_eq(dmesh_eq_t *eq);
 
@@ -140,11 +133,23 @@ int dmesh_destroy_qp(dmesh_qp_t *c);
 /* Discard unsent bytes, reset the connected stream, and destroy the QP. */
 int dmesh_abort_qp(dmesh_qp_t *c);
 
-/* Move a QP to another EQ of the same channel, e.g. an accepted QP to a
- * connection EQ. Call from the thread that polls its current EQ, after
- * dispatching the batch that named it; its later events, including receives
- * not yet returned, arrive on eq. Returns 0, or EINVAL. */
-int dmesh_move_qp(dmesh_qp_t *c, dmesh_eq_t *eq);
+/* ===== Listening (listen/accept) ===== */
+
+/* The channel as its process's listening socket. The first call, made before
+ * any EQ exists (EBUSY otherwise), hands the channel's control work to the
+ * caller: the session's messages, keepalive and loss, and the streams the DPU
+ * routes to $DPUMESH_SERVICE. The fd (an epoll set, level-triggered) is
+ * readable when that work waits, and dmesh_accept() does it. From then on the
+ * channel's EQs carry only their own QPs and return no CONN_REQ. Later calls
+ * return the same fd. */
+int dmesh_channel_fd(dmesh_channel_t *ch);
+
+/* Do the channel's control work, then take the next inbound stream onto eq:
+ * its first bytes arrive there as RECV. NULL with EAGAIN when none waits (the
+ * fd is then armed for the next), EINVAL before dmesh_channel_fd(), or the
+ * session's errno after a transport loss. eq may be NULL for the control work
+ * alone, as on a channel that serves nothing. One thread at a time. */
+dmesh_qp_t *dmesh_accept(dmesh_channel_t *ch, dmesh_eq_t *eq);
 
 /* ===== Send (ibv_post_send) ===== */
 

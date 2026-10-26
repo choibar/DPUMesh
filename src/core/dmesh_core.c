@@ -53,7 +53,7 @@ static int dmesh_drain_tx_upto_locked(dmesh_qp_t *, int, uint64_t);
  * ==================================================================== */
 
 /* Accept queue between the reverse-drain side (producers — a NEW conn's first
- * message lands here; draining EQ threads race via CAS) and dmesh_accept
+ * message lands here; draining EQ threads race via CAS) and dpumesh_accept
  * (consumers — any EQ may claim a conn). */
 #define RX_QUEUE_SIZE 65536
 
@@ -289,6 +289,13 @@ struct dpumesh_ctx {
     /* The channel wake fd (dmesh_native_wake_fd), or -1. It wakes any EQ, so
      * every EQ nests it directly: one epoll level, not two via spare_epfd. */
     int wake_fd;
+    /* Listening (dmesh_channel_fd): the thread polling the channel does its
+     * control work and accepts its inbound streams, and EQs carry only their
+     * own QPs. listen_epfd nests wake_fd, spare_epfd and listen_timer, a
+     * one-shot timerfd for re-polls and the backstop. Set under eq_lock
+     * before any EQ exists. */
+    int listening;
+    int listen_epfd, listen_timer;
     /* Idle wake policy (dpumesh_eq_arm), nanoseconds; nap_min 0 = no naps. */
     uint64_t nap_min_ns, nap_cap_ns, linger_ns, backstop_ns;
     /* Every receive raises the wake fd by itself (dmesh_native_rx_signaled).
@@ -298,7 +305,7 @@ struct dpumesh_ctx {
      * (tx_waiters) or a closed flow still retires. */
     int rx_signaled;
     /* Every stripe raises its own doorbell (dmesh_native_flow_wake): a stripe
-     * owned by a connection EQ is that EQ's alone to advance and drain. */
+     * an EQ owns is that EQ's alone to advance and drain. */
     int flow_wake;
     atomic_int tx_waiters;              /* QPs whose tx_wait_state is ARMED */
     /* For measurement only: DPUMESH_CUSTODY_SLEEP=0 keeps polling open custody
@@ -1060,7 +1067,7 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
     /* (1) A LIVE or PENDING conn takes it into its inbound ring. A SERVER_PENDING
      * conn — created by the drain side at message-1 delivery and not yet
      * accepted — coalesces its pipelined messages there too. The ready list
-     * carries ACCEPTED conns only; a pending conn is drained by dmesh_accept. */
+     * carries ACCEPTED conns only; a pending conn is drained by dpumesh_accept. */
     if (role != DMESH_ROLE_FREE) {
         if (!rx_seq_accept(psl, desc)) {
             rx_credit_return(ctx, slot);
@@ -1083,7 +1090,7 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
 
     /* (2) FREE + dst_port is a DPU-assigned upstream id → a NEW server conn. Create
      * a PENDING port slot immediately so further messages for this uP coalesce into its
-     * inbox), then push message 1 to the accept queue so dmesh_accept returns it
+     * inbox), then push message 1 to the accept queue so dpumesh_accept returns it
      * first. dst_port==BLANK never reaches a host (the DPU always resolves). */
     if (dport >= DMESH_UPORT_BASE) {
         pthread_mutex_lock(&ctx->port_lock);
@@ -1125,7 +1132,7 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
         psl->rx_next_pos = (uint32_t)desc->body_buf_slot + desc->body_len;
         psl->rx_seq_valid = 1;
         psl->user      = NULL;
-        psl->eq        = NULL;   /* no owner until an EQ accepts it (dmesh_accept binds) */
+        psl->eq        = NULL;   /* no owner until an EQ accepts it (dpumesh_accept binds) */
         port_reset_tx(psl); /* fresh TX block-chain cursors */
         __atomic_store_n(&psl->role, DMESH_ROLE_SERVER_PENDING, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&ctx->port_lock);
@@ -1198,9 +1205,11 @@ static uint32_t drain_stripe(dpumesh_ctx_t *ctx, int stripe, uint32_t budget)
     return drained;
 }
 
-/* A session EQ's drain (a NULL eq: anyone's): progress the channel session,
- * wake the owners of stripes with control news, and interpret every active
- * stripe except one with its own wake that another EQ owns. */
+/* A session drain: progress the channel session, wake the owners of stripes
+ * with control news, and interpret the active stripes. With flow wake a
+ * stripe an EQ owns is that EQ's alone: an EQ skips the ones others own, and
+ * the listening channel (NULL eq) every owned one. A NULL eq on a channel
+ * that is not listening is a closing QP's wait, which drains them all. */
 static int drain_rev_rings_span(dpumesh_ctx_t *ctx, struct dmesh_eq *eq, uint32_t budget)
 {
     uint32_t drained = 0;
@@ -1213,7 +1222,7 @@ static int drain_rev_rings_span(dpumesh_ctx_t *ctx, struct dmesh_eq *eq, uint32_
         }
     for (int stripe = 0; stripe < ctx->landing_stripes && drained < budget; ++stripe) {
         if (!(active & (UINT32_C(1) << stripe))) continue;
-        if (eq && ctx->flow_wake) {
+        if (ctx->flow_wake && (eq || ctx->listening)) {
             struct dmesh_eq *owner = __atomic_load_n(&ctx->stripe_owner[stripe], __ATOMIC_ACQUIRE);
             if (owner && owner != eq) continue;
         }
@@ -1222,8 +1231,8 @@ static int drain_rev_rings_span(dpumesh_ctx_t *ctx, struct dmesh_eq *eq, uint32_
     return (int)drained;
 }
 
-/* A connection EQ's drain: its own stripes only. The session and every other
- * stripe belong to session EQs. */
+/* An EQ's drain on a listening channel: its own stripes only. The session
+ * and every other stripe are the channel's. */
 static int drain_own_stripes(dpumesh_ctx_t *ctx, struct dmesh_eq *eq, uint32_t budget)
 {
     uint32_t drained = 0;
@@ -1248,6 +1257,16 @@ static int epoll_nest(int epfd, int fd, uint64_t tag)
 static void epoll_unnest(int epfd, int fd)
 {
     if (fd >= 0 && epfd >= 0) (void)epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
+}
+
+/* Acknowledge the unowned stripes' doorbells; returns how many rang. */
+static int spare_ack(dpumesh_ctx_t *ctx)
+{
+    struct epoll_event spare[DMESH_MAX_STRIPES];
+    int m = epoll_wait(ctx->spare_epfd, spare, DMESH_MAX_STRIPES, 0);
+    for (int j = 0; j < m; ++j)
+        dmesh_native_stripe_clear(ctx->transport, (int)(uint32_t)spare[j].data.u64);
+    return m;
 }
 
 /* Acknowledge every doorbell that woke this EQ: the stripes it owns, the
@@ -1279,14 +1298,9 @@ static unsigned eq_ack_doorbells(struct dmesh_eq *eq)
             dmesh_native_wake_clear(ctx->transport);
             fired |= EQ_FIRED_WAKE;
             break;
-        case EQ_TAG_SPARE: {
-            struct epoll_event spare[DMESH_MAX_STRIPES];
-            int m = epoll_wait(ctx->spare_epfd, spare, DMESH_MAX_STRIPES, 0);
-            for (int j = 0; j < m; ++j)
-                dmesh_native_stripe_clear(ctx->transport, (int)(uint32_t)spare[j].data.u64);
-            if (m > 0) fired |= EQ_FIRED_STRIPE;
+        case EQ_TAG_SPARE:
+            if (spare_ack(ctx) > 0) fired |= EQ_FIRED_STRIPE;
             break;
-        }
         case EQ_TAG_STRIPE:
             dmesh_native_stripe_clear(ctx->transport, (int)stripe);
             fired |= EQ_FIRED_STRIPE;
@@ -1397,7 +1411,7 @@ int dpumesh_eq_drain(struct dmesh_eq *eq)
         return 0;
     dpumesh_ctx_t *ctx = eq->ch->ctx;
     atomic_fetch_add_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
-    int drained = eq->conn ? drain_own_stripes(ctx, eq, 256) : drain_rev_rings_span(ctx, eq, 256);
+    int drained = ctx->listening ? drain_own_stripes(ctx, eq, 256) : drain_rev_rings_span(ctx, eq, 256);
     atomic_fetch_sub_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
     if (drained > 0) eq_note_work(eq);
     return drained;
@@ -1489,12 +1503,12 @@ void dpumesh_eq_arm(struct dmesh_eq *eq)
      * submitter publishes custody before reading the flag. So either this
      * sees the custody or the submitter wakes the EQ (eq_note_tx). */
     atomic_store_explicit(&eq->asleep, 1, memory_order_seq_cst);
-    /* A connection EQ arms only its own stripes; unowned ones and the
-     * session's wake are armed by session EQs. */
+    /* On a listening channel an EQ arms only its own stripes: the unowned
+     * ones and the session's wake are the channel's. */
     int busy = 0;
     for (int stripe = 0; stripe < ctx->landing_stripes; ++stripe) {
         struct dmesh_eq *owner = __atomic_load_n(&ctx->stripe_owner[stripe], __ATOMIC_ACQUIRE);
-        if (owner == eq || (owner == NULL && !eq->conn))
+        if (owner == eq || (owner == NULL && !ctx->listening))
             busy |= dmesh_native_stripe_arm(ctx->transport, stripe);
     }
     /* Signaled receives: open custody is reclaimed on the next wake unless a
@@ -1504,7 +1518,7 @@ void dpumesh_eq_arm(struct dmesh_eq *eq)
         busy = 0;
         atomic_fetch_add_explicit(&wait_stats.custody_sleeps, 1, memory_order_relaxed);
     }
-    if (busy || (!eq->conn && dmesh_native_idle_arm(ctx->transport) != 0)) {
+    if (busy || (!ctx->listening && dmesh_native_idle_arm(ctx->transport) != 0)) {
         atomic_store_explicit(&eq->asleep, 0, memory_order_relaxed);
         eq_timer(eq, ctx->nap_cap_ns ? ctx->nap_cap_ns : 100000ull, 0);
         atomic_fetch_add(busy ? &wait_stats.busy : &wait_stats.arm_failures, 1);
@@ -1647,6 +1661,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
     if (!ctx) { errno = ENOMEM; return -1; }
     ctx->spare_epfd = -1;
     ctx->wake_fd = -1;
+    ctx->listen_epfd = ctx->listen_timer = -1;
     int prc = pthread_mutex_init(&ctx->eq_lock, NULL);
     if (prc != 0) { errno = prc; goto fail; }
     ctx->eq_lock_initialized = 1;
@@ -1823,6 +1838,8 @@ static int cleanup_ctx(dpumesh_ctx_t *ctx)
         }
     }
     if (ctx->spare_epfd >= 0) { close(ctx->spare_epfd); ctx->spare_epfd = -1; }
+    if (ctx->listen_epfd >= 0) { close(ctx->listen_epfd); ctx->listen_epfd = -1; }
+    if (ctx->listen_timer >= 0) { close(ctx->listen_timer); ctx->listen_timer = -1; }
     if (ctx->transport && dmesh_native_close(ctx->transport) != 0)
         return -1;
     ctx->transport = NULL;
@@ -2619,11 +2636,9 @@ void *dpumesh_next_ready(struct dmesh_eq *eq) {
     while (ready_pop(eq, &port)) {
         struct dmesh_port_slot *psl = &ctx->ports[port];
         uint8_t role = __atomic_load_n(&psl->role, __ATOMIC_ACQUIRE);
-        /* Return only ACCEPTED conns this EQ still owns. FREE is stale,
-         * SERVER_PENDING is drained by dmesh_accept, which is what sets its
-         * user handle, and a moved conn was armed on its new EQ. */
-        if ((role == DMESH_ROLE_CLIENT || role == DMESH_ROLE_SERVER) &&
-            __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE) == eq)
+        /* Return only ACCEPTED conns. FREE is stale, and SERVER_PENDING is
+         * drained by dpumesh_accept, which is what sets its user handle. */
+        if (role == DMESH_ROLE_CLIENT || role == DMESH_ROLE_SERVER)
             return psl->user;
     }
     return NULL;
@@ -2787,17 +2802,16 @@ int dmesh_post_max(dmesh_channel_t *s) { return s->block_size; }
 /* ===== Event queue ===== */
 
 /* Readiness is active at EQ creation. The eventfd is optional; polling remains
- * available when eventfd creation fails. A connection EQ (conn) refuses
- * accepts and leaves the session to session EQs. */
-static dmesh_eq_t *eq_create(dmesh_channel_t *ch, int conn) {
+ * available when eventfd creation fails. On a listening channel the EQ takes
+ * no inbound streams and leaves the channel's control work to the channel. */
+dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
     if (!ch) { errno = EINVAL; return NULL; }
     dmesh_eq_t *eq = (dmesh_eq_t *)calloc(1, sizeof(*eq));
     if (!eq) { errno = ENOMEM; return NULL; }
     eq->accept_spare = (dmesh_qp_t *)calloc(1, sizeof(*eq->accept_spare));
     if (!eq->accept_spare) { free(eq); errno = ENOMEM; return NULL; }
     eq->ch         = ch;
-    eq->conn       = conn;
-    atomic_init(&eq->no_accept, conn);
+    atomic_init(&eq->no_accept, 0);
     atomic_init(&eq->stripes, 0);
     eq->notify_efd = -1;
     eq->epfd       = -1;
@@ -2836,14 +2850,15 @@ static dmesh_eq_t *eq_create(dmesh_channel_t *ch, int conn) {
         return NULL;
     }
     eq->reg_idx = idx;
+    atomic_store(&eq->no_accept, ctx->listening);
     /* Born idle: the first empty poll sleeps rather than naps. */
     eq->nap_ns = ctx->nap_cap_ns + 1;
     atomic_fetch_add(&ctx->live_eqs, 1);
     /* The readiness fd is an epoll set: this EQ's eventfd (wakes from other
-     * threads: deliveries, accepts, a connection's control news), its
+     * threads: deliveries, accepts, its flows' control news), its
      * nap/backstop timer, its tail deadline, once bound its own stripes'
-     * doorbells and, for a session EQ, the channel wake fd and the spare set
-     * (unowned stripes). */
+     * doorbells and, unless the channel is listening, the channel wake fd and
+     * the spare set (unowned stripes). */
     eq->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     eq->tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     eq->tail_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -2852,8 +2867,8 @@ static dmesh_eq_t *eq_create(dmesh_channel_t *ch, int conn) {
         (epoll_nest(eq->epfd, eq->notify_efd, EQ_TAG(EQ_TAG_EFD, 0)) != 0 ||
          epoll_nest(eq->epfd, eq->tick_fd, EQ_TAG(EQ_TAG_TICK, 0)) != 0 ||
          epoll_nest(eq->epfd, eq->tail_fd, EQ_TAG(EQ_TAG_TAIL, 0)) != 0 ||
-         (!conn && epoll_nest(eq->epfd, ctx->wake_fd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0) ||
-         (!conn && epoll_nest(eq->epfd, ctx->spare_epfd, EQ_TAG(EQ_TAG_SPARE, 0)) != 0))) {
+         (!ctx->listening && epoll_nest(eq->epfd, ctx->wake_fd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0) ||
+         (!ctx->listening && epoll_nest(eq->epfd, ctx->spare_epfd, EQ_TAG(EQ_TAG_SPARE, 0)) != 0))) {
         close(eq->epfd);
         eq->epfd = -1;
     }
@@ -2861,9 +2876,6 @@ static dmesh_eq_t *eq_create(dmesh_channel_t *ch, int conn) {
     pthread_mutex_unlock(&ctx->eq_lock);
     return eq;
 }
-
-dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) { return eq_create(ch, 0); }
-dmesh_eq_t *dmesh_create_conn_eq(dmesh_channel_t *ch) { return eq_create(ch, 1); }
 
 /* Unregister first, under eq_lock, so a concurrent accept-path notify_all_eqs
  * either saw this EQ before or never sees it again; then free. A live QP is
@@ -2915,66 +2927,7 @@ dmesh_eq_t *dmesh_grpc_create_serializer_eq(dmesh_channel_t *ch) {
     return eq;
 }
 
-static int eq_bit_test(atomic_uint_fast64_t *bits, uint16_t port) {
-    return (atomic_load_explicit(&bits[port >> 6], memory_order_acquire) >> (port & 63u)) & 1u;
-}
-
-/* Rebind a QP to another EQ of its channel, from the thread that polls its
- * current EQ (events already returned stay with that caller). Its doorbell,
- * pending readiness and receives move with it: the target is armed once, so
- * a receive that raced the move is drained there, and the old EQ skips the
- * stale ready entry. */
-int dmesh_move_qp(dmesh_qp_t *c, dmesh_eq_t *eq) {
-    if (!c || !eq || !c->ep || !c->eq || eq->ch != c->ep) { errno = EINVAL; return -1; }
-    dmesh_eq_t *old = c->eq;
-    if (old == eq) return 0;
-    dpumesh_ctx_t *ctx = c->ep->ctx;
-    uint16_t port = c->local_port;
-    struct dmesh_port_slot *psl = &ctx->ports[port];
-    pthread_mutex_lock(&ctx->port_lock);
-    uint8_t role = __atomic_load_n(&psl->role, __ATOMIC_ACQUIRE);
-    if ((role != DMESH_ROLE_CLIENT && role != DMESH_ROLE_SERVER) ||
-        __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE) != old) {
-        pthread_mutex_unlock(&ctx->port_lock);
-        errno = EINVAL;
-        return -1;
-    }
-    int stripe = psl->stripe;
-    if (stripe >= 0) {
-        int fd = dmesh_native_stripe_fd(ctx->transport, stripe);
-        if (epoll_nest(eq->epfd, fd, EQ_TAG(EQ_TAG_STRIPE, stripe)) != 0) {
-            int saved = errno;
-            pthread_mutex_unlock(&ctx->port_lock);
-            errno = saved;
-            return -1;
-        }
-        epoll_unnest(old->epfd, fd);
-        __atomic_store_n(&ctx->stripe_owner[stripe], eq, __ATOMIC_RELEASE);
-        atomic_fetch_and(&old->stripes, ~(UINT32_C(1) << stripe));
-        atomic_fetch_or(&eq->stripes, UINT32_C(1) << stripe);
-    }
-    int tx_error = eq_bit_test(old->tx_error, port), tx_ready = eq_bit_test(old->tx_ready, port);
-    int tx_armed = eq_bit_test(old->tx_armed, port);
-    if (tx_error) eq_tx_error_clear(old, port);
-    if (tx_ready) eq_tx_ready_clear(old, port);
-    if (tx_armed) eq_tx_armed_clear(old, port);
-    __atomic_store_n(&psl->eq, eq, __ATOMIC_RELEASE);
-    if (tx_error) eq_tx_error_set(eq, port);
-    if (tx_ready) eq_tx_ready_set(eq, port);
-    if (tx_armed) eq_tx_armed_set(eq, port, atomic_load_explicit(&psl->tx_deadline_ns, memory_order_relaxed));
-    pthread_mutex_unlock(&ctx->port_lock);
-    if (old->drain_cur == c) old->drain_cur = NULL;
-    atomic_fetch_sub_explicit(&old->nqp, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&eq->nqp, 1, memory_order_relaxed);
-    c->eq = eq;
-    atomic_store_explicit(&psl->on_ready, 1u, memory_order_release);
-    ready_push(eq, port);
-    eq_notify(eq);
-    return 0;
-}
-
-dmesh_qp_t *dmesh_accept(dmesh_eq_t *eq) {
-    if (atomic_load(&eq->no_accept)) { CTRACE("accept: eq refuses accepts"); errno = EAGAIN; return NULL; }
+dmesh_qp_t *dpumesh_accept(dmesh_eq_t *eq) {
     dmesh_channel_t *s = eq->ch;
     /* Reserve the QP object before consuming the shared accept queue. */
     if (!eq->accept_spare) {
@@ -3021,6 +2974,103 @@ dmesh_qp_t *dmesh_accept(dmesh_eq_t *eq) {
     c->rx_len      = req.body_len;
     c->rx_pos      = 0;
     atomic_fetch_add_explicit(&eq->nqp, 1, memory_order_relaxed);
+    return c;
+}
+
+/* ===== Listening ===== */
+
+/* The first call makes the channel the listening socket. EQs created before
+ * would go on doing the channel's work, so none may exist yet. */
+int dmesh_channel_fd(dmesh_channel_t *ch) {
+    if (!ch || !ch->ctx) { errno = EINVAL; return -1; }
+    dpumesh_ctx_t *ctx = ch->ctx;
+    pthread_mutex_lock(&ctx->eq_lock);
+    if (!ctx->listening) {
+        if (atomic_load(&ctx->live_eqs) != 0) {
+            pthread_mutex_unlock(&ctx->eq_lock);
+            errno = EBUSY;
+            return -1;
+        }
+        ctx->listen_epfd = epoll_create1(EPOLL_CLOEXEC);
+        ctx->listen_timer = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (ctx->listen_epfd < 0 || ctx->listen_timer < 0 ||
+            epoll_nest(ctx->listen_epfd, ctx->wake_fd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0 ||
+            epoll_nest(ctx->listen_epfd, ctx->spare_epfd, EQ_TAG(EQ_TAG_SPARE, 0)) != 0 ||
+            epoll_nest(ctx->listen_epfd, ctx->listen_timer, EQ_TAG(EQ_TAG_TICK, 0)) != 0) {
+            int saved = errno;
+            if (ctx->listen_epfd >= 0) close(ctx->listen_epfd);
+            if (ctx->listen_timer >= 0) close(ctx->listen_timer);
+            ctx->listen_epfd = ctx->listen_timer = -1;
+            pthread_mutex_unlock(&ctx->eq_lock);
+            errno = saved;
+            return -1;
+        }
+        ctx->listening = 1;
+    }
+    int fd = ctx->listen_epfd;
+    pthread_mutex_unlock(&ctx->eq_lock);
+    return fd;
+}
+
+/* Acknowledge the channel's doorbells: the session's wake, the unowned
+ * stripes and the timer. */
+static void listen_ack(dpumesh_ctx_t *ctx)
+{
+    struct epoll_event evs[3];
+    int n = epoll_wait(ctx->listen_epfd, evs, 3, 0);
+    for (int i = 0; i < n; ++i) {
+        uint32_t tag = (uint32_t)(evs[i].data.u64 >> 32);
+        uint64_t v;
+        if (tag == EQ_TAG_WAKE)
+            dmesh_native_wake_clear(ctx->transport);
+        else if (tag == EQ_TAG_SPARE)
+            (void)spare_ack(ctx);
+        else if (read(ctx->listen_timer, &v, sizeof(v)) < 0) {}
+    }
+}
+
+/* Before the listening thread sleeps: arm the unowned stripes and the
+ * session's wake. A stripe still retiring, or a failed arm, re-polls after a
+ * nap; otherwise only the backstop remains, which also paces keepalive. */
+static void listen_arm(dpumesh_ctx_t *ctx)
+{
+    int busy = 0;
+    for (int stripe = 0; stripe < ctx->landing_stripes; ++stripe)
+        if (__atomic_load_n(&ctx->stripe_owner[stripe], __ATOMIC_ACQUIRE) == NULL)
+            busy |= dmesh_native_stripe_arm(ctx->transport, stripe);
+    uint64_t ns = busy || dmesh_native_idle_arm(ctx->transport) != 0
+                      ? (ctx->nap_cap_ns ? ctx->nap_cap_ns : 100000ull) : ctx->backstop_ns;
+    struct itimerspec its = {0};
+    its.it_value.tv_sec = (time_t)(ns / 1000000000ull);
+    its.it_value.tv_nsec = (long)(ns % 1000000000ull);
+    (void)timerfd_settime(ctx->listen_timer, 0, &its, NULL);
+}
+
+/* The channel's control work, then the next inbound stream bound to eq and
+ * armed on its ready list, so eq returns the held first bytes and whatever
+ * queued behind them. */
+static dmesh_qp_t *listen_take(dpumesh_ctx_t *ctx, dmesh_eq_t *eq)
+{
+    (void)drain_rev_rings_span(ctx, NULL, 256);
+    if (!eq) { errno = EAGAIN; return NULL; }
+    dmesh_qp_t *c = dpumesh_accept(eq);
+    if (c) arm_ready_after_push(&ctx->ports[c->local_port], c->local_port);
+    return c;
+}
+
+/* An empty pass arms the channel's doorbells and looks once more, so work
+ * that landed before the arm is not slept through. */
+dmesh_qp_t *dmesh_accept(dmesh_channel_t *ch, dmesh_eq_t *eq) {
+    if (!ch || !ch->ctx || !ch->ctx->listening || (eq && eq->ch != ch)) { errno = EINVAL; return NULL; }
+    dpumesh_ctx_t *ctx = ch->ctx;
+    listen_ack(ctx);
+    dmesh_qp_t *c = listen_take(ctx, eq);
+    if (!c && errno == EAGAIN) {
+        listen_arm(ctx);
+        c = listen_take(ctx, eq);
+    }
+    int lost = dpumesh_lost(ctx);
+    if (!c && errno == EAGAIN && lost) errno = lost;
     return c;
 }
 
@@ -3158,7 +3208,7 @@ static int dmesh_wait_tx_reclaimed_locked(dpumesh_ctx_t *ctx, const struct dmesh
 
     while (dmesh_tx_inflight_locked(psl)) {
         struct dmesh_eq *eq = __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE);
-        if ((eq && eq->conn ? drain_own_stripes(ctx, eq, 256) : drain_rev_rings_span(ctx, NULL, 256)) > 0)
+        if ((eq && ctx->listening ? drain_own_stripes(ctx, eq, 256) : drain_rev_rings_span(ctx, NULL, 256)) > 0)
             continue;
         if (monotonic_ns() >= deadline || atomic_load(&ctx->lost)) {
             errno = EBADMSG;

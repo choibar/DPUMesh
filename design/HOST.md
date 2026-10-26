@@ -109,29 +109,40 @@ Three things have no completion doorbell, and each gets a wake:
   the arming EQ sets the flag before it reads custody under that lock, so a
   send either finds the EQ awake or wakes it.
 
+### Listening channel
+
+A channel whose fd the application takes (`dmesh_channel_fd`, before any EQ
+exists) does its control work on the thread that polls it, and its EQs carry
+only their own QPs. Its fd is an epoll set of the channel wake fd, the spare
+set and a one-shot timer. `dmesh_accept` acknowledges them, progresses the
+control PE, drains the stripes no EQ owns and binds the next inbound stream
+to the EQ it names: the stream's stripe moves to that EQ and the stream is
+put on its ready list with the held first bytes. When it finds nothing it
+arms the unowned stripes and `idle_arm`, leaving the backstop, which also
+paces the keepalive, and looks once more. Its EQs hold no channel wake fd and
+no spare set, take no inbound stream (`no_accept`), drain and arm only their
+own stripes, and never `idle_arm`. Without flow wake the channel's drain
+interprets every active stripe, and what it delivers to an EQ's QPs wakes
+that EQ through its eventfd.
+
 ### Flow wake
 
 With the Comch fast path (`DPUMESH_COMCH_WAKE`, on by default on DPU-DMA), the
 DPU sends each push descriptor as a Comch message to the session's consumer
 on the control PE, so a completion raises the channel's wake fd and wakes
-every session EQ. `DPUMESH_FLOW_WAKE=1` gives each of the session's 32 flow
+every EQ nesting it. `DPUMESH_FLOW_WAKE=1` gives each of the session's 32 flow
 slots a consumer of its own, on its own PE in `PROGRESS_ALL` mode, created
 with the session before any flow opens (all or none; on a failure the session
 stays on its consumer). They start one at a time: each start and stop sends
 the DPU a message from the Comch connection's small pool of internal tasks
-(about 16), which the control PE frees. A push flow's OPEN names its slot's consumer, and the
-DPU sends that flow's descriptors there. The slot's PE fd is the stripe's
-doorbell, nested directly in the owning EQ's epoll set.
-
-A connection EQ (`dmesh_create_conn_eq`) is the path built on it. Its epoll
-set holds its eventfd, its two timers and its own stripes' PE fds; no channel
-wake fd and no spare set. Its drain progresses and polls only its own
-stripes, and its sleep arms only their PEs, with no `idle_arm`. Session EQs
-progress the control PE; a flow's CLOSED or ERROR there marks the flow's
-stripe, and the drain wakes the stripe's owner through its eventfd. Session
-EQs skip stripes another EQ owns. With the knob off, session EQs drain every
-active stripe as before, and what they deliver to a connection EQ's QPs
-wakes it through its eventfd.
+(about 16), which the control PE frees. A push flow's OPEN names its slot's
+consumer, and the DPU sends that flow's descriptors there. The slot's PE fd
+is the stripe's doorbell, nested directly in the owning EQ's epoll set, and
+a stripe an EQ owns is that EQ's alone to advance and drain: on a listening
+channel an EQ wakes only for its own QPs' receives. Control messages still
+arrive on the control PE; a flow's CLOSED or ERROR marks its stripe, and the
+drain that progresses the control PE wakes the stripe's owner through its
+eventfd.
 
 ### Host-dpa reverse path
 

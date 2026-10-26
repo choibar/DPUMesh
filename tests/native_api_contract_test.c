@@ -61,7 +61,7 @@ void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
     assert(eq != NULL && (delta == 1 || delta == -1));
 }
 
-dmesh_qp_t *dmesh_accept(dmesh_eq_t *eq)
+dmesh_qp_t *dpumesh_accept(dmesh_eq_t *eq)
 {
     (void)eq;
     accept_calls++;

@@ -104,13 +104,13 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events, i
         eq->drain_cur = NULL;
     }
 
-    /* 2. New inbound conns off the SHARED accept queue (MPMC — sibling EQs may be
-     * popping it too; whichever wins one owns it). One CONN_REQ, then the conn's
+    /* 2. New inbound conns off the SHARED accept queue, on an EQ that accepts (MPMC —
+     * sibling EQs may be popping it too; whichever wins one owns it). One CONN_REQ, then the conn's
      * already-landed messages (held first message + any pipelined ones coalesced while
      * it was SERVER_PENDING — those predate the promote, so they too never re-edge). */
-    while (n < max_events) {
+    while (n < max_events && !atomic_load(&eq->no_accept)) {
         errno = 0;
-        dmesh_qp_t *c = dmesh_accept(eq);
+        dmesh_qp_t *c = dpumesh_accept(eq);
         if (!c)
             break;
         events[n].qp        = c;

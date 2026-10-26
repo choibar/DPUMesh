@@ -18,8 +18,9 @@ QP destruction. `user_data` belongs to the application.
 | Surface | Calls |
 |---|---|
 | Channel | `dmesh_create_channel`, `dmesh_destroy_channel`, `dmesh_pod_id`, `dmesh_msg_max`, `dmesh_post_max` |
-| EQ | `dmesh_create_eq`, `dmesh_create_conn_eq`, `dmesh_destroy_eq`, `dmesh_eq_fd`, `dmesh_eq_next_deadline_ns` |
-| QP | `dmesh_create_qp`, `dmesh_destroy_qp`, `dmesh_abort_qp`, `dmesh_move_qp` |
+| EQ | `dmesh_create_eq`, `dmesh_destroy_eq`, `dmesh_eq_fd`, `dmesh_eq_next_deadline_ns` |
+| QP | `dmesh_create_qp`, `dmesh_destroy_qp`, `dmesh_abort_qp` |
+| Listening | `dmesh_channel_fd`, `dmesh_accept` |
 | TX | `dmesh_alloc`, `dmesh_post_send`, `dmesh_flush`, `dmesh_tx_inflight` |
 | Events | `dmesh_poll_eq`, `dmesh_release_rx_buffer` |
 | Statistics | `dmesh_get_tx_stats` |
@@ -75,15 +76,20 @@ drains `dmesh_poll_eq` until empty, then waits on `dmesh_eq_fd` and drains the
 eventfd on wake, bounding the wait by `dmesh_eq_next_deadline_ns` (`-1` when
 no tail needs service). Poll one EQ from one thread.
 
-A runtime that waits per connection, as Go's netpoller does, gives each QP a
-connection EQ (`dmesh_create_conn_eq`). It is woken by and drains only the
-QPs bound to it; with `DPUMESH_FLOW_WAKE=1` its fd is raised by those QPs'
-own completions ([flow wake](HOST.md#flow-wake)). It takes no inbound
-connection and does not progress the channel session, so the process keeps
-one EQ from `dmesh_create_eq` polled for accepts, control messages and loss.
-An accepted QP arrives on that session EQ; `dmesh_move_qp` moves it to a
-connection EQ, called from the session EQ's thread after the batch that named
-it, and its later events arrive there.
+## Listening
+
+A runtime that waits per connection, as Go's netpoller does, uses the
+channel as its listening socket and gives each QP an EQ of its own, like
+`listen`, `accept` and a socket per connection. `dmesh_channel_fd`, called
+before any EQ exists, hands the channel's control work to its caller: the
+session's messages, keepalive and loss, the flows no QP owns yet, and the
+streams the DPU routes to `DPUMESH_SERVICE`. The fd is readable when that
+work waits. `dmesh_accept(ch, eq)` does it and binds the next inbound stream
+to `eq`, which returns the stream's first bytes as RECV; a client calls it
+with a NULL `eq`. The channel's EQs then carry only their own QPs: they
+return no CONN_REQ and never progress the session, and with
+`DPUMESH_FLOW_WAKE=1` each EQ's fd is raised by its own QPs' completions
+([flow wake](HOST.md#flow-wake)).
 
 ## Transport semantics
 

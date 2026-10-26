@@ -71,12 +71,9 @@ _Static_assert(DMESH_PORT_SPACE == (UINT16_MAX + 1),
  * queue allows any EQ to claim a new connection. */
 struct dmesh_eq {
     dmesh_channel_t   *ch;
-    atomic_int no_accept; /* private accelerator EQs leave incoming RPCs to reactors */
-    /* A connection EQ (dmesh_create_conn_eq) takes no inbound connections and
-     * leaves the channel session to session EQs: it waits on and drains only
-     * the stripes bound to it. */
-    int                conn;
-    atomic_uint_fast32_t stripes;   /* stripes bound here (stripe_bind, dmesh_move_qp) */
+    atomic_int no_accept; /* private accelerator EQs, and every EQ of a listening
+                           * channel, leave incoming streams to others */
+    atomic_uint_fast32_t stripes;   /* stripes bound here (stripe_bind) */
     struct dmesh_qp *accept_spare; /* preallocated before consuming an accept descriptor;
                                     * prevents OOM from stranding SERVER_PENDING */
     struct dmesh_qp *drain_cur;   /* poll_eq resume cursor: the conn whose inbox was only
@@ -289,10 +286,11 @@ int  dpumesh_lost(dpumesh_ctx_t *ctx);
  * `eq`: allocate a SERVER conn that learns its peer (pod,port) and holds the first
  * fragment (c->rx_slot). NULL+EAGAIN if none pending; NULL+ENOMEM on alloc failure,
  * which drops the message and reclaims its RX credit. dmesh_poll_eq folds this
- * in as DMESH_EVENT_CONN_REQ for both the native API and the shim's dispatcher.
+ * in as DMESH_EVENT_CONN_REQ for both the native API and the shim's dispatcher,
+ * on an EQ that accepts; dmesh_accept() does it for a listening channel.
  * The queue is MPMC: several EQs may call this concurrently and each conn goes
  * to exactly one of them, which owns it from then on. */
-dmesh_qp_t *dmesh_accept(dmesh_eq_t *eq);
+dmesh_qp_t *dpumesh_accept(dmesh_eq_t *eq);
 
 /* Pop the next conn that has inbound from this EQ's ready list, which the
  * drain side publishes, so there is no scan and no per-conn fd. Returns the
