@@ -8,10 +8,11 @@ int channel_dev_progress(struct channel_dev *dev)
 { (void)dev; ++progress_calls; return 0; }
 /* Off unless a test turns it on: the stripes keep their slot epoll doorbells. */
 static int flow_wake;
-static unsigned flow_arm_calls;
+static unsigned flow_arm_calls, flow_progress_calls;
 int channel_dev_flow_wake(const struct channel_dev *dev) { (void)dev; return flow_wake; }
 int channel_flow_fd(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; return -1; }
-void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; }
+void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id)
+{ (void)dev; assert(flow_id == 1); ++flow_progress_calls; }
 int channel_flow_arm(struct channel_dev *dev, uint32_t flow_id)
 { (void)dev; assert(flow_id == 1); ++flow_arm_calls; return 0; }
 uint32_t channel_dev_take_news(struct channel_dev *dev) { (void)dev; return 0; }
@@ -91,7 +92,8 @@ static void test_custody_polling(void)
 }
 
 /* A flow wake's consumer outlives its flows: one raised as its flow closed is
- * cleared by the next request, which a closed or free slot still gets. */
+ * cleared by the next request, which a closed or free slot still gets, after
+ * its clear progresses away the descriptors its last flow left. */
 static void test_flow_consumer_rearmed_after_close(void)
 {
     struct dmesh_native_transport *t = calloc(1, sizeof(*t));
@@ -101,13 +103,18 @@ static void test_flow_consumer_rearmed_after_close(void)
     flow_wake = 1;
     s->state = SLOT_OPEN;
     assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 1);
+    dmesh_native_stripe_clear(t, 0);
+    assert(flow_progress_calls == 0);   /* an open slot's receives are its drain's */
+    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 2);
     s->state = SLOT_CLOSED;
     dmesh_native_stripe_clear(t, 0);
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 2);
+    assert(flow_progress_calls == 1);
+    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 3);
     s->state = SLOT_FREE;
     dmesh_native_stripe_clear(t, 0);
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 3);
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && flow_arm_calls == 3); /* still one-shot */
+    assert(flow_progress_calls == 2);
+    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 4);
+    assert(dmesh_native_stripe_arm(t, 0) == 0 && flow_arm_calls == 4); /* still one-shot */
     flow_wake = 0;
     pthread_mutex_destroy(&s->lock);
     free(t);

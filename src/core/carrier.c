@@ -469,6 +469,10 @@ void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe)
     struct slot *s = &t->slots[stripe];
     pthread_mutex_lock(&s->lock);
     if (channel_dev_flow_wake(t->dev)) {
+        /* A closed or free slot's consumer may still hold descriptors of its
+         * last flow, which no drain progresses; unpolled, they would fire its
+         * next request at once. Its progress drops them. */
+        if (s->state != SLOT_OPEN) channel_flow_progress(t->dev, (uint32_t)stripe + 1);
         s->armed = 0;      /* the next arm's request clears the raised fd */
     } else if (s->conn) {
         struct epoll_event evs[CHANNEL_CONN_FDS];
