@@ -629,13 +629,22 @@ static void flow_wake_state_changed(const union doca_data user_data, struct doca
 	fw->running = next == DOCA_CTX_STATE_RUNNING;
 }
 
-/* Stop and release one flow wake; one whose consumer does not stop is kept. */
-static int flow_wake_free(struct channel_flow_wake *fw)
+/* Stop and release one flow wake; one whose consumer does not stop is kept.
+ * The stop's message to the DPU completes on the control PE, so the wait
+ * progresses it with the consumer's own. */
+static int flow_wake_free(struct channel_dev *dev, struct channel_flow_wake *fw)
 {
 	if (fw->consumer != NULL) {
 		struct doca_ctx *ctx = doca_comch_consumer_as_ctx(fw->consumer);
+		enum doca_ctx_states state = DOCA_CTX_STATE_STOPPING;
 		(void)doca_ctx_stop(ctx);
-		if (wait_ctx_idle(ctx, fw->pe) != 0 || doca_comch_consumer_destroy(fw->consumer) != DOCA_SUCCESS) {
+		for (int spins = 0; spins < CHANNEL_CTX_STOP_SPINS && state != DOCA_CTX_STATE_IDLE; ++spins) {
+			(void)doca_pe_progress(fw->pe);
+			(void)doca_pe_progress(dev->control->pe);
+			if (doca_ctx_get_state(ctx, &state) != DOCA_SUCCESS)
+				break;
+		}
+		if (state != DOCA_CTX_STATE_IDLE || doca_comch_consumer_destroy(fw->consumer) != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("flow wake: consumer %u did not stop; retained", fw->id);
 			return -1;
 		}
@@ -655,7 +664,7 @@ static int flow_wake_free(struct channel_flow_wake *fw)
 static void flow_wakes_close_locked(struct channel_dev *dev)
 {
 	for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id)
-		if (dev->flow_wake[id] != NULL && flow_wake_free(dev->flow_wake[id]) == 0)
+		if (dev->flow_wake[id] != NULL && flow_wake_free(dev, dev->flow_wake[id]) == 0)
 			dev->flow_wake[id] = NULL;
 	dev->flow_wake_on = 0;
 }
@@ -716,31 +725,30 @@ static doca_error_t flow_wake_post_locked(struct channel_flow_wake *fw)
 
 /* Every slot's consumer, before any flow opens, so each push OPEN can name
  * one the DPU already knows. All or none: on a failure the session stays on
- * its consumer. The consumers start together and are awaited together. */
+ * its consumer. One at a time: a consumer's start sends the DPU a message
+ * from the connection's small pool of internal tasks, freed only as the
+ * control PE progresses, so the next start waits until this one runs. */
 static void flow_wakes_open_locked(struct channel_dev *dev)
 {
 	const char *env = getenv("DPUMESH_FLOW_WAKE");
 	if (!dev->fastpath || env == NULL || strcmp(env, "1") != 0)
 		return;
+	uint64_t start_ms = channel_now_ms();
 	const char *step = "start";
 	doca_error_t result = DOCA_SUCCESS;
 	for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS && result == DOCA_SUCCESS; ++id) {
-		dev->flow_wake[id] = calloc(1, sizeof(*dev->flow_wake[id]));
-		result = dev->flow_wake[id] == NULL ? DOCA_ERROR_NO_MEMORY : flow_wake_start_locked(dev, dev->flow_wake[id]);
-	}
-	if (result == DOCA_SUCCESS) {
+		struct channel_flow_wake *fw = dev->flow_wake[id] = calloc(1, sizeof(*fw));
+		step = "start";
+		result = fw == NULL ? DOCA_ERROR_NO_MEMORY : flow_wake_start_locked(dev, fw);
+		if (result != DOCA_SUCCESS)
+			break;
 		step = "running";
-		result = DOCA_ERROR_TIME_OUT;
-		if (WAKE_WAIT_LOCKED(dev, ({ int all = 1;
-			for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id) {
-				(void)doca_pe_progress(dev->flow_wake[id]->pe);
-				all &= dev->flow_wake[id]->running;
-			} all; }), WAKE_START_MS))
-			result = DOCA_SUCCESS;
-	}
-	for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS && result == DOCA_SUCCESS; ++id) {
+		if (!WAKE_WAIT_LOCKED(dev, ((void)doca_pe_progress(fw->pe), fw->running), WAKE_START_MS)) {
+			result = DOCA_ERROR_TIME_OUT;
+			break;
+		}
 		step = "post receives";
-		result = flow_wake_post_locked(dev->flow_wake[id]);
+		result = flow_wake_post_locked(fw);
 	}
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("flow wake unavailable (%s: %s); flows publish through the session consumer",
@@ -749,7 +757,8 @@ static void flow_wakes_open_locked(struct channel_dev *dev)
 		return;
 	}
 	dev->flow_wake_on = 1;
-	DOCA_LOG_INFO("flow wake on: each flow slot has its own consumer");
+	DOCA_LOG_INFO("flow wake on: each flow slot has its own consumer (%lu ms)",
+		      (unsigned long)(channel_now_ms() - start_ms));
 }
 
 int channel_dev_flow_wake(const struct channel_dev *dev)

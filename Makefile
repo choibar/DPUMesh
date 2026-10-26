@@ -30,7 +30,7 @@ LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c 
 HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_signaled_test native_loss_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
     channel_session_test comch_client_test session_server_test backend_dispatch_test dma_cleanup_test dpa_cleanup_test dpa_runtime_test \
-    dispatch_wake_test rx_consumed_pos_test native_multi_eq_test
+    dispatch_wake_test rx_consumed_pos_test native_multi_eq_test channel_flow_wake_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
 .PHONY: all lib test test-native-headers test-abi examples clean
@@ -77,6 +77,9 @@ $(TESTDIR)/session_flow_test: tests/session_flow_test.c $(TRANSPORT)/common/obje
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+
+$(TESTDIR)/channel_flow_wake_test: tests/channel_flow_wake_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/comch_client_test: tests/comch_client_test.c $(TRANSPORT)/host/comch_client.c $(TRANSPORT_HDRS) | $(TESTDIR)

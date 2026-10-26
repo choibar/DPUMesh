@@ -117,7 +117,9 @@ on the control PE, so a completion raises the channel's wake fd and wakes
 every session EQ. `DPUMESH_FLOW_WAKE=1` gives each of the session's 32 flow
 slots a consumer of its own, on its own PE in `PROGRESS_ALL` mode, created
 with the session before any flow opens (all or none; on a failure the session
-stays on its consumer). A push flow's OPEN names its slot's consumer, and the
+stays on its consumer). They start one at a time: each start and stop sends
+the DPU a message from the Comch connection's small pool of internal tasks
+(about 16), which the control PE frees. A push flow's OPEN names its slot's consumer, and the
 DPU sends that flow's descriptors there. The slot's PE fd is the stripe's
 doorbell, nested directly in the owning EQ's epoll set.
 
