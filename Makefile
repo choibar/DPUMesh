@@ -47,9 +47,14 @@ $(DPA_KERNEL): $(TRANSPORT)/device/dpa_kernel.c $(DPA_BENCH) $(TRANSPORT)/device
 	$(DPACC) $(abspath $(BUILD)/dpa) $(abspath $(TRANSPORT)) $(abspath $<) dpa_kernel nv-dpa-bf3 \
 	    $$(pkg-config --variable=libdir doca-dpa) $(abspath $(DPA_BENCH))
 
+# Calls within the library bind directly and calls into libc and DOCA go
+# through the GOT without a PLT stub; the exported symbols are unchanged.
+LIB_CFLAGS := -fno-plt -fno-semantic-interposition
+LIB_LDFLAGS := -Wl,-Bsymbolic-functions
+
 $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/*.h src/core/*.h $(TRANSPORT_HDRS) | $(LIBDIR)
-	$(CC) $(HOST_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \
-	    $(LIB_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
+	$(CC) $(HOST_CFLAGS) $(LIB_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \
+	    $(LIB_LDFLAGS) $(LIB_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
 	ln -sfn libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh.so
 
 $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR)
