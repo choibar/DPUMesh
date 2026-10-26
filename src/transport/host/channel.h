@@ -96,6 +96,12 @@ int channel_conn_progress(struct channel_conn *conn);
  * every flow even if another poller performed the shared progress. */
 int channel_dev_progress(struct channel_dev *dev);
 int channel_conn_poll(struct channel_conn *conn);
+/* Nonzero when channel_conn_poll and channel_conn_rx_next have nothing to
+ * report: a push flow with no new batch, no peer close and no error. A
+ * hint read without the session lock by the flow's single consumer (which
+ * owns the receive cursor); a drain skips the flow on it. Host-dpa flows
+ * always return 0: their reverse engine needs progress. */
+int channel_conn_idle(const struct channel_conn *conn);
 
 /* Doorbells: private reverse-completion engines only. The shared control PE
  * is serialized and polled through the carrier fallback tick. Returns the

@@ -80,8 +80,9 @@ struct dmesh_eq {
                                   * edge — this is the only path back to it). Owned by this
                                   * EQ's thread; dmesh_destroy_qp clears it on a matching conn. */
     int                epfd;        /* this EQ's readiness fd (dmesh_eq_fd): an epoll set
-                                     * nesting notify_efd, tick_fd, the spare stripes'
-                                     * doorbells and the doorbells of the stripes it owns */
+                                     * nesting notify_efd, tick_fd, tail_fd, the channel
+                                     * wake fd, the spare stripes' doorbells and the
+                                     * doorbells of the stripes it owns */
     int                notify_efd;  /* eventfd other threads write on ready edges; writes
                                      * begin when dmesh_eq_fd hands out epfd (wants_notify). */
     int                tick_fd;     /* one-shot timerfd: the next nap, linger poll or the
@@ -256,6 +257,12 @@ void dpumesh_publish_due_tails(struct dmesh_eq *eq);
  * fd wakes its thread. */
 int  dpumesh_eq_drain(struct dmesh_eq *eq);
 void dpumesh_eq_arm(struct dmesh_eq *eq);
+/* The drain does not write its own EQ's eventfd: before an empty
+ * dmesh_poll_eq returns, dpumesh_eq_pending says whether anything queued for
+ * this EQ is still unconsumed, and dpumesh_eq_kick_pending raises the
+ * eventfd if a delivery is still being published. */
+int  dpumesh_eq_pending(struct dmesh_eq *eq);
+void dpumesh_eq_kick_pending(struct dmesh_eq *eq);
 /* dmesh_poll_eq returned events: naps restart. */
 void dpumesh_eq_note_work(struct dmesh_eq *eq);
 /* Entering dmesh_poll_eq: the EQ is no longer asleep. */

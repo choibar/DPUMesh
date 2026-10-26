@@ -1346,6 +1346,23 @@ int channel_conn_poll(struct channel_conn *conn)
 	return gone;
 }
 
+int channel_conn_idle(const struct channel_conn *conn)
+{
+	const struct channel_dev *dev = conn->dev;
+	if (dev->host_dpa || conn->reverse != NULL || conn->descs == NULL)
+		return 0;
+	if (__atomic_load_n(&dev->control, __ATOMIC_ACQUIRE) == NULL ||
+	    __atomic_load_n(&dev->session_error, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&conn->error, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&conn->peer_closed, __ATOMIC_ACQUIRE))
+		return 0;
+	if (conn->forward_ring && __atomic_load_n(&conn->forward_ring->ctrl->error, __ATOMIC_ACQUIRE))
+		return 0;
+	/* push: the slot channel_conn_rx_next would read next is not filled */
+	return __atomic_load_n(&conn->descs[conn->expected % DMESH_PUSH_DESC_N].seq, __ATOMIC_ACQUIRE) !=
+	       conn->expected;
+}
+
 int channel_dev_fd(struct channel_dev *dev)
 {
 	doca_notification_handle_t handle;
@@ -1394,9 +1411,10 @@ int channel_dev_arm(struct channel_dev *dev)
 			dev->arm_outstanding = 1;
 		}
 	}
-	/* Control messages (DOORBELL, CLOSED, ERROR) now raise the fd. Progress
-	 * after arming, per the DOCA flow, so an event that landed before the
-	 * request is handled here instead of being slept through. */
+	/* Control messages (DOORBELL, CLOSED, ERROR) and fast-path receives now
+	 * raise the fd. The DOCA flow progresses after arming, so an event that
+	 * landed before the request is not slept through: the caller's next
+	 * drain (channel_dev_progress) is that progress, not a second one here. */
 	/* The control PE runs in PROGRESS_ALL mode (comch_client.c): every
 	 * progress call delivers all events, and a new request clears the last
 	 * notification, so the handle needs no clear before progressing. */
@@ -1406,7 +1424,6 @@ int channel_dev_arm(struct channel_dev *dev)
 		rc = -1;
 		goto out;
 	}
-	(void)doca_pe_progress(dev->control->pe);
 out:
 	pthread_mutex_unlock(&dev->session_lock);
 	if (rc != 0) errno = saved;

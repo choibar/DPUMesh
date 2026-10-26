@@ -26,6 +26,22 @@ static int empty_poll(dmesh_eq_t *eq)
     return dmesh_poll_eq(eq, ev, 8);
 }
 
+/* idle_arm hooks: a reply landing between a drain and its arm, and a sibling
+ * EQ's ready-list claim that is not published yet. */
+static dmesh_qp_t *reply_qp;
+static dmesh_eq_t *claim_eq;
+static void send_reply(void)
+{
+    void *b = dmesh_alloc(reply_qp, 16);
+    assert(b);
+    memset(b, 9, 16);
+    assert(dmesh_post_send(reply_qp, b, 16) == 0);
+}
+static void claim_unpublished(void)
+{
+    atomic_fetch_add_explicit(&claim_eq->ready_tail, 1, memory_order_relaxed);
+}
+
 int main(void)
 {
     unsetenv("DPUMESH_NAP_US");
@@ -96,17 +112,53 @@ int main(void)
     assert(atomic_load(&wait_stats.busy) == busy + 1);
     test_native_retiring(0);
 
+    /* A productive poll consumes what its own drain queued (here the first
+     * send, accepted by a server EQ) without writing its own eventfd, so the
+     * next sleep is not cut short. */
+    dmesh_eq_t *seq = dmesh_create_eq(server);
+    assert(seq && dmesh_eq_fd(seq) >= 0);
+    settle(seq);
+    dmesh_event_t ev[8];
+    int n = dmesh_poll_eq(seq, ev, 8);
+    assert(n == 2 && ev[0].type == DMESH_EVENT_CONN_REQ && ev[1].type == DMESH_EVENT_RECV);
+    assert(!readable(seq->notify_efd));
+    reply_qp = ev[0].qp;
+    dmesh_release_rx_buffer(server, &ev[1]);
+
+    /* A reply landing after the drain but before the arm: the re-check drain
+     * finds it and the same poll returns it, again with no eventfd write. */
+    settle(eq);
+    test_native_on_idle_arm(send_reply);
+    n = dmesh_poll_eq(eq, ev, 8);
+    assert(n == 1 && ev[0].type == DMESH_EVENT_RECV && ev[0].qp == qp && ev[0].len == 16);
+    assert(!readable(eq->notify_efd));
+    dmesh_release_rx_buffer(ch, &ev[0]);
+
+    /* A sibling EQ's delivery still being published when the poll runs
+     * empty: nothing is returned, but the eventfd makes the sleep return at
+     * once so the next poll finds it. */
+    claim_eq = eq;
+    settle(eq);
+    test_native_on_idle_arm(claim_unpublished);
+    assert(empty_poll(eq) == 0);
+    assert(readable(eq->notify_efd));
+    atomic_fetch_sub_explicit(&eq->ready_tail, 1, memory_order_relaxed);   /* withdraw the claim */
+    settle(eq);
+
     /* Retire the held ACK so the QP closes cleanly. */
     test_native_custody(0);
     test_native_hold_acks(0);
-    dmesh_event_t ev[8];
-    int n;
     while ((n = dmesh_poll_eq(eq, ev, 8)) > 0)
         for (int i = 0; i < n; ++i) dmesh_release_rx_buffer(ch, &ev[i]);
+    while ((n = dmesh_poll_eq(seq, ev, 8)) > 0)
+        for (int i = 0; i < n; ++i) dmesh_release_rx_buffer(server, &ev[i]);
     assert(dmesh_destroy_qp(qp) == 0);
+    assert(dmesh_destroy_qp(reply_qp) == 0);
     assert(dmesh_destroy_eq(eq) == 0);
+    assert(dmesh_destroy_eq(seq) == 0);
     assert(dmesh_destroy_channel(ch) == 0);
     assert(dmesh_destroy_channel(server) == 0);
     test_native_rx_signaled(0);
-    puts("native_signaled_test: no naps, quiet sends, kept backstop, custody sleeps, waiter wake and poll, retiring poll: PASS");
+    puts("native_signaled_test: no naps, quiet sends, kept backstop, custody sleeps, waiter wake and poll, retiring poll, "
+         "no own-eventfd writes, re-check drain returns, unpublished claim wakes: PASS");
 }

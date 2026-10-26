@@ -285,6 +285,9 @@ struct dpumesh_ctx {
     unsigned int stripe_lock[DMESH_MAX_STRIPES];
     struct dmesh_eq *stripe_owner[DMESH_MAX_STRIPES];
     int spare_epfd;
+    /* The channel wake fd (dmesh_native_wake_fd), or -1. It wakes any EQ, so
+     * every EQ nests it directly: one epoll level, not two via spare_epfd. */
+    int wake_fd;
     /* Idle wake policy (dpumesh_eq_arm), nanoseconds; nap_min 0 = no naps. */
     uint64_t nap_min_ns, nap_cap_ns, linger_ns, backstop_ns;
     /* Every receive raises the wake fd by itself (dmesh_native_rx_signaled).
@@ -1214,9 +1217,9 @@ static void epoll_unnest(int epfd, int fd)
 static unsigned eq_ack_doorbells(struct dmesh_eq *eq)
 {
     dpumesh_ctx_t *ctx = eq->ch->ctx;
-    struct epoll_event evs[DMESH_MAX_STRIPES + 3];
+    struct epoll_event evs[DMESH_MAX_STRIPES + 5];
     unsigned fired = 0;
-    int n = eq->epfd >= 0 ? epoll_wait(eq->epfd, evs, DMESH_MAX_STRIPES + 3, 0) : 0;
+    int n = eq->epfd >= 0 ? epoll_wait(eq->epfd, evs, DMESH_MAX_STRIPES + 5, 0) : 0;
     for (int i = 0; i < n; ++i) {
         uint32_t tag = (uint32_t)(evs[i].data.u64 >> 32), stripe = (uint32_t)evs[i].data.u64;
         uint64_t v;
@@ -1233,18 +1236,16 @@ static unsigned eq_ack_doorbells(struct dmesh_eq *eq)
             if (read(eq->tail_fd, &v, sizeof(v)) < 0) {}
             fired |= EQ_FIRED_TAIL;
             break;
+        case EQ_TAG_WAKE:
+            dmesh_native_wake_clear(ctx->transport);
+            fired |= EQ_FIRED_WAKE;
+            break;
         case EQ_TAG_SPARE: {
-            struct epoll_event spare[DMESH_MAX_STRIPES + 1];
-            int m = epoll_wait(ctx->spare_epfd, spare, DMESH_MAX_STRIPES + 1, 0);
-            for (int j = 0; j < m; ++j) {
-                if ((uint32_t)(spare[j].data.u64 >> 32) == EQ_TAG_WAKE) {
-                    dmesh_native_wake_clear(ctx->transport);
-                    fired |= EQ_FIRED_WAKE;
-                } else {
-                    dmesh_native_stripe_clear(ctx->transport, (int)(uint32_t)spare[j].data.u64);
-                    fired |= EQ_FIRED_STRIPE;
-                }
-            }
+            struct epoll_event spare[DMESH_MAX_STRIPES];
+            int m = epoll_wait(ctx->spare_epfd, spare, DMESH_MAX_STRIPES, 0);
+            for (int j = 0; j < m; ++j)
+                dmesh_native_stripe_clear(ctx->transport, (int)(uint32_t)spare[j].data.u64);
+            if (m > 0) fired |= EQ_FIRED_STRIPE;
             break;
         }
         case EQ_TAG_STRIPE:
@@ -1346,19 +1347,35 @@ void dpumesh_eq_awake(struct dmesh_eq *eq)
 }
 
 /* In-line drain by an awake EQ thread: interprets whatever reverse entries
- * are published on any stripe. Only this EQ's self-notification is
- * suppressed; deliveries still wake their own EQs. Doorbells are left alone:
- * an unacknowledged one merely makes the next sleep return at once. */
+ * are published on any stripe. Deliveries still wake their own EQs, but not
+ * this one: its thread consumes what is pending right after (poll_eq_once,
+ * or dmesh_poll_eq's check of dpumesh_eq_pending), so writing its own
+ * eventfd would only make the next sleep return at once. Doorbells are left
+ * alone: an unacknowledged one merely makes the next sleep return at once. */
 int dpumesh_eq_drain(struct dmesh_eq *eq)
 {
     if (eq == NULL || eq->ch == NULL || eq->ch->ctx == NULL)
         return 0;
     dpumesh_ctx_t *ctx = eq->ch->ctx;
-    dmesh_eq_suppress_notify(eq, 1);
+    atomic_fetch_add_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
     int drained = drain_rev_rings_span(ctx, 256);
-    dmesh_eq_suppress_notify(eq, -1);
+    atomic_fetch_sub_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
     if (drained > 0) eq_note_work(eq);
     return drained;
+}
+
+int dpumesh_eq_pending(struct dmesh_eq *eq)
+{
+    return eq != NULL && eq->ch != NULL && eq->ch->ctx != NULL && eq_has_pending(eq);
+}
+
+/* An empty poll still sees work pending: a sibling EQ claimed a ready-list
+ * slot during this EQ's drain (its notify suppressed) and has not published
+ * the port yet. The eventfd then makes the coming sleep return at once. */
+void dpumesh_eq_kick_pending(struct dmesh_eq *eq)
+{
+    if (dpumesh_eq_pending(eq))
+        eq_notify(eq);
 }
 
 /* Before the EQ's thread sleeps on its fd (an empty dmesh_poll_eq): settle
@@ -1584,6 +1601,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
     dpumesh_ctx_t *ctx = (dpumesh_ctx_t *)calloc(1, sizeof(dpumesh_ctx_t));
     if (!ctx) { errno = ENOMEM; return -1; }
     ctx->spare_epfd = -1;
+    ctx->wake_fd = -1;
     int prc = pthread_mutex_init(&ctx->eq_lock, NULL);
     if (prc != 0) { errno = prc; goto fail; }
     ctx->eq_lock_initialized = 1;
@@ -1628,9 +1646,9 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
                        EQ_TAG(EQ_TAG_STRIPE, stripe)) != 0)
             goto fail;
     /* The channel's wake fd is raised by control messages (DOORBELL, CLOSED,
-     * ERROR) once idle_arm succeeded; like a spare stripe, it wakes any EQ. */
-    { int wfd = dmesh_native_wake_fd(ctx->transport);
-      if (wfd >= 0 && epoll_nest(ctx->spare_epfd, wfd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0) goto fail; }
+     * ERROR) and fast-path receives once idle_arm succeeded; like a spare
+     * stripe, it wakes any EQ. dmesh_create_eq nests it in each EQ. */
+    ctx->wake_fd = dmesh_native_wake_fd(ctx->transport);
     { struct { const char *name; uint64_t *out; long lo, hi, unit_ns; uint64_t def; } knobs[] = {
           /* Naps and linger stand in for a receive signal; signaled
            * receives need neither unless asked for. */
@@ -2772,7 +2790,7 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
     atomic_fetch_add(&ctx->live_eqs, 1);
     /* The readiness fd is an epoll set: this EQ's eventfd (wakes from other
      * threads: deliveries, accepts), its nap/backstop timer, its tail
-     * deadline, the spare set (unowned stripes and the channel wake fd) and,
+     * deadline, the channel wake fd, the spare set (unowned stripes) and,
      * once bound, its own stripes' doorbells. */
     eq->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     eq->tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -2782,6 +2800,7 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
         (epoll_nest(eq->epfd, eq->notify_efd, EQ_TAG(EQ_TAG_EFD, 0)) != 0 ||
          epoll_nest(eq->epfd, eq->tick_fd, EQ_TAG(EQ_TAG_TICK, 0)) != 0 ||
          epoll_nest(eq->epfd, eq->tail_fd, EQ_TAG(EQ_TAG_TAIL, 0)) != 0 ||
+         epoll_nest(eq->epfd, ctx->wake_fd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0 ||
          epoll_nest(eq->epfd, ctx->spare_epfd, EQ_TAG(EQ_TAG_SPARE, 0)) != 0)) {
         close(eq->epfd);
         eq->epfd = -1;

@@ -266,7 +266,8 @@ static void dispatch_doorbell(struct channel_dev *dev)
 }
 
 /* ARM lists the unread descriptor of each live push flow, at most one ARM is
- * outstanding until a DOORBELL, and the control PE is armed then progressed. */
+ * outstanding until a DOORBELL, and the control PE is armed but not
+ * progressed: the caller's next drain progresses it. */
 static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, struct channel_conn *b)
 {
     control_notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -278,7 +279,7 @@ static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, stru
     assert(arm_flows_seen[0].flow_id == 1 && arm_flows_seen[0].generation == a->generation &&
            arm_flows_seen[0].expected_seq == 1);
     assert(arm_flows_seen[1].flow_id == 2 && arm_flows_seen[1].expected_seq == 5);
-    assert(notify_requests == requests + 1 && shared_progress_calls == progress + 1);
+    assert(notify_requests == requests + 1 && shared_progress_calls == progress);
     assert(dev->arm_outstanding);
 
     /* Outstanding: the next sleep re-arms the PE but sends nothing. */

@@ -169,11 +169,18 @@ int dmesh_native_wake_fd(struct dmesh_native_transport *t)
     if (wake_efd < 0) wake_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     return wake_efd;
 }
+/* Runs once inside the next successful idle_arm: what lands between a
+ * consumer's drain and its arm. */
+static void (*idle_arm_hook)(void);
+void test_native_on_idle_arm(void (*fn)(void)) { idle_arm_hook = fn; }
 int dmesh_native_idle_arm(struct dmesh_native_transport *t)
 {
     (void)t;
     if (!sleepable) { errno = EAGAIN; return -1; }
     ++idle_arms;
+    void (*fn)(void) = idle_arm_hook;
+    idle_arm_hook = NULL;
+    if (fn) fn();
     return 0;
 }
 void dmesh_native_wake_clear(struct dmesh_native_transport *t)

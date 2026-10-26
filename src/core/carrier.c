@@ -335,7 +335,10 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
     if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == SLOT_FREE) return 0;
     pthread_mutex_lock(&s->lock);
     int n = 0;
-    if (s->state == SLOT_OPEN) {
+    if (s->state == SLOT_OPEN && s->t_head == s->t_tail && channel_conn_idle(s->conn)) {
+        /* No custody to retire and nothing received, closed or failed: skip
+         * the session lock. Most stripes of a drain look like this. */
+    } else if (s->state == SLOT_OPEN) {
         int gone = channel_conn_poll(s->conn);
         uint64_t consumed = channel_conn_consumed(s->conn);
         if (gone >= 0 && s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {

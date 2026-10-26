@@ -83,11 +83,12 @@ static int eq_drain_conn(dmesh_channel_t *s, dmesh_qp_t *c,
     return n;
 }
 
-static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
+/* `drain` 0: the caller has just drained the reverse stripes itself. */
+static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events, int drain) {
     dmesh_channel_t *s = eq->ch;
     int n = 0, drained;
 
-    (void)dpumesh_eq_drain(eq);
+    if (drain) (void)dpumesh_eq_drain(eq);
 
     /* 0. Publish any tail whose deadline expired; each QP's transmit gate
      * serializes this against its owner. */
@@ -162,23 +163,28 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
 
 /* An empty poll is what precedes the caller's sleep on dmesh_eq_fd: arm the
  * doorbells, then drain once more so a completion that landed between the
- * drain and the arm is not slept through. */
+ * drain and the arm is not slept through. That drain progresses the control
+ * PE the arm requested a notification on. Anything it (or a sibling EQ
+ * meanwhile) queued for this EQ is consumed here: the drain does not write
+ * this EQ's own eventfd. */
 int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
     if (!eq || !events || max_events <= 0) { errno = EINVAL; return -1; }
     dpumesh_eq_awake(eq);
-    int n = poll_eq_once(eq, events, max_events);
+    int n = poll_eq_once(eq, events, max_events, 1);
     if (n != 0) {
         if (n > 0) dpumesh_eq_note_work(eq);
         return n;
     }
     dpumesh_eq_arm(eq);
-    if (dpumesh_eq_drain(eq) <= 0) {
-        /* Events that landed before a loss are delivered first. */
-        int lost = dpumesh_lost(eq->ch->ctx);
-        if (lost) { errno = lost; return -1; }
-        return 0;
+    if (dpumesh_eq_drain(eq) > 0 || dpumesh_eq_pending(eq)) {
+        n = poll_eq_once(eq, events, max_events, 0);
+        if (n != 0) return n;
+        dpumesh_eq_kick_pending(eq);
     }
-    return poll_eq_once(eq, events, max_events);
+    /* Events that landed before a loss are delivered first. */
+    int lost = dpumesh_lost(eq->ch->ctx);
+    if (lost) { errno = lost; return -1; }
+    return 0;
 }
 
 void dmesh_release_rx_buffer(dmesh_channel_t *s, dmesh_event_t *event) {

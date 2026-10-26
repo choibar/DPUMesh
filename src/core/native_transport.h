@@ -57,7 +57,9 @@ int dmesh_native_rx_signaled(struct dmesh_native_transport *);
 void dmesh_native_stripe_clear(struct dmesh_native_transport *, int stripe);
 /* Channel-wide idle wake: the fd (or -1) is raised by control messages once
  * dmesh_native_idle_arm succeeded, which also asks the DPU to ring for
- * receives without a doorbell. A failed arm means the consumer must keep
+ * receives without a doorbell. The arm does not progress the channel: the
+ * consumer calls dmesh_native_progress after it, so nothing that landed
+ * before the arm is slept through. A failed arm means the consumer must keep
  * polling. dmesh_native_wake_clear acknowledges a raised fd. */
 int dmesh_native_wake_fd(struct dmesh_native_transport *);
 int dmesh_native_idle_arm(struct dmesh_native_transport *);
