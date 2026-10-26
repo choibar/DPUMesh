@@ -25,8 +25,7 @@ static atomic_int fake_flush_calls;
 static atomic_int fake_fail_fin;
 static atomic_int fake_inflight;
 static atomic_int fake_release_calls;
-static atomic_int fake_suppress_depth;
-static atomic_int fake_suppress_calls;
+static atomic_int fake_kick_calls;
 static atomic_int fake_poll_active;
 static atomic_int fake_poll_max_active;
 static atomic_int fake_poll_delay_us;
@@ -46,8 +45,7 @@ static void fake_reset(void) {
     atomic_store(&fake_fail_fin, 0);
     atomic_store(&fake_inflight, 0);
     atomic_store(&fake_release_calls, 0);
-    atomic_store(&fake_suppress_depth, 0);
-    atomic_store(&fake_suppress_calls, 0);
+    atomic_store(&fake_kick_calls, 0);
     atomic_store(&fake_poll_active, 0);
     atomic_store(&fake_poll_max_active, 0);
     atomic_store(&fake_poll_delay_us, 0);
@@ -88,10 +86,9 @@ int dmesh_qp_fd(dmesh_qp_t *qp) {
     if (fake_qp_efd < 0) fake_qp_efd = eventfd(0, EFD_CLOEXEC);
     return fake_qp_efd;
 }
-void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta) {
+void dpumesh_eq_kick_pending(struct dmesh_eq *eq) {
     (void)eq;
-    atomic_fetch_add(&fake_suppress_depth, delta);
-    atomic_fetch_add(&fake_suppress_calls, 1);
+    atomic_fetch_add(&fake_kick_calls, 1);
 }
 dmesh_qp_t *dmesh_qp_open(dmesh_channel_t *channel, int service) {
     (void)channel; (void)service; return &fake_qp;
@@ -732,8 +729,7 @@ static void test_blocking_recv_drains_qp(void) {
     char out = 0;
     assert(shim_recv(e, &out, 1, 0) == 1);
     assert(out == 'x');
-    assert(atomic_load(&fake_suppress_depth) == 0);
-    assert(atomic_load(&fake_suppress_calls) == 2);
+    assert(atomic_load(&fake_kick_calls) == 1);
     assert(atomic_load(&fake_release_calls) == 1);
     test_pfd_free(e);
 }
@@ -753,8 +749,7 @@ static void test_nonblocking_recv_drains_qp(void) {
     char out = 0;
     assert(shim_recv(e, &out, 1, MSG_DONTWAIT) == 1);
     assert(out == 'n');
-    assert(atomic_load(&fake_suppress_depth) == 0);
-    assert(atomic_load(&fake_suppress_calls) == 2);
+    assert(atomic_load(&fake_kick_calls) == 1);
     assert(atomic_load(&fake_release_calls) == 1);
     test_pfd_free(e);
 }

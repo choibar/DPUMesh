@@ -92,7 +92,7 @@ struct dmesh_eq {
     /* Idle wake state, owned by this EQ's thread except the atomics. */
     uint64_t           nap_ns;      /* next nap; above the cap once the naps are spent */
     int                timer_backstop; /* tick_fd holds the backstop, not a nap */
-    int                work_since_arm; /* this EQ found work since it last armed */
+    int                events_since_arm; /* its poller got events since it last armed */
     uint64_t           backstop_until_ns; /* tick_fd holds a backstop expiring then; 0 if not */
     atomic_int         asleep;      /* doorbells armed: a submit on this EQ must wake it */
     atomic_int         kick;        /* a send on this EQ: naps restart */
@@ -100,7 +100,6 @@ struct dmesh_eq {
     /* Set when dmesh_qp_fd exposes epfd. Poll-only EQs skip eventfd writes and
      * never arm doorbells. */
     atomic_int         wants_notify;
-    atomic_int         suppress_notify;
     int                reg_idx;     /* slot in ctx->eqs[], for destroy */
     /* TX readiness is multi-producer: the drain side can reclaim a QP while any
      * owner thread can return a surplus block to the channel pool, so it is a
@@ -240,7 +239,8 @@ void dpumesh_eq_arm(struct dmesh_eq *eq);
 /* The drain does not write its own EQ's eventfd: before an empty
  * dmesh_poll_qp returns, dpumesh_eq_pending says whether anything queued for
  * this EQ is still unconsumed, and dpumesh_eq_kick_pending raises the
- * eventfd if a delivery is still being published. */
+ * eventfd if so (a delivery still being published, or a caller that stops
+ * polling before the EQ is empty). */
 int  dpumesh_eq_pending(struct dmesh_eq *eq);
 void dpumesh_eq_kick_pending(struct dmesh_eq *eq);
 /* dmesh_poll_qp returned events: naps restart. */
@@ -283,9 +283,6 @@ void dmesh_tx_call_done(dmesh_qp_t *c);
 int  dmesh_tx_call_active(dmesh_qp_t *c);
 int  dmesh_tx_after_commit(dmesh_qp_t *c);
 void dmesh_tx_pressure(dmesh_qp_t *c);
-
-/* Temporarily suppress eventfd writes while an in-process EQ consumer drains work. */
-void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta);
 
 /* Send an ordered zero-length FIN on the connection's forward ring. The call
  * first waits (bounded) for submitted data's DMA copies to complete. A drain

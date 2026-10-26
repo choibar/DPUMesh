@@ -606,16 +606,19 @@ static inline int rxq_try_pop(dpumesh_ctx_t *ctx, sw_descriptor_t *out)
     }
 }
 
+/* The EQ whose stripes this thread is draining (dpumesh_eq_drain). What the
+ * drain queues on that EQ its poller consumes right after, so it does not
+ * write the EQ's eventfd; a notify from any other thread always does. */
+static __thread struct dmesh_eq *draining_eq;
+
 /* Wake the EQ eventfd consumer when notifications are enabled. Poll-only EQs use
  * the ready list without eventfd writes. */
 static inline void eq_notify(struct dmesh_eq *eq)
 {
-    CTRACE("eq_notify efd %d wants %d suppress %d", eq->notify_efd,
-           (int)atomic_load_explicit(&eq->wants_notify, memory_order_seq_cst),
-           (int)atomic_load_explicit(&eq->suppress_notify, memory_order_seq_cst));
-    if (eq->notify_efd >= 0 &&
-        atomic_load_explicit(&eq->wants_notify, memory_order_seq_cst) &&
-        atomic_load_explicit(&eq->suppress_notify, memory_order_seq_cst) == 0) {
+    CTRACE("eq_notify efd %d wants %d own drain %d", eq->notify_efd,
+           (int)atomic_load_explicit(&eq->wants_notify, memory_order_seq_cst), eq == draining_eq);
+    if (eq->notify_efd >= 0 && eq != draining_eq &&
+        atomic_load_explicit(&eq->wants_notify, memory_order_seq_cst)) {
         uint64_t one = 1;
         ssize_t w = write(eq->notify_efd, &one, sizeof(one));
         (void)w;
@@ -632,24 +635,6 @@ static int eq_has_pending(const struct dmesh_eq *eq)
     if (atomic_load_explicit(&eq->tx_ready_count, memory_order_acquire) != 0)
         return 1;
     return atomic_load_explicit(&eq->tx_error_count, memory_order_acquire) != 0;
-}
-
-void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
-{
-    if (!eq || (delta != 1 && delta != -1))
-        return;
-    if (delta > 0) {
-        atomic_fetch_add_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
-        return;
-    }
-    int old = atomic_fetch_sub_explicit(&eq->suppress_notify, 1,
-                                        memory_order_seq_cst);
-    if (old <= 0) {
-        atomic_fetch_add_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
-        return;
-    }
-    if (old == 1 && eq_has_pending(eq))
-        eq_notify(eq);
 }
 
 /* Wake every QP's EQ: the session is lost, or the shared block pool freed a
@@ -1353,13 +1338,16 @@ static int eq_oversubscribed(dpumesh_ctx_t *ctx, uint64_t now)
 static void eq_note_work(struct dmesh_eq *eq)
 {
     eq->nap_ns = eq->ch->ctx->nap_min_ns;
-    eq->work_since_arm = 1;
     atomic_store_explicit(&eq->last_work_ns, monotonic_ns(), memory_order_relaxed);
 }
 
+/* Events reached the poller. Custody ACKs alone do not count: a sleep on open
+ * custody leaves them for the next wake on purpose. */
 void dpumesh_eq_note_work(struct dmesh_eq *eq)
 {
-    if (eq != NULL && eq->ch != NULL && eq->ch->ctx != NULL) eq_note_work(eq);
+    if (eq == NULL || eq->ch == NULL || eq->ch->ctx == NULL) return;
+    eq_note_work(eq);
+    eq->events_since_arm = 1;
 }
 
 /* The EQ's thread is polling again: submitters need not wake it. Not cleared
@@ -1380,9 +1368,9 @@ int dpumesh_eq_drain(struct dmesh_eq *eq)
     if (eq == NULL || eq->ch == NULL || eq->ch->ctx == NULL)
         return 0;
     dpumesh_ctx_t *ctx = eq->ch->ctx;
-    atomic_fetch_add_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
+    draining_eq = eq;
     int drained = drain_own_stripes(ctx, eq, 256);
-    atomic_fetch_sub_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
+    draining_eq = NULL;
     if (drained > 0) eq_note_work(eq);
     return drained;
 }
@@ -1392,9 +1380,9 @@ int dpumesh_eq_pending(struct dmesh_eq *eq)
     return eq != NULL && eq->ch != NULL && eq->ch->ctx != NULL && eq_has_pending(eq);
 }
 
-/* An empty poll still sees work pending: a sibling EQ claimed a ready-list
- * slot during this EQ's drain (its notify suppressed) and has not published
- * the port yet. The eventfd then makes the coming sleep return at once. */
+/* Work is still pending after a poll: a delivery claimed a ready-list slot
+ * during this EQ's drain and has not published the port yet, or the caller
+ * stopped before draining it all. The eventfd keeps the fd readable for it. */
 void dpumesh_eq_kick_pending(struct dmesh_eq *eq)
 {
     if (dpumesh_eq_pending(eq))
@@ -1431,10 +1419,10 @@ void dpumesh_eq_arm(struct dmesh_eq *eq)
     for (int i = 0; i < 5; ++i)
         if (fired & (1u << i)) atomic_fetch_add_explicit(&wait_stats.fired[i], 1, memory_order_relaxed);
     if (eq->timer_backstop && fired == EQ_FIRED_TICK) {
-        /* Nothing but the backstop woke a sleeping EQ. Work found then was a
-         * missed wake: count it, the regression tests require zero. */
+        /* Nothing but the backstop woke a sleeping EQ. Events found then
+         * were a missed wake: count it, the regression tests require zero. */
         atomic_fetch_add(&wait_stats.backstop_wakes, 1);
-        if (eq->work_since_arm) {
+        if (eq->events_since_arm) {
             atomic_fetch_add(&wait_stats.backstop_work, 1);
             CTRACE("backstop found work: a wake was missed");
         }
@@ -1442,7 +1430,7 @@ void dpumesh_eq_arm(struct dmesh_eq *eq)
     eq->timer_backstop = 0;
     if (atomic_exchange_explicit(&eq->kick, 0, memory_order_relaxed))
         eq->nap_ns = ctx->nap_min_ns;   /* a send: its reply follows */
-    eq->work_since_arm = 0;
+    eq->events_since_arm = 0;
 
     uint64_t now = monotonic_ns();
     if (!eq_oversubscribed(ctx, now)) {
@@ -2757,7 +2745,6 @@ static dmesh_eq_t *eq_create(dmesh_channel_t *ch) {
     atomic_init(&eq->ready_head, (uint_fast32_t)0);
     atomic_init(&eq->ready_tail, (uint_fast32_t)0);
     atomic_init(&eq->wants_notify, 0);   /* poll-only until dmesh_qp_fd is called */
-    atomic_init(&eq->suppress_notify, 0);
 
     dpumesh_ctx_t *ctx = ch->ctx;
     pthread_mutex_lock(&ctx->eq_lock);

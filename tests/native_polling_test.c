@@ -136,6 +136,38 @@ int main(void)
     assert(atomic_load(&wait_stats.backstop_wakes) == wakes + 1);
     assert(atomic_load(&wait_stats.backstop_work) == 0);
 
+    /* A backstop that reclaims only custody ACKs, left for the next wake on
+     * purpose, is not a missed wake; one that hands the poller a receive is.
+     * This carrier rings no stripe doorbell, so a receive is found only by
+     * the backstop. */
+    test_native_hold_acks(1);
+    buf = dmesh_alloc(qp, 64);
+    assert(buf);
+    memset(buf, 9, 64);
+    assert(dmesh_post_send(qp, buf, 64) == 0 && dmesh_flush(qp) == 0);
+    settle(eq);                                     /* the send's wake: only the backstop fires */
+    test_native_hold_acks(0);
+    assert(timerfd_settime(eq->tick_fd, 0, &soon, NULL) == 0);
+    assert(poll(&p, 1, 1000) == 1);
+    (void)empty_poll(qp);
+    assert(atomic_load(&wait_stats.backstop_wakes) == wakes + 2);
+    assert(atomic_load(&wait_stats.backstop_work) == 0);
+    dmesh_qp_t *sq = NULL;
+    for (int i = 0; i < 1000 && !sq; ++i) sq = dmesh_accept(server);
+    assert(sq);
+    while (!eq->timer_backstop) (void)empty_poll(qp);
+    void *reply = dmesh_alloc(sq, 4);
+    assert(reply);
+    memcpy(reply, "pong", 4);
+    assert(dmesh_post_send(sq, reply, 4) == 0 && dmesh_flush(sq) == 0);
+    assert(timerfd_settime(eq->tick_fd, 0, &soon, NULL) == 0);
+    assert(poll(&p, 1, 1000) == 1);
+    assert(dmesh_poll_qp(qp, ev, 8) == 1 && ev[0].type == DMESH_EVENT_RECV);
+    dmesh_release_rx_buffer(ch, &ev[0]);
+    (void)empty_poll(qp);
+    assert(atomic_load(&wait_stats.backstop_wakes) == wakes + 3);
+    assert(atomic_load(&wait_stats.backstop_work) == 1);
+
     /* DPUMESH_NAP_US=0 skips the naps; with no linger the EQ sleeps. */
     ctx->nap_min_ns = 0;
     atomic_store(&eq->kick, 1);
@@ -152,11 +184,12 @@ int main(void)
     atomic_store(&ctx->live_eqs, 1);
 
     test_native_sleepable(0);
+    assert(dmesh_destroy_qp(sq) == 0);
     assert(dmesh_destroy_qp(qp) == 0);
     assert(dmesh_destroy_channel(ch) == 0);
     assert(dmesh_destroy_channel(server) == 0);
     unsetenv("DPUMESH_LINGER_US");
     unsetenv("DPUMESH_SPIN_US");
     puts("native_polling_test: naps, linger, custody polling, sleep on its own stripe, submit wake, "
-         "channel doorbell re-poll, backstop: PASS");
+         "channel doorbell re-poll, backstop and missed-wake count: PASS");
 }

@@ -58,7 +58,6 @@ static void fixture_init(struct fixture *f, int pool_empty)
     atomic_init(&f->eq->ready_head, (uint_fast32_t)0);
     atomic_init(&f->eq->ready_tail, (uint_fast32_t)0);
     atomic_init(&f->eq->wants_notify, 0);
-    atomic_init(&f->eq->suppress_notify, 0);
 
     f->qp.ep = &f->channel;
     f->qp.eq = f->eq;
@@ -95,22 +94,37 @@ static void fixture_destroy(struct fixture *f)
     free(f->ctx);
 }
 
-static void test_suppressed_notify_rechecks_pending(void)
+static void *ready_from_other_thread(void *arg)
+{
+    struct fixture *f = arg;
+    eq_tx_ready_set(f->eq, TEST_PORT);
+    return NULL;
+}
+
+/* While its poller drains, an EQ's own deliveries stay off its eventfd (the
+ * poller consumes them next), but another thread's notify still raises it:
+ * dropping that one would leave the EQ asleep until the backstop. */
+static void test_drain_quiets_only_its_own_thread(void)
 {
     struct fixture f;
     fixture_init(&f, 0);
     f.eq->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     assert(f.eq->notify_efd >= 0);
     atomic_store(&f.eq->wants_notify, 1);
-
-    dmesh_eq_suppress_notify(f.eq, 1);
     atomic_store(&f.ports[TEST_PORT].tx_wait_state, DMESH_TX_WAIT_READY);
+
+    draining_eq = f.eq;
     eq_tx_ready_set(f.eq, TEST_PORT);
     uint64_t value = 0;
     assert(read(f.eq->notify_efd, &value, sizeof(value)) == -1);
     assert(errno == EAGAIN);
+    assert(dpumesh_next_tx_ready(f.eq) == &f.qp);
 
-    dmesh_eq_suppress_notify(f.eq, -1);
+    atomic_store(&f.ports[TEST_PORT].tx_wait_state, DMESH_TX_WAIT_READY);
+    pthread_t other;
+    assert(pthread_create(&other, NULL, ready_from_other_thread, &f) == 0);
+    assert(pthread_join(other, NULL) == 0);
+    draining_eq = NULL;
     assert(read(f.eq->notify_efd, &value, sizeof(value)) == sizeof(value));
     assert(value == 1);
     assert(dpumesh_next_tx_ready(f.eq) == &f.qp);
@@ -434,7 +448,7 @@ int main(void)
     test_shared_pool_return_and_direct_retry();
     test_pool_eagain_does_not_commit_padding();
     test_default_four_mib_window_and_dynamic_fifo();
-    test_suppressed_notify_rechecks_pending();
+    test_drain_quiets_only_its_own_thread();
     puts("native_writable_test: PASS");
     return 0;
 }

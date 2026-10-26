@@ -54,10 +54,6 @@ void dpumesh_eq_kick_pending(struct dmesh_eq *eq) { assert(eq != NULL); }
 int dpumesh_lost(dpumesh_ctx_t *ctx) { (void)ctx; return 0; }
 void dpumesh_eq_awake(struct dmesh_eq *eq) { assert(eq != NULL); }
 void dpumesh_eq_note_work(struct dmesh_eq *eq) { assert(eq != NULL); }
-void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
-{
-    assert(eq != NULL && (delta == 1 || delta == -1));
-}
 
 void *dpumesh_next_tx_ready(struct dmesh_eq *eq)
 {

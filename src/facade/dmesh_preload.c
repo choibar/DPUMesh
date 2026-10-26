@@ -766,8 +766,9 @@ static int drain_target_ready(pfd_t *e, enum drain_target target) {
 }
 
 /* Returns readiness after accepting, or draining at most one batch of self's
- * QP, on the app thread. The QP's own eventfd stays quiet meanwhile, so the
- * dispatcher is not woken for what this thread consumes. */
+ * QP, on the app thread. The drain does not write the QP's own eventfd, so the
+ * dispatcher is not woken for what this thread consumes; what one batch
+ * leaves raises it. */
 static int shim_try_drain(pfd_t *self, enum drain_target target, int *drained) {
     *drained = 0;
     if (!g_ch || pthread_mutex_trylock(&g_poll_mu) != 0)
@@ -777,9 +778,8 @@ static int shim_try_drain(pfd_t *self, enum drain_target target, int *drained) {
     } else if (self->conn) {
         dmesh_qp_t *c = self->conn;
         int failed;
-        dmesh_eq_suppress_notify(c->eq, 1);
         *drained = dispatcher_drain_qp(self, self, 1, &failed);
-        dmesh_eq_suppress_notify(c->eq, -1);
+        dpumesh_eq_kick_pending(c->eq);
         if (failed) pfd_fail(self, c);
     }
     pthread_mutex_unlock(&g_poll_mu);
