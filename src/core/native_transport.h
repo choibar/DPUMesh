@@ -69,10 +69,9 @@ void dmesh_native_stripe_clear(struct dmesh_native_transport *, int stripe);
  * receives without a doorbell. The arm does not progress the channel: the
  * consumer calls dmesh_native_progress after it, so nothing that landed
  * before the arm is slept through. A failed arm means the consumer must keep
- * polling. dmesh_native_wake_clear acknowledges a raised fd. */
+ * polling. The next arm clears a raised fd. */
 int dmesh_native_wake_fd(struct dmesh_native_transport *);
 int dmesh_native_idle_arm(struct dmesh_native_transport *);
-void dmesh_native_wake_clear(struct dmesh_native_transport *);
 /* ARM messages sent and DOORBELLs received, for diagnostics. */
 void dmesh_native_wake_counters(struct dmesh_native_transport *, uint64_t *arms, uint64_t *doorbells);
 int dmesh_native_resolve(struct dmesh_native_transport *, const char *name, uint32_t addr, uint16_t port);

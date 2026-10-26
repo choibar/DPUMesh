@@ -138,15 +138,16 @@ void dmesh_native_release(struct dmesh_native_transport *t, int pos) {
 }
 /* No doorbells: every stripe keeps its consumer polling, unless a test lets
  * the channel sleep (test_native_sleepable), where idle_arm succeeds and the
- * wake fd is an eventfd the test raises. */
+ * wake fd is an eventfd the test raises with a DOORBELL. As a PROGRESS_ALL PE
+ * does, every arm clears the raised fd. */
 static int sleepable, wake_efd = -1;
-static unsigned idle_arms, wake_clears;
+static unsigned idle_arms, doorbells;
 void test_native_sleepable(int value) { sleepable = value; }
 unsigned test_native_idle_arms(void) { return idle_arms; }
-unsigned test_native_wake_clears(void) { return wake_clears; }
 void test_native_raise_wake(void)
 {
     uint64_t one = 1;
+    ++doorbells;
     assert(wake_efd >= 0 && write(wake_efd, &one, sizeof(one)) == sizeof(one));
 }
 int dmesh_native_stripe_fd(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return -1; }
@@ -176,12 +177,23 @@ void test_native_retiring(int value) { retiring = value; }
 void test_native_custody(int value) { custody = value; }   /* open custody, idle_arm still works */
 void test_native_rx_signaled(int value) { rx_signaled = value; }
 int dmesh_native_rx_signaled(struct dmesh_native_transport *t) { (void)t; return rx_signaled; }
+/* Runs once inside the next arm, a stripe's or the session's: what lands
+ * between a consumer's drain and its arm. */
+static void (*arm_hook)(void);
+void test_native_on_arm(void (*fn)(void)) { arm_hook = fn; }
+static void run_arm_hook(void)
+{
+    void (*fn)(void) = arm_hook;
+    arm_hook = NULL;
+    if (fn) fn();
+}
 static uint32_t armed_stripes;
 uint32_t test_native_armed(void) { uint32_t a = armed_stripes; armed_stripes = 0; return a; }
 int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
 {
     (void)t;
     armed_stripes |= UINT32_C(1) << stripe;
+    run_arm_hook();
     return (sleepable && !custody ? 0 : DMESH_STRIPE_CUSTODY) | (retiring ? DMESH_STRIPE_RETIRING : 0);
 }
 void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; }
@@ -191,32 +203,21 @@ int dmesh_native_wake_fd(struct dmesh_native_transport *t)
     if (wake_efd < 0) wake_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     return wake_efd;
 }
-/* Runs once inside the next successful idle_arm: what lands between a
- * consumer's drain and its arm. */
-static void (*idle_arm_hook)(void);
-void test_native_on_idle_arm(void (*fn)(void)) { idle_arm_hook = fn; }
 int dmesh_native_idle_arm(struct dmesh_native_transport *t)
 {
     (void)t;
+    uint64_t v;
+    while (wake_efd >= 0 && read(wake_efd, &v, sizeof(v)) > 0) {}
     if (!sleepable) { errno = EAGAIN; return -1; }
     ++idle_arms;
-    void (*fn)(void) = idle_arm_hook;
-    idle_arm_hook = NULL;
-    if (fn) fn();
+    run_arm_hook();
     return 0;
 }
-void dmesh_native_wake_clear(struct dmesh_native_transport *t)
-{
-    (void)t;
-    uint64_t v;
-    ++wake_clears;
-    while (wake_efd >= 0 && read(wake_efd, &v, sizeof(v)) > 0) {}
-}
-void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms, uint64_t *doorbells)
+void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms, uint64_t *rung)
 {
     (void)t;
     *arms = idle_arms;
-    *doorbells = wake_clears;
+    *rung = doorbells;
 }
 int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int service_id) {
     (void)t; (void)port; (void)service_id;

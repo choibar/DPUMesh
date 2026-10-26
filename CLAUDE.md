@@ -27,7 +27,7 @@ Three trees at the repo root:
   `dmesh-router-cpp/`, `dmeshgo/` (old Go host lib, `libdmesh_hostlib.so`),
   `hpack-h2-bench/`.
 - `src/core/`, `src/facade/`, `include/dpumesh/` — the DOCA-free host library
-  (`libdpumesh.so.5`, root `Makefile`): core, carrier, native/preload façades.
+  (`libdpumesh.so.6`, root `Makefile`): core, carrier, native/preload façades.
   `src/core` sees the transport only through `src/transport/host/channel.h`.
 - `linkerd2-proxy/` — a git submodule (Rust), a fork carrying a `dmesh_doca`
   transport crate + `doca` cargo features that plug the DMA path into
@@ -89,7 +89,7 @@ addresses from `LINKERD2_PROXY_DOCA_DEV_PCI_ADDR` (`03:00.1`) and
 
 `apps/dma_bench`: the legacy `host_worker.c` / `dpu_worker.c` benchmark roles
 ported onto the current APIs. `dpumesh_host` (`host/dpumesh_host.c`) streams
-fixed-size messages through `libdpumesh` (one channel, one EQ + QP per thread;
+fixed-size messages through `libdpumesh` (one channel polled on its own thread, one QP per thread;
 `BENCH_MODE=sink|echo`, `BENCH_THREADS`, `BENCH_SIZE`, `BENCH_DURATION`,
 `BENCH_WINDOW`); `dpumesh_dpu` (`dpu/dpumesh_dpu.c`, `DMESH_MODE=sink|echo`,
 `DMESH_BUSY_POLL`) serves the flows over the shim, counting every forward DMA

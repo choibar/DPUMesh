@@ -1,6 +1,6 @@
 # Host library over the DPUMesh transport
 
-The host library (`libdpumesh.so.5`) is the DPUmesh native API and core; the
+The host library (`libdpumesh.so.6`) is the DPUmesh native API and core; the
 DPU runs the DPUMesh transport and its embedded Linkerd proxy. The two
 meet at DPUMesh's host wire: one Comch control session per channel, a forward
 descriptor ring per connection and, back to the host, either the DPA-free push
@@ -12,10 +12,11 @@ exports rcv_ring + tx_staging instead of pushing).
 
 ## Layout
 
-- `include/dpumesh`: public API and descriptor layout (ABI 5).
-- `src/core/dmesh_core.c`: channels, EQs, QPs, TX reservation and credits,
+- `include/dpumesh`: public API and descriptor layout (ABI 6).
+- `src/core/dmesh_core.c`: channels, QPs, TX reservation and credits,
   custody ACK reclamation, RX delivery and the accept queue, FIN and teardown,
-  the EQ readiness fd and its idle-wake policy (naps, linger, doorbells).
+  the channel's and each QP's readiness fd and their idle-wake policy (naps,
+  linger, doorbells).
 - `src/core/native_transport.h`: the private carrier contract
   (open, connect, submit, poll, release, wait, resolve, disconnect, close).
 - `src/core/carrier.c`: the carrier over the channel layer.
@@ -37,7 +38,7 @@ exports rcv_ring + tx_staging instead of pushing).
 | inbound stream | The first push batch on a BACKEND flow enters the core's accept queue under that flow's upstream port. After the stream closes, the flow reopens under a new port. |
 | `dmesh_post_send` | The descriptor's TX-pool range is posted to the flow's forward ring as one or two DPUMesh descriptors (a multiple of 128 bytes plus a remainder of at most 128 bytes, each at most 8064 bytes). |
 | custody ACK | The DPA's `consumer_head` passing a descriptor's ticket. |
-| `dmesh_poll_eq` receive | One push batch `{seq, pos, len}` becomes one receive event pointing into the flow's data ring. No copy. |
+| `dmesh_poll_qp` receive | One push batch `{seq, pos, len}` becomes one receive event pointing into the flow's data ring. No copy. |
 | `dmesh_release_rx_buffer` | Marks the batch released; the consumption cursor advances over the released prefix and the DPU pulls it for flow control. A long-held batch blocks only its own QP. |
 | `dmesh_destroy_qp`, `dmesh_abort_qp` | Retain the current FIN behavior. Transport cleanup sends flow CLOSE after local reverse DMA stops; matching CLOSED permits resource release. A flow close leaves the channel's Comch session and siblings alive. |
 
@@ -59,90 +60,85 @@ ignored.
 
 ### Readiness: no background thread
 
-The library creates no thread of its own. The EQ thread that calls
-`dmesh_poll_eq` drains every stripe in line (`dpumesh_eq_drain`) and
-publishes its QPs' retained transmit tails, and `dmesh_eq_fd` hands out an
-epoll set that wakes it: its eventfd (deliveries from other EQ threads,
-accepts, a send while it sleeps), a one-shot timerfd programmed to the
-earliest retained-tail deadline, a one-shot nap/backstop timerfd, the
-doorbells of the stripes it owns, and the spare set: the doorbells of the
-spare backend flows and the channel's wake fd. A stripe's doorbell is the
-carrier's per-slot epoll of the private reverse MsgQ notification fd in
-host-dpa mode; the core moves it from the spare set to the owning EQ at
-connect/accept and back at free. A drain snapshots active stripes, including
-closed flows awaiting custody/FIN retirement, and skips unused stripes. It
-progresses the shared control PE once per pass under a channel mutex; each
-flow then observes the retained session error and advances its private
-reverse engine. The control PE's notification fd is the channel's wake fd.
-No control thread is added.
+The library creates no thread of its own. Two kinds of fd wake the threads
+that call it, each an epoll set:
 
-Each empty poll chooses the next wake (`dpumesh_eq_arm`). After work, the EQ
-re-polls on the nap timer, doubling from `DPUMESH_NAP_US` (10) to
+- **The channel's** (`dmesh_channel_fd`): the control PE's notification fd
+  (the channel's wake fd), the spare set (the doorbells of the stripes no QP
+  owns: a backend flow awaiting its first stream, a closed flow still
+  retiring) and a one-shot timer. `dmesh_accept` acknowledges them,
+  progresses the control PE once under a channel mutex, interprets the active
+  stripes (with flow wake, only those no QP owns) and returns the next inbound
+  stream. Its stripe moves from the spare set to the new QP's EQ, and the
+  stream goes on that EQ's ready list with its held first bytes.
+- **A QP's** (`dmesh_qp_fd`): its EQ, private to the QP: an eventfd
+  (deliveries by the channel, its flow's control news, a loss, a send while it
+  sleeps), a one-shot timerfd programmed to its retained tail's deadline, a
+  one-shot nap/backstop timerfd and its stripe's doorbell. `dmesh_poll_qp`
+  drains that stripe (`dpumesh_eq_drain`) and publishes the retained tail. A
+  stripe's doorbell is the carrier's per-slot epoll of the private reverse
+  MsgQ notification fd in host-dpa mode, or its flow's own consumer with flow
+  wake; it moves back to the spare set when the QP is freed.
+
+A drain snapshots active stripes, including closed flows awaiting custody/FIN
+retirement, and skips unused stripes; each flow observes the retained session
+error and advances its private reverse engine. No control thread is added.
+
+Each empty QP poll chooses the QP's next wake (`dpumesh_eq_arm`). After work,
+it re-polls on the nap timer, doubling from `DPUMESH_NAP_US` (10) to
 `DPUMESH_NAP_CAP_US` (100); then it keeps polling every nap cap until
 `DPUMESH_LINGER_US` (1000) has passed since its last work, where a send counts
 as work because its reply is expected. Then it sleeps: it sets its asleep
-flag, arms the stripe doorbells and asks the channel to arm (`idle_arm`),
-leaving only the `DPUMESH_BACKSTOP_MS` (200) timer. With more live EQs than
-allowed CPUs it skips the naps and linger. A backstop expiry that finds work
-means a wake was missed and is counted (`DPUMESH_WAIT_STATS` writes the
-counters to `<dir>/dpumesh-wait.<pid>` once a second).
+flag and arms its stripe's doorbell, leaving only the `DPUMESH_BACKSTOP_MS`
+(200) timer. With more live QPs than allowed CPUs it skips the naps and
+linger. An empty `dmesh_accept` arms the channel: the unowned stripes and
+`idle_arm`, leaving the backstop, which also paces the session's keepalive.
+A backstop expiry that finds work means a wake was missed and is counted
+(`DPUMESH_WAIT_STATS` writes the counters to `<dir>/dpumesh-wait.<pid>` once a
+second).
 
 Three things have no completion doorbell, and each gets a wake:
-- **Push batches** (the DPU's DMA engine writes the window). `idle_arm` sends
-  the session message `ARM` listing, per push flow, the next descriptor
-  sequence the host has not read. The DPU sends `DOORBELL` at once if a listed
-  flow already published that sequence, otherwise after its next descriptor
-  completion. On a DPU whose Comch sessions belong to the dispatcher (the
-  proxy), the dispatcher hands each listed flow's sequence to the flow's
-  worker, which rings through its control reply queue; the dispatcher sends
-  one DOORBELL per ARM. At most one ARM is outstanding per channel; a DOORBELL
-  releases it and restarts the naps, since its descriptor may become visible
-  after the message. Plan and race argument: `docs/2026-09-30_host-wait-doorbell-plan.md`.
+- **Push batches** (the DPU's DMA engine writes the window). Without the Comch
+  fast path, `idle_arm` sends the session message `ARM` listing, per push
+  flow, the next descriptor sequence the host has not read. The DPU sends
+  `DOORBELL` at once if a listed flow already published that sequence,
+  otherwise after its next descriptor completion. On a DPU whose Comch
+  sessions belong to the dispatcher (the proxy), the dispatcher hands each
+  listed flow's sequence to the flow's worker, which rings through its control
+  reply queue; the dispatcher sends one DOORBELL per ARM. At most one ARM is
+  outstanding per channel; a DOORBELL releases it, and the channel re-polls
+  after a nap, since its descriptor may become visible after the message.
+  Plan and race argument: `docs/2026-09-30_host-wait-doorbell-plan.md`.
 - **Control messages** (DOORBELL, CLOSED, ERROR) raise the control PE's
-  notification fd once `idle_arm` requested it; the drain pass progresses it.
-  The control PE runs in `DOCA_PE_EVENT_MODE_PROGRESS_ALL`: in the selective
-  default an armed PE delivers no new event until the raised notification is
-  cleared, which stalled a synchronous flow open behind an idle wake.
+  notification fd once `idle_arm` requested it; the channel's poller
+  progresses it. The control PE runs in `DOCA_PE_EVENT_MODE_PROGRESS_ALL`: in
+  the selective default an armed PE delivers no new event until the raised
+  notification is cleared, which stalled a synchronous flow open behind an
+  idle wake.
 - **Custody ACKs** (the DPU's DPA writes `consumer_head` into host memory).
-  An EQ with custody outstanding keeps polling instead of sleeping. A send
+  A QP with custody outstanding keeps polling instead of sleeping. A send
   publishes custody under the slot lock before it reads the asleep flag, and
-  the arming EQ sets the flag before it reads custody under that lock, so a
-  send either finds the EQ awake or wakes it.
-
-### Listening channel
-
-A channel whose fd the application takes (`dmesh_channel_fd`, before any EQ
-exists) does its control work on the thread that polls it, and its EQs carry
-only their own QPs. Its fd is an epoll set of the channel wake fd, the spare
-set and a one-shot timer. `dmesh_accept` acknowledges them, progresses the
-control PE, drains the stripes no EQ owns and binds the next inbound stream
-to the EQ it names: the stream's stripe moves to that EQ and the stream is
-put on its ready list with the held first bytes. When it finds nothing it
-arms the unowned stripes and `idle_arm`, leaving the backstop, which also
-paces the keepalive, and looks once more. Its EQs hold no channel wake fd and
-no spare set, take no inbound stream (`no_accept`), drain and arm only their
-own stripes, and never `idle_arm`. Without flow wake the channel's drain
-interprets every active stripe, and what it delivers to an EQ's QPs wakes
-that EQ through its eventfd.
+  the arming QP sets the flag before it reads custody under that lock, so a
+  send either finds the QP awake or wakes it.
 
 ### Flow wake
 
 With the Comch fast path (`DPUMESH_COMCH_WAKE`, on by default on DPU-DMA), the
 DPU sends each push descriptor as a Comch message to the session's consumer
-on the control PE, so a completion raises the channel's wake fd and wakes
-every EQ nesting it. `DPUMESH_FLOW_WAKE=1` gives each of the session's 32 flow
+on the control PE, so a completion raises the channel's wake fd: the
+channel's poller then hands the receive to its QP. `DPUMESH_FLOW_WAKE=1`
+gives each of the session's 32 flow
 slots a consumer of its own, on its own PE in `PROGRESS_ALL` mode, created
 with the session before any flow opens (all or none; on a failure the session
 stays on its consumer). They start one at a time: each start and stop sends
 the DPU a message from the Comch connection's small pool of internal tasks
 (about 16), which the control PE frees. A push flow's OPEN names its slot's
 consumer, and the DPU sends that flow's descriptors there. The slot's PE fd
-is the stripe's doorbell, nested directly in the owning EQ's epoll set, and
-a stripe an EQ owns is that EQ's alone to advance and drain: on a listening
-channel an EQ wakes only for its own QPs' receives. Control messages still
-arrive on the control PE; a flow's CLOSED or ERROR marks its stripe, and the
-drain that progresses the control PE wakes the stripe's owner through its
-eventfd.
+is the stripe's doorbell, nested directly in its QP's epoll set, and the QP
+alone advances and drains it: a completion wakes only its QP's poller, with
+no hop through the channel's. Control messages still arrive on the control
+PE; a flow's CLOSED or ERROR marks its stripe, and the channel's poller wakes
+the QP through its eventfd.
 
 ### Host-dpa reverse path
 
@@ -198,7 +194,7 @@ moves the DPA objects onto the pod's SF without a code change.
 A DPU worker serves 64 flows (one DPA thread each), shared by client QPs and
 the backend pool. The channel establishes Comch once; opening a QP still waits
 synchronously for its own DMA setup and READY, bounded by a five-second control
-timeout. `dmesh_msg_max` is 8192; a descriptor larger than 8064 bytes is
+timeout. One receive carries at most 8192 bytes; a descriptor larger than 8064 bytes is
 split by the channel layer and reassembled by the stream.
 
 ## Channel session and shutdown
@@ -236,8 +232,8 @@ quarantined, consuming bounded flow/session capacity until process/device
 recovery. The proxy's void driver destructor retains a live device domain rather
 than freeing the owner underneath unfinished cleanup. A lost session is not proof that the remote DMA reader stopped.
 
-The public API and SONAME remain ABI 5; explicit listen and public async
-connect/close are later steps. The private Comch protocol and DPA argument
+The public API and SONAME are ABI 6: the channel is the listening socket
+and each QP has its own fd; public async connect/close is a later step. The private Comch protocol and DPA argument
 layout changed: rebuild the host library, DPU transport/proxy and DPA kernel
 together. Mixed old/new peers are unsupported. Unit/fault tests and builds do
 not replace hardware validation of both reverse modes and close/reconnect

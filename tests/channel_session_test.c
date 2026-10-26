@@ -311,14 +311,6 @@ static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, stru
     assert(channel_dev_arm(dev) == 0 && arms_seen == arms + 2 && notify_requests == requests + 1);
     dev->host_dpa = 0;
 
-    /* A raised fd is cleared once; an idle one is left alone. */
-    uint64_t one = 1;
-    assert(write(control_notify_fd, &one, sizeof(one)) == sizeof(one));
-    unsigned clears = notify_clears;
-    channel_dev_clear(dev);
-    channel_dev_clear(dev);
-    assert(notify_clears == clears + 1);
-
     /* A failed session cannot arm. */
     dev->session_error = ECONNRESET;
     assert(channel_dev_arm(dev) == -1 && errno == ECONNRESET);

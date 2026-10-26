@@ -9,7 +9,7 @@ BUILD := build
 LIBDIR := $(BUILD)/lib
 TESTDIR := $(BUILD)/test
 BINDIR := $(BUILD)/bin
-ABI_MAJOR := 5
+ABI_MAJOR := 6
 TRANSPORT := src/transport
 DOCA_INC := /opt/mellanox/doca/include
 DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch doca-dma doca-dpa libflexio)
@@ -134,8 +134,8 @@ $(TESTDIR)/native_loss_test: tests/native_loss_test.c src/core/dmesh_core.c src/
 $(TESTDIR)/native_listen_test: tests/native_listen_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
 
-$(TESTDIR)/native_core_transport_test: tests/native_core_transport_test.c tests/support/native_memory_transport.c src/core/dmesh_core.c src/core/service_resolve.c src/facade/dmesh_api.c src/core/native_transport.h | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) $(filter %.c,$^) -pthread -o $@
+$(TESTDIR)/native_core_transport_test: tests/native_core_transport_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
 
 $(TESTDIR)/service_resolve_test: tests/service_resolve_test.c src/core/service_resolve.c src/core/service_resolve.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -DDMESH_RESOLVE_TEST $(filter %.c,$^) -pthread -o $@

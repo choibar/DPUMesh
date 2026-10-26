@@ -456,10 +456,6 @@ int dmesh_native_idle_arm(struct dmesh_native_transport *t)
 {
     return channel_dev_arm(t->dev);
 }
-void dmesh_native_wake_clear(struct dmesh_native_transport *t)
-{
-    channel_dev_clear(t->dev);
-}
 void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms, uint64_t *doorbells)
 {
     channel_dev_wake_counters(t->dev, arms, doorbells);

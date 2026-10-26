@@ -69,10 +69,10 @@ int channel_dev_host_dpa(const struct channel_dev *dev);
  * (DOORBELL, CLOSED, ERROR) arrives. channel_dev_arm first sends one ARM for
  * the push flows, so the DPU rings for descriptors this host has not read.
  * It fails, leaving the caller to keep polling, when the session is down or
- * the ARM cannot be queued. channel_dev_clear acknowledges a raised fd. */
+ * the ARM cannot be queued. The control PE runs in PROGRESS_ALL, so the next
+ * channel_dev_arm also clears a raised fd. */
 int channel_dev_fd(struct channel_dev *dev);
 int channel_dev_arm(struct channel_dev *dev);
-void channel_dev_clear(struct channel_dev *dev);
 void channel_dev_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells);
 /* Nonzero when the DPU publishes every push descriptor as a Comch fast-path
  * completion (WAKE_READY): each receive raises channel_dev_fd without an ARM */

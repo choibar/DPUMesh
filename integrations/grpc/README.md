@@ -34,7 +34,7 @@ cmake -S integrations/grpc/cpp -B build/grpc -G Ninja \
 cmake --build build/grpc --target dpumesh_stream dpumesh_stream_loopback
 ```
 
-Processes find `libdpumesh_stream.so` and `libdpumesh.so.5` on
+Processes find `libdpumesh_stream.so` and `libdpumesh.so.6` on
 `LD_LIBRARY_PATH` (`build/grpc`, `build/lib`). `DPUMESH_STREAM_LIBRARY` names
 another build of the ABI. A binding's tests can set it to
 `build/grpc/libdpumesh_stream_loopback.so`, which routes a process's streams

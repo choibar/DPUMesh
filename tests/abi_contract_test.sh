@@ -30,11 +30,9 @@ soname=$(readelf -d "$lib" | awk '/Library soname:/ {
 
 symbols=$(nm -D --defined-only "$lib" | awk '{ print $3 }')
 for symbol in \
-    dmesh_create_channel dmesh_destroy_channel dmesh_pod_id dmesh_msg_max \
-    dmesh_post_max dmesh_create_eq dmesh_destroy_eq dmesh_eq_fd dmesh_eq_next_deadline_ns \
-    dmesh_create_qp dmesh_destroy_qp dmesh_abort_qp dmesh_channel_fd dmesh_accept dmesh_alloc \
-    dmesh_post_send dmesh_flush dmesh_tx_inflight dmesh_get_tx_stats dmesh_poll_eq \
-    dmesh_release_rx_buffer
+    dmesh_create_channel dmesh_destroy_channel dmesh_post_max dmesh_channel_fd \
+    dmesh_accept dmesh_create_qp dmesh_qp_fd dmesh_destroy_qp dmesh_abort_qp \
+    dmesh_alloc dmesh_post_send dmesh_flush dmesh_poll_qp dmesh_release_rx_buffer
 do
     if ! printf '%s\n' "$symbols" | grep -Fqx "$symbol"; then
         fail "missing public symbol: $symbol"
@@ -43,7 +41,9 @@ done
 
 for symbol in \
     dmesh_create_cq dmesh_destroy_cq dmesh_cq_fd dmesh_poll_cq \
-    dmesh_wc_release
+    dmesh_wc_release dmesh_create_eq dmesh_destroy_eq dmesh_eq_fd \
+    dmesh_eq_next_deadline_ns dmesh_poll_eq dmesh_pod_id dmesh_msg_max \
+    dmesh_tx_inflight dmesh_get_tx_stats
 do
     if printf '%s\n' "$symbols" | grep -Fqx "$symbol"; then
         fail "removed public symbol still exported: $symbol"

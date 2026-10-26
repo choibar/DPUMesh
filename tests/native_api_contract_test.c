@@ -18,8 +18,6 @@ static int rx_free_calls;
 static int last_rx_slot = -1;
 static dmesh_qp_t *tx_ready_qp;
 static dmesh_qp_t *tx_error_qp;
-static int accept_calls;
-static int accept_errno = EAGAIN;
 
 uint8_t *
 dpumesh_tx_reserve(dpumesh_ctx_t *ctx, uint16_t port, uint32_t len)
@@ -59,14 +57,6 @@ void dpumesh_eq_note_work(struct dmesh_eq *eq) { assert(eq != NULL); }
 void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
 {
     assert(eq != NULL && (delta == 1 || delta == -1));
-}
-
-dmesh_qp_t *dpumesh_accept(dmesh_eq_t *eq)
-{
-    (void)eq;
-    accept_calls++;
-    errno = accept_errno;
-    return NULL;
 }
 
 void *dpumesh_next_tx_ready(struct dmesh_eq *eq)
@@ -174,29 +164,27 @@ main(void)
     assert(commit_calls == 5);
     assert(after_commit_calls == 3);
 
-    /* poll_eq exposes the core one-shot as a payload-free API event. */
+    /* poll_qp exposes the core one-shot as a payload-free API event. */
     struct dmesh_eq eq = {0};
     dmesh_event_t event = {0};
     eq.ch = &channel;
-    accept_errno = ENOMEM;
-    accept_calls = 0;
-    assert(dmesh_poll_eq(&eq, &event, 1) == 0);
-    assert(accept_calls == 1);
+    qp.eq = &eq;
+    assert(dmesh_poll_qp(&qp, &event, 1) == 0);
     /* Entering the loop is a publication point for tails whose deadline
      * expired. */
     assert(publish_due_calls == 1);
-    accept_errno = EAGAIN;
     tx_error_qp = &qp;
-    assert(dmesh_poll_eq(&eq, &event, 1) == 1);
+    assert(dmesh_poll_qp(&qp, &event, 1) == 1);
     assert(event.qp == &qp);
     assert(event.type == DMESH_EVENT_TX_ERROR);
     assert(event.buf == NULL && event.len == 0 && event._rx_token == -1);
     tx_ready_qp = &qp;
-    assert(dmesh_poll_eq(&eq, &event, 1) == 1);
+    assert(dmesh_poll_qp(&qp, &event, 1) == 1);
     assert(event.qp == &qp);
     assert(event.type == DMESH_EVENT_TX_READY);
     assert(event.buf == NULL && event.len == 0 && event._rx_token == -1);
-    assert(dmesh_poll_eq(&eq, &event, 1) == 0);
+    assert(dmesh_poll_qp(&qp, &event, 1) == 0);
+    assert(dmesh_poll_qp(NULL, &event, 1) == -1 && errno == EINVAL);
 
     uint8_t payload = 0x5a;
     event = (dmesh_event_t){

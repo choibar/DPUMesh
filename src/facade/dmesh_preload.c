@@ -1,6 +1,7 @@
 /* LD_PRELOAD POSIX-socket facade. TCP connections to the addresses of
  * $DPUMESH_TARGETS use DPUmesh; all other descriptors remain kernel-backed. A
- * dispatcher translates native events into socket readiness. */
+ * dispatcher waits on the channel's and every QP's fd and translates native
+ * events into socket readiness. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <time.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -120,6 +122,7 @@ typedef struct preload_rx {
 
 typedef struct pfd {
     dmesh_qp_t *conn;        /* NULL for the listener entry */
+    int  qfd;                  /* conn's readiness fd, in the dispatcher's set; -1 if none */
     int  efd;                  /* PRIVATE app side of a nonblocking socketpair */
     int  sigfd;                /* dispatcher side: RX signal + TX gate drain */
     int  listener;
@@ -202,6 +205,7 @@ static pfd_t *pfd_new(dmesh_qp_t *c) {
         return NULL;
     }
     e->conn = c;
+    e->qfd = -1;
     e->family = AF_INET;
     e->efd = sv[0];
     e->sigfd = sv[1];
@@ -260,10 +264,11 @@ static void fd_unblock_tx_locked(pfd_t *e) {
 /* ===================== channel + dispatcher thread ===================== */
 
 static dmesh_channel_t *g_ch;
-static dmesh_eq_t *g_eq;                 /* the ONE EQ: every shim conn is bound to it,
-                                          * and whoever holds g_poll_mu (the dispatcher,
-                                          * or an app thread in shim_try_drain) drains
-                                          * it, so one is exactly right here. */
+/* The dispatcher's wait set: the channel's fd, g_wake_fd and every live QP's
+ * fd (tagged with its pfd). Whoever holds g_poll_mu (the dispatcher, or an app
+ * thread in shim_try_drain) accepts or drains. */
+static int  g_epfd = -1;
+static char g_tag_channel, g_tag_wake;
 static int  g_wake_fd = -1;              /* wakes the dispatcher for the close queue */
 /* The (single) dmesh listener entry and whether one was ever closed. Written by
  * listen()/close() on app threads and read by the dispatcher. Reading the pair
@@ -387,129 +392,124 @@ static void pfd_tx_error(pfd_t *e) {
     pthread_mutex_unlock(&e->mu);
 }
 
-static void defer_qp_once(dmesh_qp_t **qps, int *nqps, int cap, dmesh_qp_t *qp) {
-    if (!qp) return;
-    for (int i = 0; i < *nqps; i++) if (qps[i] == qp) return;
-    if (*nqps < cap) qps[(*nqps)++] = qp;
+/* Put a QP's fd in the dispatcher's set, or take it out before its QP goes. */
+static int pfd_watch(pfd_t *e) {
+    int fd = dmesh_qp_fd(e->conn);
+    struct epoll_event ev = { .events = EPOLLIN, .data.ptr = e };
+    if (fd < 0 || epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev) != 0) return -1;
+    e->qfd = fd;
+    return 0;
 }
 
-static int defer_pfd_once(pfd_t **pfds, int *npfds, int cap, pfd_t *pfd) {
-    if (!pfd) return 1;
-    for (int i = 0; i < *npfds; i++) if (pfds[i] == pfd) return 1;
-    if (*npfds >= cap) return 0;
-    pfds[(*npfds)++] = pfd;
-    return 1;
+static void pfd_unwatch(pfd_t *e) {
+    if (e->qfd >= 0) (void)epoll_ctl(g_epfd, EPOLL_CTL_DEL, e->qfd, NULL);
+    e->qfd = -1;
 }
 
-/* One EQ consumer for every native event type. QP destruction is deferred until
- * the complete returned batch has been inspected because later entries may name the
- * same QP. */
-static int dispatcher_drain_eq(pfd_t *self, int max_batches) {
+/* A pfd that never reached the fd table. */
+static void pfd_free_unused(pfd_t *e) {
+    real_close(e->sigfd);
+    real_close(e->efd);
+    pthread_mutex_destroy(&e->tx_mu);
+    pthread_mutex_destroy(&e->mu);
+    free(e);
+}
+
+/* A QP whose stream broke: its socket reports the error, and the QP goes. */
+static void pfd_fail(pfd_t *e, dmesh_qp_t *c) {
+    pthread_mutex_lock(&e->mu);
+    if (e->conn == c) e->conn = NULL;
+    if (!e->io_error) e->io_error = ECONNRESET;
+    fd_unblock_tx_locked(e);
+    efd_signal(e);
+    pthread_mutex_unlock(&e->mu);
+    /* A connection error outlives the cached answer that routed it here; the
+     * next connect() asks DNS again. paddr is set only on the connect() side,
+     * where the cache entry is. */
+    if (e->paddr != 0)
+        dmesh_resolve_invalidate(e->paddr, e->pport);
+    pfd_unwatch(e);
+    dmesh_abort_qp(c);
+}
+
+/* Every inbound stream the channel holds: queued for accept(), or aborted when
+ * no listener can ever take it. A stream's first bytes come from its own fd. */
+static int dispatcher_accept(pfd_t *self) {
+    int accepted = 0;
+    dmesh_qp_t *c;
+    while ((c = dmesh_accept(g_ch)) != NULL) {
+        pfd_t *listener = atomic_load_explicit(&g_listener, memory_order_acquire);
+        pfd_t *e = NULL;
+        if (listener != NULL ||
+            !atomic_load_explicit(&g_listener_closed, memory_order_acquire))
+            e = pfd_new(c);
+        if (e) {
+            e->pport = c->remote_port;
+            e->lport = c->local_port;
+            c->user_data = e;
+            if (pfd_watch(e) != 0) {
+                pfd_free_unused(e);
+                e = NULL;
+            }
+        }
+        if (!e) {
+            dmesh_abort_qp(c);
+            continue;
+        }
+        accept_q_push(e);
+        accepted++;
+        if (listener && listener != self) efd_signal(listener);
+        DBG("accepted conn (peer pod=%d port=%u)", c->remote_pod, c->remote_port);
+    }
+    if (errno != EAGAIN) DBG("dmesh_accept failed: %s", strerror(errno));
+    return accepted;
+}
+
+/* One QP's events into its socket. A stream that breaks is reported through
+ * *failed once the batch has been inspected, for the caller to fail it. */
+static int dispatcher_drain_qp(pfd_t *e, pfd_t *self, int max_batches, int *failed) {
+    dmesh_qp_t *c = e->conn;
     dmesh_event_t events[64];
     int batches = 0;
+    *failed = 0;
+    if (!c) return 0;
     for (;;) {
-        int n = dmesh_poll_eq(g_eq, events, (int)(sizeof(events) / sizeof(events[0])));
+        int n = dmesh_poll_qp(c, events, (int)(sizeof(events) / sizeof(events[0])));
         if (n == 0) return batches;
         if (n < 0) {
-            DBG("dmesh_poll_eq failed: %s", strerror(errno));
+            DBG("dmesh_poll_qp failed: %s", strerror(errno));
             return batches;
         }
         batches++;
-        dmesh_qp_t *deferred[64];
-        int ndeferred = 0;
-        pfd_t *signalled[64];
-        int nsignalled = 0;
-
+        int signal = 0;
         for (int i = 0; i < n; i++) {
-            dmesh_qp_t *c = events[i].qp;
-            pfd_t *e = c ? (pfd_t *)c->user_data : NULL;
             switch (events[i].type) {
-            case DMESH_EVENT_CONN_REQ: {
-                if (!c) break;
-                pfd_t *listener = atomic_load_explicit(&g_listener,
-                                                       memory_order_acquire);
-                if (listener == NULL &&
-                    atomic_load_explicit(&g_listener_closed,
-                                         memory_order_acquire)) {
-                    defer_qp_once(deferred, &ndeferred, 64, c);
-                    break;
-                }
-                e = pfd_new(c);
-                if (!e) {
-                    defer_qp_once(deferred, &ndeferred, 64, c);
-                    break;
-                }
-                e->pport = c->remote_port;
-                e->lport = c->local_port;
-                c->user_data = e;
-                accept_q_push(e);
-                if (listener && listener != self) efd_signal(listener);
-                DBG("accepted conn (peer pod=%d port=%u)", c->remote_pod,
-                    c->remote_port);
-                break;
-            }
-
             case DMESH_EVENT_RECV:
-                if (!e || pfd_queue_rx(e, &events[i], 1) != 0) {
-                    if (!e) dmesh_release_rx_buffer(g_ch, &events[i]);
-                    if (e) defer_qp_once(deferred, &ndeferred, 64, c);
-                } else if (!defer_pfd_once(signalled, &nsignalled, 64, e)) {
-                    efd_signal(e);
-                }
+                if (pfd_queue_rx(e, &events[i], 1) != 0) *failed = 1;
+                else signal = 1;
                 break;
-
             case DMESH_EVENT_RECV_FIN:
-                if (e) {
-                    if (pfd_rx_fin(e, &events[i], 1) != 0)
-                        defer_qp_once(deferred, &ndeferred, 64, c);
-                    else if (!defer_pfd_once(signalled, &nsignalled, 64, e))
-                        efd_signal(e);
-                }
+                if (pfd_rx_fin(e, &events[i], 1) != 0) *failed = 1;
+                else signal = 1;
                 break;
-
             case DMESH_EVENT_TX_READY:
-                if (e) pfd_tx_ready(e);
+                pfd_tx_ready(e);
                 break;
-
             case DMESH_EVENT_TX_ERROR:
-                if (e) pfd_tx_error(e);
+                pfd_tx_error(e);
                 break;
-
             default:
                 dmesh_release_rx_buffer(g_ch, &events[i]);
-                if (e) {
-                    pthread_mutex_lock(&e->mu);
-                    e->io_error = EPROTO;
-                    efd_signal(e);
-                    pthread_mutex_unlock(&e->mu);
-                    defer_qp_once(deferred, &ndeferred, 64, c);
-                }
+                pthread_mutex_lock(&e->mu);
+                e->io_error = EPROTO;
+                efd_signal(e);
+                pthread_mutex_unlock(&e->mu);
+                *failed = 1;
                 break;
             }
         }
-
-        for (int i = 0; i < nsignalled; i++)
-            if (signalled[i] != self) efd_signal(signalled[i]);
-
-        for (int i = 0; i < ndeferred; i++) {
-            dmesh_qp_t *c = deferred[i];
-            pfd_t *e = c ? (pfd_t *)c->user_data : NULL;
-            if (e) {
-                pthread_mutex_lock(&e->mu);
-                if (e->conn == c) e->conn = NULL;
-                if (!e->io_error) e->io_error = ECONNRESET;
-                fd_unblock_tx_locked(e);
-                efd_signal(e);
-                pthread_mutex_unlock(&e->mu);
-                /* A connection error outlives the cached answer that routed
-                 * it here; the next connect() asks DNS again. paddr is set
-                 * only on the connect() side, where the cache entry is. */
-                if (e->paddr != 0)
-                    dmesh_resolve_invalidate(e->paddr, e->pport);
-            }
-            dmesh_abort_qp(c);
-        }
-        if (max_batches > 0 && batches >= max_batches)
+        if (signal && e != self) efd_signal(e);
+        if (*failed || (max_batches > 0 && batches >= max_batches))
             return batches;
     }
 }
@@ -529,6 +529,7 @@ static void dispatcher_reap_pfd(pfd_t *e) {
     fd_unblock_tx_locked(e);
     pthread_mutex_unlock(&e->mu);
     release_rx_list(rx);
+    pfd_unwatch(e);
     if (c) {
         if (abort_on_close)
             dmesh_abort_qp(c);
@@ -541,28 +542,34 @@ static void dispatcher_reap_pfd(pfd_t *e) {
     pthread_mutex_unlock(&g_poll_mu);
 }
 
+/* A batch's QP and channel events come before its reaps: a reap may free a
+ * pfd that a later event of the same batch names. */
 static void *dispatcher_main(void *arg) {
     (void)arg;
-    int eq_fd = dmesh_eq_fd(g_eq);
-    struct pollfd pfds[2] = {
-        { .fd = eq_fd,     .events = POLLIN },
-        { .fd = g_wake_fd, .events = POLLIN },
-    };
-    DBG("dispatcher up (eq_fd=%d wake_fd=%d)", eq_fd, g_wake_fd);
+    struct epoll_event evs[64];
+    DBG("dispatcher up (channel_fd=%d wake_fd=%d)", dmesh_channel_fd(g_ch), g_wake_fd);
     for (;;) {
-        /* The channel timer raises this fd for a buffered transmit tail. A
-         * failed poll leaves stale revents, so the round is skipped. */
-        if (poll(pfds, 2, -1) < 0)
-            continue;
-
-        if (pfds[0].revents & POLLIN) {
-            /* The fd is level-triggered; draining the EQ to empty settles it. */
+        int n = epoll_wait(g_epfd, evs, (int)(sizeof(evs) / sizeof(evs[0])), -1);
+        int reap = 0;
+        for (int i = 0; i < n; i++) {
+            void *tag = evs[i].data.ptr;
+            if (tag == &g_tag_wake) {
+                reap = 1;
+                continue;
+            }
+            /* Each fd is level-triggered; draining it to empty settles it. */
             pthread_mutex_lock(&g_poll_mu);
-            (void)dispatcher_drain_eq(NULL, 0);
+            if (tag == &g_tag_channel) {
+                (void)dispatcher_accept(NULL);
+            } else {
+                pfd_t *e = tag;
+                int failed;
+                (void)dispatcher_drain_qp(e, NULL, 0, &failed);
+                if (failed) pfd_fail(e, e->conn);
+            }
             pthread_mutex_unlock(&g_poll_mu);
         }
-
-        if (pfds[1].revents & POLLIN) {
+        if (reap) {
             uint64_t v;
             while (real_read(g_wake_fd, &v, sizeof v) > 0) {}
             for (;;) {                    /* reap the close queue */
@@ -646,7 +653,10 @@ static void preload_atfork_child(void) {
      * CLOEXEC descriptors disappear on exec; a child that continues gets a
      * fresh channel on its next mapped socket operation. */
     g_ch = NULL;
-    g_eq = NULL;
+    if (g_epfd >= 0) {
+        real_close(g_epfd);
+        g_epfd = -1;
+    }
     if (g_wake_fd >= 0) {
         real_close(g_wake_fd);
         g_wake_fd = -1;
@@ -659,6 +669,7 @@ static void preload_atfork_child(void) {
     for (pfd_t *e = g_fork_entries; e; e = e->fork_next) {
         e->orphaned = 1;
         e->conn = NULL;
+        e->qfd = -1;
         e->io_error = ECONNRESET;
         e->rx_head = e->rx_tail = NULL;
         e->active_ops = 0;       /* vanished threads owned every old reference */
@@ -678,28 +689,26 @@ static void channel_init(void) {
      * its first mapped socket operation. */
     dmesh_channel_t *ch = dmesh_create_channel();
     if (!ch) { DBG("dmesh_create_channel() FAILED (will retry)"); return; }
-    dmesh_eq_t *eq = dmesh_create_eq(ch);
-    if (!eq || dmesh_eq_fd(eq) < 0) {   /* no readiness fd → dispatcher would be deaf */
-        dmesh_destroy_eq(eq);
-        dmesh_destroy_channel(ch);
-        DBG("dmesh eq unavailable (will retry)");
-        return;
-    }
     if (g_wake_fd < 0)                  /* kept across a failed attempt (no re-create leak) */
         g_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event chan = { .events = EPOLLIN, .data.ptr = &g_tag_channel };
+    struct epoll_event wake = { .events = EPOLLIN, .data.ptr = &g_tag_wake };
     pthread_t t;
-    g_ch = ch; g_eq = eq;               /* dispatcher reads both */
-    if (g_wake_fd < 0 || pthread_create(&t, NULL, dispatcher_main, NULL) != 0) {
-        g_ch = NULL; g_eq = NULL;
-        dmesh_destroy_eq(eq);
+    g_ch = ch; g_epfd = epfd;           /* dispatcher reads both */
+    if (epfd < 0 || g_wake_fd < 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD, dmesh_channel_fd(ch), &chan) != 0 ||
+        epoll_ctl(epfd, EPOLL_CTL_ADD, g_wake_fd, &wake) != 0 ||
+        pthread_create(&t, NULL, dispatcher_main, NULL) != 0) {
+        g_ch = NULL; g_epfd = -1;
+        if (epfd >= 0) real_close(epfd);
         dmesh_destroy_channel(ch);
         DBG("dispatcher start FAILED");
         return;
     }
     pthread_detach(t);
-    DBG("channel up: service='%s' pod=%d msg_max=%d",
-        getenv("DPUMESH_SERVICE") ? getenv("DPUMESH_SERVICE") : "(none)",
-        dmesh_pod_id(ch), dmesh_msg_max(ch));
+    DBG("channel up: service='%s'",
+        getenv("DPUMESH_SERVICE") ? getenv("DPUMESH_SERVICE") : "(none)");
 }
 
 static int ensure_channel(void) {
@@ -708,26 +717,6 @@ static int ensure_channel(void) {
     int ok = (g_ch != NULL);
     pthread_mutex_unlock(&g_ch_mu);
     return ok ? 0 : -1;
-}
-
-__attribute__((visibility("default")))
-int dmesh_preload_tx_stats(unsigned long long out[7]) {
-    if (!out) { errno = EINVAL; return -1; }
-    memset(out, 0, 7 * sizeof(*out));
-    pthread_mutex_lock(&g_ch_mu);
-    dmesh_channel_t *channel = g_ch;
-    if (channel) {
-        dmesh_tx_stats_t stats;
-        dmesh_get_tx_stats(channel, &stats);
-        out[0] = stats.pool_grabs;
-        out[1] = stats.pool_returns;
-        out[2] = stats.recycle_hits;
-        out[3] = stats.grow_waits;
-        out[4] = stats.block_pads;
-        dpumesh_get_wait_split(channel->ctx, &out[5], &out[6]);
-    }
-    pthread_mutex_unlock(&g_ch_mu);
-    return 0;
 }
 
 /* Occupy the app's fd number with a kernel dup of the private socketpair end. */
@@ -776,14 +765,23 @@ static int drain_target_ready(pfd_t *e, enum drain_target target) {
     return ready;
 }
 
-/* Returns readiness after draining at most one EQ batch. */
+/* Returns readiness after accepting, or draining at most one batch of self's
+ * QP, on the app thread. The QP's own eventfd stays quiet meanwhile, so the
+ * dispatcher is not woken for what this thread consumes. */
 static int shim_try_drain(pfd_t *self, enum drain_target target, int *drained) {
     *drained = 0;
-    if (!g_eq || pthread_mutex_trylock(&g_poll_mu) != 0)
+    if (!g_ch || pthread_mutex_trylock(&g_poll_mu) != 0)
         return 0;
-    dmesh_eq_suppress_notify(g_eq, 1);
-    *drained = dispatcher_drain_eq(self, 1);
-    dmesh_eq_suppress_notify(g_eq, -1);
+    if (target == DRAIN_ACCEPT) {
+        *drained = dispatcher_accept(self);
+    } else if (self->conn) {
+        dmesh_qp_t *c = self->conn;
+        int failed;
+        dmesh_eq_suppress_notify(c->eq, 1);
+        *drained = dispatcher_drain_qp(self, self, 1, &failed);
+        dmesh_eq_suppress_notify(c->eq, -1);
+        if (failed) pfd_fail(self, c);
+    }
     pthread_mutex_unlock(&g_poll_mu);
     return drain_target_ready(self, target);
 }
@@ -1109,7 +1107,7 @@ int connect(int fd, const struct sockaddr *addr, socklen_t alen) {
             return -1;
         }
         {
-            dmesh_qp_t *c = dmesh_qp_open(g_eq, svc);
+            dmesh_qp_t *c = dmesh_qp_open(g_ch, svc);
             if (!c) {
                 dmesh_resolve_invalidate(sin->sin_addr.s_addr,
                                          ntohs(sin->sin_port));
@@ -1127,11 +1125,16 @@ int connect(int fd, const struct sockaddr *addr, socklen_t alen) {
             c->user_data = e;                      /* before any send → before any ready */
             if (install_fd(fd, e) < 0) {
                 dmesh_destroy_qp(c);
-                real_close(e->sigfd); real_close(e->efd);
-                pthread_mutex_destroy(&e->tx_mu); pthread_mutex_destroy(&e->mu);
-                free(e);
+                pfd_free_unused(e);
                 errno = ENOMEM;
                 return -1;
+            }
+            /* Watched only once installed: from here on only the dispatcher
+             * frees e. A socket nobody watches fails like a broken stream. */
+            if (pfd_watch(e) != 0) {
+                pthread_mutex_lock(&g_poll_mu);
+                pfd_fail(e, c);
+                pthread_mutex_unlock(&g_poll_mu);
             }
             DBG("connect fd=%d port=%u → svc=%d (pinned)", fd, e->pport, svc);
             return 0;                              /* local: immediate success is legal */

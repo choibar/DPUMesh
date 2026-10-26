@@ -37,7 +37,7 @@ int dmesh_post_send(dmesh_qp_t *c, const void *buf, uint32_t len) {
     return result;
 }
 
-/* ===== Event queue ===== */
+/* ===== Event polling ===== */
 
 /* Emit one event for a landed message descriptor. A 0-length body is the
  * wire FIN marker: its landing credit is returned here (nothing to hand out) and
@@ -104,26 +104,7 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events, i
         eq->drain_cur = NULL;
     }
 
-    /* 2. New inbound conns off the SHARED accept queue, on an EQ that accepts (MPMC —
-     * sibling EQs may be popping it too; whichever wins one owns it). One CONN_REQ, then the conn's
-     * already-landed messages (held first message + any pipelined ones coalesced while
-     * it was SERVER_PENDING — those predate the promote, so they too never re-edge). */
-    while (n < max_events && !atomic_load(&eq->no_accept)) {
-        errno = 0;
-        dmesh_qp_t *c = dpumesh_accept(eq);
-        if (!c)
-            break;
-        events[n].qp        = c;
-        events[n].type      = DMESH_EVENT_CONN_REQ;
-        events[n].buf       = NULL;
-        events[n].len       = 0;
-        events[n]._rx_token = -1;
-        n++;
-        n += eq_drain_conn(s, c, events + n, max_events - n, &drained);
-        if (!drained) { eq->drain_cur = c; return n; }
-    }
-
-    /* 3. Background tail faults are terminal for the QP and take precedence over
+    /* 2. Background tail faults are terminal for the QP and take precedence over
      * ordinary readiness, so an application never spins retrying a failed stream. */
     while (n < max_events) {
         dmesh_qp_t *c = (dmesh_qp_t *)dpumesh_next_tx_error(eq);
@@ -136,7 +117,7 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events, i
         n++;
     }
 
-    /* 4. QPs whose automatically armed alloc(EAGAIN) became retryable. TX readiness
+    /* 3. QPs whose automatically armed alloc(EAGAIN) became retryable. TX readiness
      * is deliberately emitted before bulk RX so a read-heavy EQ cannot starve writes.
      * It is a hint, not a reservation; the application retries only the named QP. */
     while (n < max_events) {
@@ -150,8 +131,8 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events, i
         n++;
     }
 
-    /* 5. This EQ's established conns with inbound (edge-armed by the drain side). A spurious
-     * entry (inbox already drained via 1/2) emits nothing — harmless. */
+    /* 4. The QP with inbound (edge-armed by the drain side, or by dmesh_accept for its
+     * held first message). A spurious entry (inbox already drained via 1) emits nothing. */
     while (n < max_events) {
         dmesh_qp_t *c = dmesh_next_ready(eq);
         if (!c) break;
@@ -161,14 +142,14 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events, i
     return n;
 }
 
-/* An empty poll is what precedes the caller's sleep on dmesh_eq_fd: arm the
- * doorbells, then drain once more so a completion that landed between the
- * drain and the arm is not slept through. That drain progresses the control
- * PE the arm requested a notification on. Anything it (or a sibling EQ
- * meanwhile) queued for this EQ is consumed here: the drain does not write
- * this EQ's own eventfd. */
-int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
-    if (!eq || !events || max_events <= 0) { errno = EINVAL; return -1; }
+/* An empty poll is what precedes the caller's sleep on dmesh_qp_fd: arm the
+ * doorbell, then drain once more so a completion that landed between the
+ * drain and the arm is not slept through. Anything it (or the channel
+ * meanwhile) queued for this QP is consumed here: the drain does not write
+ * the QP's own eventfd. */
+int dmesh_poll_qp(dmesh_qp_t *qp, dmesh_event_t *events, int max_events) {
+    if (!qp || !qp->eq || !events || max_events <= 0) { errno = EINVAL; return -1; }
+    dmesh_eq_t *eq = qp->eq;
     dpumesh_eq_awake(eq);
     int n = poll_eq_once(eq, events, max_events, 1);
     if (n != 0) {

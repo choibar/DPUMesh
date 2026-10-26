@@ -1679,21 +1679,6 @@ out:
 	return rc;
 }
 
-void channel_dev_clear(struct channel_dev *dev)
-{
-	doca_notification_handle_t handle;
-	pthread_mutex_lock(&dev->session_lock);
-	/* A raised handle stays readable until the next request; clear it so an
-	 * EQ that keeps polling does not see its fd stay readable. */
-	if (dev->control != NULL &&
-	    doca_pe_get_notification_handle(dev->control->pe, &handle) == DOCA_SUCCESS) {
-		struct pollfd ready = { .fd = (int)handle, .events = POLLIN };
-		if (poll(&ready, 1, 0) > 0 && (ready.revents & POLLIN))
-			(void)doca_pe_clear_notification(dev->control->pe, handle);
-	}
-	pthread_mutex_unlock(&dev->session_lock);
-}
-
 int channel_dev_rx_signaled(const struct channel_dev *dev)
 {
 	return dev->fastpath;
