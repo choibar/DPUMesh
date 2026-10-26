@@ -85,7 +85,7 @@ libuv).
   due. `dmesh_poll_qp` until it returns 0 settles the fd and arms the QP's
   doorbell.
 
-With `DPUMESH_FLOW_WAKE=1` a QP's own completions raise its fd
+With the Comch fast path a QP's own completions raise its fd
 ([flow wake](HOST.md#flow-wake)); without it the channel's work hands each
 QP its receives and raises its fd.
 

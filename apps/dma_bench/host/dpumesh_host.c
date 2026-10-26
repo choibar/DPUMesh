@@ -323,8 +323,7 @@ out:
 }
 
 /* The channel's work (dmesh_accept), on a thread of its own: the workers wait
- * on their QPs alone. Without DPUMESH_FLOW_WAKE=1 their receives also pass
- * through here. A client is offered no stream. */
+ * on their QPs alone. A client is offered no stream. */
 struct channel_thread {
     dmesh_channel_t *ch;
     atomic_int stop;

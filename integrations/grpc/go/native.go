@@ -66,13 +66,9 @@ type cgoQP struct {
 }
 
 // openCgoNative opens the process channel and puts its fd on the netpoller.
-// Connections each wait on their own QP, so each flow asks for its own wake
-// consumer (DPUMESH_FLOW_WAKE; an explicit setting wins). On failure a
-// non-nil native holds resources whose cleanup failed; close retries it.
+// On failure a non-nil native holds resources whose cleanup failed; close
+// retries it.
 func openCgoNative() (*cgoNative, error) {
-	if os.Getenv("DPUMESH_FLOW_WAKE") == "" {
-		_ = os.Setenv("DPUMESH_FLOW_WAKE", "1")
-	}
 	// dmesh_create_channel serves DPUMESH_SERVICE when it is set.
 	n := &cgoNative{serving: os.Getenv("DPUMESH_SERVICE") != ""}
 	ch, err := C.dmesh_create_channel()

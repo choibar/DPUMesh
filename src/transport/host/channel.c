@@ -99,9 +99,9 @@ struct channel_dev {
 	void *wake_mem;
 	int wake_running, wake_ready, fastpath;
 	uint64_t wake_descs, wake_drops;
-	/* Flow wake (DPUMESH_FLOW_WAKE=1 on a fastpath session): every flow slot's
-	 * own consumer, created with the session. news has bit (flow id - 1) set
-	 * for a flow-wake flow that got CLOSED or ERROR. */
+	/* Flow wake (every fastpath session): every flow slot's own consumer,
+	 * created with the session. news has bit (flow id - 1) set for a
+	 * flow-wake flow that got CLOSED or ERROR. */
 	struct channel_flow_wake *flow_wake[33];
 	int flow_wake_on;
 	uint32_t news;
@@ -724,15 +724,14 @@ static doca_error_t flow_wake_post_locked(struct channel_flow_wake *fw)
 }
 
 /* Every slot's consumer, before any flow opens, so each push OPEN can name
- * one the DPU already knows. All or none: on a failure the session stays on
- * its consumer. One at a time: a consumer's start sends the DPU a message
- * from the connection's small pool of internal tasks, freed only as the
- * control PE progresses, so the next start waits until this one runs. */
-static void flow_wakes_open_locked(struct channel_dev *dev)
+ * one the DPU already knows. All or none: a failure fails the session. One
+ * at a time: a consumer's start sends the DPU a message from the
+ * connection's small pool of internal tasks, freed only as the control PE
+ * progresses, so the next start waits until this one runs. */
+static int flow_wakes_open_locked(struct channel_dev *dev)
 {
-	const char *env = getenv("DPUMESH_FLOW_WAKE");
-	if (!dev->fastpath || env == NULL || strcmp(env, "1") != 0)
-		return;
+	if (!dev->fastpath)
+		return 0;
 	uint64_t start_ms = channel_now_ms();
 	const char *step = "start";
 	doca_error_t result = DOCA_SUCCESS;
@@ -751,14 +750,15 @@ static void flow_wakes_open_locked(struct channel_dev *dev)
 		result = flow_wake_post_locked(fw);
 	}
 	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("flow wake unavailable (%s: %s); flows publish through the session consumer",
-			     step, doca_error_get_name(result));
+		DOCA_LOG_ERR("flow wake failed (%s: %s)", step, doca_error_get_name(result));
 		flow_wakes_close_locked(dev);
-		return;
+		errno = error_number(result);
+		return -1;
 	}
 	dev->flow_wake_on = 1;
 	DOCA_LOG_INFO("flow wake on: each flow slot has its own consumer (%lu ms)",
 		      (unsigned long)(channel_now_ms() - start_ms));
+	return 0;
 }
 
 int channel_dev_flow_wake(const struct channel_dev *dev)
@@ -812,7 +812,7 @@ int channel_session_open(struct channel_dev *dev, const char *server)
 		rc = session_wait_locked(dev, NULL, 0);
 	if (rc == 0) {
 		wake_open_locked(dev);
-		flow_wakes_open_locked(dev);
+		rc = flow_wakes_open_locked(dev);
 	}
 	pthread_mutex_unlock(&dev->session_lock);
 	return rc;

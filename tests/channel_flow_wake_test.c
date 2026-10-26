@@ -213,11 +213,12 @@ static void session(struct channel_dev *dev)
     nconsumers = 0; peak_in_flight = 0; faults = 0;
 }
 
-static void open_wakes(struct channel_dev *dev)
+static int open_wakes(struct channel_dev *dev)
 {
     pthread_mutex_lock(&dev->session_lock);
-    flow_wakes_open_locked(dev);
+    int rc = flow_wakes_open_locked(dev);
     pthread_mutex_unlock(&dev->session_lock);
+    return rc;
 }
 
 static void close_wakes(struct channel_dev *dev)
@@ -239,12 +240,11 @@ static void assert_released(struct channel_dev *dev)
 int main(void)
 {
     struct channel_dev dev;
-    setenv("DPUMESH_FLOW_WAKE", "1", 1);
 
     /* Every slot gets a running consumer with its receives and its own id,
      * although the connection holds fewer internal tasks than slots. */
     session(&dev);
-    open_wakes(&dev);
+    assert(open_wakes(&dev) == 0);
     assert(dev.flow_wake_on && peak_in_flight == 1);
     for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id) {
         struct fake_consumer *c = (struct fake_consumer *)dev.flow_wake[id]->consumer;
@@ -256,23 +256,20 @@ int main(void)
     assert(nconsumers == DMESH_SESSION_MAX_FLOWS);
     assert_released(&dev);
 
-    /* A failed start leaves the session on its consumer, with every started
-     * consumer stopped before it is freed. */
+    /* A failed start fails the session, with every started consumer
+     * stopped before it is freed. */
     session(&dev);
     fail_start_at = 5;
-    open_wakes(&dev);
+    assert(open_wakes(&dev) == -1);
     fail_start_at = 0;
     assert(nconsumers == 5 && !channel_dev_flow_wake(&dev));
     assert_released(&dev);
 
-    /* No flow wake without the fast path or the knob. */
+    /* No flow wake without the fast path. */
     session(&dev);
     dev.fastpath = 0;
-    open_wakes(&dev);
-    session(&dev);
-    setenv("DPUMESH_FLOW_WAKE", "0", 1);
-    open_wakes(&dev);
+    assert(open_wakes(&dev) == 0);
     assert(nconsumers == 0 && !channel_dev_flow_wake(&dev));
-    puts("channel flow wake: consumers start one at a time, stop through the control PE, all or none: PASS");
+    puts("channel flow wake: consumers start one at a time, stop through the control PE, all or the session fails: PASS");
     return 0;
 }

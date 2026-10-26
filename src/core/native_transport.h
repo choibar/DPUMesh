@@ -49,12 +49,11 @@ int dmesh_native_stripe_of(struct dmesh_native_transport *, uint16_t port);
  * custody or FIN still has to be retired. */
 enum { DMESH_STRIPE_CUSTODY = 1, DMESH_STRIPE_RETIRING = 2 };
 int dmesh_native_stripe_arm(struct dmesh_native_transport *, int stripe);
-/* Flow wake (DPUMESH_FLOW_WAKE=1 on a signaled channel): every stripe has a
- * Comch consumer of its own, whose fd is the stripe's doorbell. Its receives
- * are published only by dmesh_native_stripe_progress, and its control
- * messages (CLOSED, ERROR) are reported by dmesh_native_take_news to the
- * session's progress, since the doorbell carries receives alone. Fixed once
- * the carrier is open. */
+/* Flow wake (every signaled channel): every stripe has a Comch consumer of
+ * its own, whose fd is the stripe's doorbell. Its receives are published only
+ * by dmesh_native_stripe_progress, and its control messages (CLOSED, ERROR)
+ * are reported by dmesh_native_take_news to the session's progress, since the
+ * doorbell carries receives alone. Fixed once the carrier is open. */
 int dmesh_native_flow_wake(struct dmesh_native_transport *);
 void dmesh_native_stripe_progress(struct dmesh_native_transport *, int stripe);
 uint32_t dmesh_native_take_news(struct dmesh_native_transport *);

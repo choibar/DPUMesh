@@ -124,13 +124,10 @@ Three things have no completion doorbell, and each gets a wake:
 ### Flow wake
 
 With the Comch fast path (`DPUMESH_COMCH_WAKE`, on by default on DPU-DMA), the
-DPU sends each push descriptor as a Comch message to the session's consumer
-on the control PE, so a completion raises the channel's wake fd: the
-channel's poller then hands the receive to its QP. `DPUMESH_FLOW_WAKE=1`
-gives each of the session's 32 flow
-slots a consumer of its own, on its own PE in `PROGRESS_ALL` mode, created
-with the session before any flow opens (all or none; on a failure the session
-stays on its consumer). They start one at a time: each start and stop sends
+DPU sends each push descriptor as a Comch message. Each of the session's 32
+flow slots has a consumer of its own, on its own PE in `PROGRESS_ALL` mode,
+created with the session before any flow opens (all or none; a failure fails
+the session). They start one at a time: each start and stop sends
 the DPU a message from the Comch connection's small pool of internal tasks
 (about 16), which the control PE frees. A push flow's OPEN names its slot's
 consumer, and the DPU sends that flow's descriptors there. The slot's PE fd
@@ -258,8 +255,6 @@ placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`),
 `DPUMESH_NAP_US` (10), `DPUMESH_NAP_CAP_US` (100),
 `DPUMESH_LINGER_US` (1000) and `DPUMESH_BACKSTOP_MS` (200) set the idle wake;
 `DPUMESH_SPIN_US` and `DPUMESH_TICK_US` are ignored with a warning.
-`DPUMESH_FLOW_WAKE=1` gives every flow slot its own Comch consumer (flow
-wake; the Go binding sets it unless the environment does).
 `DPUMESH_WAIT_STATS` names a directory for the idle-wake counters. `DPUMESH_CARRIER_TRACE` and `DPUMESH_CORE_TRACE` print flow,
 descriptor and event traces to stderr.
 

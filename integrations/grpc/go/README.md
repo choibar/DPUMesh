@@ -13,11 +13,8 @@ rings, buffers and DPA resources remain per flow.
   goroutine hands receives on. The QP has one poller at a time; a Read and a
   Write that both wait take turns, and the one that polls signals the other
   when it lets go.
-- The channel sets `DPUMESH_FLOW_WAKE=1` unless the environment says
-  otherwise, so each flow gets a Comch consumer of its own (`design/HOST.md`,
-  flow wake) and a completion wakes only its connection. With it off, the
-  channel goroutine drains every receive and wakes the connection, one hop
-  more.
+- Each flow has a Comch consumer of its own (`design/HOST.md`, flow wake),
+  so a completion wakes only its connection.
 - Read, Write and Dial run on the caller's goroutine. Each connection has its
   own locks, so no connection waits for another's I/O. A Dial waits for the
   DPU's answer without blocking other traffic; a `DialContext` whose context

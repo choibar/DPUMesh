@@ -97,16 +97,16 @@ int channel_conn_progress(struct channel_conn *conn);
 int channel_dev_progress(struct channel_dev *dev);
 int channel_conn_poll(struct channel_conn *conn);
 
-/* Flow wake (DPUMESH_FLOW_WAKE=1 on a fast-path session): every flow slot
- * (1..32) has a Comch consumer of its own on its own PE, created with the
- * session, so a push flow's descriptors complete on its slot's consumer and
- * raise that slot's fd alone; the flow's OPEN names the consumer. The slot
- * calls are serialized by the caller (the carrier's slot lock). The fd is
- * stable for the session; channel_flow_arm makes the next completion raise
- * it and clears the last raise; channel_flow_progress publishes the
- * completed descriptors into the slot's flow. The fd carries no control
- * message: channel_dev_take_news returns, and clears, bit (flow_id - 1) for
- * each flow-wake flow that got CLOSED or ERROR. */
+/* Flow wake (every fast-path session): every flow slot (1..32) has a Comch
+ * consumer of its own on its own PE, created with the session (a failure
+ * fails the session), so a push flow's descriptors complete on its slot's
+ * consumer and raise that slot's fd alone; the flow's OPEN names the
+ * consumer. The slot calls are serialized by the caller (the carrier's slot
+ * lock). The fd is stable for the session; channel_flow_arm makes the next
+ * completion raise it and clears the last raise; channel_flow_progress
+ * publishes the completed descriptors into the slot's flow. The fd carries
+ * no control message: channel_dev_take_news returns, and clears, bit
+ * (flow_id - 1) for each flow-wake flow that got CLOSED or ERROR. */
 int channel_dev_flow_wake(const struct channel_dev *dev);
 int channel_flow_fd(struct channel_dev *dev, uint32_t flow_id);
 void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id);
