@@ -28,6 +28,8 @@ static dmesh_channel_t *channel(const char *service)
     dmesh_channel_t *ch = dmesh_create_channel();
     unsetenv("DPUMESH_SERVICE");
     assert(ch && dmesh_channel_fd(ch) >= 0);
+    /* Born readable: a poller that waits before its first accept wakes. */
+    assert(readable(dmesh_channel_fd(ch)));
     return ch;
 }
 

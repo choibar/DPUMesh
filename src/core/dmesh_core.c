@@ -1663,6 +1663,11 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
         epoll_nest(ctx->listen_epfd, ctx->spare_epfd, EQ_TAG(EQ_TAG_SPARE, 0)) != 0 ||
         epoll_nest(ctx->listen_epfd, ctx->listen_timer, EQ_TAG(EQ_TAG_TICK, 0)) != 0)
         goto fail;
+    /* Nothing wakes the channel until its first dmesh_accept arms the
+     * session: the fd starts readable, so a poller that waits first still
+     * comes to that accept. */
+    { struct itimerspec now = {.it_value = {.tv_nsec = 1}};
+      (void)timerfd_settime(ctx->listen_timer, 0, &now, NULL); }
     { struct { const char *name; uint64_t *out; long lo, hi, unit_ns; uint64_t def; } knobs[] = {
           /* Naps and linger stand in for a receive signal; signaled
            * receives need neither unless asked for. */

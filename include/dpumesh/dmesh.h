@@ -97,7 +97,8 @@ int dmesh_post_max(dmesh_channel_t *s);    /* max length of one alloc/post (bloc
 /* Readiness fd (an epoll set, level-triggered) of the channel's own work: the
  * session's control messages, keepalive and loss, and the streams the DPU
  * routes to $DPUMESH_SERVICE. Every process polls it and calls dmesh_accept()
- * whenever it is readable, a client too. */
+ * whenever it is readable, a client too. It is readable from creation until
+ * the first dmesh_accept(). */
 int dmesh_channel_fd(dmesh_channel_t *ch);
 
 /* Do the channel's work, then return the next inbound stream: a QP whose
