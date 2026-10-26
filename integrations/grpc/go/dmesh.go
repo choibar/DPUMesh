@@ -1,11 +1,11 @@
 // Package dmeshgo adapts the native channel/EQ/QP API to net.Conn and
-// net.Listener. One process owns one channel. Each connection owns a
-// connection EQ that only its QP is bound to: a Read or Write that has to
-// wait polls that EQ itself and parks on its fd through Go's netpoller, so the
-// goroutine waiting for the bytes is the one the DPU's completion wakes, as
-// with a TCP socket. The channel's session EQ is polled by a session goroutine:
-// it takes the session's control messages and, on a serving channel, moves
-// each inbound stream to a connection EQ of its own and hands it to the
+// net.Listener. One process owns one channel, polled as its listening socket.
+// Each connection owns an EQ that only its QP is bound to: a Read or Write
+// that has to wait polls that EQ itself and parks on its fd through Go's
+// netpoller, so the goroutine waiting for the bytes is the one the DPU's
+// completion wakes, as with a TCP socket. A channel goroutine polls the
+// channel: it does the channel's control work and, on a serving channel,
+// accepts each inbound stream onto an EQ of its own and hands it to the
 // listener. A connection's state has its own lock; the transport lock guards
 // only the connection table, so no connection waits for another's I/O.
 //
@@ -60,7 +60,6 @@ const (
 	evUnknown eventKind = iota
 	evRecv
 	evFin
-	evConnReq
 	evTxReady
 	evTxError
 )
@@ -76,31 +75,34 @@ type nativeEvent struct {
 	qp    qpID
 	buf   []byte // evRecv: native memory, valid until release(token)
 	token int32  // receive lease; -1 when the event holds none
-
-	localPort, remotePort int // evConnReq
 }
 
 // native is the libdpumesh surface. An EQ has one consumer at a time:
-// pollWait, moveQP of a QP bound to it, destroy of such a QP and destroyEQ
-// run on whichever goroutine currently owns it. send is serialized per QP;
-// the others may run on any goroutine.
+// pollWait, destroy of a QP bound to it and destroyEQ run on whichever
+// goroutine currently owns it. The channel goroutine alone calls accept and
+// waitChannel. send is serialized per QP; the others may run on any
+// goroutine.
 type native interface {
 	postMax() int
 	// serves reports a channel that receives inbound streams for its
 	// DPUMESH_SERVICE target.
 	serves() bool
-	// newEQ creates the session EQ, or with conn a connection EQ: one that
-	// is woken by and drains only the QPs bound to it.
-	newEQ(conn bool) (eqID, error)
+	// newEQ creates an EQ: woken by and draining only the QPs bound to it.
+	newEQ() (eqID, error)
 	destroyEQ(eq eqID) error // EBUSY while a QP is bound to it
 	// pollWait returns eq's events, or 0 after wake(eq) or maxWaitNs
 	// (< 0: unbounded).
 	pollWait(eq eqID, events []nativeEvent, maxWaitNs int64) (int, error)
 	wake(eq eqID)
 	dial(eq eqID, target string) (qp qpID, localPort int, err error)
-	// moveQP binds an accepted QP to eq: its later events, including those
-	// not yet returned by its old EQ, arrive there.
-	moveQP(qp qpID, eq eqID) error
+	// accept does the channel's control work and binds the next inbound
+	// stream to eq, which then returns its first bytes; nil eq does the
+	// control work alone. syscall.EAGAIN when no stream waits.
+	accept(eq eqID) (qp qpID, remotePort int, err error)
+	// waitChannel returns once the channel has work for accept, or after
+	// wakeChannel.
+	waitChannel() error
+	wakeChannel()
 	send(qp qpID, p []byte) (int, error) // all of p, or errWouldBlock
 	release(token int32)
 	destroy(qp qpID, abort bool) error // consumes qp even on error
@@ -108,9 +110,8 @@ type native interface {
 }
 
 const (
-	// Events one poll returns: the session EQ's batch, or a connection's.
-	sessionBatch = 64
-	connBatch    = 16
+	// Events one connection's poll returns.
+	connBatch = 16
 	// Inbound streams held for a listener that has not been created yet.
 	maxPrelisten = 64
 )
@@ -131,13 +132,12 @@ type transport struct {
 	err       error         // sticky: transport failure or closed
 	failed    chan struct{} // closed when err is first set
 
-	// The session EQ and its goroutine. Connection EQs never progress the
-	// session, so it is polled for the transport's whole life: control
-	// messages, the session's liveness and, serving, inbound streams.
-	sessionEQ eqID
-	stop      chan struct{} // closed to stop the session goroutine
-	stopOnce  sync.Once
-	done      chan struct{} // closed when the session goroutine exits (at once without one)
+	// The channel goroutine. EQs never do the channel's work, so it polls
+	// the channel for the transport's whole life: control messages, the
+	// session's liveness and, serving, inbound streams.
+	stop     chan struct{} // closed to stop the channel goroutine
+	stopOnce sync.Once
+	done     chan struct{} // closed when the channel goroutine exits (at once without one)
 }
 
 var process struct {
@@ -150,14 +150,10 @@ func newTransport(n native) *transport {
 		failed: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{})}
 	if t.postMax <= 0 {
 		t.failLocked(fmt.Errorf("dmesh: native post size %d", t.postMax))
-	} else if eq, err := n.newEQ(false); err == nil {
-		t.sessionEQ = eq
-		go t.sessionLoop()
+		close(t.done)
 		return t
-	} else {
-		t.failLocked(fmt.Errorf("dmesh: session EQ: %w", err))
 	}
-	close(t.done)
+	go t.channelLoop()
 	return t
 }
 
@@ -213,96 +209,67 @@ func (t *transport) fail(err error) {
 	}
 }
 
-// sessionLoop is the session EQ's only consumer. An inbound stream is
-// accepted or promptly refused. After a transport failure it waits for close,
-// so Close still returns.
-func (t *transport) sessionLoop() {
+// channelLoop is the channel's only poller. A serving channel keeps a spare
+// EQ for the next inbound stream, which is accepted onto it or promptly
+// refused. After a transport failure it waits for close, so Close still
+// returns.
+func (t *transport) channelLoop() {
 	defer close(t.done)
-	events := make([]nativeEvent, sessionBatch)
+	var spare eqID
+	defer func() {
+		if spare != nil {
+			_ = t.n.destroyEQ(spare)
+		}
+	}()
 	for {
 		select {
 		case <-t.stop:
 			return
 		default:
 		}
-		n, err := t.n.pollWait(t.sessionEQ, events, -1)
+		if t.serves && spare == nil {
+			eq, err := t.n.newEQ()
+			if err != nil {
+				t.fail(fmt.Errorf("dmesh: EQ: %w", err))
+				<-t.stop
+				return
+			}
+			spare = eq
+		}
+		qp, port, err := t.n.accept(spare)
+		if err == nil {
+			if t.admit(qp, spare, port) {
+				spare = nil
+			}
+			continue
+		}
+		if errors.Is(err, syscall.EAGAIN) {
+			err = t.n.waitChannel()
+		}
 		if err != nil {
-			t.fail(fmt.Errorf("dmesh: poll EQ: %w", err))
+			t.fail(fmt.Errorf("dmesh: accept: %w", err))
 			<-t.stop
 			return
 		}
-		t.admit(events[:n])
 	}
 }
 
-// admit takes one batch of the session EQ. Each inbound stream a listener can
-// take gets a connection EQ of its own; the events that came with it in the
-// batch are applied to its connection, and only then is its QP moved, as the
-// native API requires. Streams nobody takes are aborted on this goroutine,
-// which owns their EQ.
-func (t *transport) admit(events []nativeEvent) {
-	var fresh []*Conn
-	var orphans []int32
-	var rejects []qpID
-	for i := range events {
-		ev := &events[i]
-		if ev.kind == evConnReq {
-			if c := t.inbound(ev); c != nil {
-				fresh = append(fresh, c)
-			} else {
-				rejects = append(rejects, ev.qp)
-			}
-			continue
-		}
-		var c *Conn
-		for _, f := range fresh {
-			if f.qp == ev.qp {
-				c = f
-				break
-			}
-		}
-		if c == nil {
-			if ev.token >= 0 {
-				orphans = append(orphans, ev.token)
-			}
-			continue
-		}
-		c.apply(ev)
-	}
-	for _, token := range orphans {
-		t.n.release(token)
-	}
-	for _, qp := range rejects {
-		_ = t.n.destroy(qp, true)
-	}
-	for _, c := range fresh {
-		if err := t.n.moveQP(c.qp, c.eq); err != nil {
-			_ = t.n.destroy(c.qp, true)
-			_ = t.n.destroyEQ(c.eq)
-			continue
-		}
-		t.hand(c)
-	}
-}
-
-// inbound opens the connection of a new stream, or nil when no listener can
-// take it.
-func (t *transport) inbound(ev *nativeEvent) *Conn {
+// admit opens the connection of an accepted stream and hands it on, or
+// aborts the stream when no listener can take it; eq then stays the spare.
+func (t *transport) admit(qp qpID, eq eqID, remotePort int) bool {
 	t.mu.Lock()
 	take := t.err == nil && (t.listener != nil || (!t.listened && len(t.prelisten) < maxPrelisten))
 	t.mu.Unlock()
 	if !take {
-		return nil
+		_ = t.n.destroy(qp, true)
+		return false
 	}
-	eq, err := t.n.newEQ(true)
-	if err != nil {
-		return nil
-	}
-	return newConn(t, ev.qp, eq, nil, &net.TCPAddr{Port: ev.remotePort})
+	t.hand(newConn(t, qp, eq, nil, &net.TCPAddr{Port: remotePort}))
+	return true
 }
 
-// hand gives a moved inbound connection to the listener, holds it for the
-// first one, or aborts it when neither is possible any more.
+// hand gives an inbound connection to the listener, holds it for the first
+// one, or aborts it when neither is possible any more.
 func (t *transport) hand(c *Conn) {
 	t.mu.Lock()
 	switch l := t.listener; {
@@ -333,7 +300,7 @@ func (t *transport) retire(c *Conn) {
 	t.mu.Unlock()
 }
 
-// dial opens a stream on a connection EQ of its own. The native dial waits for the
+// dial opens a stream on an EQ of its own. The native dial waits for the
 // DPU's answer and runs outside every lock; a cancelable ctx returns at once
 // and the late QP, if any, is aborted. Events of a dialed QP wait in its EQ
 // until its connection first polls, so the peer may speak before the dial
@@ -347,7 +314,7 @@ func (t *transport) dial(ctx context.Context, target string, local, remote *net.
 	}
 	t.dials++
 	t.mu.Unlock()
-	eq, err := t.n.newEQ(true)
+	eq, err := t.n.newEQ()
 	if err != nil {
 		t.mu.Lock()
 		t.dials--
@@ -457,7 +424,7 @@ func CloseTransport() error {
 	return nil
 }
 
-// close stops the session goroutine of an idle transport, then closes the native. A
+// close stops the channel goroutine of an idle transport, then closes the native. A
 // failed native close keeps the transport closed to new work and retryable.
 // Inbound streams no listener ever took belong to the transport and are
 // aborted here.
@@ -477,16 +444,8 @@ func (t *transport) close() error {
 	t.failLocked(net.ErrClosed)
 	t.mu.Unlock()
 	t.stopOnce.Do(func() { close(t.stop) })
-	if t.sessionEQ != nil {
-		t.n.wake(t.sessionEQ)
-	}
+	t.n.wakeChannel()
 	<-t.done
-	if t.sessionEQ != nil {
-		if err := t.n.destroyEQ(t.sessionEQ); err != nil {
-			return err
-		}
-		t.sessionEQ = nil
-	}
 	return t.n.close()
 }
 
@@ -501,7 +460,7 @@ type rxLease struct {
 type Conn struct {
 	t             *transport
 	qp            qpID
-	eq            eqID // this connection's connection EQ
+	eq            eqID // this connection's alone
 	local, remote net.Addr
 
 	readMu, writeMu sync.Mutex // serialize readers; serialize writers

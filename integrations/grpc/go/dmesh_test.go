@@ -346,6 +346,10 @@ func TestInboundWithoutListenerIsAborted(t *testing.T) {
 	if r.srvN.aborts.Load() != 1 {
 		t.Fatalf("%d server aborts, want 1", r.srvN.aborts.Load())
 	}
+	// The refused stream's EQ stays the spare: s0's and that one.
+	if n := r.srvN.liveEQs(); n != 2 {
+		t.Fatalf("%d server EQs after a refusal, want 2", n)
+	}
 	for _, conn := range []net.Conn{c, c0, s0} {
 		_ = conn.Close()
 	}
@@ -518,9 +522,9 @@ func TestTransportFailureWakesWaitersAndCloseCompletes(t *testing.T) {
 	_ = s.Close()
 }
 
-// A client polls a connection EQ only for a caller that waits: an idle
-// connection nobody reads never polls, and the session goroutine sleeps in a
-// single poll.
+// A client polls a connection's EQ only for a caller that waits: an idle
+// connection nobody reads never polls, and the channel goroutine sleeps after
+// a single accept.
 func TestIdleTransportDoesNotPoll(t *testing.T) {
 	fn := newFakeNet(1<<20, 8064, 64<<10)
 	n := fn.native(false)
@@ -543,11 +547,11 @@ func TestIdleTransportDoesNotPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(20 * time.Millisecond)
-	if polls := n.connPolls.Load(); polls != 0 {
+	if polls := n.polls.Load(); polls != 0 {
 		t.Fatalf("idle connection polled %d times", polls)
 	}
-	if polls := n.sessionPolls.Load(); polls > 1 {
-		t.Fatalf("idle session polled %d times", polls)
+	if accepts := n.accepts.Load(); accepts > 1 {
+		t.Fatalf("idle channel accepted %d times", accepts)
 	}
 	if err := c.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
 		t.Fatal(err)
@@ -555,7 +559,7 @@ func TestIdleTransportDoesNotPoll(t *testing.T) {
 	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("read of an idle stream: %v", err)
 	}
-	if n.connPolls.Load() == 0 {
+	if n.polls.Load() == 0 {
 		t.Fatal("a waiting read did not poll its EQ")
 	}
 	_ = c.Close()

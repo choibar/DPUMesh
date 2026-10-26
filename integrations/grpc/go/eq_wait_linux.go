@@ -10,11 +10,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The native EQ exposes a level-triggered epoll set. Register a duplicate with
-// Go's netpoller so waiting parks a goroutine rather than an OS thread in cgo.
-// Neither this wrapper nor its readiness check consumes the native doorbells:
-// the library's own timers (naps, retained-tail deadlines, the backstop) and
-// doorbells raise the fd, and draining the EQ settles it.
+// A native EQ's fd, like the listening channel's, is a level-triggered epoll
+// set. Register a duplicate with Go's netpoller so waiting parks a goroutine
+// rather than an OS thread in cgo. Neither this wrapper nor its readiness
+// check consumes the native doorbells: the library's own timers (naps,
+// retained-tail deadlines, the backstop) and doorbells raise the fd, and
+// draining the EQ, or accepting on the channel, settles it.
 type eqWaiter struct {
 	file *os.File
 	raw  syscall.RawConn

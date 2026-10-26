@@ -1,10 +1,10 @@
 # Go gRPC transport
 
 `dmeshgo` implements `net.Conn` and `net.Listener` over the native API. One
-process owns one channel and one shared host–DPU Comch control connection.
-Each Go connection owns a native QP and a connection EQ
-(`dmesh_create_conn_eq`) that only that QP is bound to; DMA rings, buffers
-and DPA resources remain per flow.
+process owns one channel and one shared host–DPU Comch control connection,
+and uses the channel as its listening socket (`dmesh_channel_fd`,
+`dmesh_accept`). Each Go connection owns a native QP and an EQ that only that
+QP is bound to; DMA rings, buffers and DPA resources remain per flow.
 
 - A Read or Write that has to wait polls its connection's EQ itself and,
   while it is empty, parks on Go's netpoller with a duplicate of the EQ fd
@@ -16,7 +16,7 @@ and DPA resources remain per flow.
 - The channel sets `DPUMESH_FLOW_WAKE=1` unless the environment says
   otherwise, so each flow gets a Comch consumer of its own (`design/HOST.md`,
   flow wake) and a completion wakes only its connection's EQ. With it off,
-  the session goroutine drains every receive and wakes the connection's EQ,
+  the channel goroutine drains every receive and wakes the connection's EQ,
   one hop more.
 - Read, Write and Dial run on the caller's goroutine. Each connection has its
   own locks, so no connection waits for another's I/O. A Dial waits for the
@@ -32,14 +32,14 @@ and DPA resources remain per flow.
 - Concurrent Read/Write, deadlines and Close follow the Go networking
   contract. Close wakes blocked calls, returns queued leases, destroys the QP
   and its EQ, and reports the native close result once.
-- The channel's session EQ (`dmesh_create_eq`) is polled by a session
-  goroutine for the transport's whole life. Connection EQs never progress the
-  session, so this goroutine takes its control messages, keepalive and loss.
-  On a channel that serves `DPUMESH_SERVICE` it also takes each inbound
-  stream and moves it to a connection EQ of its own (`dmesh_move_qp`) before
-  handing it out. Streams that arrive before the first `Listen` are held for
-  it. Once a listener has closed, new streams are aborted at once instead of
-  left hanging.
+- A channel goroutine polls the channel for the transport's whole life,
+  parked on its fd like a connection's Read. EQs never do the channel's
+  work, so this goroutine takes its control messages, keepalive and loss.
+  On a channel that serves `DPUMESH_SERVICE` it accepts each inbound stream
+  onto a spare EQ, which becomes the connection's, and hands it out; the
+  stream's first bytes wait in that EQ. Streams that arrive before the first
+  `Listen` are held for it. Once a listener has closed, new streams are
+  aborted at once instead of left hanging, and their EQ stays the spare.
 
 Both reverse paths wait the same way. Native code owns and drains each EQ
 and its doorbells. The library arms the EQ fd for what has no doorbell: its

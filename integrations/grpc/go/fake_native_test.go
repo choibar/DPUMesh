@@ -14,8 +14,9 @@ import (
 // transmit credit until released, a sender past its window gets
 // errWouldBlock and later one TX_READY, a destroyed QP sends FIN, and a
 // departed peer returns no credit. Events go to the EQ a QP is bound to; an
-// inbound stream goes to an accepting EQ, or waits for one. Released buffers
-// are poisoned so a read after release corrupts the data the tests verify.
+// inbound stream holds its events until accept binds it to an EQ. Released
+// buffers are poisoned so a read after release corrupts the data the tests
+// verify.
 type fakeNet struct {
 	mu      sync.Mutex
 	server  *fakeNative
@@ -35,7 +36,8 @@ type fakeLease struct {
 
 type fakeQP struct {
 	owner     *fakeNative
-	eq        *fakeEQ // nil: an inbound stream no accepting EQ took yet
+	eq        *fakeEQ       // nil: an inbound stream not accepted yet
+	held      []nativeEvent // under net.mu: its events until then
 	peer      *fakeQP
 	localPort int
 	inflight  int
@@ -45,7 +47,6 @@ type fakeQP struct {
 
 type fakeEQ struct {
 	owner     *fakeNative
-	conn      bool          // a connection EQ; a session EQ accepts
 	qps       int           // under net.mu: live QPs bound here
 	queue     []nativeEvent // under net.mu
 	notify    chan struct{}
@@ -56,16 +57,18 @@ type fakeEQ struct {
 type fakeNative struct {
 	net       *fakeNet
 	server    bool
-	eqs       []*fakeEQ     // under net.mu
-	backlog   []nativeEvent // under net.mu: inbound streams' events with no accepting EQ yet
-	pollErr   error         // under net.mu
+	eqs       []*fakeEQ // under net.mu
+	pending   []*fakeQP // under net.mu: inbound streams no accept took yet
+	pollErr   error     // under net.mu
+	chNotify  chan struct{}
+	chWake    chan struct{}
 	dialDelay time.Duration // before the DPU sees the stream
 	// After the stream is live but before dial returns: the window in which
 	// the peer's first bytes can reach the EQ ahead of the dialer.
 	dialReturnDelay time.Duration
 	closeErrs       []error // under net.mu: results of successive close calls
 
-	sessionPolls, connPolls, destroys, aborts atomic.Int64
+	polls, accepts, destroys, aborts atomic.Int64
 }
 
 func newFakeNet(window, frag, maxPost int) *fakeNet {
@@ -73,7 +76,7 @@ func newFakeNet(window, frag, maxPost int) *fakeNet {
 }
 
 func (fn *fakeNet) native(server bool) *fakeNative {
-	f := &fakeNative{net: fn, server: server}
+	f := &fakeNative{net: fn, server: server, chNotify: make(chan struct{}, 1), chWake: make(chan struct{}, 1)}
 	if server {
 		fn.mu.Lock()
 		fn.server = f
@@ -105,21 +108,11 @@ func (fn *fakeNet) outstanding() int {
 	return len(fn.leases)
 }
 
-// acceptingLocked is f's first live session EQ, or nil. Requires net.mu.
-func (f *fakeNative) acceptingLocked() *fakeEQ {
-	for _, e := range f.eqs {
-		if !e.conn && !e.destroyed {
-			return e
-		}
-	}
-	return nil
-}
-
-// enqueueLocked queues one event for q's EQ, or for the backlog of an
-// inbound stream no EQ took yet. Requires net.mu.
+// enqueueLocked queues one event for q's EQ, or holds it with q while q is
+// an inbound stream not accepted yet. Requires net.mu.
 func (q *fakeQP) enqueueLocked(ev nativeEvent) {
 	if q.eq == nil {
-		q.owner.backlog = append(q.owner.backlog, ev)
+		q.held = append(q.held, ev)
 		return
 	}
 	q.eq.queue = append(q.eq.queue, ev)
@@ -134,29 +127,23 @@ func (f *fakeNative) setPollErr(err error) {
 	for _, e := range eqs {
 		signal(e.notify)
 	}
+	signal(f.chNotify)
+}
+
+func (f *fakeNative) liveEQs() int {
+	f.net.mu.Lock()
+	defer f.net.mu.Unlock()
+	return len(f.eqs)
 }
 
 func (f *fakeNative) postMax() int { return f.net.maxPost }
 func (f *fakeNative) serves() bool { return f.server }
 
-// newEQ creates an EQ. A session EQ accepts; the first one takes the inbound
-// streams waiting for it.
-func (f *fakeNative) newEQ(conn bool) (eqID, error) {
-	e := &fakeEQ{owner: f, conn: conn, notify: make(chan struct{}, 1), wakeCh: make(chan struct{}, 1)}
-	fn := f.net
-	fn.mu.Lock()
-	defer fn.mu.Unlock()
+func (f *fakeNative) newEQ() (eqID, error) {
+	e := &fakeEQ{owner: f, notify: make(chan struct{}, 1), wakeCh: make(chan struct{}, 1)}
+	f.net.mu.Lock()
 	f.eqs = append(f.eqs, e)
-	if !conn && f.acceptingLocked() == e && len(f.backlog) != 0 {
-		for _, ev := range f.backlog {
-			if q := (*fakeQP)(ev.qp); q.eq == nil {
-				q.eq = e
-				e.qps++
-			}
-		}
-		e.queue, f.backlog = append(e.queue, f.backlog...), nil
-		signal(e.notify)
-	}
+	f.net.mu.Unlock()
 	return unsafe.Pointer(e), nil
 }
 
@@ -184,12 +171,8 @@ func (f *fakeNative) destroyEQ(id eqID) error {
 }
 
 func (f *fakeNative) pollWait(id eqID, out []nativeEvent, maxWaitNs int64) (int, error) {
+	f.polls.Add(1)
 	e := (*fakeEQ)(id)
-	if e.conn {
-		f.connPolls.Add(1)
-	} else {
-		f.sessionPolls.Add(1)
-	}
 	var timeout <-chan time.Time
 	if maxWaitNs >= 0 {
 		timer := time.NewTimer(time.Duration(maxWaitNs))
@@ -239,13 +222,10 @@ func (f *fakeNative) dial(id eqID, target string) (qpID, int, error) {
 	client := &fakeQP{owner: f, eq: (*fakeEQ)(id), localPort: fn.nextUP}
 	client.eq.qps++
 	fn.nextUP++
-	server := &fakeQP{owner: fn.server, eq: fn.server.acceptingLocked(), localPort: fn.nextUP, peer: client}
-	if server.eq != nil {
-		server.eq.qps++
-	}
+	server := &fakeQP{owner: fn.server, localPort: fn.nextUP, peer: client}
 	client.peer = server
-	server.enqueueLocked(nativeEvent{kind: evConnReq, qp: unsafe.Pointer(server), token: -1,
-		localPort: server.localPort, remotePort: client.localPort})
+	fn.server.pending = append(fn.server.pending, server)
+	signal(fn.server.chNotify)
 	fn.mu.Unlock()
 	if f.dialReturnDelay > 0 {
 		time.Sleep(f.dialReturnDelay)
@@ -253,32 +233,51 @@ func (f *fakeNative) dial(id eqID, target string) (qpID, int, error) {
 	return unsafe.Pointer(client), client.localPort, nil
 }
 
-// moveQP rebinds qp; its events still queued on the old EQ move along, in order.
-func (f *fakeNative) moveQP(qp qpID, id eqID) error {
-	q, e := (*fakeQP)(qp), (*fakeEQ)(id)
+// accept binds the oldest inbound stream to eq, with the events it held.
+func (f *fakeNative) accept(id eqID) (qpID, int, error) {
+	f.accepts.Add(1)
 	fn := f.net
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
-	if q.destroyed || q.eq == nil || e.destroyed || e.owner != f {
-		fn.fault("move of QP %d", q.localPort)
-		return syscall.EINVAL
+	if f.pollErr != nil {
+		return nil, 0, f.pollErr
 	}
-	old := q.eq
-	kept := old.queue[:0]
-	for _, ev := range old.queue {
-		if ev.qp == qp {
-			e.queue = append(e.queue, ev)
-		} else {
-			kept = append(kept, ev)
-		}
+	if id == nil || len(f.pending) == 0 {
+		return nil, 0, syscall.EAGAIN
 	}
-	old.queue = kept
-	old.qps--
+	e := (*fakeEQ)(id)
+	if e.destroyed || e.owner != f {
+		fn.fault("accept onto a destroyed or foreign EQ")
+		return nil, 0, syscall.EINVAL
+	}
+	q := f.pending[0]
+	f.pending = f.pending[1:]
 	q.eq = e
 	e.qps++
+	e.queue, q.held = append(e.queue, q.held...), nil
 	signal(e.notify)
-	return nil
+	return unsafe.Pointer(q), q.peer.localPort, nil
 }
+
+// waitChannel returns at once while a stream waits or the channel failed:
+// the native fd is level-triggered.
+func (f *fakeNative) waitChannel() error {
+	for {
+		f.net.mu.Lock()
+		ready := len(f.pending) != 0 || f.pollErr != nil
+		f.net.mu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-f.chNotify:
+		case <-f.chWake:
+			return nil
+		}
+	}
+}
+
+func (f *fakeNative) wakeChannel() { signal(f.chWake) }
 
 func (f *fakeNative) send(qp qpID, p []byte) (int, error) {
 	fn := f.net
@@ -349,13 +348,14 @@ func (f *fakeNative) destroy(qp qpID, abort bool) error {
 		fn.fault("QP %d destroyed twice", q.localPort)
 		return syscall.EBADF
 	}
+	if q.eq == nil {
+		fn.fault("destroy of QP %d before its accept", q.localPort)
+		return syscall.EINVAL
+	}
 	q.destroyed = true
 	// Like dpumesh_free_port, reclaim what landed for q but was never polled.
-	queue := &f.backlog
-	if q.eq != nil {
-		queue = &q.eq.queue
-		q.eq.qps--
-	}
+	queue := &q.eq.queue
+	q.eq.qps--
 	kept := (*queue)[:0]
 	var reclaimed []int32
 	for _, ev := range *queue {
@@ -378,7 +378,8 @@ func (f *fakeNative) destroy(qp qpID, abort bool) error {
 }
 
 // close fails with the next injected error, or tears the channel down: like
-// the native teardown it reclaims receive leases never polled out of an EQ.
+// the native teardown it reclaims the receive leases of streams never
+// accepted.
 func (f *fakeNative) close() error {
 	f.net.mu.Lock()
 	if len(f.closeErrs) != 0 {
@@ -391,12 +392,15 @@ func (f *fakeNative) close() error {
 		f.net.fault("channel closed with %d EQs", len(f.eqs))
 	}
 	var queued []int32
-	for _, ev := range f.backlog {
-		if ev.kind == evRecv {
-			queued = append(queued, ev.token)
+	for _, q := range f.pending {
+		for _, ev := range q.held {
+			if ev.kind == evRecv {
+				queued = append(queued, ev.token)
+			}
 		}
+		q.held = nil
 	}
-	f.backlog = nil
+	f.pending = nil
 	f.net.mu.Unlock()
 	for _, token := range queued {
 		f.release(token)

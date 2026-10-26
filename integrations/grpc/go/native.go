@@ -49,10 +49,12 @@ import (
 	"unsafe"
 )
 
-// cgoNative drives libdpumesh: one channel for the process, EQs on demand.
+// cgoNative drives libdpumesh: one channel for the process, polled as its
+// listening socket, and EQs on demand.
 type cgoNative struct {
-	serving bool // the channel serves DPUMESH_SERVICE
-	ch      *C.dmesh_channel_t
+	serving  bool // the channel serves DPUMESH_SERVICE
+	ch       *C.dmesh_channel_t
+	listener *eqWaiter // the channel's fd on Go's netpoller
 }
 
 // cgoEQ is one native EQ with its fd on Go's netpoller and a C-allocated
@@ -63,7 +65,8 @@ type cgoEQ struct {
 	events *C.dmesh_event_t
 }
 
-// openCgoNative opens the process channel. Connections each poll an EQ of
+// openCgoNative opens the process channel and takes its fd, before any EQ,
+// so the channel is the listening socket. Connections each poll an EQ of
 // their own, so each flow asks for its own wake consumer (DPUMESH_FLOW_WAKE;
 // an explicit setting wins). On failure a non-nil native holds resources
 // whose cleanup failed; close retries it.
@@ -78,24 +81,30 @@ func openCgoNative() (*cgoNative, error) {
 		return nil, fmt.Errorf("dmesh: create channel: %w", err)
 	}
 	n.ch = ch
+	if fd, ferr := C.dmesh_channel_fd(ch); fd < 0 {
+		err = ferr
+	} else {
+		n.listener, err = newEQWaiter(int(fd))
+	}
+	if err != nil {
+		err = fmt.Errorf("dmesh: channel fd: %w", err)
+		if cerr := n.close(); cerr != nil {
+			return n, err
+		}
+		return nil, err
+	}
 	return n, nil
 }
 
 func (n *cgoNative) postMax() int { return int(C.dmesh_post_max(n.ch)) }
 func (n *cgoNative) serves() bool { return n.serving }
 
-func (n *cgoNative) newEQ(conn bool) (eqID, error) {
+func (n *cgoNative) newEQ() (eqID, error) {
 	e := &cgoEQ{events: C.dmesh_go_events_alloc()}
 	if e.events == nil {
 		return nil, fmt.Errorf("dmesh: allocate EQ events: %w", syscall.ENOMEM)
 	}
-	var eq *C.dmesh_eq_t
-	var err error
-	if conn {
-		eq, err = C.dmesh_create_conn_eq(n.ch)
-	} else {
-		eq, err = C.dmesh_create_eq(n.ch)
-	}
+	eq, err := C.dmesh_create_eq(n.ch)
 	if eq == nil {
 		C.free(unsafe.Pointer(e.events))
 		return nil, fmt.Errorf("dmesh: create EQ: %w", err)
@@ -170,10 +179,6 @@ func (n *cgoNative) pollWait(id eqID, out []nativeEvent, maxWaitNs int64) (int, 
 			o.buf = unsafe.Slice((*byte)(unsafe.Pointer(ev.buf)), int(ev.len))
 		case C.DMESH_EVENT_RECV_FIN:
 			o.kind = evFin
-		case C.DMESH_EVENT_CONN_REQ:
-			o.kind = evConnReq
-			o.localPort = int(ev.qp.local_port)
-			o.remotePort = int(ev.qp.remote_port)
 		case C.DMESH_EVENT_TX_READY:
 			o.kind = evTxReady
 		case C.DMESH_EVENT_TX_ERROR:
@@ -199,12 +204,24 @@ func (n *cgoNative) dial(id eqID, target string) (qpID, int, error) {
 	return unsafe.Pointer(qp), int(qp.local_port), nil
 }
 
-func (n *cgoNative) moveQP(qp qpID, id eqID) error {
-	if rc, err := C.dmesh_move_qp((*C.dmesh_qp_t)(qp), (*cgoEQ)(id).eq); rc != 0 {
-		return err
+func (n *cgoNative) accept(id eqID) (qpID, int, error) {
+	var eq *C.dmesh_eq_t
+	if id != nil {
+		eq = (*cgoEQ)(id).eq
 	}
-	return nil
+	qp, err := C.dmesh_accept(n.ch, eq)
+	if qp == nil {
+		return nil, 0, err
+	}
+	return unsafe.Pointer(qp), int(qp.remote_port), nil
 }
+
+func (n *cgoNative) waitChannel() error {
+	_, err := n.listener.waitUntil(time.Time{})
+	return err
+}
+
+func (n *cgoNative) wakeChannel() { n.listener.interrupt() }
 
 func (n *cgoNative) send(qp qpID, p []byte) (int, error) {
 	r := C.dmesh_go_send((*C.dmesh_qp_t)(qp), unsafe.Pointer(&p[0]), C.uint32_t(len(p)))
@@ -237,6 +254,10 @@ func (n *cgoNative) destroy(qp qpID, abort bool) error {
 // close destroys the channel; its EQs are gone with their owners. A failed
 // step keeps the channel for a retry.
 func (n *cgoNative) close() error {
+	if n.listener != nil {
+		n.listener.close()
+		n.listener = nil
+	}
 	if n.ch != nil {
 		if rc, err := C.dmesh_destroy_channel(n.ch); rc != 0 {
 			return err
