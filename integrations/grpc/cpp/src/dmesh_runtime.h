@@ -14,11 +14,13 @@
 
 namespace dpumesh::grpc {
 
-// Process-level DPUmesh ownership: one channel, N independent EQ reactors and
-// one runtime-wide callback executor. By default the executor owns one worker
-// thread shared by every reactor and endpoint; a custom executor replaces that
-// single runtime-wide instance. Normal receive and TX-ready progress stays on
-// the EQ owner, while connect/accept delivery and deliberately deferred
+// Process-level DPUmesh ownership: one channel, N independent reactors and
+// one runtime-wide callback executor. The first reactor also waits on the
+// channel; connections, dialed or accepted, are spread round-robin over the
+// reactors. By default the executor owns one worker thread shared by every
+// reactor and endpoint; a custom executor replaces that single runtime-wide
+// instance. Normal receive and TX-ready progress stays on the reactor that
+// owns the QP, while connect/accept delivery and deliberately deferred
 // endpoint completions use the callback executor. Endpoints share ownership of
 // the executor, and the runtime outlives those endpoints.
 class DmeshRuntime final {
@@ -67,6 +69,10 @@ class DmeshRuntime final {
   DmeshRuntime(std::unique_ptr<DmeshApiOps> ops, dmesh_channel_t* channel,
                int post_max,
                std::shared_ptr<Executor> callback_executor);
+
+  DmeshReactor& NextReactor();
+  // On the listening reactor's thread: hands an accepted QP to a reactor.
+  void Route(dmesh_qp_t* qp);
 
   std::unique_ptr<DmeshApiOps> ops_;
   dmesh_channel_t* channel_;

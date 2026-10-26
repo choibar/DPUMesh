@@ -16,11 +16,11 @@ metadata stay unchanged; a service opts in with a few lines and
 
 The Go and C++ adapters drive the native API directly. The others share the
 **stream C ABI** ([`cpp/include/dpumesh_stream.h`](cpp/include/dpumesh_stream.h)),
-`libdpumesh_stream.so`: the C++ adapter's EQ reactor behind a byte-stream
+`libdpumesh_stream.so`: the C++ adapter's reactor behind a byte-stream
 interface — connect, listen, write, and callbacks for data, transmit credit,
-end of stream and errors. The reactor keeps the native rules (one EQ consumer,
-receive leases, TX_READY, serialized QP teardown), so a binding only maps the
-callbacks onto its runtime's I/O object.
+end of stream and errors. The reactor keeps the native rules (one poller per
+QP, receive leases, TX_READY, serialized QP teardown), so a binding only maps
+the callbacks onto its runtime's I/O object.
 
 ## Build
 
@@ -41,7 +41,7 @@ another build of the ABI. A binding's tests can set it to
 to its own listener, so they run real gRPC clients and servers without a
 DOCA device.
 
-`DPUMESH_REACTORS` (1–64, default 1) sets how many EQ reactors a runtime
+`DPUMESH_REACTORS` (1–64, default 1) sets how many reactors a runtime
 created without explicit options runs, the stream library's included. A
 process's connections are spread across them round-robin, and a binding's
 callbacks then arrive from that many threads.

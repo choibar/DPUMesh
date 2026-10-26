@@ -1,8 +1,8 @@
 #include "dmesh_reactor.h"
 
 #include <errno.h>
-#include <poll.h>
 #include <pthread.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -21,7 +21,6 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -44,9 +43,13 @@ constexpr size_t kMaxHeldReceives = 64;
 // not turn that gap into an unbounded per-connection queue.
 constexpr size_t kMaxPrebindBytes = kReceiveHighWaterBytes;
 
-// Poll batches one loop iteration consumes before it returns to the command
-// queue, so a saturated EQ still yields to commands and the stop request.
-constexpr int kEqBatchBudget = 8;
+// Poll batches one loop iteration consumes from a QP before it returns to the
+// command queue, so a saturated QP still yields to commands, the other QPs
+// and the stop request. Its fd stays readable, so the next wait returns it.
+constexpr int kQpBatchBudget = 8;
+
+// Ready fds one epoll_wait returns.
+constexpr int kReadyBatch = 64;
 
 absl::Status ErrnoStatus(const char* operation, int error_number) {
   if (error_number == 0) error_number = EIO;
@@ -82,7 +85,7 @@ void DrainCounterFd(int fd) {
 class DmeshReactor::Impl final
     : public std::enable_shared_from_this<DmeshReactor::Impl> {
  public:
-  struct Connection {
+  struct Connection : std::enable_shared_from_this<Connection> {
     struct QueuedReceive {
       std::vector<uint8_t> bytes;
     };
@@ -93,13 +96,15 @@ class DmeshReactor::Impl final
       kError,
     };
 
-    // Serializes transmit (Endpoint::Write caller or TX_READY EQ owner)
-    // against QP lifecycle (EQ owner). Guards qp, closing and remote_eof; the
-    // EQ thread is the only writer of qp and closing, so its own unlocked
-    // reads of them stay consistent. Never held across a driver call: the
-    // endpoint takes its own state lock first, so the reverse order deadlocks.
+    // Serializes transmit (Endpoint::Write caller or TX_READY owner) against
+    // QP lifecycle (owner). Guards qp, closing and remote_eof; the owner
+    // thread is the only writer of qp and closing, so its own unlocked reads
+    // of them stay consistent. Never held across a driver call: the endpoint
+    // takes its own state lock first, so the reverse order deadlocks.
     std::mutex tx_mu;
     dmesh_qp_t* qp = nullptr;
+    // The QP's fd in the owner's epoll set; -1 once unwatched. Owner only.
+    int fd = -1;
     std::weak_ptr<ConnectionSink> driver;
     std::deque<QueuedReceive> prebind_receives;
     size_t prebind_bytes = 0;
@@ -176,8 +181,8 @@ class DmeshReactor::Impl final
     Stats snapshot;
     snapshot.receive_credit_hold_dropped =
         receive_credit_hold_dropped_.load(std::memory_order_relaxed);
-    snapshot.eq_drain_budget_exhausted =
-        eq_drain_budget_exhausted_.load(std::memory_order_relaxed);
+    snapshot.drain_budget_exhausted =
+        drain_budget_exhausted_.load(std::memory_order_relaxed);
     return snapshot;
   }
 
@@ -193,38 +198,29 @@ class DmeshReactor::Impl final
     }
 
     event_buffer_.resize(options_.event_batch_size);
-    eq_ = ops_->CreateEq(channel_);
-    if (eq_ == nullptr) {
-      return ErrnoStatus("dmesh_create_eq", errno);
-    }
-    eq_fd_ = ops_->EqFd(eq_);
-    if (eq_fd_ < 0) {
-      const absl::Status status = ErrnoStatus("dmesh_eq_fd", errno);
-      ops_->DestroyEq(eq_);
-      eq_ = nullptr;
-      return status;
-    }
-
+    epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd_ < 0) return ErrnoStatus("epoll_create1", errno);
     command_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (command_fd_ < 0) {
       const absl::Status status = ErrnoStatus("eventfd", errno);
-      ops_->DestroyEq(eq_);
-      eq_ = nullptr;
+      CloseFds();
+      return status;
+    }
+    if (!Watch(command_fd_, &command_fd_)) {
+      const absl::Status status = ErrnoStatus("epoll_ctl", errno);
+      CloseFds();
       return status;
     }
     accepting_.store(true, std::memory_order_release);
     try {
       owner_thread_ = std::thread([self = shared_from_this()] {
-        // Named so per-thread CPU shows the EQ owner.
+        // Named so per-thread CPU shows the owner.
         pthread_setname_np(pthread_self(), "dmesh-reactor");
         self->ThreadMain();
       });
     } catch (const std::system_error& error) {
       accepting_.store(false, std::memory_order_release);
-      ::close(command_fd_);
-      command_fd_ = -1;
-      ops_->DestroyEq(eq_);
-      eq_ = nullptr;
+      CloseFds();
       return absl::InternalError(
           absl::StrCat("failed to start DPUmesh reactor thread: ",
                        error.what()));
@@ -271,6 +267,22 @@ class DmeshReactor::Impl final
     }
   }
 
+  absl::Status Listen(InboundRouter route) {
+    auto applied = std::make_shared<std::promise<absl::Status>>();
+    auto ready = applied->get_future();
+    if (!Enqueue([self = shared_from_this(), route = std::move(route),
+                  applied]() mutable {
+          applied->set_value(self->ListenOwner(std::move(route)));
+        })) {
+      return absl::UnavailableError("DPUmesh reactor is shutting down");
+    }
+    return ready.get();
+  }
+
+  bool Adopt(dmesh_qp_t* qp) {
+    return Enqueue([self = shared_from_this(), qp] { self->AdoptOwner(qp); });
+  }
+
   absl::Status SetAcceptCallback(AcceptCallback callback) {
     auto applied = std::make_shared<std::promise<void>>();
     auto ready = applied->get_future();
@@ -314,7 +326,7 @@ class DmeshReactor::Impl final
           absl::InternalError("invalid DPUmesh post length"));
     }
     /* The lock spans reserve, fill and submit: a QP holds one live reservation
-     * at a time, and the EQ thread takes the same lock before destroying it. */
+     * at a time, and the owner takes the same lock before destroying it. */
     std::lock_guard<std::mutex> lock(connection->tx_mu);
     if (connection->closing || connection->qp == nullptr) {
       return PostResult::Closed(
@@ -404,20 +416,31 @@ class DmeshReactor::Impl final
     }
     if (owner_thread_.joinable()) owner_thread_.join();
 
-    {
-      std::lock_guard<std::mutex> lock(command_mu_);
-      if (command_fd_ >= 0) {
-        ::close(command_fd_);
-        command_fd_ = -1;
-      }
-    }
-    if (eq_ != nullptr) {
-      ops_->DestroyEq(eq_);
-      eq_ = nullptr;
-    }
+    std::lock_guard<std::mutex> lock(command_mu_);
+    CloseFds();
   }
 
  private:
+  // The owner's epoll set holds the command fd, each live QP's fd and, on
+  // the listening reactor, the channel's fd; `tag` tells them apart.
+  bool Watch(int fd, void* tag) {
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.ptr = tag;
+    return ::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) == 0;
+  }
+
+  void Unwatch(int fd) {
+    if (fd >= 0) (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+  }
+
+  // Requires command_mu_ once the owner thread exists.
+  void CloseFds() {
+    if (command_fd_ >= 0) ::close(command_fd_);
+    if (epoll_fd_ >= 0) ::close(epoll_fd_);
+    command_fd_ = epoll_fd_ = -1;
+  }
+
   void ReleaseHeldReceives(const std::shared_ptr<Connection>& connection) {
     for (dmesh_event_t& event : connection->held_receives) {
       ops_->ReleaseRxBuffer(channel_, &event);
@@ -460,18 +483,76 @@ class DmeshReactor::Impl final
     }
 
     errno = 0;
-    dmesh_qp_t* qp = ops_->CreateQp(eq_, service.c_str());
+    dmesh_qp_t* qp = ops_->CreateQp(channel_, service.c_str());
     if (qp == nullptr) {
       DeliverConnect(std::move(callback),
                      ErrnoStatus("dmesh_create_qp", errno));
       return;
     }
+    auto connection = AddConnection(qp);
+    if (!connection.ok()) {
+      DeliverConnect(std::move(callback), connection.status());
+      return;
+    }
+    DeliverConnect(std::move(callback), MakeConnectedTransport(*connection));
+  }
 
+  // Owns a new QP and watches its fd; on failure the QP is destroyed.
+  absl::StatusOr<std::shared_ptr<Connection>> AddConnection(dmesh_qp_t* qp) {
+    errno = 0;
+    const int fd = ops_->QpFd(qp);
+    if (fd < 0) {
+      const absl::Status status = ErrnoStatus("dmesh_qp_fd", errno);
+      ops_->DestroyQp(qp);
+      return status;
+    }
     auto connection = std::make_shared<Connection>();
+    if (!Watch(fd, connection.get())) {
+      const absl::Status status = ErrnoStatus("epoll_ctl", errno);
+      ops_->DestroyQp(qp);
+      return status;
+    }
     connection->qp = qp;
+    connection->fd = fd;
     connections_.emplace(qp, connection);
+    return connection;
+  }
 
-    DeliverConnect(std::move(callback), MakeConnectedTransport(connection));
+  absl::Status ListenOwner(InboundRouter route) {
+    if (channel_fd_ >= 0) return absl::OkStatus();
+    errno = 0;
+    const int fd = ops_->ChannelFd(channel_);
+    if (fd < 0) return ErrnoStatus("dmesh_channel_fd", errno);
+    if (!Watch(fd, &channel_fd_)) return ErrnoStatus("epoll_ctl", errno);
+    channel_fd_ = fd;
+    route_ = std::move(route);
+    return absl::OkStatus();
+  }
+
+  // The channel's work and its inbound streams. A session that is gone stops
+  // the watch: each QP's own poll then reports the loss.
+  void AcceptAll() {
+    for (;;) {
+      errno = 0;
+      dmesh_qp_t* qp = ops_->Accept(channel_);
+      if (qp == nullptr) {
+        if (errno != EAGAIN) {
+          Unwatch(channel_fd_);
+          channel_fd_ = -1;
+        }
+        return;
+      }
+      route_(qp);
+    }
+  }
+
+  void AdoptOwner(dmesh_qp_t* qp) {
+    if (!accept_callback_ || stop_requested_.load(std::memory_order_acquire)) {
+      ops_->DestroyQp(qp);
+      return;
+    }
+    auto connection = AddConnection(qp);
+    if (connection.ok()) DeliverAccept(MakeConnectedTransport(*connection));
   }
 
   ConnectedTransport MakeConnectedTransport(
@@ -483,7 +564,6 @@ class DmeshReactor::Impl final
       if (auto self = impl.lock()) self->RequestAbort(connection);
     };
     connected.callback_executor = callback_executor_;
-    connected.local_pod = ops_->PodId(channel_);
     connected.local_port = connection->qp->local_port;
     connected.peer_pod = connection->qp->remote_pod;
     connected.peer_port = connection->qp->remote_port;
@@ -561,15 +641,11 @@ class DmeshReactor::Impl final
     deferred_closes_.push_back(connection);
   }
 
-  // Leading events that are receives on one QP. Native poll returns a
-  // connection's events consecutively, so a run spans everything that landed
-  // for it in this batch.
+  // Leading events that are receives: one run is handed to the endpoint as
+  // one write.
   int ReceiveRunLength(const dmesh_event_t* events, int available) const {
-    if (available <= 0 || events[0].type != DMESH_EVENT_RECV) return 0;
-    dmesh_qp_t* const qp = events[0].qp;
-    int length = 1;
-    while (length < available && events[length].type == DMESH_EVENT_RECV &&
-           events[length].qp == qp) {
+    int length = 0;
+    while (length < available && events[length].type == DMESH_EVENT_RECV) {
       ++length;
     }
     return length;
@@ -606,14 +682,8 @@ class DmeshReactor::Impl final
     return true;
   }
 
-  void HandleReceiveRun(dmesh_event_t* events, int count) {
-    auto found = connections_.find(events[0].qp);
-    if (found == connections_.end()) {
-      ReleaseRun(events, count);
-      return;
-    }
-    const std::shared_ptr<Connection> connection = found->second;
-
+  void HandleReceiveRun(const std::shared_ptr<Connection>& connection,
+                        dmesh_event_t* events, int count) {
     if (connection->closing || connection->remote_eof) {
       ReleaseRun(events, count);
       if (!connection->closing) {
@@ -683,28 +753,8 @@ class DmeshReactor::Impl final
     }
   }
 
-  void HandleEvent(dmesh_event_t* event) {
-    auto found = connections_.find(event->qp);
-    if (found == connections_.end()) {
-      if (event->type == DMESH_EVENT_CONN_REQ &&
-          event->qp != nullptr && accept_callback_) {
-        auto connection = std::make_shared<Connection>();
-        connection->qp = event->qp;
-        connections_.emplace(event->qp, connection);
-
-        DeliverAccept(MakeConnectedTransport(connection));
-        return;
-      }
-      if (event->type == DMESH_EVENT_CONN_REQ &&
-          event->qp != nullptr) {
-        deferred_unowned_qps_.insert(event->qp);
-      }
-      return;
-    }
-
-    const std::shared_ptr<Connection>& connection = found->second;
-    if (event->type == DMESH_EVENT_CONN_REQ) return;
-
+  void HandleEvent(const std::shared_ptr<Connection>& connection,
+                   const dmesh_event_t* event) {
     if (event->type == DMESH_EVENT_TX_READY) {
       if (connection->closing || connection->qp == nullptr) return;
       /* Native EAGAIN arms one one-shot event. The endpoint knows whether a
@@ -742,47 +792,37 @@ class DmeshReactor::Impl final
         connection, absl::InternalError("unknown DPUmesh event type"));
   }
 
-  void FailAllConnectionsOwner(const absl::Status& status) {
-    std::vector<std::shared_ptr<Connection>> connections;
-    connections.reserve(connections_.size());
-    for (const auto& entry : connections_) connections.push_back(entry.second);
-    for (const auto& connection : connections) {
-      FailConnectionOwner(connection, status);
-    }
-  }
-
-  // Consumes at most kEqBatchBudget poll batches. Returns true when the budget,
-  // not an empty EQ, ended the drain; the caller then re-enters without
-  // blocking.
-  bool DrainEq() {
+  // Consumes at most kQpBatchBudget poll batches. An empty poll settles the
+  // QP's fd for the next wait.
+  void DrainQp(const std::shared_ptr<Connection>& connection) {
     std::vector<dmesh_event_t>& events = event_buffer_;
-    for (int batch = 0; batch < kEqBatchBudget; ++batch) {
+    for (int batch = 0; batch < kQpBatchBudget; ++batch) {
       errno = 0;
-      const int count = ops_->PollEq(
-          eq_, events.data(), static_cast<int>(events.size()));
-      if (count == 0) return false;
+      const int count = ops_->PollQp(
+          connection->qp, events.data(), static_cast<int>(events.size()));
+      if (count == 0) return;
       if (count < 0) {
-        FailAllConnectionsOwner(ErrnoStatus("dmesh_poll_eq", errno));
-        return false;
+        FailConnectionOwner(connection, ErrnoStatus("dmesh_poll_qp", errno));
+        return;
       }
       if (count > static_cast<int>(events.size())) {
-        FailAllConnectionsOwner(
-            absl::InternalError("dmesh_poll_eq exceeded event capacity"));
-        return false;
+        FailConnectionOwner(
+            connection,
+            absl::InternalError("dmesh_poll_qp exceeded event capacity"));
+        return;
       }
       for (int i = 0; i < count;) {
         const int run = ReceiveRunLength(&events[i], count - i);
         if (run > 0) {
-          HandleReceiveRun(&events[i], run);
+          HandleReceiveRun(connection, &events[i], run);
           i += run;
         } else {
-          HandleEvent(&events[i]);
+          HandleEvent(connection, &events[i]);
           ++i;
         }
       }
     }
-    eq_drain_budget_exhausted_.fetch_add(1, std::memory_order_relaxed);
-    return true;
+    drain_budget_exhausted_.fetch_add(1, std::memory_order_relaxed);
   }
 
   void SweepDeferredCloses() {
@@ -792,6 +832,8 @@ class DmeshReactor::Impl final
       ReleaseHeldReceives(connection);
       connection->driver.reset();
       connections_.erase(qp);
+      Unwatch(connection->fd);
+      connection->fd = -1;
       {
         /* tx_mu spans the destroy, so a transmit racing the close either
          * completes in full against a live QP or observes qp == nullptr. */
@@ -805,15 +847,12 @@ class DmeshReactor::Impl final
       }
     }
     deferred_closes_.clear();
-
-    for (dmesh_qp_t* qp : deferred_unowned_qps_) ops_->DestroyQp(qp);
-    deferred_unowned_qps_.clear();
   }
 
   void DrainCommands() {
     /* One batch per loop cycle: tasks enqueued while this batch runs execute
      * on the next cycle, after their empty→non-empty wake is observed by
-     * poll(). */
+     * epoll_wait(). */
     std::deque<absl::AnyInvocable<void()>> batch;
     {
       std::lock_guard<std::mutex> lock(command_mu_);
@@ -859,47 +898,36 @@ class DmeshReactor::Impl final
   }
 
   void ThreadMain() {
-    pollfd descriptors[2] = {
-        pollfd{command_fd_, POLLIN, 0},
-        pollfd{eq_fd_, POLLIN, 0},
-    };
-
-    bool eq_pending = false;
+    epoll_event ready[kReadyBatch];
     while (!stop_requested_.load(std::memory_order_acquire)) {
-      /* The two fds carry every external edge. The wait is bounded by the next
-       * buffered tail this reactor's QPs must publish. */
-      timespec timeout;
-      const timespec* wait = nullptr;
-      if (eq_pending) {
-        /* The EQ still holds events; take the pending commands and resume. */
-        timeout.tv_sec = 0;
-        timeout.tv_nsec = 0;
-        wait = &timeout;
-      } else {
-        const int64_t due_ns = ops_->EqNextDeadlineNs(eq_);
-        if (due_ns >= 0) {
-          timeout.tv_sec = static_cast<time_t>(due_ns / 1000000000);
-          timeout.tv_nsec = static_cast<long>(due_ns % 1000000000);
-          wait = &timeout;
-        }
-      }
-
-      const int result = ::ppoll(descriptors, 2, wait, nullptr);
-      if (result < 0) {
+      const int count = ::epoll_wait(epoll_fd_, ready, kReadyBatch, -1);
+      if (count < 0) {
         if (errno == EINTR) continue;
         stop_requested_.store(true, std::memory_order_release);
         break;
       }
 
-      const bool command_ready = (descriptors[0].revents & POLLIN) != 0;
-      const bool eq_ready = (descriptors[1].revents & POLLIN) != 0;
-      if (command_ready) DrainCounterFd(command_fd_);
-      if (eq_ready) DrainCounterFd(eq_fd_);
+      bool channel_ready = false;
+      for (int i = 0; i < count; ++i) {
+        void* const tag = ready[i].data.ptr;
+        if (tag == &command_fd_) {
+          DrainCounterFd(command_fd_);
+        } else if (tag == &channel_fd_) {
+          channel_ready = true;
+        } else {
+          ready_qps_.push_back(
+              static_cast<Connection*>(tag)->shared_from_this());
+        }
+      }
 
       DrainCommands();
       if (stop_requested_.load(std::memory_order_acquire)) break;
 
-      eq_pending = DrainEq();
+      if (channel_ready && channel_fd_ >= 0) AcceptAll();
+      for (const auto& connection : ready_qps_) {
+        if (connection->qp != nullptr) DrainQp(connection);
+      }
+      ready_qps_.clear();
       SweepDeferredCloses();
     }
 
@@ -913,11 +941,13 @@ class DmeshReactor::Impl final
   const Options options_;
 
   std::atomic<uint64_t> receive_credit_hold_dropped_{0};
-  std::atomic<uint64_t> eq_drain_budget_exhausted_{0};
+  std::atomic<uint64_t> drain_budget_exhausted_{0};
 
-  dmesh_eq_t* eq_ = nullptr;
-  int eq_fd_ = -1;
+  int epoll_fd_ = -1;
   int command_fd_ = -1;
+  // The channel's fd while this reactor listens, else -1. Owner only.
+  int channel_fd_ = -1;
+  InboundRouter route_;
   std::thread owner_thread_;
   std::atomic<bool> accepting_{false};
   // Set by Shutdown() on any thread, consumed by the owner loop.
@@ -929,8 +959,9 @@ class DmeshReactor::Impl final
 
   std::vector<dmesh_event_t> event_buffer_;
   std::unordered_map<dmesh_qp_t*, std::shared_ptr<Connection>> connections_;
+  // The QPs the last wait returned; reused across iterations.
+  std::vector<std::shared_ptr<Connection>> ready_qps_;
   std::vector<std::shared_ptr<Connection>> deferred_closes_;
-  std::unordered_set<dmesh_qp_t*> deferred_unowned_qps_;
   AcceptCallback accept_callback_;
 };
 
@@ -953,6 +984,12 @@ DmeshReactor::~DmeshReactor() { Shutdown(); }
 void DmeshReactor::Connect(std::string service, ConnectCallback callback) {
   impl_->Connect(std::move(service), std::move(callback));
 }
+
+absl::Status DmeshReactor::Listen(InboundRouter route) {
+  return impl_->Listen(std::move(route));
+}
+
+bool DmeshReactor::Adopt(dmesh_qp_t* qp) { return impl_->Adopt(qp); }
 
 absl::Status DmeshReactor::SetAcceptCallback(AcceptCallback callback) {
   return impl_->SetAcceptCallback(std::move(callback));

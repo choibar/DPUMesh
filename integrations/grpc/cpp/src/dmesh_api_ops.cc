@@ -9,14 +9,19 @@ class NativeDmeshApiOps final : public DmeshApiOps {
   int DestroyChannel(dmesh_channel_t* channel) override {
     return dmesh_destroy_channel(channel);
   }
-  dmesh_eq_t* CreateEq(dmesh_channel_t* channel) override {
-    return dmesh_create_eq(channel);
+  int PostMax(dmesh_channel_t* channel) override {
+    return dmesh_post_max(channel);
   }
-  int DestroyEq(dmesh_eq_t* eq) override { return dmesh_destroy_eq(eq); }
-  int EqFd(dmesh_eq_t* eq) override { return dmesh_eq_fd(eq); }
-  dmesh_qp_t* CreateQp(dmesh_eq_t* eq, const char* service) override {
-    return dmesh_create_qp(eq, service);
+  int ChannelFd(dmesh_channel_t* channel) override {
+    return dmesh_channel_fd(channel);
   }
+  dmesh_qp_t* Accept(dmesh_channel_t* channel) override {
+    return dmesh_accept(channel);
+  }
+  dmesh_qp_t* CreateQp(dmesh_channel_t* channel, const char* target) override {
+    return dmesh_create_qp(channel, target);
+  }
+  int QpFd(dmesh_qp_t* qp) override { return dmesh_qp_fd(qp); }
   int DestroyQp(dmesh_qp_t* qp) override { return dmesh_destroy_qp(qp); }
   int AbortQp(dmesh_qp_t* qp) override { return dmesh_abort_qp(qp); }
   void* Alloc(dmesh_qp_t* qp, uint32_t len) override {
@@ -26,20 +31,13 @@ class NativeDmeshApiOps final : public DmeshApiOps {
     return dmesh_post_send(qp, buffer, len);
   }
   int Flush(dmesh_qp_t* qp) override { return dmesh_flush(qp); }
-  int PollEq(dmesh_eq_t* eq, dmesh_event_t* events,
+  int PollQp(dmesh_qp_t* qp, dmesh_event_t* events,
              int max_events) override {
-    return dmesh_poll_eq(eq, events, max_events);
+    return dmesh_poll_qp(qp, events, max_events);
   }
   void ReleaseRxBuffer(dmesh_channel_t* channel,
                        dmesh_event_t* event) override {
     dmesh_release_rx_buffer(channel, event);
-  }
-  int PostMax(dmesh_channel_t* channel) override {
-    return dmesh_post_max(channel);
-  }
-  int PodId(dmesh_channel_t* channel) override { return dmesh_pod_id(channel); }
-  int64_t EqNextDeadlineNs(dmesh_eq_t* eq) override {
-    return dmesh_eq_next_deadline_ns(eq);
   }
 };
 
