@@ -44,7 +44,8 @@ static inline uint32_t dpa_dma_payload_cap(uint64_t offset, uint32_t cap) {
     return cap < room ? cap : room;
 }
 static int cleanup_ctx(dpumesh_ctx_t *ctx);
-static int drain_rev_rings_span(dpumesh_ctx_t *, uint32_t);
+static int drain_rev_rings_span(dpumesh_ctx_t *, struct dmesh_eq *, uint32_t);
+static int drain_own_stripes(dpumesh_ctx_t *, struct dmesh_eq *, uint32_t);
 static int dmesh_drain_tx_locked(dmesh_qp_t *, int);
 static int dmesh_drain_tx_upto_locked(dmesh_qp_t *, int, uint64_t);
 /* ====================================================================
@@ -296,6 +297,9 @@ struct dpumesh_ctx {
      * keeps an EQ polling only while a sender waits for the space it frees
      * (tx_waiters) or a closed flow still retires. */
     int rx_signaled;
+    /* Every stripe raises its own doorbell (dmesh_native_flow_wake): a stripe
+     * owned by a connection EQ is that EQ's alone to advance and drain. */
+    int flow_wake;
     atomic_int tx_waiters;              /* QPs whose tx_wait_state is ARMED */
     /* For measurement only: DPUMESH_CUSTODY_SLEEP=0 keeps polling open custody
      * and DPUMESH_SEND_WAKE=1 wakes a sleeping EQ on a send, as without
@@ -633,7 +637,8 @@ static int eq_has_pending(const struct dmesh_eq *eq)
         return 1;
     if (atomic_load_explicit(&eq->tx_error_count, memory_order_acquire) != 0)
         return 1;
-    return atomic_load_explicit(&ctx->rx_enq, memory_order_acquire) !=
+    return !atomic_load(&eq->no_accept) &&
+           atomic_load_explicit(&ctx->rx_enq, memory_order_acquire) !=
            atomic_load_explicit(&ctx->rx_deq, memory_order_acquire);
 }
 
@@ -655,14 +660,15 @@ void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
         eq_notify(eq);
 }
 
-/* Wake EVERY EQ. Used only for the shared accept queue, whose conns have no EQ
- * yet, so any consumer may claim them. The lock also keeps a concurrent
- * dmesh_destroy_eq from freeing an EQ under this walk. */
-static void notify_all_eqs(dpumesh_ctx_t *ctx)
+/* Wake every EQ, or with accepting set those that accept: a conn on the shared
+ * accept queue has no EQ yet, and any accepting EQ may claim it. The lock also
+ * keeps a concurrent dmesh_destroy_eq from freeing an EQ under this walk. */
+static void notify_all_eqs(dpumesh_ctx_t *ctx, int accepting)
 {
     pthread_mutex_lock(&ctx->eq_lock);
     for (int i = 0; i < ctx->n_eqs; i++)
-        if (ctx->eqs[i]) eq_notify(ctx->eqs[i]);
+        if (ctx->eqs[i] && !(accepting && atomic_load(&ctx->eqs[i]->no_accept)))
+            eq_notify(ctx->eqs[i]);
     pthread_mutex_unlock(&ctx->eq_lock);
 }
 
@@ -681,7 +687,7 @@ static void transport_check(dpumesh_ctx_t *ctx)
         _exit(DMESH_EXIT_LOST);
     }
     DOCA_LOG_ERR("transport lost (%s)", strerror(error));
-    notify_all_eqs(ctx);
+    notify_all_eqs(ctx, 0);
 }
 
 int dpumesh_lost(dpumesh_ctx_t *ctx)
@@ -984,7 +990,7 @@ static void tx_wait_arm(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl,
         atomic_load_explicit(&psl->tx_wait_state, memory_order_seq_cst) ==
             (uint_fast32_t)DMESH_TX_WAIT_ARMED) {
         if (reason == DMESH_TX_WAIT_SHARED_POOL) {
-            notify_all_eqs(ctx);
+            notify_all_eqs(ctx, 0);
         } else {
             struct dmesh_eq *eq = __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE);
             if (eq && atomic_load_explicit(&eq->asleep, memory_order_seq_cst))
@@ -1151,7 +1157,7 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
             /* diff > 0: a sibling advanced rx_enq under us — reload. */
         }
         CTRACE("rx_deliver: new server conn uP=%u queued", dport);
-        notify_all_eqs(ctx);       /* no owner yet → every EQ may accept it */
+        notify_all_eqs(ctx, 1);    /* no owner yet → every accepting EQ may take it */
         return;
     }
 
@@ -1160,36 +1166,69 @@ static void rx_deliver_desc(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc, int
     rx_credit_return(ctx, slot);
 }
 
-static int drain_rev_rings_span(dpumesh_ctx_t *ctx, uint32_t budget)
+/* Interpret one stripe's published reverse entries under its lock; a flow
+ * wake's receives are published by advancing that wake first. */
+static uint32_t drain_stripe(dpumesh_ctx_t *ctx, int stripe, uint32_t budget)
+{
+    uint32_t drained = 0;
+    if (__atomic_exchange_n(&ctx->stripe_lock[stripe], 1u, __ATOMIC_ACQUIRE))
+        return 0;
+    if (ctx->flow_wake)
+        dmesh_native_stripe_progress(ctx->transport, stripe);
+    struct dmesh_native_event ev;
+    while (drained < budget && dmesh_native_poll(ctx->transport, stripe, &ev) > 0) {
+        if (ev.kind == DMESH_NATIVE_RX) {
+            sw_descriptor_t *d = &ev.desc;
+            if (d->body_buf_slot >= 0 && d->body_len <= DPUMESH_SLOT_SIZE &&
+                (size_t)d->body_buf_slot + d->body_len <= ctx->rx_dma_buf_size)
+                rx_deliver_desc(ctx, d, d->body_buf_slot);
+            else
+                rx_credit_return(ctx, d->body_buf_slot);
+        } else if (ev.kind == DMESH_NATIVE_ACK) {
+            uint32_t count = ev.seq_count ? ev.seq_count : 1;
+            for (uint32_t i = 0; i < count; ++i)
+                tx_reclaim_ack(ctx, ev.port, (uint16_t)(ev.seq + i));
+        } else if (ev.kind == DMESH_NATIVE_ERROR) {
+            struct dmesh_port_slot *psl = &ctx->ports[ev.port];
+            tx_error_publish(psl, ev.port, ev.error ? ev.error : EIO);
+        }
+        ++drained;
+    }
+    __atomic_store_n(&ctx->stripe_lock[stripe], 0u, __ATOMIC_RELEASE);
+    return drained;
+}
+
+/* A session EQ's drain (a NULL eq: anyone's): progress the channel session,
+ * wake the owners of stripes with control news, and interpret every active
+ * stripe except one with its own wake that another EQ owns. */
+static int drain_rev_rings_span(dpumesh_ctx_t *ctx, struct dmesh_eq *eq, uint32_t budget)
 {
     uint32_t drained = 0;
     uint32_t active = dmesh_native_progress(ctx->transport);
     transport_check(ctx);
+    if (ctx->flow_wake)
+        for (uint32_t news = dmesh_native_take_news(ctx->transport); news; news &= news - 1) {
+            struct dmesh_eq *owner = __atomic_load_n(&ctx->stripe_owner[__builtin_ctz(news)], __ATOMIC_ACQUIRE);
+            if (owner && owner != eq) eq_notify(owner);
+        }
     for (int stripe = 0; stripe < ctx->landing_stripes && drained < budget; ++stripe) {
         if (!(active & (UINT32_C(1) << stripe))) continue;
-        if (__atomic_exchange_n(&ctx->stripe_lock[stripe], 1u, __ATOMIC_ACQUIRE))
-            continue;
-        struct dmesh_native_event ev;
-        while (drained < budget && dmesh_native_poll(ctx->transport, stripe, &ev) > 0) {
-            if (ev.kind == DMESH_NATIVE_RX) {
-                sw_descriptor_t *d = &ev.desc;
-                if (d->body_buf_slot >= 0 && d->body_len <= DPUMESH_SLOT_SIZE &&
-                    (size_t)d->body_buf_slot + d->body_len <= ctx->rx_dma_buf_size)
-                    rx_deliver_desc(ctx, d, d->body_buf_slot);
-                else
-                    rx_credit_return(ctx, d->body_buf_slot);
-            } else if (ev.kind == DMESH_NATIVE_ACK) {
-                uint32_t count = ev.seq_count ? ev.seq_count : 1;
-                for (uint32_t i = 0; i < count; ++i)
-                    tx_reclaim_ack(ctx, ev.port, (uint16_t)(ev.seq + i));
-            } else if (ev.kind == DMESH_NATIVE_ERROR) {
-                struct dmesh_port_slot *psl = &ctx->ports[ev.port];
-                tx_error_publish(psl, ev.port, ev.error ? ev.error : EIO);
-            }
-            ++drained;
+        if (eq && ctx->flow_wake) {
+            struct dmesh_eq *owner = __atomic_load_n(&ctx->stripe_owner[stripe], __ATOMIC_ACQUIRE);
+            if (owner && owner != eq) continue;
         }
-        __atomic_store_n(&ctx->stripe_lock[stripe], 0u, __ATOMIC_RELEASE);
+        drained += drain_stripe(ctx, stripe, budget - drained);
     }
+    return (int)drained;
+}
+
+/* A connection EQ's drain: its own stripes only. The session and every other
+ * stripe belong to session EQs. */
+static int drain_own_stripes(dpumesh_ctx_t *ctx, struct dmesh_eq *eq, uint32_t budget)
+{
+    uint32_t drained = 0;
+    for (uint32_t own = (uint32_t)atomic_load(&eq->stripes); own && drained < budget; own &= own - 1)
+        drained += drain_stripe(ctx, __builtin_ctz(own), budget - drained);
     return (int)drained;
 }
 
@@ -1346,8 +1385,8 @@ void dpumesh_eq_awake(struct dmesh_eq *eq)
         atomic_store_explicit(&eq->asleep, 0, memory_order_relaxed);
 }
 
-/* In-line drain by an awake EQ thread: interprets whatever reverse entries
- * are published on any stripe. Deliveries still wake their own EQs, but not
+/* In-line drain by an awake EQ thread: interprets the reverse entries
+ * published on the stripes it drains. Deliveries still wake their own EQs, but not
  * this one: its thread consumes what is pending right after (poll_eq_once,
  * or dmesh_poll_eq's check of dpumesh_eq_pending), so writing its own
  * eventfd would only make the next sleep return at once. Doorbells are left
@@ -1358,7 +1397,7 @@ int dpumesh_eq_drain(struct dmesh_eq *eq)
         return 0;
     dpumesh_ctx_t *ctx = eq->ch->ctx;
     atomic_fetch_add_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
-    int drained = drain_rev_rings_span(ctx, 256);
+    int drained = eq->conn ? drain_own_stripes(ctx, eq, 256) : drain_rev_rings_span(ctx, eq, 256);
     atomic_fetch_sub_explicit(&eq->suppress_notify, 1, memory_order_seq_cst);
     if (drained > 0) eq_note_work(eq);
     return drained;
@@ -1450,10 +1489,12 @@ void dpumesh_eq_arm(struct dmesh_eq *eq)
      * submitter publishes custody before reading the flag. So either this
      * sees the custody or the submitter wakes the EQ (eq_note_tx). */
     atomic_store_explicit(&eq->asleep, 1, memory_order_seq_cst);
+    /* A connection EQ arms only its own stripes; unowned ones and the
+     * session's wake are armed by session EQs. */
     int busy = 0;
     for (int stripe = 0; stripe < ctx->landing_stripes; ++stripe) {
         struct dmesh_eq *owner = __atomic_load_n(&ctx->stripe_owner[stripe], __ATOMIC_ACQUIRE);
-        if (owner == NULL || owner == eq)
+        if (owner == eq || (owner == NULL && !eq->conn))
             busy |= dmesh_native_stripe_arm(ctx->transport, stripe);
     }
     /* Signaled receives: open custody is reclaimed on the next wake unless a
@@ -1463,7 +1504,7 @@ void dpumesh_eq_arm(struct dmesh_eq *eq)
         busy = 0;
         atomic_fetch_add_explicit(&wait_stats.custody_sleeps, 1, memory_order_relaxed);
     }
-    if (busy || dmesh_native_idle_arm(ctx->transport) != 0) {
+    if (busy || (!eq->conn && dmesh_native_idle_arm(ctx->transport) != 0)) {
         atomic_store_explicit(&eq->asleep, 0, memory_order_relaxed);
         eq_timer(eq, ctx->nap_cap_ns ? ctx->nap_cap_ns : 100000ull, 0);
         atomic_fetch_add(busy ? &wait_stats.busy : &wait_stats.arm_failures, 1);
@@ -1493,6 +1534,7 @@ static void stripe_bind(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl, uint16_
         return;
     }
     __atomic_store_n(&ctx->stripe_owner[stripe], eq, __ATOMIC_RELEASE);
+    atomic_fetch_or(&eq->stripes, UINT32_C(1) << stripe);
     psl->stripe = (int16_t)stripe;
 }
 static void stripe_unbind(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl)
@@ -1502,7 +1544,10 @@ static void stripe_unbind(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl)
     if (stripe < 0) return;
     struct dmesh_eq *owner = __atomic_load_n(&ctx->stripe_owner[stripe], __ATOMIC_ACQUIRE);
     int fd = dmesh_native_stripe_fd(ctx->transport, stripe);
-    if (owner) epoll_unnest(owner->epfd, fd);
+    if (owner) {
+        epoll_unnest(owner->epfd, fd);
+        atomic_fetch_and(&owner->stripes, ~(UINT32_C(1) << stripe));
+    }
     __atomic_store_n(&ctx->stripe_owner[stripe], NULL, __ATOMIC_RELEASE);
     (void)epoll_nest(ctx->spare_epfd, fd, EQ_TAG(EQ_TAG_STRIPE, stripe));
 }
@@ -1632,6 +1677,7 @@ int dpumesh_init(dpumesh_ctx_t **out, const char *service_name,
     if (dmesh_native_open(&ctx->transport, &native) != 0)
         goto fail;
     ctx->rx_signaled = dmesh_native_rx_signaled(ctx->transport);
+    ctx->flow_wake = dmesh_native_flow_wake(ctx->transport);
     if (native.stripes < 1 || native.stripes > DMESH_MAX_STRIPES) {
         DOCA_LOG_ERR("carrier exposes %d reverse stripes; at most %d supported",
                      native.stripes, DMESH_MAX_STRIPES);
@@ -2573,9 +2619,11 @@ void *dpumesh_next_ready(struct dmesh_eq *eq) {
     while (ready_pop(eq, &port)) {
         struct dmesh_port_slot *psl = &ctx->ports[port];
         uint8_t role = __atomic_load_n(&psl->role, __ATOMIC_ACQUIRE);
-        /* Return only ACCEPTED conns. FREE is stale, and SERVER_PENDING is
-         * drained by dmesh_accept, which is what sets its user handle. */
-        if (role == DMESH_ROLE_CLIENT || role == DMESH_ROLE_SERVER)
+        /* Return only ACCEPTED conns this EQ still owns. FREE is stale,
+         * SERVER_PENDING is drained by dmesh_accept, which is what sets its
+         * user handle, and a moved conn was armed on its new EQ. */
+        if ((role == DMESH_ROLE_CLIENT || role == DMESH_ROLE_SERVER) &&
+            __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE) == eq)
             return psl->user;
     }
     return NULL;
@@ -2739,15 +2787,18 @@ int dmesh_post_max(dmesh_channel_t *s) { return s->block_size; }
 /* ===== Event queue ===== */
 
 /* Readiness is active at EQ creation. The eventfd is optional; polling remains
- * available when eventfd creation fails. */
-dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
+ * available when eventfd creation fails. A connection EQ (conn) refuses
+ * accepts and leaves the session to session EQs. */
+static dmesh_eq_t *eq_create(dmesh_channel_t *ch, int conn) {
     if (!ch) { errno = EINVAL; return NULL; }
     dmesh_eq_t *eq = (dmesh_eq_t *)calloc(1, sizeof(*eq));
     if (!eq) { errno = ENOMEM; return NULL; }
     eq->accept_spare = (dmesh_qp_t *)calloc(1, sizeof(*eq->accept_spare));
     if (!eq->accept_spare) { free(eq); errno = ENOMEM; return NULL; }
     eq->ch         = ch;
-    atomic_init(&eq->no_accept, 0);
+    eq->conn       = conn;
+    atomic_init(&eq->no_accept, conn);
+    atomic_init(&eq->stripes, 0);
     eq->notify_efd = -1;
     eq->epfd       = -1;
     eq->tick_fd    = -1;
@@ -2789,9 +2840,10 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
     eq->nap_ns = ctx->nap_cap_ns + 1;
     atomic_fetch_add(&ctx->live_eqs, 1);
     /* The readiness fd is an epoll set: this EQ's eventfd (wakes from other
-     * threads: deliveries, accepts), its nap/backstop timer, its tail
-     * deadline, the channel wake fd, the spare set (unowned stripes) and,
-     * once bound, its own stripes' doorbells. */
+     * threads: deliveries, accepts, a connection's control news), its
+     * nap/backstop timer, its tail deadline, once bound its own stripes'
+     * doorbells and, for a session EQ, the channel wake fd and the spare set
+     * (unowned stripes). */
     eq->notify_efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     eq->tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     eq->tail_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -2800,8 +2852,8 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
         (epoll_nest(eq->epfd, eq->notify_efd, EQ_TAG(EQ_TAG_EFD, 0)) != 0 ||
          epoll_nest(eq->epfd, eq->tick_fd, EQ_TAG(EQ_TAG_TICK, 0)) != 0 ||
          epoll_nest(eq->epfd, eq->tail_fd, EQ_TAG(EQ_TAG_TAIL, 0)) != 0 ||
-         epoll_nest(eq->epfd, ctx->wake_fd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0 ||
-         epoll_nest(eq->epfd, ctx->spare_epfd, EQ_TAG(EQ_TAG_SPARE, 0)) != 0)) {
+         (!conn && epoll_nest(eq->epfd, ctx->wake_fd, EQ_TAG(EQ_TAG_WAKE, 0)) != 0) ||
+         (!conn && epoll_nest(eq->epfd, ctx->spare_epfd, EQ_TAG(EQ_TAG_SPARE, 0)) != 0))) {
         close(eq->epfd);
         eq->epfd = -1;
     }
@@ -2809,6 +2861,9 @@ dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) {
     pthread_mutex_unlock(&ctx->eq_lock);
     return eq;
 }
+
+dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch) { return eq_create(ch, 0); }
+dmesh_eq_t *dmesh_create_conn_eq(dmesh_channel_t *ch) { return eq_create(ch, 1); }
 
 /* Unregister first, under eq_lock, so a concurrent accept-path notify_all_eqs
  * either saw this EQ before or never sees it again; then free. A live QP is
@@ -2858,6 +2913,64 @@ dmesh_eq_t *dmesh_grpc_create_serializer_eq(dmesh_channel_t *ch) {
     dmesh_eq_t *eq = dmesh_create_eq(ch);
     if (eq) atomic_store(&eq->no_accept, 1);
     return eq;
+}
+
+static int eq_bit_test(atomic_uint_fast64_t *bits, uint16_t port) {
+    return (atomic_load_explicit(&bits[port >> 6], memory_order_acquire) >> (port & 63u)) & 1u;
+}
+
+/* Rebind a QP to another EQ of its channel, from the thread that polls its
+ * current EQ (events already returned stay with that caller). Its doorbell,
+ * pending readiness and receives move with it: the target is armed once, so
+ * a receive that raced the move is drained there, and the old EQ skips the
+ * stale ready entry. */
+int dmesh_move_qp(dmesh_qp_t *c, dmesh_eq_t *eq) {
+    if (!c || !eq || !c->ep || !c->eq || eq->ch != c->ep) { errno = EINVAL; return -1; }
+    dmesh_eq_t *old = c->eq;
+    if (old == eq) return 0;
+    dpumesh_ctx_t *ctx = c->ep->ctx;
+    uint16_t port = c->local_port;
+    struct dmesh_port_slot *psl = &ctx->ports[port];
+    pthread_mutex_lock(&ctx->port_lock);
+    uint8_t role = __atomic_load_n(&psl->role, __ATOMIC_ACQUIRE);
+    if ((role != DMESH_ROLE_CLIENT && role != DMESH_ROLE_SERVER) ||
+        __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE) != old) {
+        pthread_mutex_unlock(&ctx->port_lock);
+        errno = EINVAL;
+        return -1;
+    }
+    int stripe = psl->stripe;
+    if (stripe >= 0) {
+        int fd = dmesh_native_stripe_fd(ctx->transport, stripe);
+        if (epoll_nest(eq->epfd, fd, EQ_TAG(EQ_TAG_STRIPE, stripe)) != 0) {
+            int saved = errno;
+            pthread_mutex_unlock(&ctx->port_lock);
+            errno = saved;
+            return -1;
+        }
+        epoll_unnest(old->epfd, fd);
+        __atomic_store_n(&ctx->stripe_owner[stripe], eq, __ATOMIC_RELEASE);
+        atomic_fetch_and(&old->stripes, ~(UINT32_C(1) << stripe));
+        atomic_fetch_or(&eq->stripes, UINT32_C(1) << stripe);
+    }
+    int tx_error = eq_bit_test(old->tx_error, port), tx_ready = eq_bit_test(old->tx_ready, port);
+    int tx_armed = eq_bit_test(old->tx_armed, port);
+    if (tx_error) eq_tx_error_clear(old, port);
+    if (tx_ready) eq_tx_ready_clear(old, port);
+    if (tx_armed) eq_tx_armed_clear(old, port);
+    __atomic_store_n(&psl->eq, eq, __ATOMIC_RELEASE);
+    if (tx_error) eq_tx_error_set(eq, port);
+    if (tx_ready) eq_tx_ready_set(eq, port);
+    if (tx_armed) eq_tx_armed_set(eq, port, atomic_load_explicit(&psl->tx_deadline_ns, memory_order_relaxed));
+    pthread_mutex_unlock(&ctx->port_lock);
+    if (old->drain_cur == c) old->drain_cur = NULL;
+    atomic_fetch_sub_explicit(&old->nqp, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&eq->nqp, 1, memory_order_relaxed);
+    c->eq = eq;
+    atomic_store_explicit(&psl->on_ready, 1u, memory_order_release);
+    ready_push(eq, port);
+    eq_notify(eq);
+    return 0;
 }
 
 dmesh_qp_t *dmesh_accept(dmesh_eq_t *eq) {
@@ -3044,7 +3157,9 @@ static int dmesh_wait_tx_reclaimed_locked(dpumesh_ctx_t *ctx, const struct dmesh
     long wait_ns = TX_CLOSE_DRAIN_MIN_WAIT_NS;
 
     while (dmesh_tx_inflight_locked(psl)) {
-        if (drain_rev_rings_span(ctx, 256) > 0) continue;
+        struct dmesh_eq *eq = __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE);
+        if ((eq && eq->conn ? drain_own_stripes(ctx, eq, 256) : drain_rev_rings_span(ctx, NULL, 256)) > 0)
+            continue;
         if (monotonic_ns() >= deadline || atomic_load(&ctx->lost)) {
             errno = EBADMSG;
             return -1;

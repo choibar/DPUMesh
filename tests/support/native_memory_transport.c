@@ -112,8 +112,10 @@ int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t 
     } else push(t, ack);
     pthread_mutex_unlock(&lock); return 0;
 }
+static unsigned session_progress;
+unsigned test_native_session_progress(void) { return session_progress; }
 uint32_t dmesh_native_progress(struct dmesh_native_transport *t)
-{ return (UINT32_C(1) << t->stripes) - 1; }
+{ ++session_progress; return (UINT32_C(1) << t->stripes) - 1; }
 /* A test fails the session of every channel with test_native_lose. */
 static int lost_errno;
 void test_native_lose(int error) { lost_errno = error; }
@@ -148,7 +150,24 @@ void test_native_raise_wake(void)
     assert(wake_efd >= 0 && write(wake_efd, &one, sizeof(one)) == sizeof(one));
 }
 int dmesh_native_stripe_fd(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return -1; }
-int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return -1; }
+/* With test_native_stripe_map a stream sits on stripe port % stripes, so the
+ * core binds stripe owners as a real carrier does (no doorbell fds here). */
+static int stripe_map;
+void test_native_stripe_map(int value) { stripe_map = value; }
+int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
+{ return stripe_map ? port % t->stripes : -1; }
+/* Flow wake: a test turns it on before opening, counts which stripes were
+ * advanced, and posts control news for stripes. */
+static int flow_wake;
+static uint32_t progressed, news;
+void test_native_flow_wake(int value) { flow_wake = value; }
+uint32_t test_native_progressed(void) { uint32_t p = progressed; progressed = 0; return p; }
+void test_native_news(uint32_t mask) { __atomic_fetch_or(&news, mask, __ATOMIC_RELEASE); }
+int dmesh_native_flow_wake(struct dmesh_native_transport *t) { (void)t; return flow_wake; }
+void dmesh_native_stripe_progress(struct dmesh_native_transport *t, int stripe)
+{ (void)t; progressed |= UINT32_C(1) << stripe; }
+uint32_t dmesh_native_take_news(struct dmesh_native_transport *t)
+{ (void)t; return __atomic_exchange_n(&news, 0, __ATOMIC_ACQUIRE); }
 /* A channel that cannot sleep models open custody; test_native_retiring
  * models a closed flow that still retires custody or its FIN. A test can
  * also declare its receives signaled (the fast path) before opening. */
@@ -157,9 +176,12 @@ void test_native_retiring(int value) { retiring = value; }
 void test_native_custody(int value) { custody = value; }   /* open custody, idle_arm still works */
 void test_native_rx_signaled(int value) { rx_signaled = value; }
 int dmesh_native_rx_signaled(struct dmesh_native_transport *t) { (void)t; return rx_signaled; }
+static uint32_t armed_stripes;
+uint32_t test_native_armed(void) { uint32_t a = armed_stripes; armed_stripes = 0; return a; }
 int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
 {
-    (void)t; (void)stripe;
+    (void)t;
+    armed_stripes |= UINT32_C(1) << stripe;
     return (sleepable && !custody ? 0 : DMESH_STRIPE_CUSTODY) | (retiring ? DMESH_STRIPE_RETIRING : 0);
 }
 void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; }

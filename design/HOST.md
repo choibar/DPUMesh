@@ -109,6 +109,28 @@ Three things have no completion doorbell, and each gets a wake:
   the arming EQ sets the flag before it reads custody under that lock, so a
   send either finds the EQ awake or wakes it.
 
+### Flow wake
+
+With the Comch fast path (`DPUMESH_COMCH_WAKE`, on by default on DPU-DMA), the
+DPU sends each push descriptor as a Comch message to the session's consumer
+on the control PE, so a completion raises the channel's wake fd and wakes
+every session EQ. `DPUMESH_FLOW_WAKE=1` gives each of the session's 32 flow
+slots a consumer of its own, on its own PE in `PROGRESS_ALL` mode, created
+with the session before any flow opens (all or none; on a failure the session
+stays on its consumer). A push flow's OPEN names its slot's consumer, and the
+DPU sends that flow's descriptors there. The slot's PE fd is the stripe's
+doorbell, nested directly in the owning EQ's epoll set.
+
+A connection EQ (`dmesh_create_conn_eq`) is the path built on it. Its epoll
+set holds its eventfd, its two timers and its own stripes' PE fds; no channel
+wake fd and no spare set. Its drain progresses and polls only its own
+stripes, and its sleep arms only their PEs, with no `idle_arm`. Session EQs
+progress the control PE; a flow's CLOSED or ERROR there marks the flow's
+stripe, and the drain wakes the stripe's owner through its eventfd. Session
+EQs skip stripes another EQ owns. With the knob off, session EQs drain every
+active stripe as before, and what they deliver to a connection EQ's QPs
+wakes it through its eventfd.
+
 ### Host-dpa reverse path
 
 `DPUMESH_HOST_DPA_PCI` names the host function whose DPA runs the reverse threads
@@ -227,6 +249,8 @@ placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`),
 `DPUMESH_NAP_US` (10), `DPUMESH_NAP_CAP_US` (100),
 `DPUMESH_LINGER_US` (1000) and `DPUMESH_BACKSTOP_MS` (200) set the idle wake;
 `DPUMESH_SPIN_US` and `DPUMESH_TICK_US` are ignored with a warning.
+`DPUMESH_FLOW_WAKE=1` gives every flow slot its own Comch consumer (flow
+wake; the Go binding sets it unless the environment does).
 `DPUMESH_WAIT_STATS` names a directory for the idle-wake counters. `DPUMESH_CARRIER_TRACE` and `DPUMESH_CORE_TRACE` print flow,
 descriptor and event traces to stderr.
 

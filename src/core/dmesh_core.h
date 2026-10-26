@@ -72,6 +72,11 @@ _Static_assert(DMESH_PORT_SPACE == (UINT16_MAX + 1),
 struct dmesh_eq {
     dmesh_channel_t   *ch;
     atomic_int no_accept; /* private accelerator EQs leave incoming RPCs to reactors */
+    /* A connection EQ (dmesh_create_conn_eq) takes no inbound connections and
+     * leaves the channel session to session EQs: it waits on and drains only
+     * the stripes bound to it. */
+    int                conn;
+    atomic_uint_fast32_t stripes;   /* stripes bound here (stripe_bind, dmesh_move_qp) */
     struct dmesh_qp *accept_spare; /* preallocated before consuming an accept descriptor;
                                     * prevents OOM from stranding SERVER_PENDING */
     struct dmesh_qp *drain_cur;   /* poll_eq resume cursor: the conn whose inbox was only

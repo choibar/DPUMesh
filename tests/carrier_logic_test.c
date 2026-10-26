@@ -6,6 +6,12 @@ static int arm_result;
 static unsigned progress_calls;
 int channel_dev_progress(struct channel_dev *dev)
 { (void)dev; ++progress_calls; return 0; }
+/* No flow wake here: the stripes keep their slot epoll doorbells. */
+int channel_dev_flow_wake(const struct channel_dev *dev) { (void)dev; return 0; }
+int channel_flow_fd(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; return -1; }
+void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; }
+int channel_flow_arm(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; return -1; }
+uint32_t channel_dev_take_news(struct channel_dev *dev) { (void)dev; return 0; }
 
 int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *token)
 { (void)dev; (void)worker; (void)token; return 0; }

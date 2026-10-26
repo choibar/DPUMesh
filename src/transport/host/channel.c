@@ -99,10 +99,31 @@ struct channel_dev {
 	void *wake_mem;
 	int wake_running, wake_ready, fastpath;
 	uint64_t wake_descs, wake_drops;
+	/* Flow wake (DPUMESH_FLOW_WAKE=1 on a fastpath session): every flow slot's
+	 * own consumer, created with the session. news has bit (flow id - 1) set
+	 * for a flow-wake flow that got CLOSED or ERROR. */
+	struct channel_flow_wake *flow_wake[33];
+	int flow_wake_on;
+	uint32_t news;
     struct doca_dev *reverse_dev;       /* base PF or optional SF */
     struct doca_dpa *reverse_dpa;       /* base context or SF extension */
     struct doca_dev *base_dev;
     struct doca_dpa *base_dpa;
+};
+
+/* A flow slot's own consumer on its own PE (PROGRESS_ALL: a request clears
+ * the last notification). Progressed under the carrier's slot lock, which
+ * also orders conn against the slot's flow open and close. */
+struct channel_flow_wake {
+	struct doca_pe *pe;
+	struct doca_comch_consumer *consumer;
+	struct doca_mmap *mmap;
+	struct doca_buf_inventory *inv;
+	void *mem;
+	uint32_t id;                        /* consumer id a push flow's OPEN names */
+	int running;
+	struct channel_conn *conn;          /* the slot's open push flow, or NULL */
+	uint64_t descs, drops;
 };
 
 struct channel_mem {
@@ -126,6 +147,7 @@ struct channel_conn {
 	int rx_ended;                       /* Push: end of stream or a malformed batch was read */
 	uint32_t flow_id, generation;
 	int open_sent, ready, peer_closed, error, close_sent, close_error;
+	struct channel_flow_wake *wake;     /* its slot's flow wake, or NULL */
 	/* host-dpa reverse path */
     struct dmesh_dpa_endpoint *reverse;
 	struct doca_mmap *tx_mmap;          /* Imported DPU tx_staging */
@@ -300,6 +322,9 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
 		conn->error = EPROTO;
 		break;
 	}
+	/* A flow-wake flow's doorbell carries receives only: report the news. */
+	if (conn->wake != NULL && (h.type == DMESH_SESSION_CLOSED || h.type == DMESH_SESSION_ERROR))
+		__atomic_fetch_or(&dev->news, UINT32_C(1) << (h.flow_id - 1), __ATOMIC_RELEASE);
 }
 
 static uint64_t channel_now_ms(void)
@@ -391,6 +416,19 @@ static int session_wait_locked(struct channel_dev *dev, struct channel_conn *con
 #define WAKE_START_MS 2000u
 #define WAKE_READY_MS_DEFAULT 200u
 
+/* Hand a completed receive back to its consumer. */
+static void wake_repost(struct doca_comch_consumer_task_post_recv *task)
+{
+	struct doca_buf *buf = doca_comch_consumer_task_post_recv_get_buf(task);
+	doca_buf_reset_data_len(buf);
+	if (doca_task_submit(doca_comch_consumer_task_post_recv_as_task(task)) != DOCA_SUCCESS) {
+		/* One receive fewer; the DPU producer waits once none is left. */
+		(void)doca_buf_dec_refcount(buf, NULL);
+		doca_task_free(doca_comch_consumer_task_post_recv_as_task(task));
+		DOCA_LOG_ERR("fast-path wake: receive could not be reposted");
+	}
+}
+
 /* Runs inside the control PE progress, under session_lock like every
  * flow-map change. The sequence is published last (dmesh_wake_desc_publish). */
 static void wake_recv_done(struct doca_comch_consumer_task_post_recv *task,
@@ -413,14 +451,7 @@ static void wake_recv_done(struct doca_comch_consumer_task_post_recv *task,
 	} else {
 		dev->wake_drops++;              /* a flow already closed, or a malformed message */
 	}
-	struct doca_buf *buf = doca_comch_consumer_task_post_recv_get_buf(task);
-	doca_buf_reset_data_len(buf);
-	if (doca_task_submit(doca_comch_consumer_task_post_recv_as_task(task)) != DOCA_SUCCESS) {
-		/* One receive fewer; the DPU producer waits once none is left. */
-		(void)doca_buf_dec_refcount(buf, NULL);
-		doca_task_free(doca_comch_consumer_task_post_recv_as_task(task));
-		DOCA_LOG_ERR("fast-path wake: receive could not be reposted");
-	}
+	wake_repost(task);
 }
 
 static void wake_recv_failed(struct doca_comch_consumer_task_post_recv *task,
@@ -562,6 +593,199 @@ fail:
 	wake_close_locked(dev);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Flow wake
+ * ---------------------------------------------------------------------------
+ */
+#define FLOW_WAKE_RECV_N 32u /* the DPU holds one descriptor in flight per flow */
+
+/* Runs inside the slot's own PE progress (channel_flow_progress). */
+static void flow_wake_recv_done(struct doca_comch_consumer_task_post_recv *task,
+				union doca_data task_data, union doca_data ctx_data)
+{
+	struct channel_flow_wake *fw = ctx_data.ptr;
+	const uint8_t *imm = doca_comch_consumer_task_post_recv_get_imm_data(task);
+	uint32_t n = doca_comch_consumer_task_post_recv_get_imm_data_len(task);
+	struct channel_conn *conn = fw->conn;
+	struct dmesh_wake_desc d = {0};
+	(void)task_data;
+	if (imm != NULL && n >= DMESH_WAKE_IMM_LEN)
+		memcpy(&d, imm, sizeof(d));
+	if (conn != NULL && conn->flow_id == d.flow_id && conn->generation == d.generation && conn->descs != NULL) {
+		dmesh_wake_desc_publish(conn->descs, &d);
+		fw->descs++;
+	} else {
+		fw->drops++;                    /* a descriptor of the slot's previous flow */
+	}
+	wake_repost(task);
+}
+
+static void flow_wake_state_changed(const union doca_data user_data, struct doca_ctx *ctx,
+				    enum doca_ctx_states prev, enum doca_ctx_states next)
+{
+	struct channel_flow_wake *fw = user_data.ptr;
+	(void)ctx; (void)prev;
+	fw->running = next == DOCA_CTX_STATE_RUNNING;
+}
+
+/* Stop and release one flow wake; one whose consumer does not stop is kept. */
+static int flow_wake_free(struct channel_flow_wake *fw)
+{
+	if (fw->consumer != NULL) {
+		struct doca_ctx *ctx = doca_comch_consumer_as_ctx(fw->consumer);
+		(void)doca_ctx_stop(ctx);
+		if (wait_ctx_idle(ctx, fw->pe) != 0 || doca_comch_consumer_destroy(fw->consumer) != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("flow wake: consumer %u did not stop; retained", fw->id);
+			return -1;
+		}
+		fw->consumer = NULL;
+	}
+	if (fw->inv != NULL)
+		(void)doca_buf_inventory_destroy(fw->inv);
+	if (fw->mmap != NULL)
+		(void)doca_mmap_destroy(fw->mmap);
+	if (fw->pe != NULL)
+		(void)doca_pe_destroy(fw->pe);
+	free(fw->mem);
+	free(fw);
+	return 0;
+}
+
+static void flow_wakes_close_locked(struct channel_dev *dev)
+{
+	for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id)
+		if (dev->flow_wake[id] != NULL && flow_wake_free(dev->flow_wake[id]) == 0)
+			dev->flow_wake[id] = NULL;
+	dev->flow_wake_on = 0;
+}
+
+/* Create and start one slot's consumer; its receives are posted once it runs. */
+static doca_error_t flow_wake_start_locked(struct channel_dev *dev, struct channel_flow_wake *fw)
+{
+	doca_error_t result;
+	union doca_data user_data = { .ptr = fw };
+	fw->mem = aligned_alloc(64, FLOW_WAKE_RECV_N * WAKE_SLOT);
+	if (fw->mem == NULL)
+		return DOCA_ERROR_NO_MEMORY;
+	memset(fw->mem, 0, FLOW_WAKE_RECV_N * WAKE_SLOT);
+	if ((result = doca_pe_create(&fw->pe)) != DOCA_SUCCESS ||
+	    (result = doca_pe_set_event_mode(fw->pe, DOCA_PE_EVENT_MODE_PROGRESS_ALL)) != DOCA_SUCCESS ||
+	    (result = doca_mmap_create(&fw->mmap)) != DOCA_SUCCESS ||
+	    (result = doca_mmap_add_dev(fw->mmap, dev->dev)) != DOCA_SUCCESS ||
+	    (result = doca_mmap_set_permissions(fw->mmap, DOCA_ACCESS_FLAG_PCI_READ_WRITE)) != DOCA_SUCCESS ||
+	    (result = doca_mmap_set_memrange(fw->mmap, fw->mem, FLOW_WAKE_RECV_N * WAKE_SLOT)) != DOCA_SUCCESS ||
+	    (result = doca_mmap_start(fw->mmap)) != DOCA_SUCCESS ||
+	    (result = doca_buf_inventory_create(FLOW_WAKE_RECV_N, &fw->inv)) != DOCA_SUCCESS ||
+	    (result = doca_buf_inventory_start(fw->inv)) != DOCA_SUCCESS ||
+	    (result = doca_comch_consumer_create(dev->control->connection, fw->mmap, &fw->consumer)) != DOCA_SUCCESS)
+		return result;
+	struct doca_ctx *ctx = doca_comch_consumer_as_ctx(fw->consumer);
+	if ((result = doca_pe_connect_ctx(fw->pe, ctx)) != DOCA_SUCCESS ||
+	    (result = doca_comch_consumer_set_imm_data_len(fw->consumer, DMESH_WAKE_IMM_LEN)) != DOCA_SUCCESS ||
+	    (result = doca_comch_consumer_task_post_recv_set_conf(fw->consumer, flow_wake_recv_done,
+								  wake_recv_failed, FLOW_WAKE_RECV_N)) != DOCA_SUCCESS ||
+	    (result = doca_ctx_set_user_data(ctx, user_data)) != DOCA_SUCCESS ||
+	    (result = doca_ctx_set_state_changed_cb(ctx, flow_wake_state_changed)) != DOCA_SUCCESS)
+		return result;
+	result = doca_ctx_start(ctx);
+	return result == DOCA_ERROR_IN_PROGRESS ? DOCA_SUCCESS : result;
+}
+
+static doca_error_t flow_wake_post_locked(struct channel_flow_wake *fw)
+{
+	doca_error_t result;
+	for (uint32_t i = 0; i < FLOW_WAKE_RECV_N; ++i) {
+		struct doca_buf *buf;
+		struct doca_comch_consumer_task_post_recv *task;
+		if ((result = doca_buf_inventory_buf_get_by_addr(fw->inv, fw->mmap, (uint8_t *)fw->mem + i * WAKE_SLOT,
+								 WAKE_SLOT, &buf)) != DOCA_SUCCESS)
+			return result;
+		if ((result = doca_comch_consumer_task_post_recv_alloc_init(fw->consumer, buf, &task)) != DOCA_SUCCESS) {
+			(void)doca_buf_dec_refcount(buf, NULL);
+			return result;
+		}
+		if ((result = doca_task_submit(doca_comch_consumer_task_post_recv_as_task(task))) != DOCA_SUCCESS) {
+			(void)doca_buf_dec_refcount(buf, NULL);
+			doca_task_free(doca_comch_consumer_task_post_recv_as_task(task));
+			return result;
+		}
+	}
+	return doca_comch_consumer_get_id(fw->consumer, &fw->id);
+}
+
+/* Every slot's consumer, before any flow opens, so each push OPEN can name
+ * one the DPU already knows. All or none: on a failure the session stays on
+ * its consumer. The consumers start together and are awaited together. */
+static void flow_wakes_open_locked(struct channel_dev *dev)
+{
+	const char *env = getenv("DPUMESH_FLOW_WAKE");
+	if (!dev->fastpath || env == NULL || strcmp(env, "1") != 0)
+		return;
+	const char *step = "start";
+	doca_error_t result = DOCA_SUCCESS;
+	for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS && result == DOCA_SUCCESS; ++id) {
+		dev->flow_wake[id] = calloc(1, sizeof(*dev->flow_wake[id]));
+		result = dev->flow_wake[id] == NULL ? DOCA_ERROR_NO_MEMORY : flow_wake_start_locked(dev, dev->flow_wake[id]);
+	}
+	if (result == DOCA_SUCCESS) {
+		step = "running";
+		result = DOCA_ERROR_TIME_OUT;
+		if (WAKE_WAIT_LOCKED(dev, ({ int all = 1;
+			for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id) {
+				(void)doca_pe_progress(dev->flow_wake[id]->pe);
+				all &= dev->flow_wake[id]->running;
+			} all; }), WAKE_START_MS))
+			result = DOCA_SUCCESS;
+	}
+	for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS && result == DOCA_SUCCESS; ++id) {
+		step = "post receives";
+		result = flow_wake_post_locked(dev->flow_wake[id]);
+	}
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("flow wake unavailable (%s: %s); flows publish through the session consumer",
+			     step, doca_error_get_name(result));
+		flow_wakes_close_locked(dev);
+		return;
+	}
+	dev->flow_wake_on = 1;
+	DOCA_LOG_INFO("flow wake on: each flow slot has its own consumer");
+}
+
+int channel_dev_flow_wake(const struct channel_dev *dev)
+{
+	return dev != NULL && dev->flow_wake_on;
+}
+
+int channel_flow_fd(struct channel_dev *dev, uint32_t flow_id)
+{
+	doca_notification_handle_t handle;
+	if (!dev->flow_wake_on || flow_id == 0 || flow_id > DMESH_SESSION_MAX_FLOWS ||
+	    doca_pe_get_notification_handle(dev->flow_wake[flow_id]->pe, &handle) != DOCA_SUCCESS)
+		return -1;
+	return (int)handle;
+}
+
+/* Publish every descriptor that completed on the slot's consumer, bounded so
+ * one flow cannot hold its EQ. */
+void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id)
+{
+	struct doca_pe *pe = dev->flow_wake[flow_id]->pe;
+	for (uint32_t n = 0; n < FLOW_WAKE_RECV_N && doca_pe_progress(pe); ++n) {}
+}
+
+int channel_flow_arm(struct channel_dev *dev, uint32_t flow_id)
+{
+	doca_error_t result = doca_pe_request_notification(dev->flow_wake[flow_id]->pe);
+	if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
+	return 0;
+}
+
+uint32_t channel_dev_take_news(struct channel_dev *dev)
+{
+	return __atomic_exchange_n(&dev->news, 0, __ATOMIC_ACQUIRE);
+}
+
 int channel_session_open(struct channel_dev *dev, const char *server)
 {
 	if (!dev || !server || !*server) { errno = EINVAL; return -1; }
@@ -577,8 +801,10 @@ int channel_session_open(struct channel_dev *dev, const char *server)
 	if (result != DOCA_SUCCESS) errno = error_number(result);
 	else if (session_send_locked(dev, DMESH_SESSION_HELLO, 0, 0, NULL, 0) == 0)
 		rc = session_wait_locked(dev, NULL, 0);
-	if (rc == 0)
+	if (rc == 0) {
 		wake_open_locked(dev);
+		flow_wakes_open_locked(dev);
+	}
 	pthread_mutex_unlock(&dev->session_lock);
 	return rc;
 }
@@ -637,6 +863,7 @@ int channel_session_close(struct channel_dev *dev)
 		if (dev->flows[i] && channel_conn_close(dev->flows[i]) != 0) return -1;
 	pthread_mutex_lock(&dev->session_lock);
 	struct dmesh_comch_client *control = dev->control;
+	flow_wakes_close_locked(dev);
 	if (control)
 		wake_close_locked(dev);
 	if (control && control->cc_client) {
@@ -1259,14 +1486,22 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 	int rc = -1;
 	if (result != DOCA_SUCCESS) errno = error_number(result);
     else {
-        uint8_t payload[8 + sizeof(metadata)];
+        uint8_t payload[8 + sizeof(metadata) + 4];
         uint16_t type = cfg->backend_token ? DMESH_SESSION_BACKEND_OPEN : DMESH_SESSION_OPEN;
-        size_t offset = cfg->backend_token ? 8 : 0;
+        size_t offset = cfg->backend_token ? 8 : 0, len = offset + sizeof(metadata);
         dmesh_session_put_u32(payload, cfg->backend_worker);
         dmesh_session_put_u32(payload + 4, cfg->backend_token);
         memcpy(payload + offset, &metadata, sizeof(metadata));
+        /* A push flow of a flow-wake session completes on its slot's consumer. */
+        if (dev->flow_wake_on && (cfg->mode == CHANNEL_MODE_CLIENT_DPU_DMA ||
+                                  cfg->mode == CHANNEL_MODE_BACKEND_DPU_DMA)) {
+            conn->wake = dev->flow_wake[conn->flow_id];
+            conn->wake->conn = conn;
+            dmesh_session_put_u32(payload + len, conn->wake->id);
+            len += 4;
+        }
         if (session_send_locked(dev, type, conn->flow_id, conn->generation,
-                               payload, offset + sizeof(metadata)) == 0) {
+                               payload, len) == 0) {
             conn->open_sent = 1;
             rc = session_wait_locked(dev, conn, 0);
         }
@@ -1314,8 +1549,12 @@ int channel_conn_close(struct channel_conn *conn)
 	}
 	if (rc == 0) {
 		uint32_t id = conn->flow_id;
+		struct channel_flow_wake *fw = conn->wake;
 		rc = conn_teardown(conn);
-		if (rc == 0) dev->flows[id] = NULL;
+		if (rc == 0) {
+			dev->flows[id] = NULL;
+			if (fw != NULL) fw->conn = NULL;
+		}
 	}
 	pthread_mutex_unlock(&dev->session_lock);
 	return rc;
@@ -1332,11 +1571,12 @@ int channel_dev_progress(struct channel_dev *dev)
 int channel_conn_poll(struct channel_conn *conn)
 {
 	struct channel_dev *dev = conn->dev;
-	pthread_mutex_lock(&dev->session_lock);
-	int saved = !dev->control ? ENOTCONN :
-		(dev->session_error ? dev->session_error : conn->error);
-	int gone = conn->peer_closed;
-	pthread_mutex_unlock(&dev->session_lock);
+	/* Three ints the session callbacks write: read without the session lock,
+	 * which a flow's poll never needs to wait for. */
+	int saved = __atomic_load_n(&dev->control, __ATOMIC_ACQUIRE) == NULL ? ENOTCONN :
+		__atomic_load_n(&dev->session_error, __ATOMIC_ACQUIRE);
+	if (!saved) saved = __atomic_load_n(&conn->error, __ATOMIC_ACQUIRE);
+	int gone = __atomic_load_n(&conn->peer_closed, __ATOMIC_ACQUIRE);
 	if (conn->reverse != NULL && conn->reverse->pe != NULL)
 		(void)doca_pe_progress(conn->reverse->pe);
 	if ((conn->forward_ring && __atomic_load_n(&conn->forward_ring->ctrl->error, __ATOMIC_ACQUIRE)) ||

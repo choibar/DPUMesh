@@ -392,9 +392,12 @@ void dmesh_native_release(struct dmesh_native_transport *t, int pos)
     }
     pthread_mutex_unlock(&s->lock);
 }
+/* With flow wake a stripe's doorbell is its slot's own consumer fd; otherwise
+ * the slot's epoll of its connection's private engines (host-dpa). */
 int dmesh_native_stripe_fd(struct dmesh_native_transport *t, int stripe)
 {
-    return stripe >= 0 && stripe < SLOTS ? t->slots[stripe].epfd : -1;
+    if (stripe < 0 || stripe >= SLOTS) return -1;
+    return channel_dev_flow_wake(t->dev) ? channel_flow_fd(t->dev, (uint32_t)stripe + 1) : t->slots[stripe].epfd;
 }
 int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
 {
@@ -415,12 +418,31 @@ int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
     int busy = 0;
     if (s->state == SLOT_OPEN) {
         if (s->t_head != s->t_tail) busy = DMESH_STRIPE_CUSTODY;
-        if (!s->armed && channel_conn_arm(s->conn) == 0) s->armed = 1;
+        if (!s->armed && (channel_dev_flow_wake(t->dev) ? channel_flow_arm(t->dev, (uint32_t)stripe + 1)
+                                                        : channel_conn_arm(s->conn)) == 0)
+            s->armed = 1;
     } else if (s->t_head != s->t_tail || s->fin_pending) {
         busy = DMESH_STRIPE_RETIRING;   /* retired by the next poll */
     }
     pthread_mutex_unlock(&s->lock);
     return busy;
+}
+int dmesh_native_flow_wake(struct dmesh_native_transport *t)
+{
+    return channel_dev_flow_wake(t->dev);
+}
+void dmesh_native_stripe_progress(struct dmesh_native_transport *t, int stripe)
+{
+    if (stripe < 0 || stripe >= SLOTS) return;
+    struct slot *s = &t->slots[stripe];
+    if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != SLOT_OPEN) return;
+    pthread_mutex_lock(&s->lock);
+    if (s->state == SLOT_OPEN) channel_flow_progress(t->dev, (uint32_t)stripe + 1);
+    pthread_mutex_unlock(&s->lock);
+}
+uint32_t dmesh_native_take_news(struct dmesh_native_transport *t)
+{
+    return channel_dev_take_news(t->dev);   /* bit flow_id - 1 = slot index = stripe */
 }
 int dmesh_native_rx_signaled(struct dmesh_native_transport *t)
 {
@@ -447,7 +469,9 @@ void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe)
     if (stripe < 0 || stripe >= SLOTS) return;
     struct slot *s = &t->slots[stripe];
     pthread_mutex_lock(&s->lock);
-    if (s->conn) {
+    if (channel_dev_flow_wake(t->dev)) {
+        s->armed = 0;      /* the next arm's request clears the raised fd */
+    } else if (s->conn) {
         struct epoll_event evs[CHANNEL_CONN_FDS];
         int n = epoll_wait(s->epfd, evs, CHANNEL_CONN_FDS, 0);
         for (int i = 0; i < n; ++i) channel_conn_clear(s->conn, evs[i].data.fd);

@@ -1,6 +1,6 @@
 # Native API
 
-`include/dpumesh/dmesh.h` declares nineteen calls with ABI major 5. They
+`include/dpumesh/dmesh.h` declares twenty-one calls with ABI major 5. They
 describe reliable full-duplex byte streams through channels, event queues
 (EQs), queue pairs (QPs) and registered buffers, and expose no remote-memory
 operations. The façade and the channel/QP core are linked into
@@ -18,8 +18,8 @@ QP destruction. `user_data` belongs to the application.
 | Surface | Calls |
 |---|---|
 | Channel | `dmesh_create_channel`, `dmesh_destroy_channel`, `dmesh_pod_id`, `dmesh_msg_max`, `dmesh_post_max` |
-| EQ | `dmesh_create_eq`, `dmesh_destroy_eq`, `dmesh_eq_fd`, `dmesh_eq_next_deadline_ns` |
-| QP | `dmesh_create_qp`, `dmesh_destroy_qp`, `dmesh_abort_qp` |
+| EQ | `dmesh_create_eq`, `dmesh_create_conn_eq`, `dmesh_destroy_eq`, `dmesh_eq_fd`, `dmesh_eq_next_deadline_ns` |
+| QP | `dmesh_create_qp`, `dmesh_destroy_qp`, `dmesh_abort_qp`, `dmesh_move_qp` |
 | TX | `dmesh_alloc`, `dmesh_post_send`, `dmesh_flush`, `dmesh_tx_inflight` |
 | Events | `dmesh_poll_eq`, `dmesh_release_rx_buffer` |
 | Statistics | `dmesh_get_tx_stats` |
@@ -74,6 +74,16 @@ A server sets `DPUMESH_SERVICE` before creating its channel. An event loop
 drains `dmesh_poll_eq` until empty, then waits on `dmesh_eq_fd` and drains the
 eventfd on wake, bounding the wait by `dmesh_eq_next_deadline_ns` (`-1` when
 no tail needs service). Poll one EQ from one thread.
+
+A runtime that waits per connection, as Go's netpoller does, gives each QP a
+connection EQ (`dmesh_create_conn_eq`). It is woken by and drains only the
+QPs bound to it; with `DPUMESH_FLOW_WAKE=1` its fd is raised by those QPs'
+own completions ([flow wake](HOST.md#flow-wake)). It takes no inbound
+connection and does not progress the channel session, so the process keeps
+one EQ from `dmesh_create_eq` polled for accepts, control messages and loss.
+An accepted QP arrives on that session EQ; `dmesh_move_qp` moves it to a
+connection EQ, called from the session EQ's thread after the batch that named
+it, and its later events arrive there.
 
 ## Transport semantics
 

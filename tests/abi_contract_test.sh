@@ -31,8 +31,8 @@ soname=$(readelf -d "$lib" | awk '/Library soname:/ {
 symbols=$(nm -D --defined-only "$lib" | awk '{ print $3 }')
 for symbol in \
     dmesh_create_channel dmesh_destroy_channel dmesh_pod_id dmesh_msg_max \
-    dmesh_post_max dmesh_create_eq dmesh_destroy_eq dmesh_eq_fd dmesh_eq_next_deadline_ns \
-    dmesh_create_qp dmesh_destroy_qp dmesh_abort_qp dmesh_alloc \
+    dmesh_post_max dmesh_create_eq dmesh_create_conn_eq dmesh_destroy_eq dmesh_eq_fd \
+    dmesh_eq_next_deadline_ns dmesh_create_qp dmesh_destroy_qp dmesh_abort_qp dmesh_move_qp dmesh_alloc \
     dmesh_post_send dmesh_flush dmesh_tx_inflight dmesh_get_tx_stats dmesh_poll_eq \
     dmesh_release_rx_buffer
 do
