@@ -346,9 +346,9 @@ func TestInboundWithoutListenerIsAborted(t *testing.T) {
 	if r.srvN.aborts.Load() != 1 {
 		t.Fatalf("%d server aborts, want 1", r.srvN.aborts.Load())
 	}
-	// The refused stream's EQ stays the spare: s0's and that one.
-	if n := r.srvN.liveEQs(); n != 2 {
-		t.Fatalf("%d server EQs after a refusal, want 2", n)
+	// The refused stream leaves no QP behind: s0's alone.
+	if n := r.srvN.liveQPs(); n != 1 {
+		t.Fatalf("%d server QPs after a refusal, want 1", n)
 	}
 	for _, conn := range []net.Conn{c, c0, s0} {
 		_ = conn.Close()
@@ -414,7 +414,7 @@ func TestInboundBeforeListenIsHandedToListener(t *testing.T) {
 }
 
 // The peer can speak and even close before the dial returns (an HTTP/2
-// server sends SETTINGS at once). Those events wait in the dialed QP's EQ
+// server sends SETTINGS at once). Those events wait in the dialed QP
 // instead of being dropped, and those of an abandoned dial are returned.
 func TestPeerSpeaksBeforeDialReturns(t *testing.T) {
 	r := newRig(t, 1<<20, 3, 64<<10, true)
@@ -522,7 +522,7 @@ func TestTransportFailureWakesWaitersAndCloseCompletes(t *testing.T) {
 	_ = s.Close()
 }
 
-// A client polls a connection's EQ only for a caller that waits: an idle
+// A client polls a connection's QP only for a caller that waits: an idle
 // connection nobody reads never polls, and the channel goroutine sleeps after
 // a single accept.
 func TestIdleTransportDoesNotPoll(t *testing.T) {
@@ -560,7 +560,7 @@ func TestIdleTransportDoesNotPoll(t *testing.T) {
 		t.Fatalf("read of an idle stream: %v", err)
 	}
 	if n.polls.Load() == 0 {
-		t.Fatal("a waiting read did not poll its EQ")
+		t.Fatal("a waiting read did not poll its QP")
 	}
 	_ = c.Close()
 	_ = s.Close()

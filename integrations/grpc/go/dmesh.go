@@ -1,11 +1,10 @@
-// Package dmeshgo adapts the native channel/EQ/QP API to net.Conn and
-// net.Listener. One process owns one channel, polled as its listening socket.
-// Each connection owns an EQ that only its QP is bound to: a Read or Write
-// that has to wait polls that EQ itself and parks on its fd through Go's
-// netpoller, so the goroutine waiting for the bytes is the one the DPU's
-// completion wakes, as with a TCP socket. A channel goroutine polls the
-// channel: it does the channel's control work and, on a serving channel,
-// accepts each inbound stream onto an EQ of its own and hands it to the
+// Package dmeshgo adapts the native channel/QP socket API to net.Conn and
+// net.Listener. One process owns one channel, its listening socket. Each
+// connection owns a QP: a Read or Write that has to wait polls that QP itself
+// and parks on its fd through Go's netpoller, so the goroutine waiting for
+// the bytes is the one the DPU's completion wakes, as with a TCP socket. A
+// channel goroutine polls the channel: it does the channel's control work
+// and, on a serving channel, accepts each inbound stream and hands it to the
 // listener. A connection's state has its own lock; the transport lock guards
 // only the connection table, so no connection waits for another's I/O.
 //
@@ -64,48 +63,41 @@ const (
 	evTxError
 )
 
-// qpID and eqID are native handles, used as opaque keys.
-type (
-	qpID = unsafe.Pointer
-	eqID = unsafe.Pointer
-)
+// qpID is a native QP handle, used as an opaque key.
+type qpID = unsafe.Pointer
 
 type nativeEvent struct {
 	kind  eventKind
-	qp    qpID
 	buf   []byte // evRecv: native memory, valid until release(token)
 	token int32  // receive lease; -1 when the event holds none
 }
 
-// native is the libdpumesh surface. An EQ has one consumer at a time:
-// pollWait, destroy of a QP bound to it and destroyEQ run on whichever
-// goroutine currently owns it. The channel goroutine alone calls accept and
-// waitChannel. send is serialized per QP; the others may run on any
-// goroutine.
+// native is the libdpumesh surface. A QP has one poller at a time: pollWait
+// and destroy run on whichever goroutine currently owns it. The channel
+// goroutine alone calls accept and waitChannel. send is serialized per QP;
+// the others may run on any goroutine.
 type native interface {
 	postMax() int
 	// serves reports a channel that receives inbound streams for its
 	// DPUMESH_SERVICE target.
 	serves() bool
-	// newEQ creates an EQ: woken by and draining only the QPs bound to it.
-	newEQ() (eqID, error)
-	destroyEQ(eq eqID) error // EBUSY while a QP is bound to it
-	// pollWait returns eq's events, or 0 after wake(eq) or maxWaitNs
+	// pollWait returns qp's events, or 0 after wake(qp) or maxWaitNs
 	// (< 0: unbounded).
-	pollWait(eq eqID, events []nativeEvent, maxWaitNs int64) (int, error)
-	wake(eq eqID)
-	dial(eq eqID, target string) (qp qpID, localPort int, err error)
-	// accept does the channel's control work and binds the next inbound
-	// stream to eq, which then returns its first bytes; nil eq does the
-	// control work alone. syscall.EAGAIN when no stream waits.
-	accept(eq eqID) (qp qpID, remotePort int, err error)
+	pollWait(qp qpID, events []nativeEvent, maxWaitNs int64) (int, error)
+	wake(qp qpID)
+	// dial connects a QP; what the peer sends before it returns waits in it.
+	dial(target string) (qp qpID, localPort int, err error)
+	// accept does the channel's control work and returns the next inbound
+	// stream, whose first bytes its own poll returns. syscall.EAGAIN when
+	// none waits.
+	accept() (qp qpID, remotePort int, err error)
 	// waitChannel returns once the channel has work for accept, or after
 	// wakeChannel.
 	waitChannel() error
 	wakeChannel()
 	send(qp qpID, p []byte) (int, error) // all of p, or errWouldBlock
 	release(token int32)
-	destroy(qp qpID, abort bool) error // consumes qp even on error
+	destroy(qp qpID, abort bool) error // consumes qp and its fd even on error
 	close() error                      // retryable
 }
 
@@ -132,7 +124,7 @@ type transport struct {
 	err       error         // sticky: transport failure or closed
 	failed    chan struct{} // closed when err is first set
 
-	// The channel goroutine. EQs never do the channel's work, so it polls
+	// The channel goroutine. QPs never do the channel's work, so it polls
 	// the channel for the transport's whole life: control messages, the
 	// session's liveness and, serving, inbound streams.
 	stop     chan struct{} // closed to stop the channel goroutine
@@ -209,38 +201,20 @@ func (t *transport) fail(err error) {
 	}
 }
 
-// channelLoop is the channel's only poller. A serving channel keeps a spare
-// EQ for the next inbound stream, which is accepted onto it or promptly
-// refused. After a transport failure it waits for close, so Close still
-// returns.
+// channelLoop is the channel's only poller: each inbound stream is accepted
+// or promptly refused. After a transport failure it waits for close, so
+// Close still returns.
 func (t *transport) channelLoop() {
 	defer close(t.done)
-	var spare eqID
-	defer func() {
-		if spare != nil {
-			_ = t.n.destroyEQ(spare)
-		}
-	}()
 	for {
 		select {
 		case <-t.stop:
 			return
 		default:
 		}
-		if t.serves && spare == nil {
-			eq, err := t.n.newEQ()
-			if err != nil {
-				t.fail(fmt.Errorf("dmesh: EQ: %w", err))
-				<-t.stop
-				return
-			}
-			spare = eq
-		}
-		qp, port, err := t.n.accept(spare)
+		qp, port, err := t.n.accept()
 		if err == nil {
-			if t.admit(qp, spare, port) {
-				spare = nil
-			}
+			t.admit(qp, port)
 			continue
 		}
 		if errors.Is(err, syscall.EAGAIN) {
@@ -255,17 +229,16 @@ func (t *transport) channelLoop() {
 }
 
 // admit opens the connection of an accepted stream and hands it on, or
-// aborts the stream when no listener can take it; eq then stays the spare.
-func (t *transport) admit(qp qpID, eq eqID, remotePort int) bool {
+// aborts the stream when no listener can take it.
+func (t *transport) admit(qp qpID, remotePort int) {
 	t.mu.Lock()
 	take := t.err == nil && (t.listener != nil || (!t.listened && len(t.prelisten) < maxPrelisten))
 	t.mu.Unlock()
 	if !take {
 		_ = t.n.destroy(qp, true)
-		return false
+		return
 	}
-	t.hand(newConn(t, qp, eq, nil, &net.TCPAddr{Port: remotePort}))
-	return true
+	t.hand(newConn(t, qp, nil, &net.TCPAddr{Port: remotePort}))
 }
 
 // hand gives an inbound connection to the listener, holds it for the first
@@ -300,11 +273,10 @@ func (t *transport) retire(c *Conn) {
 	t.mu.Unlock()
 }
 
-// dial opens a stream on an EQ of its own. The native dial waits for the
-// DPU's answer and runs outside every lock; a cancelable ctx returns at once
-// and the late QP, if any, is aborted. Events of a dialed QP wait in its EQ
-// until its connection first polls, so the peer may speak before the dial
-// returns.
+// dial opens a stream. The native dial waits for the DPU's answer and runs
+// outside every lock; a cancelable ctx returns at once and the late QP, if
+// any, is aborted. Events of a dialed QP wait in it until its connection
+// first polls, so the peer may speak before the dial returns.
 func (t *transport) dial(ctx context.Context, target string, local, remote *net.TCPAddr) (*Conn, error) {
 	t.mu.Lock()
 	if t.err != nil {
@@ -314,16 +286,9 @@ func (t *transport) dial(ctx context.Context, target string, local, remote *net.
 	}
 	t.dials++
 	t.mu.Unlock()
-	eq, err := t.n.newEQ()
-	if err != nil {
-		t.mu.Lock()
-		t.dials--
-		t.mu.Unlock()
-		return nil, err
-	}
 	if ctx.Done() == nil {
-		qp, port, err := t.n.dial(eq, target)
-		return t.adopt(ctx, eq, qp, port, err, local, remote)
+		qp, port, err := t.n.dial(target)
+		return t.adopt(ctx, qp, port, err, local, remote)
 	}
 	type result struct {
 		qp   qpID
@@ -332,22 +297,22 @@ func (t *transport) dial(ctx context.Context, target string, local, remote *net.
 	}
 	res := make(chan result, 1)
 	go func() {
-		qp, port, err := t.n.dial(eq, target)
+		qp, port, err := t.n.dial(target)
 		res <- result{qp, port, err}
 	}()
 	select {
 	case r := <-res:
-		return t.adopt(ctx, eq, r.qp, r.port, r.err, local, remote)
+		return t.adopt(ctx, r.qp, r.port, r.err, local, remote)
 	case <-ctx.Done():
 		go func() {
 			r := <-res
-			t.abandon(eq, r.qp, r.err)
+			t.abandon(r.qp, r.err)
 		}()
 		return nil, ctx.Err()
 	}
 }
 
-func (t *transport) adopt(ctx context.Context, eq eqID, qp qpID, port int, err error, local, remote *net.TCPAddr) (*Conn, error) {
+func (t *transport) adopt(ctx context.Context, qp qpID, port int, err error, local, remote *net.TCPAddr) (*Conn, error) {
 	t.mu.Lock()
 	t.dials--
 	late := false
@@ -362,24 +327,22 @@ func (t *transport) adopt(ctx context.Context, eq eqID, qp qpID, port int, err e
 		if late {
 			_ = t.n.destroy(qp, true)
 		}
-		_ = t.n.destroyEQ(eq)
 		return nil, err
 	}
 	local.Port = port
-	c := newConn(t, qp, eq, local, remote)
+	c := newConn(t, qp, local, remote)
 	t.conns[qp] = c
 	t.mu.Unlock()
 	return c, nil
 }
 
-func (t *transport) abandon(eq eqID, qp qpID, err error) {
+func (t *transport) abandon(qp qpID, err error) {
 	t.mu.Lock()
 	t.dials--
 	t.mu.Unlock()
 	if err == nil {
 		_ = t.n.destroy(qp, true)
 	}
-	_ = t.n.destroyEQ(eq)
 }
 
 func (t *transport) listen(addr net.Addr) (*Listener, error) {
@@ -460,14 +423,13 @@ type rxLease struct {
 type Conn struct {
 	t             *transport
 	qp            qpID
-	eq            eqID // this connection's alone
 	local, remote net.Addr
 
 	readMu, writeMu sync.Mutex // serialize readers; serialize writers
 	done            []int32    // reader-owned: leases consumed by one Read
 
-	// The EQ's single consumer: a waiting Read or Write that takes pollMu
-	// polls the EQ and parks on its fd; the other waits for its signal.
+	// The QP's single poller: a waiting Read or Write that takes pollMu
+	// polls the QP and parks on its fd; the other waits for its signal.
 	pollMu sync.Mutex
 	events []nativeEvent // under pollMu
 
@@ -486,8 +448,8 @@ type Conn struct {
 	closeErr  error
 }
 
-func newConn(t *transport, qp qpID, eq eqID, local, remote net.Addr) *Conn {
-	return &Conn{t: t, qp: qp, eq: eq, local: local, remote: remote, events: make([]nativeEvent, connBatch),
+func newConn(t *transport, qp qpID, local, remote net.Addr) *Conn {
+	return &Conn{t: t, qp: qp, local: local, remote: remote, events: make([]nativeEvent, connBatch),
 		rdSig: make(chan struct{}, 1), wrSig: make(chan struct{}, 1), closedCh: make(chan struct{})}
 }
 
@@ -559,7 +521,7 @@ func (c *Conn) fail(err error) {
 }
 
 // await waits until something may have changed for its caller. A caller
-// that finds the EQ free polls it, parking on its fd until events, the
+// that finds the QP free polls it, parking on its fd until events, the
 // deadline, Close or a wake; then it signals the other side, which may have
 // waited for this poll and must now poll for itself. A caller that finds it
 // taken waits for that poller's signal on own.
@@ -573,7 +535,7 @@ func (c *Conn) await(own, other chan struct{}, deadline time.Time) error {
 	return err
 }
 
-// poll takes one batch of the EQ, parking while it is empty. Requires pollMu.
+// poll takes one batch of the QP, parking while it is empty. Requires pollMu.
 // A Close that ran before pollMu was taken is seen here; one that runs after
 // wakes the parked poll.
 func (c *Conn) poll(deadline time.Time) error {
@@ -591,18 +553,13 @@ func (c *Conn) poll(deadline time.Time) error {
 	if closed {
 		return nil
 	}
-	n, err := c.t.n.pollWait(c.eq, c.events, maxWait)
+	n, err := c.t.n.pollWait(c.qp, c.events, maxWait)
 	if err != nil {
-		c.t.fail(fmt.Errorf("dmesh: poll EQ: %w", err))
+		c.t.fail(fmt.Errorf("dmesh: poll QP: %w", err))
 		return nil
 	}
 	for i := range c.events[:n] {
-		ev := &c.events[i]
-		if ev.qp == c.qp {
-			c.apply(ev)
-		} else if ev.token >= 0 {
-			c.t.n.release(ev.token)
-		}
+		c.apply(&c.events[i])
 		c.events[i] = nativeEvent{}
 	}
 	if n == 0 && expired(deadline) {
@@ -734,7 +691,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 			return written, syscall.EPIPE
 		}
 		// The space comes back with custody ACKs, which only a poll of
-		// the EQ retires: wait as its poller when nobody else is.
+		// the QP retires: wait as its poller when nobody else is.
 		if err := c.await(c.wrSig, c.rdSig, deadline); err != nil {
 			return written, err
 		}
@@ -743,8 +700,8 @@ func (c *Conn) Write(p []byte) (int, error) {
 }
 
 // Close ends the stream: it wakes blocked Read and Write calls, returns queued
-// leases and destroys the QP and its EQ, reporting the native close result
-// once. ABI5 consumes the QP even when that fails; later calls return nil.
+// leases and destroys the QP, reporting the native close result once. The
+// native close consumes the QP even when that fails; later calls return nil.
 func (c *Conn) Close() error { return c.shutdown(false) }
 
 func (c *Conn) shutdown(abort bool) error {
@@ -757,9 +714,9 @@ func (c *Conn) shutdown(abort bool) error {
 		c.rx, c.pos = nil, 0
 		c.mu.Unlock()
 		close(c.closedCh)
-		c.t.n.wake(c.eq)
+		c.t.n.wake(c.qp)
 		// A Read copying out of a lease, a Write inside a native send and
-		// a poll of the EQ finish before the QP goes away; all return
+		// a poll of the QP finish before the QP goes away; all return
 		// promptly once closed.
 		c.readMu.Lock()
 		c.writeMu.Lock()
@@ -768,9 +725,6 @@ func (c *Conn) shutdown(abort bool) error {
 			c.t.n.release(lease.token)
 		}
 		c.closeErr = c.t.n.destroy(c.qp, abort)
-		if err := c.t.n.destroyEQ(c.eq); err != nil && c.closeErr == nil {
-			c.closeErr = err
-		}
 		c.pollMu.Unlock()
 		c.writeMu.Unlock()
 		c.readMu.Unlock()
@@ -805,7 +759,7 @@ func (c *Conn) setDeadlines(read, write bool, d time.Time) error {
 	if write {
 		c.signalWriter()
 	}
-	c.t.n.wake(c.eq)
+	c.t.n.wake(c.qp)
 	return nil
 }
 

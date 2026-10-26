@@ -7,7 +7,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestEQWaiterNestedReadinessAndOwnership(t *testing.T) {
+func TestFDWaiterNestedReadinessAndOwnership(t *testing.T) {
 	eq, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		t.Fatal(err)
@@ -21,7 +21,7 @@ func TestEQWaiterNestedReadinessAndOwnership(t *testing.T) {
 	if err = unix.EpollCtl(eq, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)}); err != nil {
 		t.Fatal(err)
 	}
-	w, err := newEQWaiter(eq)
+	w, err := newFDWaiter(eq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func TestEQWaiterNestedReadinessAndOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	if time.Since(start) < 10*time.Millisecond {
-		t.Fatal("empty EQ did not wait for deadline")
+		t.Fatal("empty fd did not wait for deadline")
 	}
 	one := []byte{1, 0, 0, 0, 0, 0, 0, 0}
 	for pass := 0; pass < 2; pass++ {
@@ -39,7 +39,7 @@ func TestEQWaiterNestedReadinessAndOwnership(t *testing.T) {
 		go func() { done <- w.wait(time.Second) }()
 		select {
 		case err := <-done:
-			t.Fatalf("empty EQ woke early: %v", err)
+			t.Fatalf("empty fd woke early: %v", err)
 		case <-time.After(10 * time.Millisecond):
 		}
 		if _, err = unix.Write(fd, one); err != nil {
@@ -51,7 +51,7 @@ func TestEQWaiterNestedReadinessAndOwnership(t *testing.T) {
 				t.Fatal(err)
 			}
 		case <-time.After(500 * time.Millisecond):
-			t.Fatal("missed EQ wake")
+			t.Fatal("missed fd wake")
 		}
 		// Readiness remains level-triggered until the native consumer clears it.
 		start = time.Now()
@@ -67,7 +67,7 @@ func TestEQWaiterNestedReadinessAndOwnership(t *testing.T) {
 		}
 	}
 	w.close()
-	// Closing the Go waiter must not close the native-owned EQ.
+	// Closing the Go waiter must not close the native-owned fd.
 	if _, err = unix.EpollWait(eq, make([]unix.EpollEvent, 1), 0); err != nil {
 		t.Fatal(err)
 	}

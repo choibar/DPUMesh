@@ -7,7 +7,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func newTestWaiter(t *testing.T) (*eqWaiter, int) {
+func newTestWaiter(t *testing.T) (*fdWaiter, int) {
 	t.Helper()
 	eq, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -22,7 +22,7 @@ func newTestWaiter(t *testing.T) (*eqWaiter, int) {
 	if err = unix.EpollCtl(eq, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)}); err != nil {
 		t.Fatal(err)
 	}
-	w, err := newEQWaiter(eq)
+	w, err := newFDWaiter(eq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func newTestWaiter(t *testing.T) (*eqWaiter, int) {
 
 // An interrupt ends a parked wait at once, and one that lands before the wait
 // is not lost to the deadline the wait sets.
-func TestEQWaiterInterrupt(t *testing.T) {
+func TestFDWaiterInterrupt(t *testing.T) {
 	w, _ := newTestWaiter(t)
 	done := make(chan bool, 1)
 	go func() {
@@ -44,7 +44,7 @@ func TestEQWaiterInterrupt(t *testing.T) {
 	}()
 	select {
 	case <-done:
-		t.Fatal("empty EQ returned without an interrupt")
+		t.Fatal("empty fd returned without an interrupt")
 	case <-time.After(20 * time.Millisecond):
 	}
 	w.interrupt()
@@ -77,7 +77,7 @@ func TestEQWaiterInterrupt(t *testing.T) {
 
 // Readiness still wins over a long deadline, and interrupts racing many waits
 // are each observed exactly once.
-func TestEQWaiterReadinessAndRacingInterrupts(t *testing.T) {
+func TestFDWaiterReadinessAndRacingInterrupts(t *testing.T) {
 	w, fd := newTestWaiter(t)
 	one := []byte{1, 0, 0, 0, 0, 0, 0, 0}
 	go func() {

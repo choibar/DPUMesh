@@ -10,13 +10,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// A native EQ's fd, like the listening channel's, is a level-triggered epoll
-// set. Register a duplicate with Go's netpoller so waiting parks a goroutine
+// A native QP's fd, like the channel's, is a level-triggered epoll set. Register a duplicate with Go's netpoller so waiting parks a goroutine
 // rather than an OS thread in cgo. Neither this wrapper nor its readiness
 // check consumes the native doorbells: the library's own timers (naps,
 // retained-tail deadlines, the backstop) and doorbells raise the fd, and
-// draining the EQ, or accepting on the channel, settles it.
-type eqWaiter struct {
+// polling the QP, or accepting on the channel, settles it.
+type fdWaiter struct {
 	file *os.File
 	raw  syscall.RawConn
 
@@ -25,7 +24,7 @@ type eqWaiter struct {
 	woken   bool // interrupt pending for the current or next waitUntil
 }
 
-func newEQWaiter(fd int) (*eqWaiter, error) {
+func newFDWaiter(fd int) (*fdWaiter, error) {
 	dup, err := unix.FcntlInt(uintptr(fd), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
@@ -34,7 +33,7 @@ func newEQWaiter(fd int) (*eqWaiter, error) {
 		unix.Close(dup)
 		return nil, err
 	}
-	f := os.NewFile(uintptr(dup), "dmesh-eq")
+	f := os.NewFile(uintptr(dup), "dmesh-fd")
 	// SetReadDeadline also verifies that NewFile registered the fd as pollable.
 	if err = f.SetReadDeadline(time.Time{}); err != nil {
 		f.Close()
@@ -45,22 +44,22 @@ func newEQWaiter(fd int) (*eqWaiter, error) {
 		f.Close()
 		return nil, err
 	}
-	return &eqWaiter{file: f, raw: raw}, nil
+	return &fdWaiter{file: f, raw: raw}, nil
 }
 
-func (w *eqWaiter) close() { w.file.Close() }
+func (w *fdWaiter) close() { w.file.Close() }
 
-// wait blocks until the EQ is readable or timeout passes.
-func (w *eqWaiter) wait(timeout time.Duration) error {
+// wait blocks until the fd is readable or timeout passes.
+func (w *fdWaiter) wait(timeout time.Duration) error {
 	_, err := w.waitUntil(time.Now().Add(timeout))
 	return err
 }
 
-// waitUntil blocks until the EQ is readable, the deadline passes (zero: none)
+// waitUntil blocks until the fd is readable, the deadline passes (zero: none)
 // or interrupt is called; woken reports an interrupt. The deadline is set
 // under the lock interrupt takes, so an interrupt is never overwritten by a
 // later deadline.
-func (w *eqWaiter) waitUntil(deadline time.Time) (woken bool, err error) {
+func (w *fdWaiter) waitUntil(deadline time.Time) (woken bool, err error) {
 	w.mu.Lock()
 	if w.woken {
 		w.woken = false
@@ -104,7 +103,7 @@ func (w *eqWaiter) waitUntil(deadline time.Time) (woken bool, err error) {
 }
 
 // interrupt makes the current or the next waitUntil return woken.
-func (w *eqWaiter) interrupt() {
+func (w *fdWaiter) interrupt() {
 	w.mu.Lock()
 	w.woken = true
 	if w.waiting {
