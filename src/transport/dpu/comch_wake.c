@@ -28,7 +28,6 @@ struct dmesh_wake_producer {
     struct objects *objs;
     uint64_t session_id, session_epoch;
     struct doca_comch_producer *producer;
-    uint32_t consumer;
     unsigned refs;
     enum wake_state state;
     bool idle;                 /* the context reached IDLE after a stop */
@@ -181,7 +180,7 @@ doca_error_t dmesh_wake_attach(struct dmesh_conn *c, struct doca_comch_connectio
     for (unsigned i = 0; i < DMESH_MAX_SESSIONS; ++i) {
         struct dmesh_wake_producer *e = &o->wake_producers[i];
         if (e->state != WAKE_FREE && e->session_id == c->key.session_id &&
-            e->session_epoch == c->key.session_epoch && e->consumer == consumer) {
+            e->session_epoch == c->key.session_epoch) {
             p = e;
             break;
         }
@@ -198,7 +197,6 @@ doca_error_t dmesh_wake_attach(struct dmesh_conn *c, struct doca_comch_connectio
         p->objs = o;
         p->session_id = c->key.session_id;
         p->session_epoch = c->key.session_epoch;
-        p->consumer = consumer;
         pthread_mutex_t *lock = dmesh_dispatch_sdk_lock(o);
         if (lock) pthread_mutex_lock(lock);
         doca_error_t r = wake_start(p, connection);
@@ -212,6 +210,7 @@ doca_error_t dmesh_wake_attach(struct dmesh_conn *c, struct doca_comch_connectio
     }
     p->refs++;
     c->wake = p;
+    c->wake_consumer = consumer;              /* the session's, or the host flow's own */
     c->wake_desc_pending = false;
     return DOCA_SUCCESS;
 }
@@ -242,7 +241,7 @@ doca_error_t dmesh_wake_send_desc(struct dmesh_conn *c, uint64_t seq, uint32_t p
                                            .seq = seq, .pos = pos, .len = len};
     struct doca_comch_producer_task_send *task;
     doca_error_t r = doca_comch_producer_task_send_alloc_init(p->producer, NULL, (uint8_t *)&c->wake_imm,
-                                                              DMESH_WAKE_IMM_LEN, p->consumer, &task);
+                                                              DMESH_WAKE_IMM_LEN, c->wake_consumer, &task);
     if (r == DOCA_ERROR_NO_MEMORY)
         return DOCA_ERROR_AGAIN;
     if (r != DOCA_SUCCESS)

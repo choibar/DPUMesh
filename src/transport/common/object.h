@@ -49,6 +49,8 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
  * This is the per-worker-thread limit; total = num_threads x this. */
 #define DMESH_MAX_CONNECTIONS 64
 #define DMESH_MAX_SESSIONS 64
+/* Host flow slots per session that may each bring a flow wake consumer. */
+#define DMESH_SESSION_FLOW_CONSUMERS 32
 
 /* A Comch peer is a channel, independently of its logical data flows. */
 struct dmesh_session {
@@ -82,7 +84,28 @@ struct dmesh_session {
      * publish through a worker producer (dpu/comch_wake.c). */
     uint32_t wake_consumer;
     bool wake_ready_sent;
+    /* Flow wake: the session's further host consumers, one per host flow
+     * slot, any of which an OPEN may name (0 = free entry). */
+    uint32_t flow_consumers[DMESH_SESSION_FLOW_CONSUMERS];
 };
+
+/* Flow wake consumers of a session: record an arrival or an expiry, and
+ * whether an OPEN may name one. */
+static inline void dmesh_session_flow_consumer_set(struct dmesh_session *s, uint32_t id, bool present)
+{
+    for (unsigned i = 0; i < DMESH_SESSION_FLOW_CONSUMERS; ++i)
+        if (s->flow_consumers[i] == (present ? 0 : id)) {
+            s->flow_consumers[i] = present ? id : 0;
+            return;
+        }
+}
+static inline bool dmesh_session_flow_consumer(const struct dmesh_session *s, uint32_t id)
+{
+    for (unsigned i = 0; id != 0 && i < DMESH_SESSION_FLOW_CONSUMERS; ++i)
+        if (s->flow_consumers[i] == id)
+            return true;
+    return false;
+}
 
 /* A push descriptor reached host memory: queue one DOORBELL for an ARMed host. */
 static inline void dmesh_session_push_published(struct dmesh_session *s)
@@ -208,6 +231,7 @@ struct dmesh_conn {
      * host's consumer instead of the desc copy. One the producer could not
      * take yet is retried from the RUNNING advance. */
     struct dmesh_wake_producer *wake;
+    uint32_t wake_consumer;                   /* the host consumer the descriptors go to */
     bool wake_desc_pending;
     struct dmesh_wake_desc wake_imm;          /* the send task points at it */
 

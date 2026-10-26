@@ -373,8 +373,10 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     }
     bool backend = h->type == DMESH_SESSION_BACKEND_OPEN;
     uint32_t requested_worker = 0, request_token = 0;
+    /* A flow-wake host appends the u32 id of the flow's own consumer. */
+    size_t base = sizeof(struct dmesh_export_metadata_msg) + (backend ? 8 : 0);
     if ((h->type != DMESH_SESSION_OPEN && !backend) ||
-        h->payload_len != sizeof(struct dmesh_export_metadata_msg) + (backend ? 8 : 0)) {
+        (h->payload_len != base && h->payload_len != base + 4)) {
         reply_error(o, s, h, EINVAL); return;
     }
     if (h->generation < s->generation[idx] ||
@@ -406,6 +408,8 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     }
     struct dmesh_export_metadata_msg metadata;
     memcpy(&metadata, payload, sizeof(metadata));
+    uint32_t flow_consumer = h->payload_len == base + 4 ?
+        dmesh_session_get_u32((const uint8_t *)payload + sizeof(metadata)) : 0;
     bool backend_mode = metadata.flow.mode == DMESH_FLOW_MODE_BACKEND ||
                         metadata.flow.mode == DMESH_FLOW_MODE_BACKEND_PULL;
     if (backend != backend_mode || (backend && (metadata.flow.dst_ip != s->listen_ip ||
@@ -438,7 +442,9 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     memcpy(m.payload, &metadata, sizeof(metadata));
     if (s->wake_consumer && s->connection && DMESH_FLOW_USES_PUSH(metadata.flow.mode)) {
         m.wake_connection = s->connection;
-        m.wake_consumer = s->wake_consumer;
+        /* A named consumer this session has not seen arrive yet leaves the
+         * flow on the session's: the host publishes from either. */
+        m.wake_consumer = dmesh_session_flow_consumer(s, flow_consumer) ? flow_consumer : s->wake_consumer;
     }
     if (!admit(&d->workers[owner], &m)) {
         memset(a, 0, sizeof(*a)); reply_error(o, s, h, EAGAIN); return;

@@ -594,8 +594,14 @@ static void server_consumer_arrived(struct doca_comch_event_consumer *event,
     if (objs == NULL || !objs->dispatcher || !dmesh_wake_enabled())
         return;
     struct dmesh_session *s = session_get(objs, connection, false);
-    if (s != NULL && !s->closing && s->wake_consumer == 0)
+    if (s == NULL || s->closing)
+        return;
+    /* The first consumer is the session's; later ones are host flow slots'
+     * own (flow wake), named by the OPENs of their flows. */
+    if (s->wake_consumer == 0)
         s->wake_consumer = id;
+    else
+        dmesh_session_flow_consumer_set(s, id, true);
 }
 static void server_consumer_expired(struct doca_comch_event_consumer *event,
                                     struct doca_comch_connection *connection, uint32_t id)
@@ -605,6 +611,8 @@ static void server_consumer_expired(struct doca_comch_event_consumer *event,
     struct dmesh_session *s = objs ? session_get(objs, connection, false) : NULL;
     if (s != NULL && s->wake_consumer == id)
         s->wake_consumer = 0;
+    else if (s != NULL)
+        dmesh_session_flow_consumer_set(s, id, false);
 }
 
 doca_error_t

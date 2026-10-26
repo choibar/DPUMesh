@@ -9,7 +9,8 @@
  * idle host sleeps on that PE's notification with no ARM round trip.
  *
  * Each worker keeps one producer per session it serves such flows of, on its
- * own PE (consumer_pe). Producer create/start/stop/destroy go through the
+ * own PE (consumer_pe); each send names the flow's consumer: the session's,
+ * or with flow wake the host flow slot's own. Producer create/start/stop/destroy go through the
  * session's connection, which the dispatcher thread progresses, so they run
  * under the dispatcher's SDK lock; sends and completions are worker-local.
  */
