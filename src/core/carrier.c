@@ -406,22 +406,25 @@ int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
 }
 /* An armed doorbell is one-shot: it fires on the next completion of any of the
  * connection's engines and stays readable until cleared. Rearmed only after a
- * clear, so a sleeping consumer costs one request per wake. The ticket read
+ * clear, so a sleeping consumer costs one request per wake. A flow wake's
+ * consumer outlives its flows, and only its request clears what raised it as
+ * a flow closed, so it is rearmed whatever the slot's state. The ticket read
  * under the slot lock pairs with the submitter's check of the EQ's sleep flag:
  * either this sees the new custody or the submitter wakes the EQ. */
 int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
 {
     if (stripe < 0 || stripe >= SLOTS) return 0;
     struct slot *s = &t->slots[stripe];
-    if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == SLOT_FREE) return 0;
+    int flow_wake = channel_dev_flow_wake(t->dev);
+    if (!flow_wake && __atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == SLOT_FREE) return 0;
     pthread_mutex_lock(&s->lock);
     int busy = 0;
+    if (!s->armed && (flow_wake ? channel_flow_arm(t->dev, (uint32_t)stripe + 1) == 0
+                                : s->state == SLOT_OPEN && channel_conn_arm(s->conn) == 0))
+        s->armed = 1;
     if (s->state == SLOT_OPEN) {
         if (s->t_head != s->t_tail) busy = DMESH_STRIPE_CUSTODY;
-        if (!s->armed && (channel_dev_flow_wake(t->dev) ? channel_flow_arm(t->dev, (uint32_t)stripe + 1)
-                                                        : channel_conn_arm(s->conn)) == 0)
-            s->armed = 1;
-    } else if (s->t_head != s->t_tail || s->fin_pending) {
+    } else if (s->state == SLOT_CLOSED && (s->t_head != s->t_tail || s->fin_pending)) {
         busy = DMESH_STRIPE_RETIRING;   /* retired by the next poll */
     }
     pthread_mutex_unlock(&s->lock);

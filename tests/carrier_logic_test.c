@@ -6,11 +6,14 @@ static int arm_result;
 static unsigned progress_calls;
 int channel_dev_progress(struct channel_dev *dev)
 { (void)dev; ++progress_calls; return 0; }
-/* No flow wake here: the stripes keep their slot epoll doorbells. */
-int channel_dev_flow_wake(const struct channel_dev *dev) { (void)dev; return 0; }
+/* Off unless a test turns it on: the stripes keep their slot epoll doorbells. */
+static int flow_wake;
+static unsigned flow_arm_calls;
+int channel_dev_flow_wake(const struct channel_dev *dev) { (void)dev; return flow_wake; }
 int channel_flow_fd(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; return -1; }
 void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; }
-int channel_flow_arm(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; return -1; }
+int channel_flow_arm(struct channel_dev *dev, uint32_t flow_id)
+{ (void)dev; assert(flow_id == 1); ++flow_arm_calls; return 0; }
 uint32_t channel_dev_take_news(struct channel_dev *dev) { (void)dev; return 0; }
 
 int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *token)
@@ -23,6 +26,7 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 { (void)dev; (void)cfg; (void)out; assert(!"unexpected open"); return -1; }
 int channel_conn_fds(struct channel_conn *conn, int *fds, int max)
 { (void)conn; (void)fds; (void)max; return 0; }
+void channel_conn_clear(struct channel_conn *conn, int fd) { (void)conn; (void)fd; }
 
 static void test_closed_stripe_stays_pollable_until_retired(void)
 {
@@ -86,10 +90,34 @@ static void test_custody_polling(void)
     free(t);
 }
 
+/* A flow wake's consumer outlives its flows: one raised as its flow closed is
+ * cleared by the next request, which a closed or free slot still gets. */
+static void test_flow_consumer_rearmed_after_close(void)
+{
+    struct dmesh_native_transport *t = calloc(1, sizeof(*t));
+    assert(t);
+    struct slot *s = &t->slots[0];
+    assert(pthread_mutex_init(&s->lock, NULL) == 0);
+    flow_wake = 1;
+    s->state = SLOT_OPEN;
+    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 1);
+    s->state = SLOT_CLOSED;
+    dmesh_native_stripe_clear(t, 0);
+    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 2);
+    s->state = SLOT_FREE;
+    dmesh_native_stripe_clear(t, 0);
+    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 3);
+    assert(dmesh_native_stripe_arm(t, 0) == 0 && flow_arm_calls == 3); /* still one-shot */
+    flow_wake = 0;
+    pthread_mutex_destroy(&s->lock);
+    free(t);
+}
+
 int main(void)
 {
     test_closed_stripe_stays_pollable_until_retired();
     test_custody_polling();
+    test_flow_consumer_rearmed_after_close();
     uint32_t p[2];
     assert(carrier_chunks(0, p) == 0);
     assert(carrier_chunks(1, p) == 1 && p[0] == 1);
@@ -113,6 +141,6 @@ int main(void)
     assert(carrier_window_release(&w, 384) == 0);
     assert(carrier_window_advance(&w, &seq, &bytes) && seq == 3 && bytes == 600);
     assert(carrier_window_add(&w, 1 + CHANNEL_DESC_N, 0, 8) == 0);  /* slot reuse after retirement */
-    puts("carrier logic: chunking, release window, custody polling: PASS");
+    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm: PASS");
     return 0;
 }
