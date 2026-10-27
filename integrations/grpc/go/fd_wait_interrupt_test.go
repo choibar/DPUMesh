@@ -7,14 +7,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func newTestWaiter(t *testing.T) (*fdWaiter, int) {
+// newTestFDs returns an epoll set nesting an eventfd, as a native QP's fd
+// nests its doorbells.
+func newTestFDs(t *testing.T) (eq, fd int) {
 	t.Helper()
 	eq, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { unix.Close(eq) })
-	fd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	fd, err = unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +24,13 @@ func newTestWaiter(t *testing.T) (*fdWaiter, int) {
 	if err = unix.EpollCtl(eq, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(fd)}); err != nil {
 		t.Fatal(err)
 	}
-	w, err := newFDWaiter(eq)
+	return eq, fd
+}
+
+func newTestWaiter(t *testing.T) (*fdWaiter, int) {
+	t.Helper()
+	eq, fd := newTestFDs(t)
+	w, err := newFDWaiter(eq, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

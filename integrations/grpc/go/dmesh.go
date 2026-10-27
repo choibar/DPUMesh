@@ -638,20 +638,25 @@ func (c *Conn) Read(p []byte) (int, error) {
 }
 
 // takeLocked copies queued leases into p and moves the fully read ones to
-// c.done for release after c.mu is dropped. Requires c.mu and c.readMu.
+// c.done for release after c.mu is dropped. The rest move to the front of the
+// queue's array, which deliver keeps appending to. Requires c.mu and c.readMu.
 func (c *Conn) takeLocked(p []byte) int {
-	n := 0
-	for n < len(p) && len(c.rx) != 0 {
-		lease := &c.rx[0]
+	n, read := 0, 0
+	for n < len(p) && read < len(c.rx) {
+		lease := &c.rx[read]
 		k := copy(p[n:], lease.buf[c.pos:])
 		n += k
 		c.pos += k
 		if c.pos == len(lease.buf) {
 			c.done = append(c.done, lease.token)
-			c.rx[0] = rxLease{}
-			c.rx = c.rx[1:]
+			read++
 			c.pos = 0
 		}
+	}
+	if read != 0 {
+		left := copy(c.rx, c.rx[read:])
+		clear(c.rx[left:])
+		c.rx = c.rx[:left]
 	}
 	return n
 }

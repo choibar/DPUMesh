@@ -63,6 +63,15 @@ type cgoQP struct {
 	qp     *C.dmesh_qp_t
 	waiter *fdWaiter
 	events *C.dmesh_event_t
+	max    C.int // events the next poll may return
+	r      C.int // the last poll's result: events, or -errno
+}
+
+// poll is the waiter's try: one native poll, which arms the QP's fd when it
+// comes back empty.
+func (q *cgoQP) poll() bool {
+	q.r = C.dmesh_go_poll(q.qp, q.events, q.max)
+	return q.r != 0
 }
 
 // openCgoNative opens the process channel and puts its fd on the netpoller.
@@ -79,7 +88,7 @@ func openCgoNative() (*cgoNative, error) {
 	if fd := C.dmesh_channel_fd(ch); fd < 0 {
 		err = syscall.EIO
 	} else {
-		n.listener, err = newFDWaiter(int(fd))
+		n.listener, err = newFDWaiter(int(fd), nil)
 	}
 	if err != nil {
 		err = fmt.Errorf("dmesh: channel fd: %w", err)
@@ -102,7 +111,7 @@ func wrap(qp *C.dmesh_qp_t) (*cgoQP, error) {
 		if fd := C.dmesh_qp_fd(qp); fd < 0 {
 			err = syscall.EIO
 		} else {
-			q.waiter, err = newFDWaiter(int(fd))
+			q.waiter, err = newFDWaiter(int(fd), q.poll)
 		}
 	}
 	if err != nil {
@@ -115,33 +124,21 @@ func wrap(qp *C.dmesh_qp_t) (*cgoQP, error) {
 
 // pollWait drains the QP; while it is empty the goroutine parks on the Go
 // netpoller until the QP's fd is readable, wake is called or maxWaitNs passes
-// (< 0: unbounded). A wake or an expiry returns 0.
+// (< 0: unbounded). A wake or an expiry returns 0. The waiter runs the polls
+// (cgoQP.poll), each after the netpoller's readiness is reset.
 func (n *cgoNative) pollWait(id qpID, out []nativeEvent, maxWaitNs int64) (int, error) {
 	q := (*cgoQP)(id)
-	max := len(out)
-	if max > C.DMESH_GO_EVENTS {
-		max = C.DMESH_GO_EVENTS
-	}
+	q.max = C.int(min(len(out), C.DMESH_GO_EVENTS))
 	var deadline time.Time
 	if maxWaitNs >= 0 {
 		deadline = time.Now().Add(time.Duration(maxWaitNs))
 	}
-	var r C.int
-	for {
-		r = C.dmesh_go_poll(q.qp, q.events, C.int(max))
-		if r < 0 {
-			return 0, syscall.Errno(-r)
-		}
-		if r > 0 {
-			break
-		}
-		woken, err := q.waiter.waitUntil(deadline)
-		if err != nil {
-			return 0, err
-		}
-		if woken || (!deadline.IsZero() && !time.Now().Before(deadline)) {
-			return 0, nil
-		}
+	if _, err := q.waiter.waitUntil(deadline); err != nil {
+		return 0, err
+	}
+	r := q.r
+	if r < 0 {
+		return 0, syscall.Errno(-r)
 	}
 	events := unsafe.Slice(q.events, int(r))
 	for i := range events {

@@ -769,3 +769,30 @@ func TestServiceListenerNeedsNoAddress(t *testing.T) {
 		}
 	}
 }
+
+// Reading moves the unread leases to the front of the queue's array, so a
+// connection that delivers and reads in turn stops allocating.
+func TestReceiveQueueReusesItsArray(t *testing.T) {
+	c := &Conn{}
+	lease := []byte("abcd")
+	p := make([]byte, 8)
+	cycle := func() {
+		c.deliver(lease, 1)
+		c.deliver(lease, 2)
+		c.mu.Lock()
+		n := c.takeLocked(p[:6])
+		n += c.takeLocked(p[6:])
+		c.mu.Unlock()
+		if n != 8 || string(p) != "abcdabcd" || len(c.done) != 2 || c.done[0] != 1 || c.done[1] != 2 || len(c.rx) != 0 {
+			t.Fatalf("read %d bytes %q, leases done %v, %d queued", n, p, c.done, len(c.rx))
+		}
+		c.done = c.done[:0]
+	}
+	cycle()
+	if raceEnabled {
+		return
+	}
+	if allocs := testing.AllocsPerRun(100, cycle); allocs != 0 {
+		t.Fatalf("%v allocations per delivery and read", allocs)
+	}
+}
