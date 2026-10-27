@@ -124,6 +124,9 @@ struct dmesh_conn {
     struct dmesh_session *session;
     uint32_t flow_id, generation;
     bool multiplexed, ready_sent, error_sent, close_requested, quarantined;
+    /* Dispatcher asked the proxy to drain this flow (GOAWAY) so the host
+     * reconnects on another worker; taken once by the proxy driver. */
+    bool migrate_requested;
     bool readers_detached; /* proxy acknowledged local staging pointer retirement */
     int32_t error_status;
     struct dmesh_export_metadata_msg *pending_metadata;
@@ -229,6 +232,7 @@ struct objects {
     struct dmesh_worker_mailbox *mailbox;
     struct dmesh_comch_client legacy_client; /* compatibility adapter, not used by native channels */
     int worker_idx;                 /* index of the owning worker thread */
+    bool migrate_pending;           /* some conn has migrate_requested set */
     struct doca_dev *dev;
     struct doca_dev_rep *rep_dev;
     struct doca_pe *pe;

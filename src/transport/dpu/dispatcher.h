@@ -43,6 +43,9 @@ int dmesh_dispatch_worker_fd(struct objects *);
 void dmesh_dispatch_worker_arm(struct objects *);
 void dmesh_dispatch_worker_drain(struct objects *);
 void dmesh_dispatch_worker_flush(struct objects *);
+/* Slots the dispatcher asked to drain for migration (GOAWAY); each is
+ * returned once. Returns the count written to slots (at most max). */
+int dmesh_dispatch_worker_take_migrations(struct objects *, int32_t *slots, int max);
 void dmesh_dispatch_worker_ready(struct objects *);
 void dmesh_dispatch_worker_depart(struct objects *);
 bool dmesh_dispatch_worker_stop_admission(struct objects *);

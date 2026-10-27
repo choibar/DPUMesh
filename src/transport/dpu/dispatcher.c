@@ -16,7 +16,7 @@
 /* Only control messages cross these queues. In particular no DMA descriptor,
  * payload, data completion or credit update visits the dispatcher. */
 #define QUEUE_SIZE 128u
-enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, ARM };
+enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, ARM, DRAIN };
 struct message {
     struct dmesh_flow_key key;
     struct dmesh_flow_location location;
@@ -44,6 +44,19 @@ struct assignment {
     struct dmesh_flow_key key;
     struct dmesh_flow_location location;
     uint32_t backend_token;
+    /* Migration: a draining flow was told to GOAWAY; its host reconnects and
+     * the reconnect is steered (struct steer) to another worker. */
+    bool draining, drain_pending;
+    uint32_t mode, dst_ip;
+    uint16_t dst_port;
+    uint64_t ready_ms;
+};
+/* The next client OPEN of `session` to dst goes to `worker`, until expiry. */
+struct steer {
+    struct dmesh_session *session;
+    uint64_t session_epoch, expires_ms;
+    uint32_t dst_ip, worker;
+    uint16_t dst_port;
 };
 struct dmesh_dispatcher {
     size_t count, cursor;
@@ -54,6 +67,13 @@ struct dmesh_dispatcher {
     struct assignment *flows; /* worker-local slot reservation table */
     struct pollfd *pollfds;
     struct dmesh_placement_policy policy;
+    /* DMESH_MIGRATE_PERIOD_MS: drain every client flow that has been ready on
+     * its worker this long and steer its reconnect to the next worker (a
+     * mechanism test; the policy deciding when/where comes later).
+     * DMESH_MIGRATE_MAX caps the total (0 = unlimited). */
+    uint64_t migrate_period_ms, steer_ms;
+    unsigned long migrate_max, migrations;
+    struct steer steers[DMESH_MAX_CONNECTIONS];
     int fd;
     pthread_t thread;
     _Atomic unsigned remaining;
@@ -141,6 +161,19 @@ static void forget_listeners(struct dmesh_dispatcher *d)
     pthread_mutex_unlock(&membership_lock);
 }
 
+static uint64_t realtime_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+static uint64_t env_u64(const char *name, uint64_t fallback)
+{
+    const char *env = getenv(name);
+    char *end = NULL;
+    unsigned long long v = env && *env ? strtoull(env, &end, 10) : 0;
+    return env && *env && end && !*end ? (uint64_t)v : fallback;
+}
 static void wake(int fd)
 {
     uint64_t one = 1;
@@ -315,6 +348,61 @@ static void arm_flows(struct dmesh_dispatcher *d, struct objects *o, struct dmes
     }
 }
 
+static int take_steer(struct dmesh_dispatcher *d, struct dmesh_session *s,
+                      uint32_t dst_ip, uint16_t dst_port)
+{
+    uint64_t now = membership_now_ms();
+    for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+        struct steer *st = &d->steers[i];
+        if (!st->session) continue;
+        if (now >= st->expires_ms) { memset(st, 0, sizeof(*st)); continue; }
+        if (st->session == s && st->session_epoch == s->epoch &&
+            st->dst_ip == dst_ip && st->dst_port == dst_port) {
+            int worker = (int)st->worker;
+            memset(st, 0, sizeof(*st));
+            return worker;
+        }
+    }
+    return -1;
+}
+/* Drain each client flow ready for migrate_period_ms; steer its reconnect to
+ * the next eligible worker with a free slot. The old flow keeps its worker and
+ * slot until the host closes it, so no live state ever changes owner. */
+static void migrate_due(struct dmesh_dispatcher *d)
+{
+    if (!d->migrate_period_ms || d->count < 2) return;
+    uint64_t now = membership_now_ms();
+    for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
+        if (d->migrate_max && d->migrations >= d->migrate_max) return;
+        struct assignment *a = &d->flows[i];
+        if (!a->used || !a->ready || a->draining || a->backend_token ||
+            a->close_pending || a->lost_pending || a->session->closing ||
+            (a->mode != DMESH_FLOW_MODE_CLIENT && a->mode != DMESH_FLOW_MODE_INGRESS_PUSH) ||
+            now - a->ready_ms < d->migrate_period_ms)
+            continue;
+        size_t from = a->location.worker, to = from;
+        for (size_t k = 1; k < d->count; ++k) {
+            size_t w = (from + k) % d->count;
+            if (atomic_load(&d->workers[w].ready) && !atomic_load(&d->workers[w].departed) &&
+                d->loads[w].assigned < DMESH_MAX_CONNECTIONS) { to = w; break; }
+        }
+        if (to == from) continue;
+        struct steer *st = NULL;
+        for (unsigned j = 0; j < DMESH_MAX_CONNECTIONS && !st; ++j)
+            if (!d->steers[j].session || now >= d->steers[j].expires_ms) st = &d->steers[j];
+        if (!st) continue;
+        *st = (struct steer){.session = a->session, .session_epoch = a->session->epoch,
+            .expires_ms = now + d->steer_ms, .dst_ip = a->dst_ip, .dst_port = a->dst_port,
+            .worker = (uint32_t)to};
+        a->draining = true;
+        a->drain_pending = true;
+        ++d->migrations;
+        fprintf(stderr, "[dispatcher] migrate session=%lu/%lu flow=%u/%u from=%zu slot=%u to=%zu n=%lu unix_ns=%llu\n",
+                a->key.session_id, a->key.session_epoch, a->key.flow_id, a->key.generation,
+                from, a->location.slot, to, d->migrations, (unsigned long long)realtime_ns());
+    }
+}
+
 void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
                               const struct dmesh_session_header *h, const void *payload)
 {
@@ -415,6 +503,12 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         d->loads[i].eligible = atomic_load(&d->workers[i].ready) && !atomic_load(&d->workers[i].departed);
     int owner = backend ? (int)requested_worker :
         d->policy.select(&spec, d->loads, d->count, d->cursor, d->policy.context);
+    int steered = backend ? -1 : take_steer(d, s, metadata.flow.dst_ip, metadata.flow.dst_port);
+    if (steered >= 0 && d->loads[steered].eligible &&
+        d->loads[steered].assigned < DMESH_MAX_CONNECTIONS)
+        owner = steered;
+    else
+        steered = -1;
     if (owner < 0 || (size_t)owner >= d->count || !d->loads[owner].eligible ||
         d->loads[owner].assigned >= DMESH_MAX_CONNECTIONS) {
         reply_error(o, s, h, ENOSPC); return;
@@ -427,7 +521,8 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     *a = (struct assignment){.used = true, .opening = true, .control = o, .session = s,
         .key = {spec.session_id, spec.session_epoch, h->flow_id, h->generation},
         .location = {.worker = (uint32_t)owner, .slot = slot, .ownership_epoch = 1},
-        .backend_token = request_token};
+        .backend_token = request_token, .mode = metadata.flow.mode,
+        .dst_ip = metadata.flow.dst_ip, .dst_port = metadata.flow.dst_port};
     struct message m = {.key = a->key, .location = a->location, .type = OPEN, .length = sizeof(metadata)};
     memcpy(m.payload, &metadata, sizeof(metadata));
     if (!admit(&d->workers[owner], &m)) {
@@ -440,8 +535,9 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     s->closed[idx] = false;
     s->close_status[idx] = 0;
     wake(d->workers[owner].fd);
-    fprintf(stderr, "[dispatcher] session=%lu/%lu flow=%u/%u owner=%d slot=%u epoch=1 backend=%d\n",
-            a->key.session_id, a->key.session_epoch, h->flow_id, h->generation, owner, slot, backend);
+    fprintf(stderr, "[dispatcher] session=%lu/%lu flow=%u/%u owner=%d slot=%u epoch=1 backend=%d steered=%d unix_ns=%llu\n",
+            a->key.session_id, a->key.session_epoch, h->flow_id, h->generation, owner, slot, backend,
+            steered >= 0, (unsigned long long)realtime_ns());
 }
 
 void dmesh_dispatcher_session_lost(struct objects *o, struct dmesh_session *s)
@@ -469,7 +565,15 @@ static void flush_commands(struct dmesh_dispatcher *d)
 {
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
         struct assignment *a = &d->flows[i];
-        if (!a->used || (!a->lost_pending && !a->close_pending)) continue;
+        if (!a->used) continue;
+        if (a->drain_pending) {
+            struct message m = {.key = a->key, .location = a->location, .type = DRAIN};
+            if (push(&d->workers[a->location.worker].requests, &m)) {
+                a->drain_pending = false;
+                wake(d->workers[a->location.worker].fd);
+            }
+        }
+        if (!a->lost_pending && !a->close_pending) continue;
         struct message m = {.key = a->key, .location = a->location,
                             .type = a->lost_pending ? LOST : CLOSE};
         if (push(&d->workers[a->location.worker].requests, &m)) {
@@ -523,6 +627,7 @@ static void flush_replies(struct dmesh_dispatcher *d)
                     }
                     if (r == DOCA_SUCCESS && m.type == DMESH_SESSION_READY) {
                         a->ready = true;
+                        a->ready_ms = membership_now_ms();
                         if (a->opening) { a->opening = false; --d->loads[w].opening; }
                     }
                 }
@@ -585,11 +690,27 @@ void dmesh_dispatch_worker_drain(struct objects *o)
         } else if (same_key(&c->key, &m.key) &&
                    c->location.ownership_epoch == m.location.ownership_epoch && c->state != DMESH_CONN_FREE) {
             if (m.type == ARM) { arm_flow(c, &m); continue; }
+            if (m.type == DRAIN) { c->migrate_requested = o->migrate_pending = true; continue; }
             if (m.type == LOST) c->session->closing = true;
             if (m.type == CLOSE) c->close_requested = true;
             c->state = DMESH_CONN_CLOSING;
         }
     }
+}
+int dmesh_dispatch_worker_take_migrations(struct objects *o, int32_t *slots, int max)
+{
+    if (!o || !o->migrate_pending) return 0;
+    int n = 0;
+    bool more = false;
+    for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+        struct dmesh_conn *c = &o->conns[i];
+        if (!c->migrate_requested) continue;
+        if (n == max) { more = true; break; }
+        c->migrate_requested = false;
+        slots[n++] = (int32_t)i;
+    }
+    o->migrate_pending = more;
+    return n;
 }
 doca_error_t dmesh_dispatch_reply(struct dmesh_conn *c, uint16_t type,
                                   const void *payload, size_t length, int32_t status)
@@ -663,6 +784,7 @@ static void *dispatch_main(void *arg)
             (void)dmesh_doca_ctrl_drain(d->controls[i]);
         }
         flush_replies(d);
+        migrate_due(d);
         flush_commands(d);
         flush_listeners(d);
         for (size_t i = 0; i < d->count; ++i) dmesh_sessions_advance(d->controls[i]);
@@ -719,6 +841,13 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
     if (!d->controls || !d->workers || !d->loads || !d->flows || !d->pollfds) goto fail;
     size_t initialized = 0;
     d->policy = dmesh_placement_least_flows;
+    d->migrate_period_ms = env_u64("DMESH_MIGRATE_PERIOD_MS", 0);
+    d->migrate_max = (unsigned long)env_u64("DMESH_MIGRATE_MAX", 0);
+    d->steer_ms = env_u64("DMESH_MIGRATE_STEER_MS", 5000);
+    if (d->migrate_period_ms)
+        fprintf(stderr, "[dispatcher] migration period=%llums max=%lu steer=%llums\n",
+                (unsigned long long)d->migrate_period_ms, d->migrate_max,
+                (unsigned long long)d->steer_ms);
     const char *policy = getenv("DMESH_FLOW_PLACEMENT");
     if (policy && strcmp(policy, "round-robin") == 0) d->policy = dmesh_placement_round_robin;
     else if (policy && strcmp(policy, "least-flows") != 0) goto fail;
