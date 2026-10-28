@@ -89,6 +89,13 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 /* Quiesce reverse DMA, wait for CLOSED, then release the private ring.
  * Failure leaves the handle and exported memory live for safe retry. */
 int channel_conn_close(struct channel_conn *conn);
+/* The same close in two steps, for a caller that must not wait: start sends
+ * CLOSE; finish releases the ring once CLOSED arrived (0), reports 1 while it
+ * is outstanding, or -1 with errno (CLOSED with an error, a lost session, or
+ * no CLOSED in time), leaving the handle live for channel_conn_close. Neither
+ * progresses the session; CLOSED lands through channel_dev_progress. */
+int channel_conn_close_start(struct channel_conn *conn);
+int channel_conn_close_finish(struct channel_conn *conn);
 /* Progresses the control path (and the reverse completions on the host-dpa reverse path).
  * Returns 1 for CLOSED, -1 with errno for flow/session failure, otherwise 0. */
 int channel_conn_progress(struct channel_conn *conn);

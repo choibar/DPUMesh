@@ -10,7 +10,13 @@
  * Push batches have no doorbell: before sleeping, idle_arm asks the DPU to ring
  * over the control session, whose fd the core nests in every EQ. Custody ACKs
  * (the DPU's consumer_head) have neither, so stripe_arm keeps the consumer
- * polling while any is outstanding. */
+ * polling while any is outstanding.
+ *
+ * A FIN or reset closes the flow without waiting for the DPU: the slot sends
+ * CLOSE and stays CLOSING, its ring still exported, until a later poll sees
+ * CLOSED and releases it. The DPU's teardown (DMA stop, DPA thread release)
+ * takes tens of milliseconds, and a caller blocked on it would stall every
+ * other connection the same thread polls. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -36,7 +42,7 @@ static int trace_enabled = -1;
 #define TRACE(...) do { if (trace_enabled < 0) trace_enabled = getenv("DPUMESH_CARRIER_TRACE") != NULL; \
     if (trace_enabled) { fprintf(stderr, "carrier: " __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
-enum { SLOT_FREE = 0, SLOT_OPEN, SLOT_CLOSED };
+enum { SLOT_FREE = 0, SLOT_OPEN, SLOT_CLOSING, SLOT_CLOSED };
 struct ticket { uint16_t seq; uint64_t ticket; };
 struct slot {
     pthread_mutex_t lock;
@@ -48,6 +54,7 @@ struct slot {
     struct ticket tickets[TICKETS];
     uint32_t t_head, t_tail;
     int fin_pending, peer_gone_reported;
+    int close_failed;                  /* CLOSING without CLOSED: quarantined, ring kept */
     uint16_t fin_seq, rx_seq;
     struct carrier_rx_window window;
 };
@@ -108,7 +115,7 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
     s->backend = mode == CHANNEL_MODE_BACKEND_DPU_DMA || mode == CHANNEL_MODE_BACKEND_HOST_DPA;
     s->peer = s->backend ? (uint16_t)(1 + slot_index(t, s)) : (uint16_t)(UPORT_BASE + slot_index(t, s));
     s->t_head = s->t_tail = 0; s->fin_pending = 0; s->peer_gone_reported = 0; s->claimed = 0;
-    s->fin_seq = 0; s->rx_seq = 0;
+    s->fin_seq = 0; s->rx_seq = 0; s->close_failed = 0;
     carrier_window_init(&s->window);
     /* Published last: a drainer that reads OPEN without the slot lock sees
      * the connection it describes. Dials can run beside another EQ's drain. */
@@ -118,6 +125,12 @@ static int slot_open(struct dmesh_native_transport *t, struct slot *s, uint32_t 
     TRACE("slot %d open mode %u port %u peer %u service %d", slot_index(t, s), mode, port, s->peer, service_id);
     return 0;
 }
+static void slot_unwatch(struct slot *s, const int *fds, int nfd)
+{
+    for (int i = 0; i < nfd; ++i) (void)epoll_ctl(s->epfd, EPOLL_CTL_DEL, fds[i], NULL);
+    s->armed = 0;
+}
+/* Waits for CLOSED. Under the slot lock. */
 static int slot_close(struct dmesh_native_transport *t, struct slot *s)
 {
     (void)t;
@@ -125,11 +138,41 @@ static int slot_close(struct dmesh_native_transport *t, struct slot *s)
         int fds[CHANNEL_CONN_FDS], nfd = channel_conn_fds(s->conn, fds, CHANNEL_CONN_FDS);
         if (channel_conn_close(s->conn) != 0) return -1;
         s->conn = NULL;
-        for (int i = 0; i < nfd; ++i) (void)epoll_ctl(s->epfd, EPOLL_CTL_DEL, fds[i], NULL);
+        slot_unwatch(s, fds, nfd);
     }
     s->armed = 0;
     s->state = SLOT_CLOSED;
     return 0;
+}
+/* Sends CLOSE and leaves the slot CLOSING; slot_reap completes it. Under the slot lock. */
+static int slot_close_start(struct dmesh_native_transport *t, struct slot *s)
+{
+    if (!s->conn) return slot_close(t, s);
+    int fds[CHANNEL_CONN_FDS], nfd = channel_conn_fds(s->conn, fds, CHANNEL_CONN_FDS);
+    if (channel_conn_close_start(s->conn) != 0) return -1;
+    /* The doorbells serve a reader that is gone; CLOSED wakes the EQ through
+     * the control session. */
+    slot_unwatch(s, fds, nfd);
+    s->state = SLOT_CLOSING;
+    TRACE("slot %d closing port %u", slot_index(t, s), s->port);
+    return 0;
+}
+/* CLOSING -> CLOSED once the DPU confirmed. Under the slot lock. */
+static void slot_reap(struct dmesh_native_transport *t, struct slot *s)
+{
+    if (s->close_failed) return;
+    int rc = channel_conn_close_finish(s->conn);
+    if (rc == 0) {
+        s->conn = NULL;
+        s->state = SLOT_CLOSED;
+        TRACE("slot %d closed port %u", slot_index(t, s), s->port);
+    } else if (rc < 0) {
+        /* The DPU may still read the ring: keep it, and the slot, until
+         * dmesh_native_close retries the close. */
+        s->close_failed = 1;
+        fprintf(stderr, "dpumesh: flow %d port %u close failed (%s); slot quarantined\n",
+                slot_index(t, s) + 1, s->port, strerror(errno));
+    }
 }
 static void slot_free(struct dmesh_native_transport *t, struct slot *s)
 {
@@ -293,7 +336,7 @@ int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t 
     TRACE("submit slot %d port %u seq %u len %u off %d state %d", slot_index(t, s), d->src_port, d->seq, d->body_len, d->body_buf_slot, s->state);
     if (d->body_len == 0) {
         /* FIN or reset: the stream ends with the connection. */
-        if (s->state == SLOT_OPEN) rc = slot_close(t, s);
+        if (s->state == SLOT_OPEN) rc = slot_close_start(t, s);
         if (rc == 0) { s->fin_pending = 1; s->fin_seq = d->seq; }
     } else if (s->state != SLOT_OPEN) {
         errno = EPIPE; rc = -1;
@@ -376,7 +419,10 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
                 s->peer_gone_reported = 1; fill_rx(t, s, e, 0, 0); n = 1;   /* end of stream or malformed batch */
             }
         }
-    } else {
+    } else if (s->state == SLOT_CLOSING) {
+        slot_reap(t, s);
+    }
+    if (n == 0 && s->state == SLOT_CLOSED) {
         /* Closed: retire outstanding custody, then the close marker, then recycle. */
         if (s->t_head != s->t_tail) { fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1; }
         else if (s->fin_pending) {
@@ -398,7 +444,7 @@ void dmesh_native_release(struct dmesh_native_transport *t, int pos)
     pthread_mutex_lock(&s->lock);
     if (carrier_window_release(&s->window, (uint32_t)(local - CHANNEL_DATA_OFF)) == 0) {
         uint64_t seq, bytes;
-        if (carrier_window_advance(&s->window, &seq, &bytes) && s->conn) { channel_conn_rx_consumed(s->conn, seq, bytes); TRACE("release slot %zu cursor seq %lu bytes %lu", idx, (unsigned long)seq, (unsigned long)bytes); }
+        if (carrier_window_advance(&s->window, &seq, &bytes) && s->state == SLOT_OPEN) { channel_conn_rx_consumed(s->conn, seq, bytes); TRACE("release slot %zu cursor seq %lu bytes %lu", idx, (unsigned long)seq, (unsigned long)bytes); }
     }
     pthread_mutex_unlock(&s->lock);
 }
@@ -425,7 +471,7 @@ int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
     int busy = s->t_head != s->t_tail;
     if (s->state == SLOT_OPEN) {
         if (!s->armed && channel_conn_arm(s->conn) == 0) s->armed = 1;
-    } else {
+    } else if (s->state == SLOT_CLOSED) {
         busy |= s->fin_pending;   /* retired by the next poll */
     }
     pthread_mutex_unlock(&s->lock);
@@ -452,7 +498,7 @@ void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe)
     if (stripe < 0 || stripe >= SLOTS) return;
     struct slot *s = &t->slots[stripe];
     pthread_mutex_lock(&s->lock);
-    if (s->conn) {
+    if (s->state == SLOT_OPEN) {
         struct epoll_event evs[CHANNEL_CONN_FDS];
         int n = epoll_wait(s->epfd, evs, CHANNEL_CONN_FDS, 0);
         for (int i = 0; i < n; ++i) channel_conn_clear(s->conn, evs[i].data.fd);

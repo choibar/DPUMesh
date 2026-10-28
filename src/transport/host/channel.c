@@ -116,6 +116,7 @@ struct channel_conn {
 	int rx_ended;                       /* Push: end of stream or a malformed batch was read */
 	uint32_t flow_id, generation;
 	int open_sent, ready, peer_closed, error, close_sent, close_error;
+	uint64_t close_deadline_ms;         /* CLOSE sent: CLOSED expected by then */
 	/* host-dpa reverse path */
     struct dmesh_dpa_endpoint *reverse;
 	struct doca_mmap *tx_mmap;          /* Imported DPU tx_staging */
@@ -1129,6 +1130,28 @@ fail:
 	return -1;
 }
 
+/* Sends CLOSE once. Requires dev->session_lock. */
+static int conn_close_send_locked(struct channel_dev *dev, struct channel_conn *conn)
+{
+	if (!conn->open_sent || conn->peer_closed || conn->close_sent) return 0;
+	conn->close_error = 0;
+	if (session_send_locked(dev, DMESH_SESSION_CLOSE, conn->flow_id, conn->generation, NULL, 0) != 0)
+		return -1;
+	conn->close_sent = 1;
+	conn->close_deadline_ms = channel_now_ms() + CHANNEL_REV_READY_MS;
+	return 0;
+}
+
+/* Releases the ring once CLOSED proved the DPU stopped reading it. Requires
+ * dev->session_lock; conn is freed on success. */
+static int conn_close_finish_locked(struct channel_dev *dev, struct channel_conn *conn)
+{
+	uint32_t id = conn->flow_id;
+	int rc = conn_teardown(conn);
+	if (rc == 0) dev->flows[id] = NULL;
+	return rc;
+}
+
 int channel_conn_close(struct channel_conn *conn)
 {
 	if (conn == NULL) return 0;
@@ -1136,18 +1159,38 @@ int channel_conn_close(struct channel_conn *conn)
 	if (conn->dev->host_dpa && host_dpa_teardown(conn) != 0) return -1;
 	struct channel_dev *dev = conn->dev;
 	pthread_mutex_lock(&dev->session_lock);
+	if (conn->close_error) conn->close_sent = 0;   /* a failed close is asked again */
+	int rc = conn_close_send_locked(dev, conn);
+	if (rc == 0 && conn->close_sent && !conn->peer_closed)
+		rc = session_wait_locked(dev, conn, 1);
+	if (rc == 0) rc = conn_close_finish_locked(dev, conn);
+	pthread_mutex_unlock(&dev->session_lock);
+	return rc;
+}
+
+int channel_conn_close_start(struct channel_conn *conn)
+{
+	if (conn == NULL) return 0;
+	if (conn->dev->host_dpa && host_dpa_teardown(conn) != 0) return -1;
+	struct channel_dev *dev = conn->dev;
+	pthread_mutex_lock(&dev->session_lock);
+	int rc = conn_close_send_locked(dev, conn);
+	pthread_mutex_unlock(&dev->session_lock);
+	return rc;
+}
+
+int channel_conn_close_finish(struct channel_conn *conn)
+{
+	struct channel_dev *dev = conn->dev;
+	pthread_mutex_lock(&dev->session_lock);
 	int rc = 0;
-	if (conn->open_sent && !conn->peer_closed) {
-		conn->close_error = 0;
-		rc = session_send_locked(dev, DMESH_SESSION_CLOSE, conn->flow_id, conn->generation, NULL, 0);
-		if (rc == 0) conn->close_sent = 1;
-		if (rc == 0) rc = session_wait_locked(dev, conn, 1);
+	if (conn->close_sent && !conn->peer_closed) {
+		int saved = conn->close_error ? conn->close_error : dev->session_error;
+		if (!saved && channel_now_ms() >= conn->close_deadline_ms) saved = ETIMEDOUT;
+		if (saved) { errno = saved; rc = -1; }
+		else rc = 1;
 	}
-	if (rc == 0) {
-		uint32_t id = conn->flow_id;
-		rc = conn_teardown(conn);
-		if (rc == 0) dev->flows[id] = NULL;
-	}
+	if (rc == 0) rc = conn_close_finish_locked(dev, conn);
 	pthread_mutex_unlock(&dev->session_lock);
 	return rc;
 }
