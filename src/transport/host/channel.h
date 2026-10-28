@@ -86,6 +86,13 @@ void channel_mem_free(struct channel_mem *mem);
 
 /* Connection: tagged OPEN/READY on the shared session, private DMA rings. */
 int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out);
+/* The same open in two steps, for a caller that must not wait: start sends
+ * OPEN and returns the handle; finish reports READY (0), still outstanding
+ * (1), or -1 with errno (refused, lost session, or no READY within
+ * CHANNEL_REV_READY_MS), after which the handle is closed like an open one.
+ * Neither progresses the session. Not on the host-dpa path (ENOTSUP). */
+int channel_conn_open_start(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out);
+int channel_conn_open_finish(struct channel_conn *conn);
 /* Quiesce reverse DMA, wait for CLOSED, then release the private ring.
  * Failure leaves the handle and exported memory live for safe retry. */
 int channel_conn_close(struct channel_conn *conn);

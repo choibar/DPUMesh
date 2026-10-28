@@ -117,6 +117,7 @@ struct channel_conn {
 	uint32_t flow_id, generation;
 	int open_sent, ready, peer_closed, error, close_sent, close_error;
 	uint64_t close_deadline_ms;         /* CLOSE sent: CLOSED expected by then */
+	uint64_t open_deadline_ms;          /* OPEN sent: READY expected by then */
 	/* host-dpa reverse path */
     struct dmesh_dpa_endpoint *reverse;
 	struct doca_mmap *tx_mmap;          /* Imported DPU tx_staging */
@@ -1022,7 +1023,10 @@ static int conn_teardown(struct channel_conn *conn)
 	return 0;
 }
 
-int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
+/* Sends OPEN; with wait, also waits for READY (and sets up the host-dpa
+ * reverse path). */
+static int conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg,
+                     struct channel_conn **out, int wait)
 {
 	struct channel_conn *conn;
 	doca_error_t result;
@@ -1100,7 +1104,8 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
         if (session_send_locked(dev, type, conn->flow_id, conn->generation,
                                payload, offset + sizeof(metadata)) == 0) {
             conn->open_sent = 1;
-            rc = session_wait_locked(dev, conn, 0);
+            conn->open_deadline_ms = channel_now_ms() + CHANNEL_REV_READY_MS;
+            rc = wait ? session_wait_locked(dev, conn, 0) : 0;
         }
     }
 	int saved = errno;
@@ -1112,7 +1117,7 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 		return -1;
 	}
 
-	if (dev->host_dpa) {
+	if (wait && dev->host_dpa) {
 		result = host_dpa_setup(conn, cfg);
 		if (result != DOCA_SUCCESS) {
 			saved = error_number(result);
@@ -1128,6 +1133,32 @@ fail:
 	(void)channel_conn_close(conn);
 	errno = error_number(result);
 	return -1;
+}
+
+int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
+{
+	return conn_open(dev, cfg, out, 1);
+}
+
+int channel_conn_open_start(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
+{
+	/* The host-dpa reverse path sets up after READY, on the caller. */
+	if (dev && dev->host_dpa) { errno = ENOTSUP; return -1; }
+	return conn_open(dev, cfg, out, 0);
+}
+
+int channel_conn_open_finish(struct channel_conn *conn)
+{
+	struct channel_dev *dev = conn->dev;
+	pthread_mutex_lock(&dev->session_lock);
+	int rc = 1, saved = 0;
+	if (dev->session_error) saved = dev->session_error;
+	else if (conn->error || conn->peer_closed) saved = conn->error ? conn->error : ECONNRESET;
+	else if (conn->ready) rc = 0;
+	else if (channel_now_ms() >= conn->open_deadline_ms) saved = ETIMEDOUT;
+	pthread_mutex_unlock(&dev->session_lock);
+	if (saved) { errno = saved; return -1; }
+	return rc;
 }
 
 /* Sends CLOSE once. Requires dev->session_lock. */
