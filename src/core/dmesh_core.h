@@ -72,6 +72,7 @@ _Static_assert(DMESH_PORT_SPACE == (UINT16_MAX + 1),
 struct dmesh_eq {
     dmesh_channel_t   *ch;
     char               prepare_target[24]; /* PREPARE event text, valid until the next poll */
+    dmesh_scale_t      scale;              /* SCALE event body, valid until the next poll */
     atomic_int no_accept; /* private accelerator EQs leave incoming RPCs to reactors */
     struct dmesh_qp *accept_spare; /* preallocated before consuming an accept descriptor;
                                     * prevents OOM from stranding SERVER_PENDING */
@@ -268,6 +269,9 @@ int  dpumesh_lost(dpumesh_ctx_t *ctx);
  * or 0 when none is queued; report a client port's stream as a ready spare. */
 int  dpumesh_prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len);
 int  dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port);
+/* Flow scaling: the next SCALE request (1) or none (0); answer one. */
+int  dpumesh_scale_next(dpumesh_ctx_t *ctx, dmesh_scale_t *out);
+int  dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied);
 
 /* ====== Connection lifecycle — internal, shared by both surfaces ======
  *

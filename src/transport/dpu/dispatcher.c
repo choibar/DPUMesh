@@ -69,6 +69,16 @@ struct steer {
     size_t replaced;
     struct dmesh_flow_key replaced_key;
 };
+/* Flow scaling: the stream count asked of one session's clients of a
+ * destination. The entry stays after its ACK, so a count is asked once. */
+struct scale {
+    struct objects *control;
+    struct dmesh_session *session;
+    uint64_t session_epoch, sent_ms;
+    uint32_t dst_ip, count, token, applied;
+    uint16_t dst_port;
+    bool pending, acked, scaled_in;
+};
 struct dmesh_dispatcher {
     size_t count, cursor;
     uint32_t next_backend_token;
@@ -87,6 +97,14 @@ struct dmesh_dispatcher {
     bool migrate_spare;         /* DMESH_MIGRATE_SPARE=1: PREPARE first */
     uint32_t next_prepare_token;
     struct steer steers[DMESH_MAX_CONNECTIONS];
+    /* DMESH_SCALE_AFTER_MS: once a client flow has been ready this long, ask
+     * its session's clients of that destination for DMESH_SCALE_COUNT
+     * streams (default 2); DMESH_SCALE_IN_AFTER_MS later, for one again (0 =
+     * never). A mechanism test; the policy deciding when comes later. */
+    uint64_t scale_after_ms, scale_in_after_ms;
+    unsigned scale_count;
+    uint32_t next_scale_token;
+    struct scale scales[DMESH_MAX_CONNECTIONS];
     int fd;
     pthread_t thread;
     _Atomic unsigned remaining;
@@ -282,18 +300,48 @@ static void retire_session_listener(struct dmesh_dispatcher *d, struct dmesh_ses
         retire_listener(d, s->listen_ip, s->listen_port);
 }
 
+/* Ask listener s for a backend flow on worker, unless one is requested or
+ * open there. Returns whether a request was queued. */
+static bool backend_demand_session(struct dmesh_dispatcher *d, size_t worker, struct dmesh_session *s)
+{
+    if (!s || s->backend[worker].token || !atomic_load(&d->workers[worker].ready) ||
+        atomic_load(&d->workers[worker].departed) ||
+        d->loads[worker].assigned >= DMESH_MAX_CONNECTIONS) return false;
+    /* Never wrap a token: delayed requests must not alias a new operation. */
+    if (d->next_backend_token == UINT32_MAX) return false;
+    s->backend[worker].token = ++d->next_backend_token;
+    s->backend[worker].sent = false;
+    return true;
+}
+
 static void backend_demand(struct dmesh_dispatcher *d, size_t worker, const struct message *m)
 {
     uint32_t ip = dmesh_session_get_u32(m->payload);
     uint16_t port = (uint16_t)dmesh_session_get_u32(m->payload + 4);
-    struct dmesh_session *s = listener(d, ip, port);
-    if (!s || s->backend[worker].token || !atomic_load(&d->workers[worker].ready) ||
-        atomic_load(&d->workers[worker].departed) ||
-        d->loads[worker].assigned >= DMESH_MAX_CONNECTIONS) return;
-    /* Never wrap a token: delayed requests must not alias a new operation. */
-    if (d->next_backend_token == UINT32_MAX) return;
-    s->backend[worker].token = ++d->next_backend_token;
-    s->backend[worker].sent = false;
+    (void)backend_demand_session(d, worker, listener(d, ip, port));
+}
+
+/* A client flow of a pair that other workers already serve was placed on
+ * owner: open there the backends those workers hold, so its first requests
+ * do not wait for backend setup. The other workers' backends stand for what
+ * the pair uses; one never used waits in the proxy's registry. Reads the
+ * loads[].pair_flows that pair_restrict() filled for this placement. */
+static void backend_follow(struct dmesh_dispatcher *d, size_t owner)
+{
+    unsigned queued = 0;
+    for (size_t c = 0; c < d->count; ++c)
+        for (unsigned i = 0; i < DMESH_MAX_SESSIONS; ++i) {
+            struct dmesh_session *s = &d->controls[c]->sessions[i];
+            if (!s->occupied || !s->negotiated || s->closing || !s->listen_port) continue;
+            for (size_t w = 0; w < d->count; ++w) {
+                if (w == owner || !d->loads[w].pair_flows || !s->backend[w].token) continue;
+                queued += backend_demand_session(d, owner, s);
+                break;
+            }
+        }
+    if (queued)
+        fprintf(stderr, "[dispatcher] backend-follow worker=%zu listeners=%u unix_ns=%llu\n",
+                owner, queued, (unsigned long long)realtime_ns());
 }
 
 int dmesh_dispatch_backend_request(struct objects *o, uint32_t ip, uint16_t port)
@@ -419,6 +467,90 @@ static bool take_steer(struct dmesh_dispatcher *d, struct dmesh_session *s,
 /* Drain each client flow ready for migrate_period_ms; steer its reconnect to
  * the next eligible worker with a free slot. The old flow keeps its worker and
  * slot until the host closes it, so no live state ever changes owner. */
+static struct scale *find_scale(struct dmesh_dispatcher *d, const struct dmesh_session *s,
+                                uint32_t ip, uint16_t port)
+{
+    for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+        struct scale *e = &d->scales[i];
+        if (e->session == s && e->session_epoch == s->epoch &&
+            e->dst_ip == ip && e->dst_port == port) return e;
+    }
+    return NULL;
+}
+
+/* The flow-scaling hook: ask session s's clients of ip:port to keep count
+ * streams to it. count is clamped to the eligible workers, the most streams
+ * the pair placement can put on distinct workers. Returns the count asked,
+ * or -1 when no entry is free. */
+static int dmesh_scale(struct dmesh_dispatcher *d, struct objects *o, struct dmesh_session *s,
+                       uint32_t ip, uint16_t port, unsigned count)
+{
+    unsigned eligible = 0;
+    for (size_t w = 0; w < d->count; ++w)
+        eligible += atomic_load(&d->workers[w].ready) && !atomic_load(&d->workers[w].departed);
+    if (count > eligible) count = eligible;
+    if (count < 1) count = 1;
+    struct scale *e = find_scale(d, s, ip, port);
+    for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS && !e; ++i) {
+        struct scale *f = &d->scales[i];
+        if (!f->session || !f->session->occupied || f->session->closing ||
+            f->session->epoch != f->session_epoch) e = f;
+    }
+    if (!e) return -1;
+    if (!++d->next_scale_token) ++d->next_scale_token;
+    bool scaled_in = e->session == s && e->scaled_in;
+    *e = (struct scale){.control = o, .session = s, .session_epoch = s->epoch,
+        .dst_ip = ip, .dst_port = port, .count = count, .token = d->next_scale_token,
+        .pending = true, .scaled_in = scaled_in};
+    return (int)count;
+}
+
+static void flush_scales(struct dmesh_dispatcher *d)
+{
+    for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+        struct scale *e = &d->scales[i];
+        if (!e->pending) continue;
+        if (!e->session->occupied || e->session->closing || e->session->epoch != e->session_epoch) {
+            e->pending = false;
+            continue;
+        }
+        uint8_t payload[12];
+        dmesh_session_put_u32(payload, e->dst_ip);
+        dmesh_session_put_u32(payload + 4, e->dst_port);
+        dmesh_session_put_u32(payload + 8, e->count);
+        if (dmesh_session_send(e->control, e->session, DMESH_SESSION_SCALE, 0, e->token,
+                               payload, sizeof(payload), 0) != DOCA_SUCCESS) continue;
+        e->pending = false;
+        e->sent_ms = membership_now_ms();
+        fprintf(stderr, "[dispatcher] scale session=%lu/%lu dst=%08x:%u count=%u token=%u unix_ns=%llu\n",
+                session_id(d, e->control, e->session), e->session_epoch, e->dst_ip, e->dst_port,
+                e->count, e->token, (unsigned long long)realtime_ns());
+    }
+}
+
+static void scale_due(struct dmesh_dispatcher *d)
+{
+    if (!d->scale_after_ms) return;
+    uint64_t now = membership_now_ms();
+    for (unsigned i = 0; d->scale_in_after_ms && i < DMESH_MAX_CONNECTIONS; ++i) {
+        struct scale *e = &d->scales[i];
+        if (!e->session || e->pending || e->scaled_in || e->count < 2 || !e->sent_ms ||
+            now - e->sent_ms < d->scale_in_after_ms) continue;
+        if (dmesh_scale(d, e->control, e->session, e->dst_ip, e->dst_port, 1) > 0)
+            e->scaled_in = true;
+    }
+    for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
+        struct assignment *a = &d->flows[i];
+        if (!a->used || !a->ready || a->backend_token || a->close_pending || a->lost_pending ||
+            a->session->closing ||
+            (a->mode != DMESH_FLOW_MODE_CLIENT && a->mode != DMESH_FLOW_MODE_INGRESS_PUSH) ||
+            now - a->ready_ms < d->scale_after_ms ||
+            find_scale(d, a->session, a->dst_ip, a->dst_port))
+            continue;
+        (void)dmesh_scale(d, a->control, a->session, a->dst_ip, a->dst_port, d->scale_count);
+    }
+}
+
 static void migrate_due(struct dmesh_dispatcher *d)
 {
     if (!d->migrate_period_ms || d->count < 2) return;
@@ -510,6 +642,19 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
                 admitted |= a->used && a->session == s && a->backend_token == h->generation;
             }
             if (!admitted) s->backend[worker].token = 0;
+        }
+        return;
+    }
+    if (h->type == DMESH_SESSION_SCALE_ACK) {
+        for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+            struct scale *e = &d->scales[i];
+            if (e->session != s || e->session_epoch != s->epoch || e->token != h->generation)
+                continue;
+            e->acked = true;
+            e->applied = dmesh_session_get_u32(payload);
+            fprintf(stderr, "[dispatcher] scale-ack session=%lu/%lu dst=%08x:%u count=%u applied=%u unix_ns=%llu\n",
+                    session_id(d, o, s), s->epoch, e->dst_ip, e->dst_port, e->count, e->applied,
+                    (unsigned long long)realtime_ns());
         }
         return;
     }
@@ -629,6 +774,7 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     ++d->loads[owner].assigned;
     ++d->loads[owner].opening;
     if (!backend) d->cursor = ((size_t)owner + 1) % d->count;
+    if (!backend) backend_follow(d, (size_t)owner);
     s->generation[idx] = h->generation;
     s->closed[idx] = false;
     s->close_status[idx] = 0;
@@ -892,8 +1038,10 @@ static void *dispatch_main(void *arg)
         }
         flush_replies(d);
         migrate_due(d);
+        scale_due(d);
         flush_commands(d);
         flush_listeners(d);
+        flush_scales(d);
         for (size_t i = 0; i < d->count; ++i) dmesh_sessions_advance(d->controls[i]);
         /* Retry pending SDK sends/HELLO deadlines without busy polling. */
         (void)poll(fds, d->count + 1, 10);
@@ -956,6 +1104,13 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
         fprintf(stderr, "[dispatcher] migration period=%llums max=%lu steer=%llums spare=%d\n",
                 (unsigned long long)d->migrate_period_ms, d->migrate_max,
                 (unsigned long long)d->steer_ms, d->migrate_spare);
+    d->scale_after_ms = env_u64("DMESH_SCALE_AFTER_MS", 0);
+    d->scale_in_after_ms = env_u64("DMESH_SCALE_IN_AFTER_MS", 0);
+    d->scale_count = (unsigned)env_u64("DMESH_SCALE_COUNT", 2);
+    if (d->scale_after_ms)
+        fprintf(stderr, "[dispatcher] scaling after=%llums count=%u in_after=%llums\n",
+                (unsigned long long)d->scale_after_ms, d->scale_count,
+                (unsigned long long)d->scale_in_after_ms);
     const char *policy = getenv("DMESH_FLOW_PLACEMENT");
     if (policy && strcmp(policy, "round-robin") == 0) d->policy = dmesh_placement_round_robin;
     else if (policy && strcmp(policy, "first-eligible") == 0) d->policy = dmesh_placement_first_eligible;

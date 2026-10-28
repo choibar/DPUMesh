@@ -270,6 +270,15 @@ int dmesh_native_prepare_next(struct dmesh_native_transport *t, uint32_t *ip, ui
 {
     return channel_prepare_next(t->dev, ip, port);
 }
+int dmesh_native_scale_next(struct dmesh_native_transport *t, uint32_t *ip, uint16_t *port,
+                            uint32_t *count, uint32_t *token)
+{
+    return channel_scale_next(t->dev, ip, port, count, token);
+}
+int dmesh_native_scale_ack(struct dmesh_native_transport *t, uint32_t token, uint32_t applied)
+{
+    return channel_scale_ack(t->dev, token, applied);
+}
 int dmesh_native_spare_ready(struct dmesh_native_transport *t, uint16_t port)
 {
     pthread_mutex_lock(&t->lock);

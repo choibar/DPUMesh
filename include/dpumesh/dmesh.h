@@ -76,7 +76,19 @@ typedef enum {
     DMESH_EVENT_TX_ERROR = 5, /* deferred buffered-tail submission failed */
     DMESH_EVENT_PREPARE  = 6, /* migration: open a spare stream to the "ip:port" in
                                * buf/len (valid until the next poll); qp is NULL */
+    DMESH_EVENT_SCALE    = 7, /* flow scaling: buf points to a dmesh_scale_t (len = its
+                               * size, valid until the next poll); qp is NULL. Answer
+                               * with dmesh_scale_ack. */
 } dmesh_event_type_t;
+
+/* A SCALE request: each client of target should keep count streams to it. The
+ * DPU places one svc-to-svc pair's streams on distinct workers, so count
+ * streams spread the pair's traffic over count DPU cores. */
+typedef struct dmesh_scale {
+    uint32_t token;      /* echoed by dmesh_scale_ack */
+    uint32_t count;      /* >= 1 */
+    char     target[24]; /* "ip:port", NUL-terminated */
+} dmesh_scale_t;
 
 typedef struct dmesh_event {
     dmesh_qp_t         *qp;       /* the QP this event belongs to (== the handle from
@@ -191,6 +203,11 @@ int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events);
  * (its server's first bytes have arrived); the DPU then drains the stream
  * the spare replaces. */
 int dmesh_spare_ready(dmesh_qp_t *c);
+
+/* Answer a SCALE event: applied is how many of the application's clients of
+ * the target now keep the requested count (0: none can, e.g. no client uses a
+ * scaling-aware resolver). */
+int dmesh_scale_ack(dmesh_channel_t *s, uint32_t token, uint32_t applied);
 
 /* Release the zero-copy RX buffer held by a RECV event and invalidate event->buf.
  * Idempotent, valid after QP closure, and a no-op for other event types. */

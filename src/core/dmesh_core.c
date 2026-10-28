@@ -687,6 +687,27 @@ int dpumesh_prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len)
     return 1;
 }
 
+int dpumesh_scale_next(dpumesh_ctx_t *ctx, dmesh_scale_t *out)
+{
+    uint32_t ip, count, token; uint16_t port;
+    char host[INET_ADDRSTRLEN];
+    if (!ctx || !ctx->transport ||
+        !dmesh_native_scale_next(ctx->transport, &ip, &port, &count, &token))
+        return 0;
+    if (!inet_ntop(AF_INET, &ip, host, sizeof(host))) return 0;
+    memset(out, 0, sizeof(*out));
+    out->token = token;
+    out->count = count;
+    snprintf(out->target, sizeof(out->target), "%s:%u", host, (unsigned)port);
+    return 1;
+}
+
+int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied)
+{
+    if (!ctx || !ctx->transport) { errno = EINVAL; return -1; }
+    return dmesh_native_scale_ack(ctx->transport, token, applied);
+}
+
 int dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port)
 {
     if (!ctx || !ctx->transport) { errno = EINVAL; return -1; }

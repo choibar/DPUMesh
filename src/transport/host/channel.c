@@ -81,6 +81,9 @@ struct channel_dev {
     /* PREPARE requests (migration spares) not yet taken by the core. */
     struct { uint32_t ip; uint16_t port; } prepare[8];
     unsigned prepare_head, prepare_count;
+    /* SCALE requests (flow scaling) not yet taken by the core. */
+    struct { uint32_t ip, count, token; uint16_t port; } scale[8];
+    unsigned scale_head, scale_count;
     /* state: 1=pending, 2=processing, 3=done, 4=reject pending */
 	int session_error;
 	uint64_t last_send_ms;              /* Last control message submitted (keepalive) */
@@ -254,6 +257,17 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
             unsigned i = (dev->prepare_head + dev->prepare_count++) % 8;
             dev->prepare[i].ip = dmesh_session_get_u32(payload);
             dev->prepare[i].port = (uint16_t)dmesh_session_get_u32(payload + 4);
+        }
+        return;
+    }
+    if (h.type == DMESH_SESSION_SCALE) {
+        uint32_t count = dmesh_session_get_u32(payload + 8);
+        if (count != 0 && dev->scale_count < 8) {
+            unsigned i = (dev->scale_head + dev->scale_count++) % 8;
+            dev->scale[i].ip = dmesh_session_get_u32(payload);
+            dev->scale[i].port = (uint16_t)dmesh_session_get_u32(payload + 4);
+            dev->scale[i].count = count;
+            dev->scale[i].token = h.generation;
         }
         return;
     }
@@ -442,6 +456,31 @@ int channel_prepare_next(struct channel_dev *dev, uint32_t *ip, uint16_t *port)
     }
     pthread_mutex_unlock(&dev->session_lock);
     return found;
+}
+int channel_scale_next(struct channel_dev *dev, uint32_t *ip, uint16_t *port,
+                       uint32_t *count, uint32_t *token)
+{
+    pthread_mutex_lock(&dev->session_lock);
+    int found = dev->scale_count != 0;
+    if (found) {
+        unsigned i = dev->scale_head;
+        *ip = dev->scale[i].ip; *port = dev->scale[i].port;
+        *count = dev->scale[i].count; *token = dev->scale[i].token;
+        dev->scale_head = (dev->scale_head + 1) % 8;
+        --dev->scale_count;
+    }
+    pthread_mutex_unlock(&dev->session_lock);
+    return found;
+}
+int channel_scale_ack(struct channel_dev *dev, uint32_t token, uint32_t applied)
+{
+    if (!token) { errno = EINVAL; return -1; }
+    uint8_t payload[4];
+    dmesh_session_put_u32(payload, applied);
+    pthread_mutex_lock(&dev->session_lock);
+    int rc = session_send_locked(dev, DMESH_SESSION_SCALE_ACK, 0, token, payload, sizeof(payload));
+    pthread_mutex_unlock(&dev->session_lock);
+    return rc;
 }
 int channel_conn_spare_ready(struct channel_conn *conn)
 {

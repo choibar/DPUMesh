@@ -4,14 +4,15 @@
 /* Host/DPU control protocol. The public native ABI and DMA descriptor format
  * are independent of this version. Integers in the envelope are little endian;
  * v2 adds listener registration and worker-pinned backend requests, v4 the
- * ARM/DOORBELL idle wake, v5 the PING keepalive, v6 PREPARE/SPARE_READY. DMA metadata payloads retain
+ * ARM/DOORBELL idle wake, v5 the PING keepalive, v6 PREPARE/SPARE_READY, v7
+ * SCALE/SCALE_ACK. DMA metadata payloads retain
  * the existing LP64 host/DPU layout. */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #define DMESH_SESSION_MAGIC UINT32_C(0x444d5348)
-#define DMESH_SESSION_VERSION 6u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING + spare */
+#define DMESH_SESSION_VERSION 7u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING + spare + scale */
 #define DMESH_SESSION_HEADER_SIZE 24u
 #define DMESH_SESSION_MAX_PAYLOAD 2048u
 #define DMESH_SESSION_MAX_FRAME (DMESH_SESSION_HEADER_SIZE + DMESH_SESSION_MAX_PAYLOAD)
@@ -49,6 +50,13 @@ enum dmesh_session_message_type {
      * has its server's first bytes; drain the flow it replaces. */
     DMESH_SESSION_PREPARE = 17,
     DMESH_SESSION_SPARE_READY = 18,
+    /* Flow scaling. SCALE (DPU -> host; flow 0, generation = token, payload
+     * u32 dst_ip, u32 dst_port, u32 count >= 1): each client of that
+     * destination should keep count streams to it. SCALE_ACK (host -> DPU;
+     * flow 0, generation = the token, payload u32 applied): how many clients
+     * of it took the count. */
+    DMESH_SESSION_SCALE = 19,
+    DMESH_SESSION_SCALE_ACK = 20,
 };
 
 /* ARM payload: u64 epoch, u32 count, u32 zero, then count entries of
@@ -109,6 +117,9 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
     }
     if (h->type == DMESH_SESSION_PREPARE)
         return h->flow_id == 0 && h->generation != 0 && h->payload_len == 8 && h->status == 0;
+    if (h->type == DMESH_SESSION_SCALE || h->type == DMESH_SESSION_SCALE_ACK)
+        return h->flow_id == 0 && h->generation != 0 && h->status == 0 &&
+               h->payload_len == (h->type == DMESH_SESSION_SCALE ? 12u : 4u);
     if (h->type == DMESH_SESSION_PING)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 && h->status == 0;
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)

@@ -61,6 +61,7 @@ const (
 	evTxReady
 	evTxError
 	evPrepare
+	evScale
 )
 
 // qpID is a native QP handle, used as an opaque key.
@@ -73,7 +74,9 @@ type nativeEvent struct {
 	token int32  // receive lease; -1 when the event holds none
 
 	localPort, remotePort int    // evConnReq
-	target                string // evPrepare: "ip:port"
+	target                string // evPrepare, evScale: "ip:port"
+	count                 int    // evScale: streams each client keeps to target
+	scaleToken            uint32 // evScale: answered by scaleAck
 }
 
 // native is the libdpumesh surface. pollWait, destroy and close run only on
@@ -93,6 +96,7 @@ type native interface {
 	destroy(qp qpID, abort bool) error // consumes qp even on error
 	close() error                      // retryable
 	spareReady(qp qpID) error          // migration: qp is a ready spare
+	scaleAck(token uint32, applied int) error
 }
 
 const (
@@ -327,11 +331,16 @@ func (t *transport) dispatch(events []nativeEvent) {
 	orphans, rejects := t.orphans[:0], t.rejects[:0]
 	var accepted *Listener
 	var prepares []string
+	var scales []nativeEvent
 	t.mu.Lock()
 	for i := range events {
 		ev := &events[i]
 		if ev.kind == evPrepare {
 			prepares = append(prepares, ev.target)
+			continue
+		}
+		if ev.kind == evScale {
+			scales = append(scales, *ev)
 			continue
 		}
 		c := t.conns[ev.qp]
@@ -395,6 +404,9 @@ func (t *transport) dispatch(events []nativeEvent) {
 	}
 	for _, target := range prepares {
 		go t.prepareSpare(target)
+	}
+	for _, ev := range scales {
+		go t.scale(ev.target, ev.count, ev.scaleToken)
 	}
 	t.orphans, t.rejects = orphans[:0], rejects[:0]
 }

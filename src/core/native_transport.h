@@ -65,4 +65,8 @@ int dmesh_native_disconnect(struct dmesh_native_transport *, uint16_t port);
  * the DPU that the client stream on port is a ready spare. */
 int dmesh_native_prepare_next(struct dmesh_native_transport *, uint32_t *ip, uint16_t *port);
 int dmesh_native_spare_ready(struct dmesh_native_transport *, uint16_t port);
+/* Flow scaling: the next SCALE (1) or none (0), and its answer. */
+int dmesh_native_scale_next(struct dmesh_native_transport *, uint32_t *ip, uint16_t *port,
+                            uint32_t *count, uint32_t *token);
+int dmesh_native_scale_ack(struct dmesh_native_transport *, uint32_t token, uint32_t applied);
 #endif

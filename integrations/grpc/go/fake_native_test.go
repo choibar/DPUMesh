@@ -55,6 +55,9 @@ type fakeNative struct {
 	closeErrs       []error // under net.mu: results of successive close calls
 
 	polls, destroys, aborts atomic.Int64
+
+	mu        sync.Mutex
+	scaleAcks [][2]int // token, applied
 }
 
 func newFakeNet(window, frag, maxPost int) *fakeNet {
@@ -145,6 +148,12 @@ func (f *fakeNative) pollWait(out []nativeEvent, maxWaitNs int64) (int, error) {
 func (f *fakeNative) wake() { signal(f.wakeCh) }
 
 func (f *fakeNative) spareReady(qp qpID) error { return nil }
+func (f *fakeNative) scaleAck(token uint32, applied int) error {
+	f.mu.Lock()
+	f.scaleAcks = append(f.scaleAcks, [2]int{int(token), applied})
+	f.mu.Unlock()
+	return nil
+}
 
 func (f *fakeNative) dial(target string) (qpID, int, error) {
 	if f.dialDelay > 0 {

@@ -66,6 +66,11 @@ int channel_backend_next(struct channel_dev *, uint32_t *worker, uint32_t *token
  * and report that a spare flow has its server's first bytes. */
 int channel_prepare_next(struct channel_dev *, uint32_t *ip, uint16_t *port);
 int channel_conn_spare_ready(struct channel_conn *);
+/* Flow scaling: take one SCALE (destination ip/port, network order ip; the
+ * stream count each client keeps; the token to answer), and answer it. */
+int channel_scale_next(struct channel_dev *, uint32_t *ip, uint16_t *port,
+                       uint32_t *count, uint32_t *token);
+int channel_scale_ack(struct channel_dev *, uint32_t token, uint32_t applied);
 void channel_backend_finish(struct channel_dev *, uint32_t worker, uint32_t token, int error);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);

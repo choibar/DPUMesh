@@ -155,6 +155,12 @@ func (n *cgoNative) pollWait(out []nativeEvent, maxWaitNs int64) (int, error) {
 		case C.DMESH_EVENT_PREPARE:
 			o.kind = evPrepare
 			o.target = C.GoStringN((*C.char)(unsafe.Pointer(ev.buf)), C.int(ev.len))
+		case C.DMESH_EVENT_SCALE:
+			sc := (*C.dmesh_scale_t)(unsafe.Pointer(ev.buf))
+			o.kind = evScale
+			o.target = C.GoString(&sc.target[0])
+			o.count = int(sc.count)
+			o.scaleToken = uint32(sc.token)
 		}
 	}
 	return int(r), nil
@@ -189,6 +195,13 @@ func (n *cgoNative) send(qp qpID, p []byte) (int, error) {
 
 func (n *cgoNative) spareReady(qp qpID) error {
 	if rc, err := C.dmesh_spare_ready((*C.dmesh_qp_t)(qp)); rc != 0 {
+		return err
+	}
+	return nil
+}
+
+func (n *cgoNative) scaleAck(token uint32, applied int) error {
+	if rc, err := C.dmesh_scale_ack(n.ch, C.uint32_t(token), C.uint32_t(applied)); rc != 0 {
 		return err
 	}
 	return nil

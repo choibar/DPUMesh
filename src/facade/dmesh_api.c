@@ -132,6 +132,15 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
         events[n]._rx_token = -1;
         n++;
     }
+    /* 2c. A flow-scaling SCALE, likewise one per poll. */
+    if (n < max_events && dpumesh_scale_next(s->ctx, &eq->scale)) {
+        events[n].qp        = NULL;
+        events[n].type      = DMESH_EVENT_SCALE;
+        events[n].buf       = (const uint8_t *)&eq->scale;
+        events[n].len       = (uint32_t)sizeof(eq->scale);
+        events[n]._rx_token = -1;
+        n++;
+    }
 
     /* 3. Background tail faults are terminal for the QP and take precedence over
      * ordinary readiness, so an application never spins retrying a failed stream. */
@@ -195,6 +204,11 @@ int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
 int dmesh_spare_ready(dmesh_qp_t *c) {
     if (!c || !c->ep || c->role != DMESH_ROLE_CLIENT) { errno = EINVAL; return -1; }
     return dpumesh_spare_ready(c->ep->ctx, c->local_port);
+}
+
+int dmesh_scale_ack(dmesh_channel_t *s, uint32_t token, uint32_t applied) {
+    if (!s || !s->ctx) { errno = EINVAL; return -1; }
+    return dpumesh_scale_ack(s->ctx, token, applied);
 }
 
 void dmesh_release_rx_buffer(dmesh_channel_t *s, dmesh_event_t *event) {
