@@ -128,6 +128,11 @@ struct dmesh_conn {
      * reconnects on another worker; taken once by the proxy driver. */
     bool migrate_requested;
     bool readers_detached; /* proxy acknowledged local staging pointer retirement */
+    /* Flow statistics the proxy copies in (dmesh_dispatch_worker_flow_stats)
+     * and the dispatcher samples: cumulative requests, CPU ns, residence ns,
+     * backend ns of the client connection on this slot. Accessed with
+     * __atomic builtins; OPEN clears them with the slot. */
+    uint64_t flow_stats[4];
     int32_t error_status;
     struct dmesh_export_metadata_msg *pending_metadata;
 

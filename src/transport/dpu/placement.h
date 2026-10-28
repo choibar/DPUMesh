@@ -20,6 +20,12 @@ struct dmesh_worker_load {
      * opening ones included. The dispatcher already left eligible only the
      * workers holding the fewest; a policy may still weigh it. */
     unsigned pair_flows;
+    /* Over the last flow-statistics period (DMESH_FLOWSTAT_MS): the worker's
+     * client requests per second, the CPU its client connections were
+     * measured to use, and its thread's busy time (both per mille of a core;
+     * busy minus flow CPU is work no flow is charged for, such as backend
+     * connections and the DMA driver). */
+    unsigned rps, flow_cpu_permille, busy_permille;
 };
 struct dmesh_placement_policy {
     int (*select)(const struct dmesh_flow_spec *, const struct dmesh_worker_load *,

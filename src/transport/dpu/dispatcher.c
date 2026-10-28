@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,6 +38,9 @@ struct dmesh_worker_mailbox {
     struct queue requests, replies;
     int fd;
     _Atomic bool ready, departed;
+    struct objects *objs;       /* the worker's objects: its slots' flow_stats */
+    _Atomic int tid;            /* the worker thread, for its busy time */
+    uint64_t busy_ticks;        /* its CPU ticks at the last flow-stat sample */
 };
 struct assignment {
     bool used, opening, ready, close_pending, lost_pending;
@@ -52,6 +56,10 @@ struct assignment {
     uint16_t dst_port;
     uint64_t pair;              /* client flows: pair_key(); 0 for backends */
     uint64_t ready_ms;
+    /* Flow statistics: the proxy's counters at the last sample, and the
+     * rates over the last DMESH_FLOWSTAT_MS. */
+    uint64_t stat_ns, stat_prev[4];
+    unsigned rps, cpu_permille, cpu_ns_per_req, residence_us, backend_us;
     /* Spare mode: the old flow waits (until spare_deadline_ms) for the spare
      * that replaces it; the spare remembers the flow it replaces. */
     bool awaiting_spare, replaces;
@@ -105,6 +113,11 @@ struct dmesh_dispatcher {
     unsigned scale_count;
     uint32_t next_scale_token;
     struct scale scales[DMESH_MAX_CONNECTIONS];
+    /* DMESH_FLOWSTAT_MS (default 1000, 0 = off): sample every client flow's
+     * statistics and each worker's busy time this often; DMESH_FLOWSTAT_LOG=1
+     * also logs them. */
+    uint64_t flowstat_ms, flowstat_next_ms, flowstat_ns;
+    bool flowstat_log;
     int fd;
     pthread_t thread;
     _Atomic unsigned remaining;
@@ -551,6 +564,92 @@ static void scale_due(struct dmesh_dispatcher *d)
     }
 }
 
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+/* A thread's user + system CPU in clock ticks, or 0 when unreadable. */
+static uint64_t thread_ticks(int tid)
+{
+    char path[64], line[512];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char *ok = fgets(line, sizeof(line), f);
+    fclose(f);
+    char *p = ok ? strrchr(line, ')') : NULL;
+    unsigned long utime = 0, stime = 0;
+    /* After "pid (comm)": state, then fields 4..13, then utime and stime. */
+    if (!p || sscanf(p + 1, " %*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu",
+                     &utime, &stime) != 2) return 0;
+    return (uint64_t)utime + stime;
+}
+
+/* Samples every ready client flow's statistics and each worker's busy time,
+ * into the assignments and loads[] that placement sees. */
+static void flowstat_due(struct dmesh_dispatcher *d)
+{
+    if (!d->flowstat_ms) return;
+    uint64_t now_ms = membership_now_ms();
+    if (now_ms < d->flowstat_next_ms) return;
+    d->flowstat_next_ms = now_ms + d->flowstat_ms;
+    uint64_t now = monotonic_ns(), period = d->flowstat_ns ? now - d->flowstat_ns : 0;
+    d->flowstat_ns = now;
+    unsigned flows[d->count];
+    for (size_t w = 0; w < d->count; ++w) {
+        d->loads[w].rps = d->loads[w].flow_cpu_permille = 0;
+        flows[w] = 0;
+    }
+    for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
+        struct assignment *a = &d->flows[i];
+        if (!a->used || !a->ready || a->backend_token ||
+            (a->mode != DMESH_FLOW_MODE_CLIENT && a->mode != DMESH_FLOW_MODE_INGRESS_PUSH))
+            continue;
+        size_t w = a->location.worker;
+        const struct dmesh_conn *c = &d->workers[w].objs->conns[a->location.slot];
+        uint64_t v[4];
+        for (int k = 0; k < 4; ++k) v[k] = __atomic_load_n(&c->flow_stats[k], __ATOMIC_RELAXED);
+        /* The first sample, or counters that restarted, only set a baseline. */
+        bool baseline = !a->stat_ns || v[0] < a->stat_prev[0] || v[1] < a->stat_prev[1];
+        uint64_t dt = now - a->stat_ns;
+        if (!baseline && dt) {
+            uint64_t req = v[0] - a->stat_prev[0], cpu = v[1] - a->stat_prev[1];
+            a->rps = (unsigned)(req * 1000000000ull / dt);
+            a->cpu_permille = (unsigned)(cpu * 1000 / dt);
+            a->cpu_ns_per_req = req ? (unsigned)(cpu / req) : 0;
+            a->residence_us = req ? (unsigned)((v[2] - a->stat_prev[2]) / req / 1000) : 0;
+            a->backend_us = req ? (unsigned)((v[3] - a->stat_prev[3]) / req / 1000) : 0;
+            d->loads[w].rps += a->rps;
+            d->loads[w].flow_cpu_permille += a->cpu_permille;
+            ++flows[w];
+            if (d->flowstat_log)
+                fprintf(stderr, "[dispatcher] flowstat worker=%zu slot=%u flow=%u/%u session=%lu/%lu pair=%016llx rps=%u cpu_permille=%u cpu_ns_per_req=%u residence_us=%u backend_us=%u unix_ns=%llu\n",
+                        w, a->location.slot, a->key.flow_id, a->key.generation,
+                        a->key.session_id, a->key.session_epoch, (unsigned long long)a->pair,
+                        a->rps, a->cpu_permille, a->cpu_ns_per_req, a->residence_us,
+                        a->backend_us, (unsigned long long)realtime_ns());
+        }
+        a->stat_ns = now;
+        memcpy(a->stat_prev, v, sizeof(v));
+    }
+    long hz = sysconf(_SC_CLK_TCK);
+    for (size_t w = 0; w < d->count; ++w) {
+        int tid = atomic_load(&d->workers[w].tid);
+        uint64_t ticks = tid ? thread_ticks(tid) : 0;
+        if (period && hz > 0 && ticks >= d->workers[w].busy_ticks && d->workers[w].busy_ticks)
+            d->loads[w].busy_permille = (unsigned)((ticks - d->workers[w].busy_ticks) *
+                1000000000000ull / (uint64_t)hz / period);
+        d->workers[w].busy_ticks = ticks;
+        if (d->flowstat_log && period)
+            fprintf(stderr, "[dispatcher] workerstat worker=%zu flows=%u rps=%u flow_cpu_permille=%u busy_permille=%u unix_ns=%llu\n",
+                    w, flows[w], d->loads[w].rps, d->loads[w].flow_cpu_permille,
+                    d->loads[w].busy_permille, (unsigned long long)realtime_ns());
+    }
+}
+
 static void migrate_due(struct dmesh_dispatcher *d)
 {
     if (!d->migrate_period_ms || d->count < 2) return;
@@ -911,6 +1010,7 @@ int dmesh_dispatch_worker_fd(struct objects *o) { return o->mailbox->fd; }
 void dmesh_dispatch_worker_arm(struct objects *o) { clear(o->mailbox->fd); }
 void dmesh_dispatch_worker_ready(struct objects *o)
 {
+    atomic_store(&o->mailbox->tid, (int)syscall(SYS_gettid));
     atomic_store(&o->mailbox->ready, true);
     wake(o->mailbox->dispatcher->fd);
 }
@@ -950,6 +1050,13 @@ void dmesh_dispatch_worker_drain(struct objects *o)
         }
     }
 }
+void dmesh_dispatch_worker_flow_stats(struct objects *o, int slot, const uint64_t counters[4])
+{
+    if (!o || slot < 0 || slot >= DMESH_MAX_CONNECTIONS) return;
+    for (int i = 0; i < 4; ++i)
+        __atomic_store_n(&o->conns[slot].flow_stats[i], counters[i], __ATOMIC_RELAXED);
+}
+
 int dmesh_dispatch_worker_take_migrations(struct objects *o, int32_t *slots, int max)
 {
     if (!o || !o->migrate_pending) return 0;
@@ -1037,6 +1144,7 @@ static void *dispatch_main(void *arg)
             (void)dmesh_doca_ctrl_drain(d->controls[i]);
         }
         flush_replies(d);
+        flowstat_due(d);
         migrate_due(d);
         scale_due(d);
         flush_commands(d);
@@ -1104,6 +1212,8 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
         fprintf(stderr, "[dispatcher] migration period=%llums max=%lu steer=%llums spare=%d\n",
                 (unsigned long long)d->migrate_period_ms, d->migrate_max,
                 (unsigned long long)d->steer_ms, d->migrate_spare);
+    d->flowstat_ms = env_u64("DMESH_FLOWSTAT_MS", 1000);
+    d->flowstat_log = env_u64("DMESH_FLOWSTAT_LOG", 0) != 0;
     d->scale_after_ms = env_u64("DMESH_SCALE_AFTER_MS", 0);
     d->scale_in_after_ms = env_u64("DMESH_SCALE_IN_AFTER_MS", 0);
     d->scale_count = (unsigned)env_u64("DMESH_SCALE_COUNT", 2);
@@ -1142,6 +1252,7 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
         controls[i]->dispatcher = d;
         workers[i]->mailbox = &d->workers[i];
         workers[i]->worker_idx = (int)i;
+        d->workers[i].objs = workers[i];
     }
     if (pthread_create(&d->thread, NULL, dispatch_main, d) != 0) {
         for (size_t i = 0; i < count; ++i) { controls[i]->dispatcher = NULL; workers[i]->mailbox = NULL; }

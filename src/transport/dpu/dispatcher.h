@@ -46,6 +46,10 @@ void dmesh_dispatch_worker_flush(struct objects *);
 /* Slots the dispatcher asked to drain for migration (GOAWAY); each is
  * returned once. Returns the count written to slots (at most max). */
 int dmesh_dispatch_worker_take_migrations(struct objects *, int32_t *slots, int max);
+/* The proxy's statistics of the client connection on slot: cumulative
+ * requests, CPU ns, residence ns, backend ns. Sampled by the dispatcher every
+ * DMESH_FLOWSTAT_MS for flow placement. */
+void dmesh_dispatch_worker_flow_stats(struct objects *, int slot, const uint64_t counters[4]);
 void dmesh_dispatch_worker_ready(struct objects *);
 void dmesh_dispatch_worker_depart(struct objects *);
 bool dmesh_dispatch_worker_stop_admission(struct objects *);
