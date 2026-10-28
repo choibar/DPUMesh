@@ -3,6 +3,7 @@
 #include "placement.h"
 #include "object.h"
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -49,6 +50,7 @@ struct assignment {
     bool draining, drain_pending;
     uint32_t mode, dst_ip;
     uint16_t dst_port;
+    uint64_t pair;              /* client flows: pair_key(); 0 for backends */
     uint64_t ready_ms;
     /* Spare mode: the old flow waits (until spare_deadline_ms) for the spare
      * that replaces it; the spare remembers the flow it replaces. */
@@ -359,6 +361,44 @@ static void arm_flows(struct dmesh_dispatcher *d, struct objects *o, struct dmes
     }
 }
 
+/* A svc-to-svc pair: the source workload and the destination service. Client
+ * flows of one pair are spread over workers, so a scaled-out pair gets the
+ * extra cores it was scaled for. */
+static uint64_t pair_key(const struct dmesh_flow_id *flow)
+{
+    uint64_t h = 1469598103934665603ull;            /* FNV-1a */
+    for (size_t i = 0; i < sizeof(flow->src_workload) && flow->src_workload[i]; ++i)
+        h = (h ^ (uint8_t)flow->src_workload[i]) * 1099511628211ull;
+    const uint8_t dst[6] = {(uint8_t)(flow->dst_ip >> 24), (uint8_t)(flow->dst_ip >> 16),
+                            (uint8_t)(flow->dst_ip >> 8), (uint8_t)flow->dst_ip,
+                            (uint8_t)(flow->dst_port >> 8), (uint8_t)flow->dst_port};
+    for (size_t i = 0; i < sizeof(dst); ++i)
+        h = (h ^ dst[i]) * 1099511628211ull;
+    return h ? h : 1;
+}
+
+/* Fills loads[].pair_flows with the pair's client flows per worker, opening
+ * ones included, and leaves eligible only the workers holding the fewest: a
+ * pair never doubles up on a worker while another has room and none of it.
+ * Returns that fewest count. */
+static unsigned pair_restrict(struct dmesh_dispatcher *d, uint64_t pair)
+{
+    unsigned fewest = UINT_MAX;
+    for (size_t w = 0; w < d->count; ++w) {
+        struct dmesh_worker_load *l = &d->loads[w];
+        l->pair_flows = 0;
+        for (unsigned slot = 0; slot < DMESH_MAX_CONNECTIONS; ++slot) {
+            const struct assignment *a = &d->flows[w * DMESH_MAX_CONNECTIONS + slot];
+            if (a->used && a->pair == pair) ++l->pair_flows;
+        }
+        if (l->eligible && l->assigned < l->capacity && l->pair_flows < fewest)
+            fewest = l->pair_flows;
+    }
+    for (size_t w = 0; w < d->count; ++w)
+        if (d->loads[w].pair_flows > fewest) d->loads[w].eligible = false;
+    return fewest;
+}
+
 static bool take_steer(struct dmesh_dispatcher *d, struct dmesh_session *s,
                        uint32_t dst_ip, uint16_t dst_port, struct steer *out)
 {
@@ -549,10 +589,14 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         .flow_id = h->flow_id, .generation = h->generation, .mode = metadata.flow.mode,
         .service_ip = metadata.flow.dst_ip, .service_port = metadata.flow.dst_port,
     };
+    uint64_t pair = backend ? 0 : pair_key(&metadata.flow);
     for (size_t i = 0; i < d->count; ++i)
         d->loads[i].eligible = atomic_load(&d->workers[i].ready) && !atomic_load(&d->workers[i].departed);
+    unsigned pair_fewest = backend ? 0 : pair_restrict(d, pair);
     int owner = backend ? (int)requested_worker :
         d->policy.select(&spec, d->loads, d->count, d->cursor, d->policy.context);
+    for (size_t i = 0; i < d->count; ++i)   /* the steer below sees every worker */
+        d->loads[i].eligible = atomic_load(&d->workers[i].ready) && !atomic_load(&d->workers[i].departed);
     struct steer steer = {0};
     int steered = !backend && take_steer(d, s, metadata.flow.dst_ip, metadata.flow.dst_port, &steer) ?
         (int)steer.worker : -1;
@@ -574,7 +618,7 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         .key = {spec.session_id, spec.session_epoch, h->flow_id, h->generation},
         .location = {.worker = (uint32_t)owner, .slot = slot, .ownership_epoch = 1},
         .backend_token = request_token, .mode = metadata.flow.mode,
-        .dst_ip = metadata.flow.dst_ip, .dst_port = metadata.flow.dst_port,
+        .dst_ip = metadata.flow.dst_ip, .dst_port = metadata.flow.dst_port, .pair = pair,
         .replaces = steered >= 0 && steer.replaces, .replaced = steer.replaced,
         .replaced_key = steer.replaced_key};
     struct message m = {.key = a->key, .location = a->location, .type = OPEN, .length = sizeof(metadata)};
@@ -589,9 +633,10 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     s->closed[idx] = false;
     s->close_status[idx] = 0;
     wake(d->workers[owner].fd);
-    fprintf(stderr, "[dispatcher] session=%lu/%lu flow=%u/%u owner=%d slot=%u epoch=1 backend=%d steered=%d unix_ns=%llu\n",
+    fprintf(stderr, "[dispatcher] session=%lu/%lu flow=%u/%u owner=%d slot=%u epoch=1 backend=%d steered=%d pair=%016llx pair_on_owner=%u pair_fewest=%u unix_ns=%llu\n",
             a->key.session_id, a->key.session_epoch, h->flow_id, h->generation, owner, slot, backend,
-            steered >= 0, (unsigned long long)realtime_ns());
+            steered >= 0, (unsigned long long)pair, backend ? 0 : d->loads[owner].pair_flows,
+            pair_fewest, (unsigned long long)realtime_ns());
 }
 
 void dmesh_dispatcher_session_lost(struct objects *o, struct dmesh_session *s)
@@ -913,6 +958,7 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
                 (unsigned long long)d->steer_ms, d->migrate_spare);
     const char *policy = getenv("DMESH_FLOW_PLACEMENT");
     if (policy && strcmp(policy, "round-robin") == 0) d->policy = dmesh_placement_round_robin;
+    else if (policy && strcmp(policy, "first-eligible") == 0) d->policy = dmesh_placement_first_eligible;
     else if (policy && strcmp(policy, "least-flows") != 0) goto fail;
     d->fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (d->fd < 0) goto fail;

@@ -16,6 +16,10 @@ struct dmesh_flow_spec {
 struct dmesh_worker_load {
     bool eligible;
     unsigned capacity, assigned, opening;
+    /* Client flows of the placed flow's svc-to-svc pair on this worker,
+     * opening ones included. The dispatcher already left eligible only the
+     * workers holding the fewest; a policy may still weigh it. */
+    unsigned pair_flows;
 };
 struct dmesh_placement_policy {
     int (*select)(const struct dmesh_flow_spec *, const struct dmesh_worker_load *,
@@ -24,5 +28,6 @@ struct dmesh_placement_policy {
 };
 extern const struct dmesh_placement_policy dmesh_placement_least_flows;
 extern const struct dmesh_placement_policy dmesh_placement_round_robin;
+extern const struct dmesh_placement_policy dmesh_placement_first_eligible; /* test only */
 
 #endif

@@ -32,5 +32,15 @@ static int round_robin(const struct dmesh_flow_spec *f, const struct dmesh_worke
     (void)f; (void)context;
     return choose(w, n, cursor, false);
 }
+/* Test policy: the first eligible worker, whatever its load. It packs every
+ * flow onto one worker, which shows the dispatcher's svc-to-svc pair rule
+ * spreading a pair regardless of the policy beneath it. */
+static int first_eligible(const struct dmesh_flow_spec *f, const struct dmesh_worker_load *w,
+                          size_t n, size_t cursor, void *context)
+{
+    (void)f; (void)cursor; (void)context;
+    return choose(w, n, 0, false);
+}
 const struct dmesh_placement_policy dmesh_placement_least_flows = {.select = least};
 const struct dmesh_placement_policy dmesh_placement_round_robin = {.select = round_robin};
+const struct dmesh_placement_policy dmesh_placement_first_eligible = {.select = first_eligible};
