@@ -628,6 +628,14 @@ static void flush_replies(struct dmesh_dispatcher *d)
                     if (r == DOCA_SUCCESS && m.type == DMESH_SESSION_READY) {
                         a->ready = true;
                         a->ready_ms = membership_now_ms();
+                        /* An outstanding ARM cannot list a flow that was not
+                         * ready yet, so nothing would ring for it and the
+                         * host, which re-ARMs only after a DOORBELL, sleeps to
+                         * its backstop while this flow carries traffic. */
+                        if (s->armed && DMESH_FLOW_USES_PUSH(a->mode)) {
+                            s->armed = false;
+                            s->doorbell_pending_epoch = s->armed_epoch;
+                        }
                         if (a->opening) { a->opening = false; --d->loads[w].opening; }
                     }
                 }
