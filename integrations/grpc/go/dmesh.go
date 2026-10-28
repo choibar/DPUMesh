@@ -541,15 +541,21 @@ func CloseTransport() error {
 
 // close stops the poller of an idle transport, then closes the native. A
 // failed native close keeps the transport closed to new work and retryable.
-// Inbound streams no listener ever took belong to the transport and are
-// aborted here.
+// Inbound streams no listener ever took, and migration spares no dial took,
+// belong to the transport and are closed here.
 func (t *transport) close() error {
 	t.mu.Lock()
 	unclaimed := t.prelisten
 	t.prelisten = nil
+	spares := t.spares
+	t.spares = make(map[string]*spare)
 	t.mu.Unlock()
 	for _, c := range unclaimed {
 		_ = c.shutdown(true)
+	}
+	for _, s := range spares {
+		s.expiry.Stop()
+		_ = s.conn.Close()
 	}
 	t.mu.Lock()
 	if len(t.conns) != 0 || t.listener != nil || t.dials != 0 {

@@ -2,9 +2,11 @@ package dmeshgo
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"testing"
+	"time"
 )
 
 // The spare already sent the preface and read the server's first bytes: the
@@ -50,5 +52,33 @@ func TestSpareConnRejectsMissingPreface(t *testing.T) {
 	sc := &spareConn{Conn: app, skip: http2Preface}
 	if _, err := sc.Write([]byte("GET / HTTP/1.1\r\n")); err == nil {
 		t.Fatal("a non-HTTP/2 first write must fail")
+	}
+}
+
+// A spare no dial took belongs to the transport: closing the transport closes
+// it instead of reporting the transport busy.
+func TestTransportCloseClosesUntakenSpare(t *testing.T) {
+	fn := newFakeNet(1<<20, 8064, 64<<10)
+	srv := newTransport(fn.native(true))
+	defer srv.close()
+	l, err := srv.listen(&net.TCPAddr{Port: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	tr := newTransport(fn.native(false))
+	c, err := tr.dial(context.Background(), "svc:1", &net.TCPAddr{}, &net.TCPAddr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &spare{conn: &spareConn{Conn: c, skip: http2Preface}, expiry: time.AfterFunc(time.Hour, func() {})}
+	tr.mu.Lock()
+	tr.spares["svc:1"] = s
+	tr.mu.Unlock()
+	if err := tr.close(); err != nil {
+		t.Fatalf("close with an untaken spare: %v", err)
+	}
+	if peer, err := l.Accept(); err == nil {
+		_ = peer.Close()
 	}
 }
