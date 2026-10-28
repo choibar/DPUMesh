@@ -19,6 +19,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
+#include <arpa/inet.h>
 #include <dpumesh/dmesh_topology.h>
 
 #define DOCA_LOG_ERR(...) do { fprintf(stderr, "dpumesh: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
@@ -673,6 +674,23 @@ static void transport_check(dpumesh_ctx_t *ctx)
 int dpumesh_lost(dpumesh_ctx_t *ctx)
 {
     return ctx ? atomic_load(&ctx->lost) : 0;
+}
+
+int dpumesh_prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len)
+{
+    uint32_t ip; uint16_t port;
+    char host[INET_ADDRSTRLEN];
+    if (!ctx || !ctx->transport || !dmesh_native_prepare_next(ctx->transport, &ip, &port))
+        return 0;
+    if (!inet_ntop(AF_INET, &ip, host, sizeof(host))) return 0;
+    snprintf(target, len, "%s:%u", host, (unsigned)port);
+    return 1;
+}
+
+int dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port)
+{
+    if (!ctx || !ctx->transport) { errno = EINVAL; return -1; }
+    return dmesh_native_spare_ready(ctx->transport, port);
 }
 
 /* Ready-list MPSC: any draining EQ pushes a ready conn's port; that conn's EQ

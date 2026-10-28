@@ -62,6 +62,10 @@ int channel_session_close(struct channel_dev *dev);
  * outside control callbacks; completion retains errors until Comch accepts. */
 int channel_session_listen(struct channel_dev *, uint32_t ip, uint16_t port);
 int channel_backend_next(struct channel_dev *, uint32_t *worker, uint32_t *token);
+/* Migration spares: take one PREPARE (destination ip/port, network order ip),
+ * and report that a spare flow has its server's first bytes. */
+int channel_prepare_next(struct channel_dev *, uint32_t *ip, uint16_t *port);
+int channel_conn_spare_ready(struct channel_conn *);
 void channel_backend_finish(struct channel_dev *, uint32_t worker, uint32_t token, int error);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);

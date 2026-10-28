@@ -74,6 +74,8 @@ typedef enum {
     DMESH_EVENT_CONN_REQ = 3, /* new inbound conn (server side); no credit held */
     DMESH_EVENT_TX_READY = 4, /* an EAGAIN-blocked QP should retry dmesh_alloc */
     DMESH_EVENT_TX_ERROR = 5, /* deferred buffered-tail submission failed */
+    DMESH_EVENT_PREPARE  = 6, /* migration: open a spare stream to the "ip:port" in
+                               * buf/len (valid until the next poll); qp is NULL */
 } dmesh_event_type_t;
 
 typedef struct dmesh_event {
@@ -184,6 +186,11 @@ void dmesh_get_tx_stats(dmesh_channel_t *s, dmesh_tx_stats_t *out);
  * status 75); with DPUMESH_EXIT_ON_LOSS=0 this returns -1 with the session's
  * errno instead, once the events that landed before the loss are drained. */
 int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events);
+
+/* Tell the DPU that this client QP, opened for a PREPARE, is a ready spare
+ * (its server's first bytes have arrived); the DPU then drains the stream
+ * the spare replaces. */
+int dmesh_spare_ready(dmesh_qp_t *c);
 
 /* Release the zero-copy RX buffer held by a RECV event and invalidate event->buf.
  * Idempotent, valid after QP closure, and a no-op for other event types. */

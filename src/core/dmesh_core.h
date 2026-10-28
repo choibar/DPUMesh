@@ -71,6 +71,7 @@ _Static_assert(DMESH_PORT_SPACE == (UINT16_MAX + 1),
  * queue allows any EQ to claim a new connection. */
 struct dmesh_eq {
     dmesh_channel_t   *ch;
+    char               prepare_target[24]; /* PREPARE event text, valid until the next poll */
     atomic_int no_accept; /* private accelerator EQs leave incoming RPCs to reactors */
     struct dmesh_qp *accept_spare; /* preallocated before consuming an accept descriptor;
                                     * prevents OOM from stranding SERVER_PENDING */
@@ -263,6 +264,10 @@ void dpumesh_eq_awake(struct dmesh_eq *eq);
  * the process exits with DMESH_EXIT_LOST when the loss is first seen. */
 #define DMESH_EXIT_LOST 75   /* EX_TEMPFAIL */
 int  dpumesh_lost(dpumesh_ctx_t *ctx);
+/* Migration spares: format the next PREPARE destination as "ip:port" (1),
+ * or 0 when none is queued; report a client port's stream as a ready spare. */
+int  dpumesh_prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len);
+int  dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port);
 
 /* ====== Connection lifecycle — internal, shared by both surfaces ======
  *

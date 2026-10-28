@@ -61,4 +61,8 @@ int dmesh_native_resolve(struct dmesh_native_transport *, const char *name, uint
 /* A client port's stream exists from connect until its FIN or disconnect. */
 int dmesh_native_connect(struct dmesh_native_transport *, uint16_t port, int service_id);
 int dmesh_native_disconnect(struct dmesh_native_transport *, uint16_t port);
+/* Migration spares: the next PREPARE destination (1) or none (0); and tell
+ * the DPU that the client stream on port is a ready spare. */
+int dmesh_native_prepare_next(struct dmesh_native_transport *, uint32_t *ip, uint16_t *port);
+int dmesh_native_spare_ready(struct dmesh_native_transport *, uint16_t port);
 #endif

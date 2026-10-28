@@ -2,7 +2,7 @@
  * Operations run on the caller thread and expose registered RX/TX memory. */
 #include "src/core/dmesh_core.h"
 #include <stdio.h>
-
+#include <string.h>
 #include <errno.h>
 
 /* ===== Send ===== */
@@ -122,6 +122,17 @@ static int poll_eq_once(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
         if (!drained) { eq->drain_cur = c; return n; }
     }
 
+    /* 2b. A migration PREPARE: the application opens a spare stream to the
+     * named target. One per poll; the text lives in the EQ until the next. */
+    if (n < max_events && dpumesh_prepare_next(s->ctx, eq->prepare_target, sizeof(eq->prepare_target))) {
+        events[n].qp        = NULL;
+        events[n].type      = DMESH_EVENT_PREPARE;
+        events[n].buf       = (const uint8_t *)eq->prepare_target;
+        events[n].len       = (uint32_t)strlen(eq->prepare_target);
+        events[n]._rx_token = -1;
+        n++;
+    }
+
     /* 3. Background tail faults are terminal for the QP and take precedence over
      * ordinary readiness, so an application never spins retrying a failed stream. */
     while (n < max_events) {
@@ -179,6 +190,11 @@ int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
         return 0;
     }
     return poll_eq_once(eq, events, max_events);
+}
+
+int dmesh_spare_ready(dmesh_qp_t *c) {
+    if (!c || !c->ep || c->role != DMESH_ROLE_CLIENT) { errno = EINVAL; return -1; }
+    return dpumesh_spare_ready(c->ep->ctx, c->local_port);
 }
 
 void dmesh_release_rx_buffer(dmesh_channel_t *s, dmesh_event_t *event) {

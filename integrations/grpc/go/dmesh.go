@@ -60,6 +60,7 @@ const (
 	evConnReq
 	evTxReady
 	evTxError
+	evPrepare
 )
 
 // qpID is a native QP handle, used as an opaque key.
@@ -71,7 +72,8 @@ type nativeEvent struct {
 	buf   []byte // evRecv: native memory, valid until release(token)
 	token int32  // receive lease; -1 when the event holds none
 
-	localPort, remotePort int // evConnReq
+	localPort, remotePort int    // evConnReq
+	target                string // evPrepare: "ip:port"
 }
 
 // native is the libdpumesh surface. pollWait, destroy and close run only on
@@ -90,6 +92,7 @@ type native interface {
 	release(token int32)
 	destroy(qp qpID, abort bool) error // consumes qp even on error
 	close() error                      // retryable
+	spareReady(qp qpID) error          // migration: qp is a ready spare
 }
 
 const (
@@ -139,6 +142,7 @@ type transport struct {
 	// late events are returned instead of held.
 	early    map[qpID]*earlyEvents
 	closing  map[qpID]struct{}
+	spares   map[string]*spare // migration spares by "ip:port"
 	cmds     []command
 	stopping bool
 	err      error         // sticky: transport failure or closed
@@ -155,7 +159,7 @@ var process struct {
 func newTransport(n native) *transport {
 	t := &transport{n: n, postMax: n.postMax(), serves: n.serves(), events: make([]nativeEvent, eventBatch),
 		kick: make(chan struct{}, 1), conns: make(map[qpID]*Conn),
-		early: make(map[qpID]*earlyEvents), closing: make(map[qpID]struct{}),
+		early: make(map[qpID]*earlyEvents), closing: make(map[qpID]struct{}), spares: make(map[string]*spare),
 		failed: make(chan struct{}), done: make(chan struct{})}
 	if t.postMax <= 0 {
 		t.err = fmt.Errorf("dmesh: native post size %d", t.postMax)
@@ -322,9 +326,14 @@ func (t *transport) fail(err error) {
 func (t *transport) dispatch(events []nativeEvent) {
 	orphans, rejects := t.orphans[:0], t.rejects[:0]
 	var accepted *Listener
+	var prepares []string
 	t.mu.Lock()
 	for i := range events {
 		ev := &events[i]
+		if ev.kind == evPrepare {
+			prepares = append(prepares, ev.target)
+			continue
+		}
 		c := t.conns[ev.qp]
 		if c == nil && ev.kind != evConnReq && t.holdLocked(ev) {
 			continue
@@ -383,6 +392,9 @@ func (t *transport) dispatch(events []nativeEvent) {
 	}
 	if accepted != nil {
 		accepted.signal()
+	}
+	for _, target := range prepares {
+		go t.prepareSpare(target)
 	}
 	t.orphans, t.rejects = orphans[:0], rejects[:0]
 }
@@ -868,7 +880,11 @@ func dialContext(ctx context.Context, server, srcIP string, dstIP string, dstPor
 	// caller label only and never overrides the QP allocator.
 	local := &net.TCPAddr{IP: net.ParseIP(envOr("DPUMESH_POD_IP", srcIP))}
 	remote := &net.TCPAddr{IP: net.ParseIP(dstIP), Port: dstPort}
-	c, err := t.dial(ctx, net.JoinHostPort(dstIP, strconv.Itoa(dstPort)), local, remote)
+	target := net.JoinHostPort(dstIP, strconv.Itoa(dstPort))
+	if c := t.takeSpare(target); c != nil {
+		return c, nil
+	}
+	c, err := t.dial(ctx, target, local, remote)
 	if err != nil {
 		return nil, err
 	}

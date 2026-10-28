@@ -50,6 +50,12 @@ struct assignment {
     uint32_t mode, dst_ip;
     uint16_t dst_port;
     uint64_t ready_ms;
+    /* Spare mode: the old flow waits (until spare_deadline_ms) for the spare
+     * that replaces it; the spare remembers the flow it replaces. */
+    bool awaiting_spare, replaces;
+    uint64_t spare_deadline_ms;
+    size_t replaced;
+    struct dmesh_flow_key replaced_key;
 };
 /* The next client OPEN of `session` to dst goes to `worker`, until expiry. */
 struct steer {
@@ -57,6 +63,9 @@ struct steer {
     uint64_t session_epoch, expires_ms;
     uint32_t dst_ip, worker;
     uint16_t dst_port;
+    bool replaces;              /* spare mode: the flow at `replaced` waits */
+    size_t replaced;
+    struct dmesh_flow_key replaced_key;
 };
 struct dmesh_dispatcher {
     size_t count, cursor;
@@ -73,6 +82,8 @@ struct dmesh_dispatcher {
      * DMESH_MIGRATE_MAX caps the total (0 = unlimited). */
     uint64_t migrate_period_ms, steer_ms;
     unsigned long migrate_max, migrations;
+    bool migrate_spare;         /* DMESH_MIGRATE_SPARE=1: PREPARE first */
+    uint32_t next_prepare_token;
     struct steer steers[DMESH_MAX_CONNECTIONS];
     int fd;
     pthread_t thread;
@@ -348,8 +359,8 @@ static void arm_flows(struct dmesh_dispatcher *d, struct objects *o, struct dmes
     }
 }
 
-static int take_steer(struct dmesh_dispatcher *d, struct dmesh_session *s,
-                      uint32_t dst_ip, uint16_t dst_port)
+static bool take_steer(struct dmesh_dispatcher *d, struct dmesh_session *s,
+                       uint32_t dst_ip, uint16_t dst_port, struct steer *out)
 {
     uint64_t now = membership_now_ms();
     for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
@@ -358,12 +369,12 @@ static int take_steer(struct dmesh_dispatcher *d, struct dmesh_session *s,
         if (now >= st->expires_ms) { memset(st, 0, sizeof(*st)); continue; }
         if (st->session == s && st->session_epoch == s->epoch &&
             st->dst_ip == dst_ip && st->dst_port == dst_port) {
-            int worker = (int)st->worker;
+            *out = *st;
             memset(st, 0, sizeof(*st));
-            return worker;
+            return true;
         }
     }
-    return -1;
+    return false;
 }
 /* Drain each client flow ready for migrate_period_ms; steer its reconnect to
  * the next eligible worker with a free slot. The old flow keeps its worker and
@@ -372,6 +383,16 @@ static void migrate_due(struct dmesh_dispatcher *d)
 {
     if (!d->migrate_period_ms || d->count < 2) return;
     uint64_t now = membership_now_ms();
+    for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
+        struct assignment *a = &d->flows[i];
+        if (a->used && a->awaiting_spare && now >= a->spare_deadline_ms) {
+            /* No SPARE_READY in time: degrade to the GOAWAY-only path. */
+            a->awaiting_spare = false;
+            a->drain_pending = true;
+            fprintf(stderr, "[dispatcher] spare-timeout flow=%u/%u unix_ns=%llu\n",
+                    a->key.flow_id, a->key.generation, (unsigned long long)realtime_ns());
+        }
+    }
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
         if (d->migrate_max && d->migrations >= d->migrate_max) return;
         struct assignment *a = &d->flows[i];
@@ -393,9 +414,25 @@ static void migrate_due(struct dmesh_dispatcher *d)
         if (!st) continue;
         *st = (struct steer){.session = a->session, .session_epoch = a->session->epoch,
             .expires_ms = now + d->steer_ms, .dst_ip = a->dst_ip, .dst_port = a->dst_port,
-            .worker = (uint32_t)to};
+            .worker = (uint32_t)to, .replaces = d->migrate_spare, .replaced = i,
+            .replaced_key = a->key};
         a->draining = true;
-        a->drain_pending = true;
+        if (d->migrate_spare) {
+            uint8_t target[8];
+            dmesh_session_put_u32(target, a->dst_ip);
+            dmesh_session_put_u32(target + 4, a->dst_port);
+            if (!++d->next_prepare_token) ++d->next_prepare_token;
+            if (dmesh_session_send(a->control, a->session, DMESH_SESSION_PREPARE, 0,
+                                   d->next_prepare_token, target, sizeof(target), 0) == DOCA_SUCCESS) {
+                a->awaiting_spare = true;
+                a->spare_deadline_ms = now + d->steer_ms;
+            } else {
+                st->replaces = false;
+                a->drain_pending = true;
+            }
+        } else {
+            a->drain_pending = true;
+        }
         ++d->migrations;
         fprintf(stderr, "[dispatcher] migrate session=%lu/%lu flow=%u/%u from=%zu slot=%u to=%zu n=%lu unix_ns=%llu\n",
                 a->key.session_id, a->key.session_epoch, a->key.flow_id, a->key.generation,
@@ -439,6 +476,19 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     if (!h->flow_id || h->flow_id > DMESH_MAX_CONNECTIONS) return;
     unsigned idx = h->flow_id - 1;
     struct assignment *a = find(d, s, h->flow_id);
+    if (h->type == DMESH_SESSION_SPARE_READY) {
+        if (!a || a->key.generation != h->generation || !a->replaces) return;
+        a->replaces = false;
+        struct assignment *old = &d->flows[a->replaced];
+        if (old->used && same_key(&old->key, &a->replaced_key) && old->awaiting_spare) {
+            old->awaiting_spare = false;
+            old->drain_pending = true;
+            fprintf(stderr, "[dispatcher] spare-ready flow=%u/%u owner=%u replaces=%u/%u unix_ns=%llu\n",
+                    h->flow_id, h->generation, a->location.worker, old->key.flow_id,
+                    old->key.generation, (unsigned long long)realtime_ns());
+        }
+        return;
+    }
     if (h->type == DMESH_SESSION_CLOSE) {
         if (a && a->key.generation == h->generation) {
             a->close_pending = true; /* durable, including queue saturation */
@@ -503,7 +553,9 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         d->loads[i].eligible = atomic_load(&d->workers[i].ready) && !atomic_load(&d->workers[i].departed);
     int owner = backend ? (int)requested_worker :
         d->policy.select(&spec, d->loads, d->count, d->cursor, d->policy.context);
-    int steered = backend ? -1 : take_steer(d, s, metadata.flow.dst_ip, metadata.flow.dst_port);
+    struct steer steer = {0};
+    int steered = !backend && take_steer(d, s, metadata.flow.dst_ip, metadata.flow.dst_port, &steer) ?
+        (int)steer.worker : -1;
     if (steered >= 0 && d->loads[steered].eligible &&
         d->loads[steered].assigned < DMESH_MAX_CONNECTIONS)
         owner = steered;
@@ -522,7 +574,9 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         .key = {spec.session_id, spec.session_epoch, h->flow_id, h->generation},
         .location = {.worker = (uint32_t)owner, .slot = slot, .ownership_epoch = 1},
         .backend_token = request_token, .mode = metadata.flow.mode,
-        .dst_ip = metadata.flow.dst_ip, .dst_port = metadata.flow.dst_port};
+        .dst_ip = metadata.flow.dst_ip, .dst_port = metadata.flow.dst_port,
+        .replaces = steered >= 0 && steer.replaces, .replaced = steer.replaced,
+        .replaced_key = steer.replaced_key};
     struct message m = {.key = a->key, .location = a->location, .type = OPEN, .length = sizeof(metadata)};
     memcpy(m.payload, &metadata, sizeof(metadata));
     if (!admit(&d->workers[owner], &m)) {
@@ -852,10 +906,11 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
     d->migrate_period_ms = env_u64("DMESH_MIGRATE_PERIOD_MS", 0);
     d->migrate_max = (unsigned long)env_u64("DMESH_MIGRATE_MAX", 0);
     d->steer_ms = env_u64("DMESH_MIGRATE_STEER_MS", 5000);
+    d->migrate_spare = env_u64("DMESH_MIGRATE_SPARE", 0) != 0;
     if (d->migrate_period_ms)
-        fprintf(stderr, "[dispatcher] migration period=%llums max=%lu steer=%llums\n",
+        fprintf(stderr, "[dispatcher] migration period=%llums max=%lu steer=%llums spare=%d\n",
                 (unsigned long long)d->migrate_period_ms, d->migrate_max,
-                (unsigned long long)d->steer_ms);
+                (unsigned long long)d->steer_ms, d->migrate_spare);
     const char *policy = getenv("DMESH_FLOW_PLACEMENT");
     if (policy && strcmp(policy, "round-robin") == 0) d->policy = dmesh_placement_round_robin;
     else if (policy && strcmp(policy, "least-flows") != 0) goto fail;

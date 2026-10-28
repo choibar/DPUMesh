@@ -144,6 +144,8 @@ func (f *fakeNative) pollWait(out []nativeEvent, maxWaitNs int64) (int, error) {
 
 func (f *fakeNative) wake() { signal(f.wakeCh) }
 
+func (f *fakeNative) spareReady(qp qpID) error { return nil }
+
 func (f *fakeNative) dial(target string) (qpID, int, error) {
 	if f.dialDelay > 0 {
 		time.Sleep(f.dialDelay)

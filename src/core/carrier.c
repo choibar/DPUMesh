@@ -177,6 +177,19 @@ static struct slot *slot_of_port(struct dmesh_native_transport *t, uint16_t port
     uint16_t i = t->port_slot[port];
     return i ? &t->slots[i - 1] : NULL;
 }
+int dmesh_native_prepare_next(struct dmesh_native_transport *t, uint32_t *ip, uint16_t *port)
+{
+    return channel_prepare_next(t->dev, ip, port);
+}
+int dmesh_native_spare_ready(struct dmesh_native_transport *t, uint16_t port)
+{
+    pthread_mutex_lock(&t->lock);
+    struct slot *s = slot_of_port(t, port);
+    struct channel_conn *c = s && s->state == SLOT_OPEN && !s->backend ? s->conn : NULL;
+    pthread_mutex_unlock(&t->lock);
+    if (!c) { errno = ENOTCONN; return -1; }
+    return channel_conn_spare_ready(c);
+}
 
 int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_config *cfg)
 {

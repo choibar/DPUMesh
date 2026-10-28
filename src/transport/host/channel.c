@@ -78,6 +78,9 @@ struct channel_dev {
 	int hello_ready, listen_ready, listen_error;
     struct { uint32_t token; int state, error; } backend[DMESH_SESSION_MAX_WORKERS];
     unsigned backend_pending, backend_rejections;
+    /* PREPARE requests (migration spares) not yet taken by the core. */
+    struct { uint32_t ip; uint16_t port; } prepare[8];
+    unsigned prepare_head, prepare_count;
     /* state: 1=pending, 2=processing, 3=done, 4=reject pending */
 	int session_error;
 	uint64_t last_send_ms;              /* Last control message submitted (keepalive) */
@@ -241,6 +244,14 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
             ++dev->backend_pending;
             dev->backend[w].token = h.generation;
             dev->backend[w].state = 1; dev->backend[w].error = 0;
+        }
+        return;
+    }
+    if (h.type == DMESH_SESSION_PREPARE) {
+        if (dev->prepare_count < 8) {
+            unsigned i = (dev->prepare_head + dev->prepare_count++) % 8;
+            dev->prepare[i].ip = dmesh_session_get_u32(payload);
+            dev->prepare[i].port = (uint16_t)dmesh_session_get_u32(payload + 4);
         }
         return;
     }
@@ -416,6 +427,28 @@ int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *to
     }
     pthread_mutex_unlock(&dev->session_lock);
     return found;
+}
+int channel_prepare_next(struct channel_dev *dev, uint32_t *ip, uint16_t *port)
+{
+    pthread_mutex_lock(&dev->session_lock);
+    int found = dev->prepare_count != 0;
+    if (found) {
+        *ip = dev->prepare[dev->prepare_head].ip;
+        *port = dev->prepare[dev->prepare_head].port;
+        dev->prepare_head = (dev->prepare_head + 1) % 8;
+        --dev->prepare_count;
+    }
+    pthread_mutex_unlock(&dev->session_lock);
+    return found;
+}
+int channel_conn_spare_ready(struct channel_conn *conn)
+{
+    struct channel_dev *dev = conn->dev;
+    pthread_mutex_lock(&dev->session_lock);
+    int rc = session_send_locked(dev, DMESH_SESSION_SPARE_READY, conn->flow_id,
+                                 conn->generation, NULL, 0);
+    pthread_mutex_unlock(&dev->session_lock);
+    return rc;
 }
 void channel_backend_finish(struct channel_dev *dev, uint32_t worker, uint32_t token, int error)
 {
