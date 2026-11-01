@@ -63,4 +63,10 @@ static inline int carrier_window_advance(struct carrier_rx_window *w, uint64_t *
     *seq = w->next_release - 1; *bytes = w->consumed_bytes;
     return moved;
 }
+/* No batch is held. Batches are added in sequence from next_release on, so
+ * the window is empty exactly when that one is not live. */
+static inline int carrier_window_empty(const struct carrier_rx_window *w)
+{
+    return !w->batch[w->next_release % CHANNEL_DESC_N].live;
+}
 #endif

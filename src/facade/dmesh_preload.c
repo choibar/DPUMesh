@@ -1493,8 +1493,8 @@ int shutdown(int fd, int how) {
     pthread_mutex_lock(&e->mu);
     if ((how == SHUT_WR || how == SHUT_RDWR) && !e->wr_closed) {
         e->wr_closed = 1;
-        /* Ship buffered bytes, then close only the write half. The DPU keeps
-         * the return mapping until the peer's FIN, so reads may continue and
+        /* Ship buffered bytes, then close only the write half. The flow stays
+         * open until the QP closes, so reads continue to the peer's FIN and
          * a request/response protocol can finish normally. */
         if (e->conn) {
             if (dmesh_flush(e->conn) != 0 || dmesh_send_fin(e->conn) != 0) {

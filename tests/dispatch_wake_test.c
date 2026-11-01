@@ -153,6 +153,28 @@ int main(void)
     assert(s->armed && s->armed_epoch == 14);
     assert(queued(&w1->mailbox->requests) == before1 && queued(&w2->mailbox->requests) == before2);
 
+    /* SHUTDOWN reaches its flow's owner, also past a full queue, and leaves the
+     * flow running; a stale generation reaches nobody. */
+    {
+        uint8_t posted[8];
+        dmesh_session_put_u64(posted, 6);
+        struct dmesh_session_header shut = {.type = DMESH_SESSION_SHUTDOWN, .flow_id = 2,
+                                            .generation = 4, .payload_len = sizeof(posted)};
+        dmesh_dispatcher_request(d.controls[0], s, &shut, posted);
+        assert(!a2->shut_pending);
+        shut.generation = 5;
+        dmesh_dispatcher_request(d.controls[0], s, &shut, posted);
+        struct message full = {.type = CLOSE}, out;
+        while (push(&w2->mailbox->requests, &full)) {}
+        flush_commands(&d);
+        assert(a2->shut_pending);
+        while (peek(&w2->mailbox->requests, &out, true)) {}
+        flush_commands(&d);
+        assert(!a2->shut_pending && queued(&w2->mailbox->requests) == 1);
+        dmesh_dispatch_worker_drain(w2);
+        assert(c2->host_shut && c2->host_shut_descs == 6 && c2->state == DMESH_CONN_RUNNING);
+    }
+
     /* An owner whose queue is full cannot hold the ARM: ring at once. */
     struct message filler = {.type = CLOSE};
     while (push(&w1->mailbox->requests, &filler)) {}

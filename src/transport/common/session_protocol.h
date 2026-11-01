@@ -4,14 +4,14 @@
 /* Host/DPU control protocol. The public native ABI and DMA descriptor format
  * are independent of this version. Integers in the envelope are little endian;
  * v2 adds listener registration and worker-pinned backend requests, v4 the
- * ARM/DOORBELL idle wake, v5 the PING keepalive. DMA metadata payloads retain
- * the existing LP64 host/DPU layout. */
+ * ARM/DOORBELL idle wake, v5 the PING keepalive, v6 the SHUTDOWN half close.
+ * DMA metadata payloads retain the existing LP64 host/DPU layout. */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #define DMESH_SESSION_MAGIC UINT32_C(0x444d5348)
-#define DMESH_SESSION_VERSION 5u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING */
+#define DMESH_SESSION_VERSION 6u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING + SHUTDOWN */
 #define DMESH_SESSION_HEADER_SIZE 24u
 #define DMESH_SESSION_MAX_PAYLOAD 2048u
 #define DMESH_SESSION_MAX_FRAME (DMESH_SESSION_HEADER_SIZE + DMESH_SESSION_MAX_PAYLOAD)
@@ -49,6 +49,11 @@ enum dmesh_session_message_type {
      * to a host that created a consumer, so a host without one never sees
      * this type. */
     DMESH_SESSION_WAKE_READY = 17,
+    /* SHUTDOWN (host -> DPU, flow): the host closed its sending half. The
+     * u64 payload counts the descriptors it posted on the flow's forward ring;
+     * the proxy reads end of stream after all of them, and the flow stays
+     * open until CLOSE. */
+    DMESH_SESSION_SHUTDOWN = 18,
 };
 
 /* ARM payload: u64 epoch, u32 count, u32 zero, then count entries of
@@ -129,6 +134,8 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
     case DMESH_SESSION_READY:
     case DMESH_SESSION_CLOSE:
         return h->payload_len == 0 && h->status == 0;
+    case DMESH_SESSION_SHUTDOWN:
+        return h->payload_len == 8 && h->status == 0;
     case DMESH_SESSION_CLOSED:
         return h->payload_len == 0;
     case DMESH_SESSION_ERROR:

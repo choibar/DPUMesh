@@ -40,7 +40,8 @@ exports rcv_ring + tx_staging instead of pushing).
 | custody ACK | The DPA's `consumer_head` passing a descriptor's ticket. |
 | `dmesh_poll_qp` receive | One push batch `{seq, pos, len}` becomes one receive event pointing into the flow's data ring. No copy. |
 | `dmesh_release_rx_buffer` | Marks the batch released; the consumption cursor advances over the released prefix and the DPU pulls it for flow control. A long-held batch blocks only its own QP. |
-| `dmesh_destroy_qp`, `dmesh_abort_qp` | Retain the current FIN behavior. Transport cleanup sends flow CLOSE after local reverse DMA stops; matching CLOSED permits resource release. A flow close leaves the channel's Comch session and siblings alive. |
+| `dmesh_destroy_qp`, `dmesh_abort_qp` | Retain the current FIN behavior. Transport cleanup sends flow CLOSE after local reverse DMA stops; matching CLOSED permits resource release. A flow close leaves the channel's Comch session and siblings alive. The flow's window is reused only after the application releases every batch it still holds. |
+| preload `shutdown(SHUT_WR)` | Sends SHUTDOWN with the count of descriptors posted on the flow; the proxy reads end of stream after all of them, and the flow keeps receiving until the QP closes. |
 
 ### DPU-side guarantees
 

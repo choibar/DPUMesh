@@ -89,7 +89,9 @@ typedef struct dmesh_event {
 /* Create a channel using $DPUMESH_SERVICE identity. NULL indicates failure. */
 dmesh_channel_t *dmesh_create_channel(void);
 
-/* Destroy an idle channel. Returns EBUSY while a QP remains. Safe on NULL. */
+/* Destroy an idle channel. Returns EBUSY while a QP remains, changing nothing,
+ * or while a receive buffer is still held, having stopped the channel: release
+ * it and destroy again. Safe on NULL. */
 int dmesh_destroy_channel(dmesh_channel_t *s);
 
 int dmesh_post_max(dmesh_channel_t *s);    /* max length of one alloc/post (block size) */

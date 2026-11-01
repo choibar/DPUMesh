@@ -27,7 +27,8 @@ struct dmesh_native_event {
 int dmesh_native_open(struct dmesh_native_transport **, struct dmesh_native_config *);
 /* close retains ownership on failure; no mapping may be freed before quiesce. */
 int dmesh_native_close(struct dmesh_native_transport *);
-/* submit borrows the registered TX range until a custody ACK, including FIN. */
+/* submit borrows the registered TX range until a custody ACK, including FIN.
+ * A FIN with DMESH_DESC_HALF_CLOSE ends only the forward stream. */
 int dmesh_native_submit(struct dmesh_native_transport *, const sw_descriptor_t *);
 /* A stripe has one consumer at a time; the core provides per-stripe exclusion. */
 /* Advance the channel's shared control PE once before scanning its stripes.
@@ -78,7 +79,9 @@ int dmesh_native_idle_arm(struct dmesh_native_transport *);
 /* ARM messages sent and DOORBELLs received, for diagnostics. */
 void dmesh_native_wake_counters(struct dmesh_native_transport *, uint64_t *arms, uint64_t *doorbells);
 int dmesh_native_resolve(struct dmesh_native_transport *, const char *name, uint32_t addr, uint16_t port);
-/* A client port's stream exists from connect until its FIN or disconnect. */
+/* A client port's stream exists from connect until its FIN or disconnect; a
+ * half-close FIN ends only its forward direction. Its receive buffers outlive
+ * it until released; close fails with EBUSY while one is held. */
 int dmesh_native_connect(struct dmesh_native_transport *, uint16_t port, int service_id);
 int dmesh_native_disconnect(struct dmesh_native_transport *, uint16_t port);
 #endif

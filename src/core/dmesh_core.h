@@ -49,9 +49,11 @@ typedef struct {
     int16_t  dst_pod;               /* dest pod; DMESH_POD_BLANK(-1) -> DPU resolves dst_service */
     uint16_t dst_port;              /* dest port; DMESH_PORT_BLANK(0) -> accept queue */
     uint16_t seq;                   /* per-conn sequence (match key with port) */
-    uint16_t flags;                 /* private carrier: explicit object adapter */
+    uint16_t flags;                 /* DMESH_DESC_* */
     int8_t   valid;
 } sw_descriptor_t;
+/* A FIN that ends only the sender's half: the flow keeps receiving. */
+#define DMESH_DESC_HALF_CLOSE 1u
 
 /* ====== Opaque context ====== */
 typedef struct dpumesh_ctx dpumesh_ctx_t;
@@ -237,11 +239,11 @@ int  dmesh_tx_qp_valid(dmesh_qp_t *c);
 int  dmesh_tx_call_active(dmesh_qp_t *c);
 int  dmesh_tx_publish(dmesh_qp_t *c);
 
-/* Send an ordered zero-length FIN on the connection's forward ring. The call
- * first waits (bounded) for submitted data's DMA copies to complete. A drain
- * or ring timeout returns EBADMSG without latching fin_sent; an open transmit
- * call returns EDEADLK. The FIN remains in flight until the DPU retires the
- * old connection key, which quarantines the local port across close. */
+/* Close the sending half: an ordered zero-length FIN on the connection's
+ * forward ring, after which the QP keeps receiving until the peer's FIN. The
+ * call first waits (bounded) for submitted data's DMA copies to complete. A
+ * drain or ring timeout returns EBADMSG without latching fin_sent; an open
+ * transmit call returns EDEADLK. */
 int dmesh_send_fin(dmesh_qp_t *c);
 
 #ifdef __cplusplus

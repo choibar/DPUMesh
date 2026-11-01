@@ -13,7 +13,9 @@ operations. The façade and the channel/QP core are linked into
 A channel is the registration and memory domain and the process's listening
 socket. A QP is one connected stream, dialed (`dmesh_create_qp`) or accepted
 (`dmesh_accept`), with its own fd. Destroy the QPs before their channel;
-destroying a channel with a live QP returns `EBUSY`. One thread at a time
+destroying a channel with a live QP returns `EBUSY` and changes nothing.
+With a receive buffer still held it also returns `EBUSY`, having stopped the
+channel; release the buffer and destroy it again. One thread at a time
 polls a QP, and one polls the channel. A QP's transmit calls form a serial
 stream; the caller serializes them against QP destruction. `user_data`
 belongs to the application.

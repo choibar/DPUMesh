@@ -251,6 +251,15 @@ static void receive_test(void)
     expect_error(before, peer_a, 1, 8, EBUSY);
     assert(a->pending_metadata == owned && sa->generation[0] == 7);
 
+    /* SHUTDOWN half closes the live generation only and leaves it open. */
+    uint8_t posted[8];
+    dmesh_session_put_u64(posted, 5);
+    before = response_attempts;
+    deliver(peer_a, DMESH_SESSION_SHUTDOWN, 1, 6, posted, sizeof(posted));
+    deliver(peer_a, DMESH_SESSION_SHUTDOWN, 2, 4, posted, sizeof(posted));
+    assert(!a->host_shut && b->host_shut && b->host_shut_descs == 5);
+    assert(b->state == DMESH_CONN_NEW && response_attempts == before);
+
     /* An old incarnation's delayed CLOSE must not close the live generation. */
     before = response_attempts;
     deliver(peer_a, DMESH_SESSION_CLOSE, 1, 6, NULL, 0);

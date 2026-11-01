@@ -40,9 +40,11 @@ static void test_closed_stripe_stays_pollable_until_retired(void)
     assert(dmesh_native_progress(t) == (UINT32_C(1) << 31));
     assert(progress_calls == 1);
     /* Only retirement, not close, may remove the stripe from future drains. */
+    slot_reap_locked(t, s);
+    assert(dmesh_native_progress(t) == (UINT32_C(1) << 31));
     s->fin_pending = 0;
-    slot_free(t, s);
-    assert(dmesh_native_progress(t) == 0 && progress_calls == 2);
+    slot_reap_locked(t, s);
+    assert(dmesh_native_progress(t) == 0 && progress_calls == 3 && s->state == SLOT_FREE);
     free(t);
 }
 
@@ -172,10 +174,74 @@ static void test_batched_poll(void)
     t->port_slot[7] = 1;
     n = dmesh_native_poll(t, 0, ev, 8);
     assert(n == 2 && ev[0].seq == 16 && ev[0].seq_count == 2 && ev[1].seq == 18 && ev[1].seq_count == 1);
-    assert(s->state == SLOT_FREE && t->port_slot[7] == 0);
+    /* Retired, it leaves its port; the three batches the application holds
+     * keep the slot until the last is released. */
+    assert(s->state == SLOT_CLOSED && t->port_slot[7] == 0);
+    dmesh_native_release(t, CHANNEL_DATA_OFF + 128);
+    dmesh_native_release(t, CHANNEL_DATA_OFF);
+    assert(s->state == SLOT_CLOSED);
+    dmesh_native_release(t, CHANNEL_DATA_OFF + 256);
+    assert(s->state == SLOT_FREE);
     t->flow_wake = 0;
     pthread_mutex_destroy(&s->lock);
     free(t);
+}
+
+/* What the close tests script beyond the poll's connection. */
+static unsigned shutdowns, closes;
+int channel_conn_shutdown(struct channel_conn *conn) { (void)conn; ++shutdowns; return 0; }
+int channel_conn_close(struct channel_conn *conn) { (void)conn; ++closes; return 0; }
+uint32_t channel_conn_ring_free(const struct channel_conn *conn) { (void)conn; return CHANNEL_RING_SIZE; }
+uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t bytes)
+{ (void)conn; (void)addr; (void)bytes; return 0; }
+void *channel_mem_base(const struct channel_mem *mem) { (void)mem; return NULL; }
+void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes)
+{ (void)conn; (void)seq; (void)bytes; }
+int channel_session_close(struct channel_dev *dev) { (void)dev; return 0; }
+void channel_mem_free(struct channel_mem *mem) { (void)mem; }
+void channel_dev_close(struct channel_dev *dev) { (void)dev; }
+
+/* A half close ends only the forward stream: its FIN is ACKed after the
+ * custody ahead of it while receives go on. The QP's own FIN closes the flow;
+ * retired, the slot leaves its port but is reused only once its held batch is
+ * released, and the end of stream holds none. A held batch keeps the carrier
+ * from closing. */
+static void test_half_close_and_held_buffers(void)
+{
+    struct dmesh_native_transport *t = calloc(1, sizeof(*t));
+    assert(t);
+    struct slot *s = &t->slots[0];
+    assert(pthread_mutex_init(&s->lock, NULL) == 0 && pthread_mutex_init(&t->lock, NULL) == 0);
+    for (int i = 0; i < SLOTS; ++i) t->slots[i].epfd = -1;
+    struct dmesh_native_event ev[8];
+    s->state = SLOT_OPEN; s->port = 9; s->conn = (struct channel_conn *)t;
+    t->port_slot[9] = 1; t->active_stripes = 1;
+    carrier_window_init(&s->window);
+    s->tickets[0] = (struct ticket){1, 5}; s->t_tail = 1;
+    conn_consumed = 4;
+    sw_descriptor_t fin = {.src_port = 9, .seq = 2, .flags = DMESH_DESC_HALF_CLOSE, .valid = 1};
+    assert(dmesh_native_submit(t, &fin) == 0);
+    assert(shutdowns == 1 && closes == 0 && s->state == SLOT_OPEN);
+    rx_next_seq = rx_last = 1;                 /* a new flow: its first batch, at 0 */
+    assert(dmesh_native_poll(t, 0, ev, 8) == 1 && ev[0].kind == DMESH_NATIVE_RX);
+    int held = ev[0].desc.body_buf_slot;
+    conn_consumed = 5;
+    assert(dmesh_native_poll(t, 0, ev, 8) == 1);
+    assert(ev[0].kind == DMESH_NATIVE_ACK && ev[0].seq == 1 && ev[0].seq_count == 2);
+    conn_gone = 1;
+    assert(dmesh_native_poll(t, 0, ev, 8) == 1 && ev[0].kind == DMESH_NATIVE_RX && ev[0].desc.body_len == 0);
+    dmesh_native_release(t, ev[0].desc.body_buf_slot);
+    assert(!carrier_window_empty(&s->window));
+    conn_gone = 0;
+    fin.seq = 3; fin.flags = 0;
+    assert(dmesh_native_submit(t, &fin) == 0 && closes == 1 && t->port_slot[9] == 1);
+    assert(dmesh_native_poll(t, 0, ev, 8) == 1 && ev[0].kind == DMESH_NATIVE_ACK && ev[0].seq == 3);
+    assert(s->state == SLOT_CLOSED && t->port_slot[9] == 0 && t->active_stripes == 0);
+    assert(dmesh_native_close(t) == -1 && errno == EBUSY && closes == 1);
+    dmesh_native_release(t, held);
+    assert(s->state == SLOT_FREE);
+    pthread_mutex_destroy(&s->lock);
+    assert(dmesh_native_close(t) == 0);
 }
 
 int main(void)
@@ -184,6 +250,7 @@ int main(void)
     test_custody_polling();
     test_flow_consumer_rearmed_after_close();
     test_batched_poll();
+    test_half_close_and_held_buffers();
     uint32_t p[2];
     assert(carrier_chunks(0, p) == 0);
     assert(carrier_chunks(1, p) == 1 && p[0] == 1);
@@ -214,6 +281,6 @@ int main(void)
         assert(carrier_window_release(&v, (uint32_t)(k * 64u % 4096u)) == 0);
         assert(carrier_window_advance(&v, &seq, &bytes) && seq == k && bytes == k * 64u);
     }
-    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll: PASS");
+    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close and held buffers: PASS");
     return 0;
 }

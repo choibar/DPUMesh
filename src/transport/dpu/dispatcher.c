@@ -17,7 +17,7 @@
 /* Only control messages cross these queues. In particular no DMA descriptor,
  * payload, data completion or credit update visits the dispatcher. */
 #define QUEUE_SIZE 128u
-enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, ARM };
+enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, ARM, SHUTDOWN };
 struct message {
     struct dmesh_flow_key key;
     struct dmesh_flow_location location;
@@ -43,7 +43,8 @@ struct dmesh_worker_mailbox {
     _Atomic bool ready, departed;
 };
 struct assignment {
-    bool used, opening, ready, close_pending, lost_pending;
+    bool used, opening, ready, close_pending, lost_pending, shut_pending;
+    uint64_t shut_descs;           /* SHUTDOWN's descriptor count */
     struct objects *control;
     struct dmesh_session *session;
     struct dmesh_flow_key key;
@@ -357,6 +358,13 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     if (!h->flow_id || h->flow_id > DMESH_MAX_CONNECTIONS) return;
     unsigned idx = h->flow_id - 1;
     struct assignment *a = find(d, s, h->flow_id);
+    if (h->type == DMESH_SESSION_SHUTDOWN) {
+        if (a && a->key.generation == h->generation) {
+            a->shut_descs = dmesh_session_get_u64(payload);
+            a->shut_pending = true;  /* durable like CLOSE */
+        }
+        return;
+    }
     if (h->type == DMESH_SESSION_CLOSE) {
         if (a && a->key.generation == h->generation) {
             a->close_pending = true; /* durable, including queue saturation */
@@ -485,12 +493,14 @@ static void flush_commands(struct dmesh_dispatcher *d)
 {
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
         struct assignment *a = &d->flows[i];
-        if (!a->used || (!a->lost_pending && !a->close_pending)) continue;
+        if (!a->used || (!a->lost_pending && !a->close_pending && !a->shut_pending)) continue;
         struct message m = {.key = a->key, .location = a->location,
-                            .type = a->lost_pending ? LOST : CLOSE};
+                            .type = a->lost_pending ? LOST : a->close_pending ? CLOSE : SHUTDOWN};
+        if (m.type == SHUTDOWN) { m.length = 8; dmesh_session_put_u64(m.payload, a->shut_descs); }
         if (push(&d->workers[a->location.worker].requests, &m)) {
             if (m.type == LOST) a->lost_pending = false;
-            else a->close_pending = false;
+            else if (m.type == CLOSE) a->close_pending = false;
+            a->shut_pending = false;     /* sent, or moot after a close or loss */
             wake(d->workers[a->location.worker].fd);
         }
     }
@@ -613,6 +623,11 @@ void dmesh_dispatch_worker_drain(struct objects *o)
         } else if (same_key(&c->key, &m.key) &&
                    c->location.ownership_epoch == m.location.ownership_epoch && c->state != DMESH_CONN_FREE) {
             if (m.type == ARM) { arm_flow(c, &m); continue; }
+            if (m.type == SHUTDOWN) {
+                c->host_shut_descs = dmesh_session_get_u64(m.payload);
+                c->host_shut = true;
+                continue;
+            }
             if (m.type == LOST) c->session->closing = true;
             if (m.type == CLOSE) c->close_requested = true;
             c->state = DMESH_CONN_CLOSING;

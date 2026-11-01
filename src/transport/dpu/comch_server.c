@@ -310,6 +310,13 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
         }
         return;
     }
+    if (h.type == DMESH_SESSION_SHUTDOWN) {
+        if (conn != NULL) {
+            conn->host_shut_descs = dmesh_session_get_u64(payload);
+            conn->host_shut = true;
+        }
+        return;
+    }
     if (h.type == DMESH_SESSION_CLOSE) {
         if (conn != NULL) {
             conn->close_requested = true;

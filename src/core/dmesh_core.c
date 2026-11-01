@@ -1072,12 +1072,12 @@ static void stripe_unbind(dpumesh_ctx_t *ctx, struct dmesh_port_slot *psl)
     int stripe = psl->stripe;
     psl->stripe = -1;
     if (stripe < 0) return;
+    /* A stripe whose slot already carries another QP's flow stays with it. */
     struct dmesh_eq *owner = __atomic_load_n(&ctx->stripe_owner[stripe], __ATOMIC_ACQUIRE);
+    if (!owner || owner != psl->eq) return;
     int fd = dmesh_native_stripe_fd(ctx->transport, stripe);
-    if (owner) {
-        epoll_unnest(owner->epfd, fd);
-        atomic_fetch_and(&owner->stripes, ~(UINT32_C(1) << stripe));
-    }
+    epoll_unnest(owner->epfd, fd);
+    atomic_fetch_and(&owner->stripes, ~(UINT32_C(1) << stripe));
     __atomic_store_n(&ctx->stripe_owner[stripe], NULL, __ATOMIC_RELEASE);
     (void)epoll_nest(ctx->spare_epfd, fd, EQ_TAG(EQ_TAG_STRIPE, stripe));
 }
@@ -2544,11 +2544,12 @@ int dmesh_flush(dmesh_qp_t *c) {
 }
 
 
-/* Ship this conn's FIN. Idempotent: fin_sent latches. Independent of
- * peer_closed — a received FIN does not close this half, and the DPU's upstream
- * teardown fans out from this FIN alone. */
-static int dmesh_send_fin_locked(dmesh_qp_t *c) {
-    if (c->fin_sent) return 0;
+/* Ship this conn's FIN. Independent of peer_closed — a received FIN does not
+ * close this half. A half close (DMESH_DESC_HALF_CLOSE) leaves the flow
+ * receiving and latches fin_sent; the QP's own FIN, sent once as it is
+ * destroyed, ends the flow and so still follows a half close. */
+static int dmesh_send_fin_locked(dmesh_qp_t *c, uint16_t flags) {
+    if (c->fin_sent && flags) return 0;
     dpumesh_ctx_t *ctx = c->ep->ctx;
     uint16_t next_seq = (uint16_t)(c->seq + 1);
     sw_descriptor_t d;
@@ -2560,6 +2561,7 @@ static int dmesh_send_fin_locked(dmesh_qp_t *c) {
     d.dst_service   = c->dst_service;
     d.dst_pod       = c->remote_pod;                       /* the learned peer conn */
     d.dst_port      = c->remote_port;
+    d.flags         = flags;
     d.valid         = 1;
     if (tx_tracking_ensure(ctx, &ctx->ports[c->local_port]) != 0)
         return -1;
@@ -2583,9 +2585,9 @@ static int dmesh_send_fin_locked(dmesh_qp_t *c) {
 /* Publish an ordered reset marker without waiting for earlier data custody.
  * The marker shares the QP's forward ring, so the DPU observes every earlier
  * descriptor first, then drops the stream window and both proxy directions.
- * Unlike FIN, reset is used only when graceful ordering cannot complete. */
+ * Unlike FIN, reset is used only when graceful ordering cannot complete. Like
+ * the QP's own FIN, it follows a half close. */
 static int dmesh_send_abort_locked(dmesh_qp_t *c) {
-    if (c->fin_sent) return 0;
     dpumesh_ctx_t *ctx = c->ep->ctx;
     uint16_t next_seq = (uint16_t)(c->seq + 1);
     sw_descriptor_t d;
@@ -2617,7 +2619,7 @@ int dmesh_send_fin(dmesh_qp_t *c) {
     struct dmesh_port_slot *psl = &c->ep->ctx->ports[c->local_port];
     int result = dmesh_tx_publish(c);
     if (result == 0) result = dmesh_wait_tx_reclaimed_locked(c->ep->ctx, psl);
-    if (result == 0) result = dmesh_send_fin_locked(c);
+    if (result == 0) result = dmesh_send_fin_locked(c, DMESH_DESC_HALF_CLOSE);
     return result;
 }
 
@@ -2650,7 +2652,7 @@ static int dmesh_release_qp(dmesh_qp_t *c, int graceful) {
      * conn to tear down. */
     if (c->role == DMESH_ROLE_SERVER || c->seq > 0) {
         int end_result = reset ? dmesh_send_abort_locked(c)
-                               : dmesh_send_fin_locked(c);
+                               : dmesh_send_fin_locked(c, 0);
         if (end_result != 0 && close_result == 0) {
             close_result = -1;
             close_errno = errno;

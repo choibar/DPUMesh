@@ -1568,6 +1568,18 @@ int channel_conn_close(struct channel_conn *conn)
 	return rc;
 }
 
+int channel_conn_shutdown(struct channel_conn *conn)
+{
+	struct channel_dev *dev = conn->dev;
+	uint8_t posted[8];
+	dmesh_session_put_u64(posted, conn->forward_ring->head);
+	pthread_mutex_lock(&dev->session_lock);
+	int rc = session_send_locked(dev, DMESH_SESSION_SHUTDOWN, conn->flow_id, conn->generation,
+				     posted, sizeof(posted));
+	pthread_mutex_unlock(&dev->session_lock);
+	return rc;
+}
+
 int channel_dev_progress(struct channel_dev *dev)
 {
 	pthread_mutex_lock(&dev->session_lock);

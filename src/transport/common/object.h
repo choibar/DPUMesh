@@ -202,6 +202,11 @@ struct dmesh_conn {
     int recv_seg_head;                        /* consumer (Rust pop) */
     int recv_seg_cnt;
     long recv_seg_dropped;                    /* segments lost to a full ring */
+    /* The host closed its sending half after host_shut_descs forward
+     * descriptors (SHUTDOWN): once all completed and were popped, the pop
+     * reports end of stream. */
+    bool host_shut;
+    uint64_t host_shut_descs;
 
     /* Reverse (response) path, DPU-owned. The DPU exports both to the host,
      * whose DPA thread polls rcv_ring for descriptors and DMAs the referenced
