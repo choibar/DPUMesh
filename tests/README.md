@@ -9,9 +9,9 @@
 | `native_api_contract_test`, `preload_api_contract_test` | Façade argument validation without a transport |
 | `native_core_transport_test` | Channel, accept, QP, reservation, custody ACK, held RX buffers, FIN and teardown over the memory carrier in `support/` |
 | `native_listen_test` | The channel as listening socket: accept returns a QP with its own fd; with flow wake a QP drains and arms its own stripe only and gets its control news, without it the channel hands each QP its receives |
-| `native_signaled_test` | A QP's idle wake with signaled receives: no naps, quiet sends, custody sleeps, a waiting sender polls, the re-check drain returns |
+| `native_signaled_test` | A QP's idle wake with signaled receives: quiet sends, the backstop left alone, custody sleeps, a waiting sender or a retiring flow polls, the re-check drain returns |
 | `native_writable_test` | Writable-buffer accounting of the core; a drain quiets only its own thread's notifies of its EQ |
-| `native_polling_test` | A QP's idle wake (naps, linger, custody polling, sleep on its own stripe, backstop, which counts a missed wake only when it hands the poller events); the channel arms the session and re-polls after a DOORBELL |
+| `native_polling_test` | A QP's idle wake (the periodic backstop from the fd's hand-out, sleep on its own stripe, re-polls while a flow retires, the backstop's missed-wake count, which counts only when it hands the poller events); the channel arms the session and re-polls after a DOORBELL |
 | `native_loss_test` | A lost session ends the process with status 75 by default; with `DPUMESH_EXIT_ON_LOSS=0` accepts, polls and dials report the sticky errno and the channel's and QPs' fds stay readable |
 | `rx_consumed_pos_test` | Production proxy shim: DPU RX consumed-position batching under the DPA SDK lock, failed-copy retry and multiple staging wraps |
 | `carrier_logic_test` | Forward chunking to the DPUMesh copy rule and the in-order release window of the carrier |

@@ -12,6 +12,9 @@ struct dmesh_native_config {
     void *tx, *rx;
     size_t rx_bytes;              /* receive region size; 0 means the TX size */
     int pod_id, service_id, stripes;
+    /* Descriptors one flow can have submitted and unacknowledged, a power of
+     * two: within it a submit never finds the flow's ring full. */
+    uint32_t flow_depth;
 };
 enum { DMESH_NATIVE_RX = 1, DMESH_NATIVE_ACK, DMESH_NATIVE_ERROR };
 struct dmesh_native_event {
@@ -35,34 +38,35 @@ uint32_t dmesh_native_progress(struct dmesh_native_transport *);
 /* The errno of a failed session, or 0. Sticky: a lost session never recovers,
  * so every flow, dial and accept of the channel is dead with it. */
 int dmesh_native_lost(struct dmesh_native_transport *);
-int dmesh_native_poll(struct dmesh_native_transport *, int stripe, struct dmesh_native_event *);
+/* Fills up to max events of one stripe, after publishing what its flow wake
+ * completed (dmesh_native_flow_wake), all under one hold of the stripe;
+ * returns the count. Consecutive custody ACKs come as one event (seq_count). */
+int dmesh_native_poll(struct dmesh_native_transport *, int stripe, struct dmesh_native_event *, int max);
 void dmesh_native_release(struct dmesh_native_transport *, int byte_offset);
 /* Doorbell of a stripe: an fd readable while the stripe has signalled work, or
  * -1 when the stripe has none. Stable for the carrier's lifetime. */
 int dmesh_native_stripe_fd(struct dmesh_native_transport *, int stripe);
 /* The stripe carrying a port's stream, or -1. */
 int dmesh_native_stripe_of(struct dmesh_native_transport *, uint16_t port);
-/* Arms the stripe's doorbell before its consumer sleeps. Returns 0 when
+/* Arms the stripe's doorbell before its consumer sleeps; `rang` acknowledges
+ * a doorbell that fired since the last arm. Returns 0 when
  * dmesh_native_idle_arm plus the doorbell suffice; otherwise what still needs
  * polling (custody ACKs have no doorbell): DMESH_STRIPE_CUSTODY for an open
  * flow's outstanding custody, DMESH_STRIPE_RETIRING for a closed flow whose
  * custody or FIN still has to be retired. */
 enum { DMESH_STRIPE_CUSTODY = 1, DMESH_STRIPE_RETIRING = 2 };
-int dmesh_native_stripe_arm(struct dmesh_native_transport *, int stripe);
+int dmesh_native_stripe_arm(struct dmesh_native_transport *, int stripe, int rang);
 /* Flow wake (every signaled channel): every stripe has a Comch consumer of
  * its own, whose fd is the stripe's doorbell. Its receives are published only
- * by dmesh_native_stripe_progress, and its control messages (CLOSED, ERROR)
- * are reported by dmesh_native_take_news to the session's progress, since the
- * doorbell carries receives alone. Fixed once the carrier is open. */
+ * by dmesh_native_poll, and its control messages (CLOSED, ERROR) are reported
+ * by dmesh_native_take_news to the session's progress, since the doorbell
+ * carries receives alone. Fixed once the carrier is open. */
 int dmesh_native_flow_wake(struct dmesh_native_transport *);
-void dmesh_native_stripe_progress(struct dmesh_native_transport *, int stripe);
 uint32_t dmesh_native_take_news(struct dmesh_native_transport *);
 /* Nonzero when every receive raises the channel wake fd by itself (the
  * Comch fast path): an idle consumer then needs neither an ARM round trip
  * nor polling to see receives. Fixed once the carrier is open. */
 int dmesh_native_rx_signaled(struct dmesh_native_transport *);
-/* Acknowledges a signalled doorbell; the stripe is then polled. */
-void dmesh_native_stripe_clear(struct dmesh_native_transport *, int stripe);
 /* Channel-wide idle wake: the fd (or -1) is raised by control messages once
  * dmesh_native_idle_arm succeeded, which also asks the DPU to ring for
  * receives without a doorbell. The arm does not progress the channel: the

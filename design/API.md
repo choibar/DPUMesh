@@ -48,13 +48,12 @@ target, and a server's `DPUMESH_SERVICE` is the target it serves.
 
 ## Transmit and receive
 
-`dmesh_alloc` acquires the QP's transmit gate and reserves contiguous memory;
-`dmesh_post_send` commits the reservation and releases the gate. Allocation
-pressure returns `EAGAIN` and a later `TX_READY` event permits the retry. The
-library emits complete transfer units immediately and retains a short tail
-until `dmesh_flush`, pressure or a bounded deadline, at which the QP's fd
-wakes its poller to publish it. An event may carry part of a write, and
-several writes can share a unit.
+`dmesh_alloc` opens the QP's transmit call and reserves contiguous memory;
+`dmesh_post_send` commits the reservation and closes the call. Allocation
+pressure returns `EAGAIN` and a later `TX_READY` event permits the retry.
+Each post is submitted at once, a partial unit included, like a socket with
+`TCP_NODELAY`; allocation admits no more than the flow's forward ring holds,
+so a post never waits for ring space. An event may carry part of a write.
 
 `dmesh_poll_qp` returns the QP's `RECV`, `RECV_FIN`, `TX_READY` and
 `TX_ERROR` events; an accepted QP's first poll returns its first bytes. A
@@ -81,9 +80,8 @@ libuv).
   control messages, keepalive and loss, the flows no QP owns, and inbound
   streams. `dmesh_accept` does that work and returns the next inbound stream,
   until `EAGAIN`, which arms the fd. Every process polls it, a client too.
-- A QP's fd is readable when that QP has events or its retained tail comes
-  due. `dmesh_poll_qp` until it returns 0 settles the fd and arms the QP's
-  doorbell.
+- A QP's fd is readable when that QP has events. `dmesh_poll_qp` until it
+  returns 0 settles the fd and arms the QP's doorbell.
 
 With the Comch fast path a QP's own completions raise its fd
 ([flow wake](HOST.md#flow-wake)); without it the channel's work hands each

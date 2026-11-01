@@ -15,8 +15,8 @@ exports rcv_ring + tx_staging instead of pushing).
 - `include/dpumesh`: public API and descriptor layout (ABI 6).
 - `src/core/dmesh_core.c`: channels, QPs, TX reservation and credits,
   custody ACK reclamation, RX delivery and the accept queue, FIN and teardown,
-  the channel's and each QP's readiness fd and their idle-wake policy (naps,
-  linger, doorbells).
+  the channel's and each QP's readiness fd and their idle-wake policy
+  (doorbells, re-polls, the backstop).
 - `src/core/native_transport.h`: the private carrier contract
   (open, connect, submit, poll, release, wait, resolve, disconnect, close).
 - `src/core/carrier.c`: the carrier over the channel layer.
@@ -69,13 +69,15 @@ that call it, each an epoll set:
   retiring) and a one-shot timer. `dmesh_accept` acknowledges them,
   progresses the control PE once under a channel mutex, interprets the active
   stripes (with flow wake, only those no QP owns) and returns the next inbound
-  stream. Its stripe moves from the spare set to the new QP's EQ, and the
-  stream goes on that EQ's ready list with its held first bytes.
+  stream. Its stripe moves from the spare set to the new QP's EQ, whose
+  first poll returns the held first bytes and what queued behind them.
 - **A QP's** (`dmesh_qp_fd`): its EQ, private to the QP: an eventfd
-  (deliveries by the channel, its flow's control news, a loss, a send while it
-  sleeps), a one-shot timerfd programmed to its retained tail's deadline, a
-  one-shot nap/backstop timerfd and its stripe's doorbell. `dmesh_poll_qp`
-  drains that stripe (`dpumesh_eq_drain`) and publishes the retained tail. A
+  (deliveries by the channel, its flow's control news, a loss, a sender
+  waiting for space while it sleeps), a timerfd (the backstop, periodic from
+  the fd's hand-out, and re-polls ahead of it) and its stripe's doorbell.
+  `dmesh_poll_qp` drains that stripe (`dpumesh_eq_drain`), taking a batch of
+  the carrier's events per hold of the stripe, and then the QP's inbox; there
+  is no ready list, since the QP is the EQ's only connection. A
   stripe's doorbell is the carrier's per-slot epoll of the private reverse
   MsgQ notification fd in host-dpa mode, or its flow's own consumer with flow
   wake; it moves back to the spare set when the QP is freed.
@@ -84,18 +86,17 @@ A drain snapshots active stripes, including closed flows awaiting custody/FIN
 retirement, and skips unused stripes; each flow observes the retained session
 error and advances its private reverse engine. No control thread is added.
 
-Each empty QP poll chooses the QP's next wake (`dpumesh_eq_arm`). After work,
-it re-polls on the nap timer, doubling from `DPUMESH_NAP_US` (10) to
-`DPUMESH_NAP_CAP_US` (100); then it keeps polling every nap cap until
-`DPUMESH_LINGER_US` (1000) has passed since its last work, where a send counts
-as work because its reply is expected. Then it sleeps: it sets its asleep
-flag and arms its stripe's doorbell, leaving only the `DPUMESH_BACKSTOP_MS`
-(200) timer. With more live QPs than allowed CPUs it skips the naps and
-linger. An empty `dmesh_accept` arms the channel: the unowned stripes and
-`idle_arm`, leaving the backstop, which also paces the session's keepalive.
-A backstop expiry that finds work means a wake was missed and is counted
-(`DPUMESH_WAIT_STATS` writes the counters to `<dir>/dpumesh-wait.<pid>` once a
-second).
+Each empty QP poll arms the QP's next wake (`dpumesh_eq_arm`): it sets its
+asleep flag and arms its stripe's doorbell (one request per wake: the stripe
+rearms only after its doorbell rang), then drains once more. Only what has no
+doorbell and must not wait keeps it polling, on a 100 µs re-poll ahead of the
+backstop (below). The backstop fires every 200 ms; it only bounds a missed
+wake. An empty `dmesh_accept` arms the channel: the unowned stripes and
+`idle_arm`, re-polling after 100 µs when something is outstanding and
+otherwise after 200 ms, which also paces the session's keepalive. A backstop
+expiry that finds work means a wake was missed and is counted. Each EQ keeps
+its counters itself; with `DPUMESH_WAIT_STATS` the channel's poller writes
+their sum to `<dir>/dpumesh-wait.<pid>` once a second.
 
 Three things have no completion doorbell, and each gets a wake:
 - **Push batches** (the DPU's DMA engine writes the window). Without the Comch
@@ -107,7 +108,7 @@ Three things have no completion doorbell, and each gets a wake:
   listed flow's sequence to the flow's worker, which rings through its control
   reply queue; the dispatcher sends one DOORBELL per ARM. At most one ARM is
   outstanding per channel; a DOORBELL releases it, and the channel re-polls
-  after a nap, since its descriptor may become visible after the message.
+  after 100 µs, since its descriptor may become visible after the message.
   Plan and race argument: `docs/2026-09-30_host-wait-doorbell-plan.md`.
 - **Control messages** (DOORBELL, CLOSED, ERROR) raise the control PE's
   notification fd once `idle_arm` requested it; the channel's poller
@@ -116,10 +117,11 @@ Three things have no completion doorbell, and each gets a wake:
   notification is cleared, which stalled a synchronous flow open behind an
   idle wake.
 - **Custody ACKs** (the DPU's DPA writes `consumer_head` into host memory).
-  A QP with custody outstanding keeps polling instead of sleeping. A send
-  publishes custody under the slot lock before it reads the asleep flag, and
-  the arming QP sets the flag before it reads custody under that lock, so a
-  send either finds the QP awake or wakes it.
+  A QP sleeps on open custody, reclaimed on its next wake, unless a sender
+  waits for the space it frees (or its closed flow still retires): then it
+  re-polls. A sender that arms such a wait counts itself before it reads the
+  asleep flag, and the arming QP sets the flag before it reads the waiter
+  count, so the sender either finds the QP awake or wakes it.
 
 ### Flow wake
 
@@ -252,10 +254,8 @@ placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`),
 `DPUMESH_TARGETS` (the targets the preload shim carries),
 `DPUMESH_BACKEND_MAX`
 (demand-created flows, default 32; outgoing flows share the same capacity).
-`DPUMESH_NAP_US` (10), `DPUMESH_NAP_CAP_US` (100),
-`DPUMESH_LINGER_US` (1000) and `DPUMESH_BACKSTOP_MS` (200) set the idle wake;
-`DPUMESH_SPIN_US` and `DPUMESH_TICK_US` are ignored with a warning.
-`DPUMESH_WAIT_STATS` names a directory for the idle-wake counters. `DPUMESH_CARRIER_TRACE` and `DPUMESH_CORE_TRACE` print flow,
+The idle wake has no knobs. `DPUMESH_WAIT_STATS` names a directory for the
+idle-wake counters. `DPUMESH_CARRIER_TRACE` and `DPUMESH_CORE_TRACE` print flow,
 descriptor and event traces to stderr.
 
 ## Build

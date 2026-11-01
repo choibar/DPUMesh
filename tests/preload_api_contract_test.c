@@ -86,8 +86,8 @@ int dmesh_qp_fd(dmesh_qp_t *qp) {
     if (fake_qp_efd < 0) fake_qp_efd = eventfd(0, EFD_CLOEXEC);
     return fake_qp_efd;
 }
-void dpumesh_eq_kick_pending(struct dmesh_eq *eq) {
-    (void)eq;
+void dpumesh_qp_kick_pending(dmesh_qp_t *qp) {
+    (void)qp;
     atomic_fetch_add(&fake_kick_calls, 1);
 }
 dmesh_qp_t *dmesh_qp_open(dmesh_channel_t *channel, int service) {

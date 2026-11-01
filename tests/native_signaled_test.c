@@ -1,5 +1,5 @@
 /* Idle wake of a QP's EQ with signaled receives (the Comch fast path) over the
- * memory carrier: no naps or linger by default, a send does not wake its EQ,
+ * memory carrier: a send does not wake its EQ, the backstop is left alone,
  * open custody alone does not keep an EQ polling, a sender waiting for space
  * or a retiring flow does, and arming that wait wakes a sleeping EQ. */
 #include <assert.h>
@@ -26,10 +26,8 @@ static int empty_poll(dmesh_qp_t *qp)
     return dmesh_poll_qp(qp, ev, 8);
 }
 
-/* Arm hooks: a reply landing between a drain and its arm, and a ready-list
- * claim by the channel that is not published yet. */
+/* Arm hook: a reply landing between a drain and its arm. */
 static dmesh_qp_t *reply_qp;
-static dmesh_eq_t *claim_eq;
 static void send_reply(void)
 {
     void *b = dmesh_alloc(reply_qp, 16);
@@ -37,15 +35,16 @@ static void send_reply(void)
     memset(b, 9, 16);
     assert(dmesh_post_send(reply_qp, b, 16) == 0);
 }
-static void claim_unpublished(void)
+
+static struct itimerspec timer_of(dmesh_eq_t *eq)
 {
-    atomic_fetch_add_explicit(&claim_eq->ready_tail, 1, memory_order_relaxed);
+    struct itimerspec its;
+    assert(timerfd_gettime(eq->tick_fd, &its) == 0);
+    return its;
 }
 
 int main(void)
 {
-    unsetenv("DPUMESH_NAP_US");
-    unsetenv("DPUMESH_LINGER_US");
     test_native_rx_signaled(1);
     test_native_stripe_map(1);                   /* each QP owns its stripe */
     setenv("DPUMESH_SERVICE", "echo:80", 1);
@@ -55,7 +54,7 @@ int main(void)
     dmesh_channel_t *ch = dmesh_create_channel();
     assert(ch);
     dpumesh_ctx_t *ctx = ch->ctx;
-    assert(ctx->rx_signaled && ctx->nap_min_ns == 0 && ctx->linger_ns == 0);
+    assert(ctx->rx_signaled);
     dmesh_qp_t *qp = dmesh_create_qp(ch, "echo:80");
     assert(qp && dmesh_qp_fd(qp) >= 0);
     dmesh_eq_t *eq = qp->eq;
@@ -71,20 +70,21 @@ int main(void)
     assert(dmesh_post_send(qp, buf, 64) == 0);
     assert(!readable(eq->notify_efd));
 
-    /* Sleeping again soon keeps the armed backstop instead of re-arming it. */
-    uint64_t until = eq->backstop_until_ns;
-    assert(until != 0);
-    eq_notify(eq);
-    assert(empty_poll(qp) == 0 && atomic_load(&eq->asleep) == 1);
-    assert(eq->backstop_until_ns == until && eq->timer_backstop);
+    /* The backstop is periodic from the fd's hand-out: sleeping again leaves
+     * the timer alone. */
+    struct itimerspec its = timer_of(eq);
+    assert(its.it_interval.tv_sec == 0 && its.it_interval.tv_nsec == (long)DMESH_BACKSTOP_NS);
+    assert(its.it_value.tv_sec != 0 || its.it_value.tv_nsec != 0);
+    eq_notify(eq, NULL);
+    assert(empty_poll(qp) == 0 && atomic_load(&eq->asleep) == 1 && !eq->repoll);
 
     /* Open custody with no sender waiting: the EQ sleeps on its doorbells. */
     test_native_custody(1);
-    uint64_t custody_sleeps = atomic_load(&wait_stats.custody_sleeps);
-    eq_notify(eq);
+    uint64_t custody_sleeps = atomic_load(&eq->st.custody_sleeps);
+    eq_notify(eq, NULL);
     assert(empty_poll(qp) == 0);
-    assert(atomic_load(&eq->asleep) == 1 && eq->timer_backstop);
-    assert(atomic_load(&wait_stats.custody_sleeps) == custody_sleeps + 1);
+    assert(atomic_load(&eq->asleep) == 1 && !eq->repoll);
+    assert(atomic_load(&eq->st.custody_sleeps) == custody_sleeps + 1);
 
     /* A sender waiting for space this custody frees: arming the wait wakes
      * the sleeping EQ, which then keeps polling. */
@@ -93,23 +93,28 @@ int main(void)
     tx_wait_arm(ctx, psl, qp->local_port, DMESH_TX_WAIT_SU_RECLAIM);
     assert(atomic_load(&ctx->tx_waiters) == 1);
     assert(readable(eq->notify_efd));
-    uint64_t busy = atomic_load(&wait_stats.busy);
+    uint64_t busy = atomic_load(&eq->st.busy);
     assert(empty_poll(qp) == 0);
-    assert(atomic_load(&eq->asleep) == 0 && !eq->timer_backstop);
-    assert(atomic_load(&wait_stats.busy) == busy + 1);
+    assert(atomic_load(&eq->asleep) == 0 && eq->repoll);
+    its = timer_of(eq);
+    assert(its.it_value.tv_sec == 0 && its.it_value.tv_nsec <= (long)DMESH_REPOLL_NS);
+    assert(its.it_interval.tv_nsec == (long)DMESH_BACKSTOP_NS);   /* the backstop resumes after it */
+    assert(atomic_load(&eq->st.busy) == busy + 1);
 
     /* The wait ends: back to sleeping on open custody. */
     tx_wait_cancel(ctx, psl, qp->local_port);
     assert(atomic_load(&ctx->tx_waiters) == 0);
-    eq_notify(eq);
-    assert(empty_poll(qp) == 0 && atomic_load(&eq->asleep) == 1);
+    eq_notify(eq, NULL);
+    assert(empty_poll(qp) == 0 && atomic_load(&eq->asleep) == 1 && !eq->repoll);
+    its = timer_of(eq);
+    assert(its.it_value.tv_sec != 0 || its.it_value.tv_nsec > (long)DMESH_REPOLL_NS);
 
     /* A closed flow still retiring keeps polling regardless. */
     test_native_retiring(1);
-    busy = atomic_load(&wait_stats.busy);
-    eq_notify(eq);
+    busy = atomic_load(&eq->st.busy);
+    eq_notify(eq, NULL);
     assert(empty_poll(qp) == 0 && atomic_load(&eq->asleep) == 0);
-    assert(atomic_load(&wait_stats.busy) == busy + 1);
+    assert(atomic_load(&eq->st.busy) == busy + 1);
     test_native_retiring(0);
 
     /* The first send, accepted: the stream's own poll returns its first
@@ -134,17 +139,6 @@ int main(void)
     assert(!readable(eq->notify_efd));
     dmesh_release_rx_buffer(ch, &ev[0]);
 
-    /* A delivery by the channel still being published when the poll runs
-     * empty: nothing is returned, but the eventfd makes the sleep return at
-     * once so the next poll finds it. */
-    claim_eq = eq;
-    settle(eq);
-    test_native_on_arm(claim_unpublished);
-    assert(empty_poll(qp) == 0);
-    assert(readable(eq->notify_efd));
-    atomic_fetch_sub_explicit(&eq->ready_tail, 1, memory_order_relaxed);   /* withdraw the claim */
-    settle(eq);
-
     /* Retire the held ACK so the QP closes cleanly. */
     test_native_custody(0);
     test_native_hold_acks(0);
@@ -157,6 +151,6 @@ int main(void)
     assert(dmesh_destroy_channel(ch) == 0);
     assert(dmesh_destroy_channel(server) == 0);
     test_native_rx_signaled(0);
-    puts("native_signaled_test: no naps, quiet sends, kept backstop, custody sleeps, waiter wake and poll, retiring poll, "
-         "no own-eventfd writes, re-check drain returns, unpublished claim wakes: PASS");
+    puts("native_signaled_test: quiet sends, periodic backstop, custody sleeps, waiter wake and re-poll, retiring poll, "
+         "no own-eventfd writes, re-check drain returns: PASS");
 }

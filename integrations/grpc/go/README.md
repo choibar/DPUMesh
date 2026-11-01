@@ -38,10 +38,9 @@ rings, buffers and DPA resources remain per flow.
   streams are aborted at once instead of left hanging.
 
 Native code owns and drains each QP and its doorbell. The library arms the
-QP's fd for what has no doorbell: its nap and linger timers, a retained TX
-tail's deadline and the backstop (`design/HOST.md`, idle wake). The knobs are
-`DPUMESH_NAP_US`, `DPUMESH_NAP_CAP_US`, `DPUMESH_LINGER_US` and
-`DPUMESH_BACKSTOP_MS`; the adapter adds no Go timer of its own.
+QP's fd for what has no doorbell: re-polls while a sender waits for space,
+and the backstop (`design/HOST.md`, idle wake). A write is submitted at once.
+The adapter adds no Go timer of its own.
 
 Build the native library from the repository root, then compile the module:
 

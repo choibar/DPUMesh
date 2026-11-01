@@ -12,9 +12,8 @@ import (
 
 // A native QP's fd, like the channel's, is a level-triggered epoll set. Register a duplicate with Go's netpoller so waiting parks a goroutine
 // rather than an OS thread in cgo. The wrapper itself consumes no native
-// doorbell: the library's own timers (naps, retained-tail deadlines, the
-// backstop) and doorbells raise the fd, and polling the QP, or accepting on
-// the channel, settles it.
+// doorbell: the library's own timer (re-polls, the backstop) and doorbells
+// raise the fd, and polling the QP, or accepting on the channel, settles it.
 //
 // A wait runs its try as Go's own reads run their syscall: after the
 // netpoller's readiness for the fd is reset. The netpoller registers the fd

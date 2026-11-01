@@ -1,5 +1,6 @@
 /* A stream end to end over the memory carrier: dial, accept, a reservation
- * across fragments, custody ACKs, held RX buffers, FIN and teardown. */
+ * across fragments, a partial write published while earlier units are in
+ * custody, custody ACKs, held RX buffers, FIN and teardown. */
 #include <assert.h>
 #include <stdio.h>
 #include "../src/core/dmesh_core.c"
@@ -48,12 +49,17 @@ int main(void) {
     for (unsigned i = 0; i < 16385; ++i) tx[i] = (unsigned char)(i * 17);
     assert(!dmesh_alloc(cq, 1) && errno == EDEADLK);
     assert(dmesh_post_send(cq, tx, 16385) == 0);
-    assert(dmesh_flush(cq) == 0);
-    assert(in_custody(cq) > 0);
+    /* A partial write goes out at once, though earlier units are in custody:
+     * every committed byte is sent. */
+    unsigned char *more = dmesh_alloc(cq, 7); assert(more);
+    for (unsigned i = 0; i < 7; ++i) more[i] = (unsigned char)((16385 + i) * 17);
+    assert(dmesh_post_send(cq, more, 7) == 0);
+    struct dmesh_port_slot *cps = &client->ctx->ports[cq->local_port];
+    assert(in_custody(cq) && atomic_load(&cps->tx_s) == atomic_load(&cps->tx_c));
     dmesh_qp_t *sq = accept_one();
     size_t received = 0;
     dmesh_event_t held = {0};
-    while (received < 16385) {
+    while (received < 16392) {
         dmesh_event_t ev = receive(sq, DMESH_EVENT_RECV);
         for (uint32_t i = 0; i < ev.len; ++i) assert(((unsigned char *)ev.buf)[i] == (unsigned char)((received + i) * 17));
         received += ev.len;
@@ -71,7 +77,7 @@ int main(void) {
     }
     assert(in_custody(cq) == 0);
     void *reply = dmesh_alloc(sq, 4); assert(reply); memcpy(reply, "pong", 4);
-    assert(dmesh_post_send(sq, reply, 4) == 0); assert(dmesh_flush(sq) == 0);
+    assert(dmesh_post_send(sq, reply, 4) == 0);
     dmesh_event_t response = receive(cq, DMESH_EVENT_RECV);
     assert(response.len == 4 && !memcmp(response.buf, "pong", 4));
     dmesh_release_rx_buffer(client, &response); dmesh_release_rx_buffer(client, &response);

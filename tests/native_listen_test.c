@@ -89,7 +89,7 @@ int main(void)
     dmesh_event_t ev;
     setenv("DPUMESH_RINGS_PER_POD", "8", 1);
     test_native_stripe_map(1);
-    test_native_rx_signaled(1);        /* the Comch fast path: no naps or linger */
+    test_native_rx_signaled(1);        /* the Comch fast path */
     test_native_flow_wake(1);
     dmesh_channel_t *server = channel("echo:80"), *client = channel(NULL);
     assert(server->ctx->flow_wake && client->ctx->landing_stripes == 8);

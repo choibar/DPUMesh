@@ -62,7 +62,7 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     if (pod == CHANNELS) { pthread_mutex_unlock(&lock); free(t->tx); free(t->rx); free(t->leased); free(t); errno = ENOSPC; return -1; }
     t->pod = pod; channels[pod] = t;
     pthread_mutex_unlock(&lock);
-    c->tx = t->tx; c->rx = t->rx; c->stripes = t->stripes;
+    c->tx = t->tx; c->rx = t->rx; c->stripes = t->stripes; c->flow_depth = 1024;
     c->pod_id = pod; c->service_id = t->service; c->rx_bytes = c->bytes; *out = t;
     return 0;
 }
@@ -120,14 +120,21 @@ uint32_t dmesh_native_progress(struct dmesh_native_transport *t)
 static int lost_errno;
 void test_native_lose(int error) { lost_errno = error; }
 int dmesh_native_lost(struct dmesh_native_transport *t) { (void)t; return lost_errno; }
-int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e) {
+static int flow_wake;
+static uint32_t progressed;
+int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e, int max) {
     pthread_mutex_lock(&lock);
-    struct event_node *n = t->first[stripe];
-    if (!n) { pthread_mutex_unlock(&lock); return 0; }
-    t->first[stripe] = n->next; if (!n->next) t->last[stripe] = NULL;
-    *e = n->event;
-    if (e->kind == DMESH_NATIVE_RX) t->leased[e->desc.body_buf_slot / DPUMESH_SLOT_SIZE] = 1;
-    free(n); pthread_mutex_unlock(&lock); return 1;
+    if (flow_wake) progressed |= UINT32_C(1) << stripe;
+    int count = 0;
+    while (count < max && t->first[stripe]) {
+        struct event_node *n = t->first[stripe];
+        t->first[stripe] = n->next; if (!n->next) t->last[stripe] = NULL;
+        e[count] = n->event;
+        if (e[count].kind == DMESH_NATIVE_RX) t->leased[e[count].desc.body_buf_slot / DPUMESH_SLOT_SIZE] = 1;
+        free(n);
+        count++;
+    }
+    pthread_mutex_unlock(&lock); return count;
 }
 void dmesh_native_release(struct dmesh_native_transport *t, int pos) {
     pthread_mutex_lock(&lock);
@@ -158,15 +165,12 @@ void test_native_stripe_map(int value) { stripe_map = value; }
 int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
 { return stripe_map ? port % t->stripes : -1; }
 /* Flow wake: a test turns it on before opening, counts which stripes were
- * advanced, and posts control news for stripes. */
-static int flow_wake;
-static uint32_t progressed, news;
+ * advanced (by their poll), and posts control news for stripes. */
+static uint32_t news;
 void test_native_flow_wake(int value) { flow_wake = value; }
 uint32_t test_native_progressed(void) { uint32_t p = progressed; progressed = 0; return p; }
 void test_native_news(uint32_t mask) { __atomic_fetch_or(&news, mask, __ATOMIC_RELEASE); }
 int dmesh_native_flow_wake(struct dmesh_native_transport *t) { (void)t; return flow_wake; }
-void dmesh_native_stripe_progress(struct dmesh_native_transport *t, int stripe)
-{ (void)t; progressed |= UINT32_C(1) << stripe; }
 uint32_t dmesh_native_take_news(struct dmesh_native_transport *t)
 { (void)t; return __atomic_exchange_n(&news, 0, __ATOMIC_ACQUIRE); }
 /* A channel that cannot sleep models open custody; test_native_retiring
@@ -189,14 +193,13 @@ static void run_arm_hook(void)
 }
 static uint32_t armed_stripes;
 uint32_t test_native_armed(void) { uint32_t a = armed_stripes; armed_stripes = 0; return a; }
-int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
+int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe, int rang)
 {
-    (void)t;
+    (void)t; (void)rang;
     armed_stripes |= UINT32_C(1) << stripe;
     run_arm_hook();
     return (sleepable && !custody ? 0 : DMESH_STRIPE_CUSTODY) | (retiring ? DMESH_STRIPE_RETIRING : 0);
 }
-void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; }
 int dmesh_native_wake_fd(struct dmesh_native_transport *t)
 {
     (void)t;

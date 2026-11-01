@@ -30,6 +30,7 @@ struct channel_conn; /* Forward declaration: one logical flow with its own rings
 #define CHANNEL_DATA_OFF 4096u            /* Data ring offset inside a window */
 #define CHANNEL_WINDOW   (1024u * 1024u)  /* One connection's receive window */
 #define CHANNEL_DESC_MAX      8064u            /* Forward descriptor bytes */
+#define CHANNEL_RING_SIZE     1024u            /* Forward ring depth of a flow */
 #define CHANNEL_DESC_ALIGN    128u             /* Forward descriptor alignment */
 
 #define CHANNEL_MODE_CLIENT_HOST_DPA  0u /* DPUMesh CLIENT: client flow, reverse by the host DPA */

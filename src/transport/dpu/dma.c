@@ -629,7 +629,7 @@ submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca
 
 /* Backend (안 2) push: DPU -> host with this connection's doca_dma engine, no
  * host DPA. The batch is ALREADY staged at tx_staging+src_pos (the Rust writer
- * put it there); this DMAs up to <=8KB of it into the host's data ring
+ * put it there); this DMAs up to DMESH_PUSH_MAX_BATCH of it into the host's data ring
  * (rcvbuf + DMESH_PUSH_DATA_OFF) and - from that copy's completion callback -
  * DMAs a 16B dmesh_push_desc into slot seq % N. The host busy-polls the slots
  * in order. One batch outstanding at a time. Returns bytes accepted (0 while a

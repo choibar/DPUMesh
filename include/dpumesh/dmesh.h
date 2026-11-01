@@ -119,8 +119,7 @@ dmesh_qp_t *dmesh_create_qp(dmesh_channel_t *ch, const char *target);
 
 /* Readiness fd (an epoll set, level-triggered): poll it, then call
  * dmesh_poll_qp() until it returns 0, which settles the fd and arms the
- * transport's doorbell for the next sleep. It also wakes when a buffered
- * transmit tail comes due. -1 when unavailable. */
+ * transport's doorbell for the next sleep. -1 when unavailable. */
 int dmesh_qp_fd(dmesh_qp_t *qp);
 
 /* Flush, send FIN, release RX credit, and destroy the QP and its fd. The
@@ -141,19 +140,18 @@ int dmesh_abort_qp(dmesh_qp_t *c);
  *   EDEADLK  a transmit call is already open on this QP. */
 void *dmesh_alloc(dmesh_qp_t *c, uint32_t len);
 
-/* Commit bytes from the current dmesh_alloc() reservation and close the
- * transmit call. Complete transport batches submit immediately, as does an idle
- * tail. While earlier data is in flight the newest partial tail is retained and
- * published at the library's bounded deadline. `buf` must match the reservation
- * and `len` must fit it. Returns EINVAL for invalid input or no open transmit
- * call, or EBADMSG for a synchronous submission fault. Ownership transfers to
- * the transport on success. A deferred tail fault is reported once as
- * DMESH_EVENT_TX_ERROR and is sticky on the QP. */
+/* Commit bytes from the current dmesh_alloc() reservation, close the transmit
+ * call and submit them at once, a partial transport batch included. `buf` must
+ * match the reservation and `len` must fit it. Returns EINVAL for invalid input
+ * or no open transmit call, or EBADMSG for a submission fault, which leaves the
+ * bytes committed for the next post or dmesh_flush. Ownership transfers to the
+ * transport on success. A flow fault the transport reports later arrives once
+ * as DMESH_EVENT_TX_ERROR and is sticky on the QP. */
 int dmesh_post_send(dmesh_qp_t *c, const void *buf, uint32_t len);
 
-/* Submit all committed bytes, including the trailing partial batch. A
- * descriptor fault returns EBADMSG, an open transmit call returns EDEADLK; no
- * pending data is a no-op. */
+/* Submit committed bytes a failed post left behind; a post submits its own,
+ * so otherwise a no-op. A descriptor fault returns EBADMSG, an open transmit
+ * call EDEADLK. */
 int dmesh_flush(dmesh_qp_t *c);
 
 /* ===== Event polling ===== */

@@ -63,30 +63,30 @@ static void test_custody_polling(void)
     assert(t);
     struct slot *s = &t->slots[0];
     assert(pthread_mutex_init(&s->lock, NULL) == 0);
-    assert(dmesh_native_stripe_arm(t, -1) == 0);
-    assert(dmesh_native_stripe_arm(t, SLOTS) == 0);
-    assert(dmesh_native_stripe_arm(t, 0) == 0); /* no live flow */
+    assert(dmesh_native_stripe_arm(t, -1, 0) == 0);
+    assert(dmesh_native_stripe_arm(t, SLOTS, 0) == 0);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0); /* no live flow */
     s->state = SLOT_OPEN;
-    assert(dmesh_native_stripe_arm(t, 0) == 0);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0);
     assert(s->armed && arm_calls == 1);
     for (int i = 0; i < 4; ++i)
-        assert(dmesh_native_stripe_arm(t, 0) == 0);
+        assert(dmesh_native_stripe_arm(t, 0, 0) == 0);
     assert(arm_calls == 1); /* preserve one-shot doorbell arming */
     s->tickets[0] = (struct ticket){1, 1};
     s->t_tail = 1;               /* custody outstanding: no doorbell covers its ACK */
-    assert(dmesh_native_stripe_arm(t, 0) == DMESH_STRIPE_CUSTODY);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == DMESH_STRIPE_CUSTODY);
     s->t_head = 1;
-    assert(dmesh_native_stripe_arm(t, 0) == 0);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0);
     s->armed = 0;
     arm_result = -1;
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && !s->armed);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0 && !s->armed);
     s->state = SLOT_CLOSED;
-    assert(dmesh_native_stripe_arm(t, 0) == 0);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0);
     s->fin_pending = 1;
-    assert(dmesh_native_stripe_arm(t, 0) == DMESH_STRIPE_RETIRING);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == DMESH_STRIPE_RETIRING);
     s->fin_pending = 0;
     s->t_tail = 2;
-    assert(dmesh_native_stripe_arm(t, 0) == DMESH_STRIPE_RETIRING);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == DMESH_STRIPE_RETIRING);
     pthread_mutex_destroy(&s->lock);
     free(t);
 }
@@ -100,22 +100,80 @@ static void test_flow_consumer_rearmed_after_close(void)
     assert(t);
     struct slot *s = &t->slots[0];
     assert(pthread_mutex_init(&s->lock, NULL) == 0);
-    flow_wake = 1;
+    t->flow_wake = 1;
     s->state = SLOT_OPEN;
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 1);
-    dmesh_native_stripe_clear(t, 0);
-    assert(flow_progress_calls == 0);   /* an open slot's receives are its drain's */
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 2);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0 && s->armed && flow_arm_calls == 1);
+    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == 2);
+    assert(flow_progress_calls == 0);   /* an open slot's receives are its poll's */
     s->state = SLOT_CLOSED;
-    dmesh_native_stripe_clear(t, 0);
+    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == 3);
     assert(flow_progress_calls == 1);
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 3);
     s->state = SLOT_FREE;
-    dmesh_native_stripe_clear(t, 0);
+    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == 4);
     assert(flow_progress_calls == 2);
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && s->armed && flow_arm_calls == 4);
-    assert(dmesh_native_stripe_arm(t, 0) == 0 && flow_arm_calls == 4); /* still one-shot */
-    flow_wake = 0;
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0 && flow_arm_calls == 4); /* still one-shot */
+    pthread_mutex_destroy(&s->lock);
+    free(t);
+}
+
+/* A connection whose receives, custody and close the poll test scripts. */
+static uint64_t conn_consumed, rx_next_seq = 1, rx_last;
+static int conn_gone;
+int channel_conn_idle(const struct channel_conn *conn) { (void)conn; return rx_next_seq > rx_last && !conn_gone; }
+int channel_conn_poll(struct channel_conn *conn) { (void)conn; return conn_gone; }
+uint64_t channel_conn_consumed(const struct channel_conn *conn) { (void)conn; return conn_consumed; }
+int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len)
+{
+    (void)conn;
+    if (rx_next_seq > rx_last) return 0;
+    *seq = rx_next_seq; *pos = (uint32_t)(rx_next_seq - 1) * 128u; *len = 100;
+    rx_next_seq++;
+    return 1;
+}
+
+/* One poll hands out a batch under one hold of the slot: the flow wake is
+ * progressed first, consumed tickets with consecutive sequences come as one
+ * ACK before the receives, and the batch stops at max. A closed slot retires
+ * its custody and then its FIN. */
+static void test_batched_poll(void)
+{
+    struct dmesh_native_transport *t = calloc(1, sizeof(*t));
+    assert(t);
+    struct slot *s = &t->slots[0];
+    assert(pthread_mutex_init(&s->lock, NULL) == 0 && pthread_mutex_init(&t->lock, NULL) == 0);
+    struct dmesh_native_event ev[8];
+    t->flow_wake = 1;
+    s->state = SLOT_OPEN; s->port = 7;
+    carrier_window_init(&s->window);
+    unsigned progressed = flow_progress_calls;
+    assert(dmesh_native_poll(t, 0, ev, 8) == 0 && flow_progress_calls == progressed + 1);
+    /* Tickets 10, 11, 12 consumed, 14 (a gap in sequence) consumed, 15 not. */
+    uint16_t seqs[] = {10, 11, 12, 14, 15};
+    for (int i = 0; i < 5; ++i) s->tickets[i] = (struct ticket){seqs[i], (uint64_t)(i + 1) * 2};
+    s->t_tail = 5;
+    conn_consumed = 8;
+    rx_last = 3;
+    int n = dmesh_native_poll(t, 0, ev, 3);
+    assert(n == 3);
+    assert(ev[0].kind == DMESH_NATIVE_ACK && ev[0].port == 7 && ev[0].seq == 10 && ev[0].seq_count == 3);
+    assert(ev[1].kind == DMESH_NATIVE_ACK && ev[1].seq == 14 && ev[1].seq_count == 1);
+    assert(ev[2].kind == DMESH_NATIVE_RX && ev[2].desc.dst_port == 7 && ev[2].desc.body_len == 100);
+    n = dmesh_native_poll(t, 0, ev, 8);
+    assert(n == 2 && ev[0].kind == DMESH_NATIVE_RX && ev[1].kind == DMESH_NATIVE_RX);
+    assert(ev[1].desc.seq == (uint16_t)(ev[0].desc.seq + 1));
+    assert(dmesh_native_poll(t, 0, ev, 8) == 0);            /* ticket 15 still in custody */
+    conn_consumed = 10;
+    assert(dmesh_native_poll(t, 0, ev, 8) == 1 && ev[0].seq == 15 && ev[0].seq_count == 1);
+    /* Closed with custody outstanding: retired without the consumer, then the FIN. */
+    s->tickets[5] = (struct ticket){16, 99};
+    s->tickets[6] = (struct ticket){17, 100};
+    s->t_tail = 7;
+    s->state = SLOT_CLOSED; s->fin_pending = 1; s->fin_seq = 18;
+    t->port_slot[7] = 1;
+    n = dmesh_native_poll(t, 0, ev, 8);
+    assert(n == 2 && ev[0].seq == 16 && ev[0].seq_count == 2 && ev[1].seq == 18 && ev[1].seq_count == 1);
+    assert(s->state == SLOT_FREE && t->port_slot[7] == 0);
+    t->flow_wake = 0;
     pthread_mutex_destroy(&s->lock);
     free(t);
 }
@@ -125,6 +183,7 @@ int main(void)
     test_closed_stripe_stays_pollable_until_retired();
     test_custody_polling();
     test_flow_consumer_rearmed_after_close();
+    test_batched_poll();
     uint32_t p[2];
     assert(carrier_chunks(0, p) == 0);
     assert(carrier_chunks(1, p) == 1 && p[0] == 1);
@@ -148,6 +207,13 @@ int main(void)
     assert(carrier_window_release(&w, 384) == 0);
     assert(carrier_window_advance(&w, &seq, &bytes) && seq == 3 && bytes == 600);
     assert(carrier_window_add(&w, 1 + CHANNEL_DESC_N, 0, 8) == 0);  /* slot reuse after retirement */
-    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm: PASS");
+    /* In-order releases find their batch at the search's start. */
+    struct carrier_rx_window v; carrier_window_init(&v);
+    for (uint64_t k = 1; k <= 3 * CHANNEL_DESC_N; ++k) {
+        assert(carrier_window_add(&v, k, (uint32_t)(k * 64u % 4096u), 64) == 0);
+        assert(carrier_window_release(&v, (uint32_t)(k * 64u % 4096u)) == 0);
+        assert(carrier_window_advance(&v, &seq, &bytes) && seq == k && bytes == k * 64u);
+    }
+    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll: PASS");
     return 0;
 }

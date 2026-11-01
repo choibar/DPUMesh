@@ -29,7 +29,7 @@
 #include <unistd.h>
 
 #define SLOTS 32                       /* DPUMesh connections per worker */
-#define TICKETS 1024                   /* forward ring depth */
+#define TICKETS CHANNEL_RING_SIZE      /* one per forward ring cell */
 #define UPORT_BASE 32768u
 #define BACKEND_MAX_DEFAULT SLOTS      /* demand-created flows, shared per DPU worker */
 static int trace_enabled = -1;
@@ -60,6 +60,7 @@ struct dmesh_native_transport {
     uint16_t next_uport;
     pthread_mutex_t lock;
     int lost;                          /* sticky errno of a failed session; it never recovers */
+    int flow_wake;                     /* channel_dev_flow_wake, fixed once the session is open */
     uint32_t active_stripes;
     struct slot slots[SLOTS];
     uint16_t port_slot[65536];         /* port -> slot index + 1 */
@@ -208,6 +209,7 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     }
     if (channel_dev_open(pci, &t->dev) != 0) goto fail;
     if (channel_session_open(t->dev, t->server) != 0) goto fail;
+    t->flow_wake = channel_dev_flow_wake(t->dev);
     if (channel_mem_alloc(t->dev, cfg->bytes, &t->tx) != 0) goto fail;
     if (channel_mem_alloc(t->dev, (size_t)SLOTS * CHANNEL_WINDOW, &t->rx) != 0) goto fail;
     if (t->service_id != DMESH_SVC_NONE) {
@@ -218,6 +220,7 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     cfg->tx = channel_mem_base(t->tx); cfg->rx = channel_mem_base(t->rx);
     cfg->rx_bytes = (size_t)SLOTS * CHANNEL_WINDOW;
     cfg->pod_id = t->pod_id; cfg->service_id = t->service_id; cfg->stripes = SLOTS;
+    cfg->flow_depth = TICKETS / 2;     /* a descriptor takes at most two cells (carrier_chunks) */
     *out = t;
     return 0;
 fail: {
@@ -312,11 +315,17 @@ static void fill_rx(struct dmesh_native_transport *t, struct slot *s, struct dme
     e->desc.seq = ++s->rx_seq; e->desc.valid = 1;
     TRACE("rx slot %d port %u seq %u pos %u len %u", slot_index(t, s), s->port, e->desc.seq, pos, len);
 }
-static void fill_ack(struct slot *s, struct dmesh_native_event *e, uint16_t seq)
+/* Retires every consumed ticket with consecutive sequences as one ACK. */
+static void fill_acks(struct slot *s, struct dmesh_native_event *e, uint64_t consumed)
 {
+    uint16_t seq = s->tickets[s->t_head % TICKETS].seq;
+    uint32_t count = 0;
+    do { s->t_head++; count++; }
+    while (s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed &&
+           s->tickets[s->t_head % TICKETS].seq == (uint16_t)(seq + count));
     memset(e, 0, sizeof(*e));
-    e->kind = DMESH_NATIVE_ACK; e->port = s->port; e->seq = seq; e->seq_count = 1;
-    TRACE("ack port %u seq %u", s->port, seq);
+    e->kind = DMESH_NATIVE_ACK; e->port = s->port; e->seq = seq; e->seq_count = count;
+    TRACE("ack port %u seq %u count %u", s->port, seq, count);
 }
 uint32_t dmesh_native_progress(struct dmesh_native_transport *t)
 {
@@ -328,49 +337,52 @@ int dmesh_native_lost(struct dmesh_native_transport *t)
 {
     return __atomic_load_n(&t->lost, __ATOMIC_ACQUIRE);
 }
-int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e)
+int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e, int max)
 {
     if (stripe < 0 || stripe >= SLOTS) return 0;
     struct slot *s = &t->slots[stripe];
     if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == SLOT_FREE) return 0;
     pthread_mutex_lock(&s->lock);
     int n = 0;
-    if (s->state == SLOT_OPEN && s->t_head == s->t_tail && channel_conn_idle(s->conn)) {
-        /* No custody to retire and nothing received, closed or failed: skip
-         * the session lock. Most stripes of a drain look like this. */
-    } else if (s->state == SLOT_OPEN) {
-        int gone = channel_conn_poll(s->conn);
+    if (s->state == SLOT_OPEN) {
+        if (t->flow_wake) channel_flow_progress(t->dev, (uint32_t)stripe + 1);
+        /* No custody to retire and nothing received, closed or failed: done
+         * without the session's state. Most polls look like this. */
+        if (s->t_head == s->t_tail && channel_conn_idle(s->conn)) {
+            pthread_mutex_unlock(&s->lock);
+            return 0;
+        }
+        int gone = channel_conn_poll(s->conn), error = gone < 0 ? (errno ? errno : EIO) : 0;
         uint64_t consumed = channel_conn_consumed(s->conn);
-        if (gone >= 0 && s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {
-            fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1;
-        } else if (gone && !s->peer_gone_reported) {
-            s->peer_gone_reported = 1;
-            if (gone < 0) {
-                int saved = errno;
-                memset(e, 0, sizeof(*e));
-                e->kind = DMESH_NATIVE_ERROR; e->port = s->port; e->error = saved ? saved : EIO;
-            } else fill_rx(t, s, e, 0, 0);
-            n = 1;
-        } else {
-            uint64_t seq; uint32_t pos, len;
-            int r = channel_conn_rx_next(s->conn, &seq, &pos, &len);
-            if (r > 0 && carrier_window_add(&s->window, seq, pos, len) == 0) {
-                fill_rx(t, s, e, pos, len); n = 1;
-                if (s->backend && !s->claimed) {
-                    s->claimed = 1;
-                    pthread_mutex_unlock(&s->lock);
-                    return n;
-                }
-            }
-            else if (r < 0 && !s->peer_gone_reported) {
-                s->peer_gone_reported = 1; fill_rx(t, s, e, 0, 0); n = 1;   /* end of stream or malformed batch */
+        while (n < max) {
+            if (gone >= 0 && s->t_head != s->t_tail && s->tickets[s->t_head % TICKETS].ticket <= consumed) {
+                fill_acks(s, &e[n++], consumed);
+            } else if (gone && !s->peer_gone_reported) {
+                s->peer_gone_reported = 1;
+                if (gone < 0) {
+                    memset(&e[n], 0, sizeof(e[n]));
+                    e[n].kind = DMESH_NATIVE_ERROR; e[n].port = s->port; e[n].error = error;
+                    n++;
+                } else fill_rx(t, s, &e[n++], 0, 0);
+            } else {
+                uint64_t seq; uint32_t pos, len;
+                int r = channel_conn_rx_next(s->conn, &seq, &pos, &len);
+                if (r > 0 && carrier_window_add(&s->window, seq, pos, len) == 0) {
+                    fill_rx(t, s, &e[n++], pos, len);
+                    if (s->backend && !s->claimed) { s->claimed = 1; break; }
+                } else if (r < 0 && !s->peer_gone_reported) {
+                    s->peer_gone_reported = 1; fill_rx(t, s, &e[n++], 0, 0);   /* end of stream or malformed batch */
+                } else break;
             }
         }
     } else {
         /* Closed: retire outstanding custody, then the close marker, then recycle. */
-        if (s->t_head != s->t_tail) { fill_ack(s, e, s->tickets[s->t_head % TICKETS].seq); s->t_head++; n = 1; }
-        else if (s->fin_pending) {
-            s->fin_pending = 0; fill_ack(s, e, s->fin_seq); n = 1;
+        while (n < max && s->t_head != s->t_tail) fill_acks(s, &e[n++], UINT64_MAX);
+        if (n < max && s->fin_pending) {
+            s->fin_pending = 0;
+            memset(&e[n], 0, sizeof(e[n]));
+            e[n].kind = DMESH_NATIVE_ACK; e[n].port = s->port; e[n].seq = s->fin_seq; e[n].seq_count = 1;
+            n++;
             pthread_mutex_unlock(&s->lock);
             pthread_mutex_lock(&t->lock); slot_free(t, s); pthread_mutex_unlock(&t->lock);
             return n;
@@ -397,7 +409,7 @@ void dmesh_native_release(struct dmesh_native_transport *t, int pos)
 int dmesh_native_stripe_fd(struct dmesh_native_transport *t, int stripe)
 {
     if (stripe < 0 || stripe >= SLOTS) return -1;
-    return channel_dev_flow_wake(t->dev) ? channel_flow_fd(t->dev, (uint32_t)stripe + 1) : t->slots[stripe].epfd;
+    return t->flow_wake ? channel_flow_fd(t->dev, (uint32_t)stripe + 1) : t->slots[stripe].epfd;
 }
 int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
 {
@@ -405,22 +417,33 @@ int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
     return i ? (int)i - 1 : -1;
 }
 /* An armed doorbell is one-shot: it fires on the next completion of any of the
- * connection's engines and stays readable until cleared. Rearmed only after a
- * clear, so a sleeping consumer costs one request per wake. A flow wake's
- * consumer outlives its flows, and only its request clears what raised it as
- * a flow closed, so it is rearmed whatever the slot's state. The ticket read
- * under the slot lock pairs with the submitter's check of the EQ's sleep flag:
- * either this sees the new custody or the submitter wakes the EQ. */
-int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
+ * connection's engines and stays readable until cleared. `rang` acknowledges
+ * one that fired; it is rearmed only after that, so a sleeping consumer costs
+ * one request per wake. A flow wake's consumer outlives its flows, and only
+ * its request clears what raised it as a flow closed, so it is rearmed
+ * whatever the slot's state; a closed or free slot's consumer may still hold
+ * descriptors of its last flow, which no poll publishes, and unpolled they
+ * would fire its next request at once, so the clear drops them. The ticket
+ * read under the slot lock pairs with the sender's check of the EQ's sleep
+ * flag: either this sees the new custody or the sender wakes the EQ. */
+int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe, int rang)
 {
     if (stripe < 0 || stripe >= SLOTS) return 0;
     struct slot *s = &t->slots[stripe];
-    int flow_wake = channel_dev_flow_wake(t->dev);
-    if (!flow_wake && __atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == SLOT_FREE) return 0;
+    if (!t->flow_wake && __atomic_load_n(&s->state, __ATOMIC_ACQUIRE) == SLOT_FREE) return 0;
     pthread_mutex_lock(&s->lock);
+    if (rang && t->flow_wake) {
+        if (s->state != SLOT_OPEN) channel_flow_progress(t->dev, (uint32_t)stripe + 1);
+        s->armed = 0;      /* the request below clears the raised fd */
+    } else if (rang && s->conn) {
+        struct epoll_event evs[CHANNEL_CONN_FDS];
+        int n = epoll_wait(s->epfd, evs, CHANNEL_CONN_FDS, 0);
+        for (int i = 0; i < n; ++i) channel_conn_clear(s->conn, evs[i].data.fd);
+        if (n > 0) s->armed = 0;
+    }
     int busy = 0;
-    if (!s->armed && (flow_wake ? channel_flow_arm(t->dev, (uint32_t)stripe + 1) == 0
-                                : s->state == SLOT_OPEN && channel_conn_arm(s->conn) == 0))
+    if (!s->armed && (t->flow_wake ? channel_flow_arm(t->dev, (uint32_t)stripe + 1) == 0
+                                   : s->state == SLOT_OPEN && channel_conn_arm(s->conn) == 0))
         s->armed = 1;
     if (s->state == SLOT_OPEN) {
         if (s->t_head != s->t_tail) busy = DMESH_STRIPE_CUSTODY;
@@ -432,16 +455,7 @@ int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe)
 }
 int dmesh_native_flow_wake(struct dmesh_native_transport *t)
 {
-    return channel_dev_flow_wake(t->dev);
-}
-void dmesh_native_stripe_progress(struct dmesh_native_transport *t, int stripe)
-{
-    if (stripe < 0 || stripe >= SLOTS) return;
-    struct slot *s = &t->slots[stripe];
-    if (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != SLOT_OPEN) return;
-    pthread_mutex_lock(&s->lock);
-    if (s->state == SLOT_OPEN) channel_flow_progress(t->dev, (uint32_t)stripe + 1);
-    pthread_mutex_unlock(&s->lock);
+    return t->flow_wake;
 }
 uint32_t dmesh_native_take_news(struct dmesh_native_transport *t)
 {
@@ -462,25 +476,6 @@ int dmesh_native_idle_arm(struct dmesh_native_transport *t)
 void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms, uint64_t *doorbells)
 {
     channel_dev_wake_counters(t->dev, arms, doorbells);
-}
-void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe)
-{
-    if (stripe < 0 || stripe >= SLOTS) return;
-    struct slot *s = &t->slots[stripe];
-    pthread_mutex_lock(&s->lock);
-    if (channel_dev_flow_wake(t->dev)) {
-        /* A closed or free slot's consumer may still hold descriptors of its
-         * last flow, which no drain progresses; unpolled, they would fire its
-         * next request at once. Its progress drops them. */
-        if (s->state != SLOT_OPEN) channel_flow_progress(t->dev, (uint32_t)stripe + 1);
-        s->armed = 0;      /* the next arm's request clears the raised fd */
-    } else if (s->conn) {
-        struct epoll_event evs[CHANNEL_CONN_FDS];
-        int n = epoll_wait(s->epfd, evs, CHANNEL_CONN_FDS, 0);
-        for (int i = 0; i < n; ++i) channel_conn_clear(s->conn, evs[i].data.fd);
-        if (n > 0) s->armed = 0;
-    }
-    pthread_mutex_unlock(&s->lock);
 }
 int dmesh_native_resolve(struct dmesh_native_transport *t, const char *name, uint32_t addr, uint16_t port)
 {

@@ -46,17 +46,13 @@ static void fixture_init(struct fixture *f, int pool_empty)
     atomic_init(&f->ctx->pool_epoch, (uint_fast64_t)0);
     atomic_init(&f->ctx->pool_waiter_count, (uint_fast32_t)0);
     atomic_init(&f->ctx->pool_wait_cursor, (uint_fast32_t)0);
-    for (uint32_t i = 0; i < DMESH_TX_READY_WORDS; i++)
+    for (uint32_t i = 0; i < DMESH_PORT_WORDS; i++)
         atomic_init(&f->ctx->pool_waiters[i], (uint_fast64_t)0);
 
     f->channel.ctx = f->ctx;
     f->eq->ch = &f->channel;
     f->eq->notify_efd = -1;
-    for (uint32_t i = 0; i < DMESH_TX_READY_WORDS; i++)
-        atomic_init(&f->eq->tx_ready[i], (uint_fast64_t)0);
-    atomic_init(&f->eq->tx_ready_count, (uint_fast32_t)0);
-    atomic_init(&f->eq->ready_head, (uint_fast32_t)0);
-    atomic_init(&f->eq->ready_tail, (uint_fast32_t)0);
+    atomic_init(&f->eq->events, 0u);
     atomic_init(&f->eq->wants_notify, 0);
 
     f->qp.ep = &f->channel;
@@ -97,12 +93,12 @@ static void fixture_destroy(struct fixture *f)
 static void *ready_from_other_thread(void *arg)
 {
     struct fixture *f = arg;
-    eq_tx_ready_set(f->eq, TEST_PORT);
+    eq_raise(f->eq, DMESH_EQ_TX_READY, NULL);
     return NULL;
 }
 
-/* While its poller drains, an EQ's own deliveries stay off its eventfd (the
- * poller consumes them next), but another thread's notify still raises it:
+/* While its poller drains, an EQ's own events stay off its eventfd (the
+ * poller takes them next), but another thread's raise still writes it:
  * dropping that one would leave the EQ asleep until the backstop. */
 static void test_drain_quiets_only_its_own_thread(void)
 {
@@ -113,21 +109,19 @@ static void test_drain_quiets_only_its_own_thread(void)
     atomic_store(&f.eq->wants_notify, 1);
     atomic_store(&f.ports[TEST_PORT].tx_wait_state, DMESH_TX_WAIT_READY);
 
-    draining_eq = f.eq;
-    eq_tx_ready_set(f.eq, TEST_PORT);
+    eq_raise(f.eq, DMESH_EQ_TX_READY, f.eq);
     uint64_t value = 0;
     assert(read(f.eq->notify_efd, &value, sizeof(value)) == -1);
     assert(errno == EAGAIN);
-    assert(dpumesh_next_tx_ready(f.eq) == &f.qp);
+    assert(dpumesh_qp_take(&f.qp, DMESH_EQ_TX_READY) == 1);
 
     atomic_store(&f.ports[TEST_PORT].tx_wait_state, DMESH_TX_WAIT_READY);
     pthread_t other;
     assert(pthread_create(&other, NULL, ready_from_other_thread, &f) == 0);
     assert(pthread_join(other, NULL) == 0);
-    draining_eq = NULL;
     assert(read(f.eq->notify_efd, &value, sizeof(value)) == sizeof(value));
     assert(value == 1);
-    assert(dpumesh_next_tx_ready(f.eq) == &f.qp);
+    assert(dpumesh_qp_take(&f.qp, DMESH_EQ_TX_READY) == 1);
     fixture_destroy(&f);
 }
 
@@ -165,16 +159,16 @@ static void test_qp_window_wakes_at_block_reclaim(void)
     psl->su_end[1] = 64;
     psl->su_done[1] = 0;
     atomic_store(&psl->su_head, (uint_fast16_t)2);
-    tx_reclaim_ack(f.ctx, TEST_PORT, 1);
+    tx_reclaim_ack(f.ctx, TEST_PORT, 1, NULL);
     assert(atomic_load(&psl->tx_wait_state) == DMESH_TX_WAIT_ARMED);
-    assert(atomic_load(&f.eq->tx_ready_count) == 0);
+    assert(!(atomic_load(&f.eq->events) & DMESH_EQ_TX_READY));
 
     /* Crossing the block boundary produces exactly one EQ event. */
-    tx_reclaim_ack(f.ctx, TEST_PORT, 2);
+    tx_reclaim_ack(f.ctx, TEST_PORT, 2, NULL);
     assert(atomic_load(&psl->tx_wait_state) == DMESH_TX_WAIT_READY);
-    assert(atomic_load(&f.eq->tx_ready_count) == 1);
-    assert(dpumesh_next_tx_ready(f.eq) == &f.qp);
-    assert(dpumesh_next_tx_ready(f.eq) == NULL);
+    assert(atomic_load(&f.eq->events) & DMESH_EQ_TX_READY);
+    assert(dpumesh_qp_take(&f.qp, DMESH_EQ_TX_READY) == 1);
+    assert(dpumesh_qp_take(&f.qp, DMESH_EQ_TX_READY) == 0);
     assert(atomic_load(&psl->tx_wait_state) == DMESH_TX_WAIT_IDLE);
     fixture_destroy(&f);
 }
@@ -189,18 +183,18 @@ static void test_out_of_order_ack_waits_for_contiguous_prefix(void)
     assert(dpumesh_tx_commit(f.ctx, TEST_PORT, buf, 32) == 0);
     size_t moff;
     uint32_t len;
-    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, 0, &moff, &len) == 1 && len == 16);
+    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, &moff, &len) == 1 && len == 16);
     dpumesh_tx_track(f.ctx, TEST_PORT, 100, len);
-    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, 0, &moff, &len) == 1 && len == 16);
+    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, &moff, &len) == 1 && len == 16);
     dpumesh_tx_track(f.ctx, TEST_PORT, 101, len);
 
-    tx_reclaim_ack(f.ctx, TEST_PORT, 101);       /* later engine finishes first */
+    tx_reclaim_ack(f.ctx, TEST_PORT, 101, NULL);       /* later engine finishes first */
     assert(atomic_load(&psl->tx_f) == 0);
     assert(atomic_load(&psl->su_tail) == 0);
-    tx_reclaim_ack(f.ctx, TEST_PORT, 100);
+    tx_reclaim_ack(f.ctx, TEST_PORT, 100, NULL);
     assert(atomic_load(&psl->tx_f) == 32);
     assert(atomic_load(&psl->su_tail) == 2);
-    tx_reclaim_ack(f.ctx, TEST_PORT, 101);       /* stale duplicate */
+    tx_reclaim_ack(f.ctx, TEST_PORT, 101, NULL);       /* stale duplicate */
     assert(atomic_load(&psl->tx_f) == 32);
     fixture_destroy(&f);
 }
@@ -215,10 +209,10 @@ static void test_ack_tracking_precedes_forward_publication(void)
     assert(dpumesh_tx_commit(f.ctx, TEST_PORT, buf, 16) == 0);
     size_t moff;
     uint32_t len;
-    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, 0, &moff, &len) == 1);
+    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, &moff, &len) == 1);
 
     dpumesh_tx_track(f.ctx, TEST_PORT, 700, len);
-    tx_reclaim_ack(f.ctx, TEST_PORT, 700);
+    tx_reclaim_ack(f.ctx, TEST_PORT, 700, NULL);
     assert(atomic_load(&psl->tx_f) == 16);
     assert(atomic_load(&psl->su_head) == atomic_load(&psl->su_tail));
     fixture_destroy(&f);
@@ -234,12 +228,12 @@ static void test_failed_forward_publication_rolls_back_tracking(void)
     assert(dpumesh_tx_commit(f.ctx, TEST_PORT, buf, 16) == 0);
     size_t first_moff, retry_moff;
     uint32_t len;
-    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, 0, &first_moff, &len) == 1);
+    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, &first_moff, &len) == 1);
     dpumesh_tx_track(f.ctx, TEST_PORT, 701, len);
     assert(dpumesh_tx_untrack(f.ctx, TEST_PORT, 701, len) == 0);
     assert(atomic_load(&psl->tx_s) == 0);
     assert(atomic_load(&psl->su_head) == atomic_load(&psl->su_tail));
-    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, 0, &retry_moff, &len) == 1);
+    assert(dpumesh_tx_next_send(f.ctx, TEST_PORT, &retry_moff, &len) == 1);
     assert(retry_moff == first_moff);
     fixture_destroy(&f);
 }
@@ -264,7 +258,7 @@ static void test_send_unit_fifo_never_overwrites_unacked_entries(void)
     assert(atomic_load(&psl->su_head) == 8);
     assert(psl->su_seq[0] == first_seq && psl->su_end[0] == first_end);
 
-    tx_reclaim_ack(f.ctx, TEST_PORT, 100);
+    tx_reclaim_ack(f.ctx, TEST_PORT, 100, NULL);
     assert(atomic_load(&psl->su_tail) == 1);
     assert(dpumesh_tx_track(f.ctx, TEST_PORT, 108, 1) == 0);
     assert(atomic_load(&psl->su_head) == 9);
@@ -290,9 +284,9 @@ static void test_send_unit_pressure_wakes_after_ack(void)
     assert(atomic_load(&psl->tx_wait_reason) == DMESH_TX_WAIT_SU_RECLAIM);
     assert(psl->tx_w == 0);
 
-    tx_reclaim_ack(f.ctx, TEST_PORT, 1);
+    tx_reclaim_ack(f.ctx, TEST_PORT, 1, NULL);
     assert(atomic_load(&psl->tx_wait_state) == DMESH_TX_WAIT_READY);
-    assert(dpumesh_next_tx_ready(f.eq) == &f.qp);
+    assert(dpumesh_qp_take(&f.qp, DMESH_EQ_TX_READY) == 1);
     assert(dpumesh_tx_reserve(f.ctx, TEST_PORT, 8) == f.dma);
     fixture_destroy(&f);
 }
@@ -309,7 +303,7 @@ static void test_arm_recheck_closes_lost_wakeup(void)
     atomic_store(&psl->tx_f, (uint_fast64_t)64);
     tx_wait_arm(f.ctx, psl, TEST_PORT, DMESH_TX_WAIT_QP_RECLAIM);
     assert(atomic_load(&psl->tx_wait_state) == DMESH_TX_WAIT_READY);
-    assert(dpumesh_next_tx_ready(f.eq) == &f.qp);
+    assert(dpumesh_qp_take(&f.qp, DMESH_EQ_TX_READY) == 1);
     fixture_destroy(&f);
 }
 
@@ -327,14 +321,15 @@ static void test_shared_pool_return_and_direct_retry(void)
 
     block_pool_return(f.ctx, 0);
     assert(atomic_load(&psl->tx_wait_state) == DMESH_TX_WAIT_READY);
-    assert(atomic_load(&f.eq->tx_ready_count) == 1);
+    assert(atomic_load(&f.eq->events) & DMESH_EQ_TX_READY);
 
     /* Polling applications may retry first. Success consumes the block and cancels
-     * the obsolete queued event, preserving one-shot semantics. */
+     * the queued event: taking it finds the QP no longer READY, preserving
+     * one-shot semantics. */
     assert(dpumesh_tx_reserve(f.ctx, TEST_PORT, 8) == f.dma);
     assert(atomic_load(&psl->tx_wait_state) == DMESH_TX_WAIT_IDLE);
-    assert(atomic_load(&f.eq->tx_ready_count) == 0);
-    assert(dpumesh_next_tx_ready(f.eq) == NULL);
+    assert(dpumesh_qp_take(&f.qp, DMESH_EQ_TX_READY) == 0);
+    assert(!(atomic_load(&f.eq->events) & DMESH_EQ_TX_READY));
     fixture_destroy(&f);
 }
 
@@ -383,7 +378,7 @@ static void test_default_four_mib_window_and_dynamic_fifo(void)
     for (int i = 0; i < 8; i++) next[i] = (uint32_t)(i + 1);
     atomic_init(&ctx->block_free, (uint_fast64_t)0);
     atomic_init(&ctx->pool_epoch, (uint_fast64_t)0);
-    for (uint32_t i = 0; i < DMESH_TX_READY_WORDS; i++)
+    for (uint32_t i = 0; i < DMESH_PORT_WORDS; i++)
         atomic_init(&ctx->pool_waiters[i], (uint_fast64_t)0);
 
     struct dmesh_port_slot *psl = &ports[TEST_PORT];
@@ -413,17 +408,17 @@ static void test_default_four_mib_window_and_dynamic_fifo(void)
     size_t moff;
     uint32_t len;
     for (uint16_t seq = 1; seq <= 512; seq++) {
-        assert(dpumesh_tx_next_send(ctx, TEST_PORT, 0, &moff, &len) == 1);
+        assert(dpumesh_tx_next_send(ctx, TEST_PORT, &moff, &len) == 1);
         assert(len == 8192);
         assert(dpumesh_tx_track(ctx, TEST_PORT, seq, len) == 0);
     }
-    assert(dpumesh_tx_next_send(ctx, TEST_PORT, 0, &moff, &len) == 0);
+    assert(dpumesh_tx_next_send(ctx, TEST_PORT, &moff, &len) == 0);
     assert(atomic_load(&psl->su_head) == 512);
 
     /* Once the complete 512 KiB prefix is acknowledged, the next reserve recycles
      * that extent while the remaining 3.5 MiB stays in flight. */
     for (uint16_t seq = 1; seq <= 64; seq++)
-        tx_reclaim_ack(ctx, TEST_PORT, seq);
+        tx_reclaim_ack(ctx, TEST_PORT, seq, NULL);
     assert(atomic_load(&psl->tx_f) == 512u * 1024u);
     assert(dpumesh_tx_reserve(ctx, TEST_PORT, 1) != NULL);
 

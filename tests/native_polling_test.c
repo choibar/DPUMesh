@@ -1,29 +1,41 @@
 /* Idle-wake policy of the production core over the memory carrier. A QP's EQ
- * (dpumesh_eq_arm): naps, linger, sleep with only the backstop and its own
- * stripe armed, custody polling, the submit wake and the backstop. The
- * channel (dmesh_accept): it arms the session, and re-polls soon after a
- * DOORBELL. Timer values are read back from the timerfds, so no assertion
- * depends on scheduling. */
+ * (dpumesh_eq_arm): the periodic backstop from the fd's hand-out, sleep with
+ * only its own stripe armed, a send that leaves it asleep, re-polls while a
+ * flow retires, and the backstop's missed-wake count. The channel
+ * (dmesh_accept): it arms the session, and re-polls soon after a DOORBELL.
+ * Timer values are read back from the timerfds, so no assertion depends on
+ * scheduling. */
 #include <assert.h>
 #include <poll.h>
 #include <stdio.h>
 #include "../src/core/dmesh_core.c"
 #include "support/native_memory_transport.c"
 
-static uint64_t timerfd_ns(int fd)
+static struct itimerspec timer_of(int fd)
 {
     struct itimerspec its;
     assert(timerfd_gettime(fd, &its) == 0);
-    assert(its.it_interval.tv_sec == 0 && its.it_interval.tv_nsec == 0); /* one-shot */
+    return its;
+}
+
+static uint64_t timer_ns(int fd)
+{
+    struct itimerspec its = timer_of(fd);
     return (uint64_t)its.it_value.tv_sec * 1000000000ull + (uint64_t)its.it_value.tv_nsec;
 }
 
-/* An empty dmesh_poll_qp: returns the armed timer. */
-static uint64_t empty_poll(dmesh_qp_t *qp)
+/* The EQ's timer holds the periodic backstop and no re-poll ahead of it. */
+static int backstop_only(dmesh_eq_t *eq)
+{
+    struct itimerspec its = timer_of(eq->tick_fd);
+    return !eq->repoll && its.it_interval.tv_sec == 0 && its.it_interval.tv_nsec == (long)DMESH_BACKSTOP_NS &&
+           timer_ns(eq->tick_fd) > DMESH_REPOLL_NS;
+}
+
+static void empty_poll(dmesh_qp_t *qp)
 {
     dmesh_event_t ev[4];
     assert(dmesh_poll_qp(qp, ev, 4) == 0);
-    return timerfd_ns(qp->eq->tick_fd);
 }
 
 static int readable(int fd)
@@ -38,10 +50,17 @@ static void settle(dmesh_eq_t *eq)
     while (read(eq->notify_efd, &v, sizeof(v)) > 0) {}
 }
 
+/* Let only the EQ's backstop fire. */
+static void backstop_fires(dmesh_eq_t *eq)
+{
+    struct itimerspec soon = {.it_value = {.tv_nsec = 1000}, .it_interval = {.tv_nsec = (long)DMESH_BACKSTOP_NS}};
+    assert(timerfd_settime(eq->tick_fd, 0, &soon, NULL) == 0);
+    struct pollfd p = {.fd = eq->epfd, .events = POLLIN};   /* dmesh_qp_fd would self-kick */
+    assert(poll(&p, 1, 1000) == 1);
+}
+
 int main(void)
 {
-    setenv("DPUMESH_LINGER_US", "1000000", 1);   /* 1 s: long enough to observe */
-    setenv("DPUMESH_SPIN_US", "1000", 1);        /* ignored, with a warning */
     test_native_stripe_map(1);                   /* the QP owns its stripe */
     setenv("DPUMESH_SERVICE", "echo:80", 1);     /* the peer that receives sends */
     dmesh_channel_t *server = dmesh_create_channel();
@@ -50,62 +69,45 @@ int main(void)
     dmesh_channel_t *ch = dmesh_create_channel();
     assert(ch);
     dpumesh_ctx_t *ctx = ch->ctx;
-    assert(ctx->nap_min_ns == 10000 && ctx->nap_cap_ns == 100000);
-    assert(ctx->linger_ns == 1000000000ull && ctx->backstop_ns == 200000000ull);
     dmesh_qp_t *qp = dmesh_create_qp(ch, "echo:80");
-    assert(qp && dmesh_qp_fd(qp) >= 0);
+    assert(qp);
     dmesh_eq_t *eq = qp->eq;
+    assert(timer_ns(eq->tick_fd) == 0);          /* poll-only: no backstop */
+    assert(dmesh_qp_fd(qp) >= 0);
+    assert(backstop_only(eq));                   /* handing out the fd starts it */
     uint32_t own = atomic_load(&eq->stripes);
     assert(own != 0);
     settle(eq);
     test_native_sleepable(1);
 
-    /* Born idle: the first empty poll sleeps at once, with only the backstop
-     * and its own stripe armed; the session is the channel's. */
+    /* An empty poll sleeps at once, with only its own stripe armed; the
+     * session is the channel's, and the backstop is left as it was. */
     unsigned arms = test_native_idle_arms();
     (void)test_native_armed();
-    uint64_t t = empty_poll(qp);
-    assert(t > 150000000ull && t <= 200000000ull && eq->timer_backstop);
-    assert(atomic_load(&eq->asleep) == 1 && test_native_idle_arms() == arms);
-    assert(test_native_armed() == own);
+    uint64_t sleeps = atomic_load(&eq->st.arms);
+    empty_poll(qp);
+    assert(atomic_load(&eq->asleep) == 1 && atomic_load(&eq->st.arms) == sleeps + 1);
+    assert(test_native_idle_arms() == arms && test_native_armed() == own);
+    assert(backstop_only(eq));
 
-    /* A send wakes the sleeping EQ (custody has no doorbell) and naps restart. */
+    /* A send leaves the sleeping EQ asleep: its custody is reclaimed on the
+     * next wake, and a sender that waits for the space wakes it. */
     void *buf = dmesh_alloc(qp, 64);
     assert(buf);
     memset(buf, 7, 64);
     assert(dmesh_post_send(qp, buf, 64) == 0);
-    assert(readable(eq->notify_efd));
-    /* Model outstanding custody with a carrier that cannot sleep. */
-    test_native_sleepable(0);
-    const uint64_t naps[] = {10000, 20000, 40000, 80000};
-    dmesh_event_t ev[8];
-    int n;
-    while ((n = dmesh_poll_qp(qp, ev, 8)) > 0)
-        for (int i = 0; i < n; ++i) dmesh_release_rx_buffer(ch, &ev[i]);
-    /* The poll that ran empty already took the first nap. */
-    t = timerfd_ns(eq->tick_fd);
-    assert(t > 0 && t <= naps[0] && !eq->timer_backstop && atomic_load(&eq->asleep) == 0);
-    for (size_t i = 1; i < sizeof(naps) / sizeof(naps[0]); ++i) {
-        t = empty_poll(qp);
-        assert(t > naps[i - 1] && t <= naps[i]);
-    }
-    /* Naps spent, still within the linger: poll every nap_cap. */
-    for (int i = 0; i < 3; ++i) {
-        t = empty_poll(qp);
-        assert(t > naps[3] && t <= ctx->nap_cap_ns && atomic_load(&eq->asleep) == 0);
-    }
-    /* Past the linger, outstanding custody still keeps the EQ polling. */
-    ctx->linger_ns = 0;
-    uint64_t busy = atomic_load(&wait_stats.busy);
-    t = empty_poll(qp);
-    assert(t <= ctx->nap_cap_ns && !eq->timer_backstop && atomic_load(&eq->asleep) == 0);
-    assert(atomic_load(&wait_stats.busy) == busy + 1);
+    assert(!readable(eq->notify_efd));
 
-    /* Custody retired: sleep. */
-    test_native_sleepable(1);
-    t = empty_poll(qp);
-    assert(t > ctx->nap_cap_ns && eq->timer_backstop && atomic_load(&eq->asleep) == 1);
-    assert(test_native_idle_arms() == arms);
+    /* A closed flow still retiring keeps the EQ polling on a re-poll ahead of
+     * the backstop; once retired it sleeps on the backstop alone. */
+    test_native_retiring(1);
+    uint64_t busy = atomic_load(&eq->st.busy);
+    empty_poll(qp);
+    assert(atomic_load(&eq->asleep) == 0 && eq->repoll && atomic_load(&eq->st.busy) == busy + 1);
+    assert(timer_ns(eq->tick_fd) > 0 && timer_ns(eq->tick_fd) <= DMESH_REPOLL_NS);
+    test_native_retiring(0);
+    empty_poll(qp);
+    assert(atomic_load(&eq->asleep) == 1 && backstop_only(eq));
 
     /* The channel arms the session. A DOORBELL raises its fd, not the QP's;
      * accepting acknowledges it and re-polls soon, since the descriptor may
@@ -114,27 +116,22 @@ int main(void)
     assert(dmesh_accept(ch) == NULL && errno == EAGAIN);
     assert(test_native_idle_arms() == arms + 1);
     assert(dmesh_accept(ch) == NULL && errno == EAGAIN);
-    assert(timerfd_ns(ctx->listen_timer) > ctx->nap_cap_ns);
+    assert(timer_ns(ctx->listen_timer) > DMESH_REPOLL_NS);
     test_native_raise_wake();
     assert(readable(cfd) && !readable(eq->epfd));
     assert(dmesh_accept(ch) == NULL && errno == EAGAIN);
     assert(!readable(cfd));
-    t = timerfd_ns(ctx->listen_timer);
-    assert(t > 0 && t <= ctx->nap_cap_ns);
+    uint64_t t = timer_ns(ctx->listen_timer);
+    assert(t > 0 && t <= DMESH_REPOLL_NS);
     assert(dmesh_accept(ch) == NULL && errno == EAGAIN);
-    assert(timerfd_ns(ctx->listen_timer) > ctx->nap_cap_ns);
+    assert(timer_ns(ctx->listen_timer) > DMESH_REPOLL_NS);
 
-    /* Let only the QP's backstop expire: counted, and a backstop that found
-     * no work is not a missed wake. */
-    assert(eq->timer_backstop);
-    uint64_t wakes = atomic_load(&wait_stats.backstop_wakes);
-    struct itimerspec soon = {.it_value = {.tv_nsec = 1000}};
-    assert(timerfd_settime(eq->tick_fd, 0, &soon, NULL) == 0);
-    struct pollfd p = {.fd = eq->epfd, .events = POLLIN};   /* dmesh_qp_fd would self-kick */
-    assert(poll(&p, 1, 1000) == 1);
-    (void)empty_poll(qp);
-    assert(atomic_load(&wait_stats.backstop_wakes) == wakes + 1);
-    assert(atomic_load(&wait_stats.backstop_work) == 0);
+    /* A backstop that found no work is counted, and is not a missed wake. */
+    uint64_t wakes = atomic_load(&eq->st.backstop_wakes);
+    backstop_fires(eq);
+    empty_poll(qp);
+    assert(atomic_load(&eq->st.backstop_wakes) == wakes + 1);
+    assert(atomic_load(&eq->st.backstop_work) == 0);
 
     /* A backstop that reclaims only custody ACKs, left for the next wake on
      * purpose, is not a missed wake; one that hands the poller a receive is.
@@ -144,52 +141,45 @@ int main(void)
     buf = dmesh_alloc(qp, 64);
     assert(buf);
     memset(buf, 9, 64);
-    assert(dmesh_post_send(qp, buf, 64) == 0 && dmesh_flush(qp) == 0);
-    settle(eq);                                     /* the send's wake: only the backstop fires */
+    assert(dmesh_post_send(qp, buf, 64) == 0);
     test_native_hold_acks(0);
-    assert(timerfd_settime(eq->tick_fd, 0, &soon, NULL) == 0);
-    assert(poll(&p, 1, 1000) == 1);
-    (void)empty_poll(qp);
-    assert(atomic_load(&wait_stats.backstop_wakes) == wakes + 2);
-    assert(atomic_load(&wait_stats.backstop_work) == 0);
+    backstop_fires(eq);
+    empty_poll(qp);
+    assert(atomic_load(&eq->st.backstop_wakes) == wakes + 2);
+    assert(atomic_load(&eq->st.backstop_work) == 0);
     dmesh_qp_t *sq = NULL;
     for (int i = 0; i < 1000 && !sq; ++i) sq = dmesh_accept(server);
     assert(sq);
-    while (!eq->timer_backstop) (void)empty_poll(qp);
+    dmesh_event_t ev[8];
+    int n;
+    while ((n = dmesh_poll_qp(sq, ev, 8)) > 0)
+        for (int i = 0; i < n; ++i) dmesh_release_rx_buffer(server, &ev[i]);
     void *reply = dmesh_alloc(sq, 4);
     assert(reply);
     memcpy(reply, "pong", 4);
-    assert(dmesh_post_send(sq, reply, 4) == 0 && dmesh_flush(sq) == 0);
-    assert(timerfd_settime(eq->tick_fd, 0, &soon, NULL) == 0);
-    assert(poll(&p, 1, 1000) == 1);
+    assert(dmesh_post_send(sq, reply, 4) == 0);
+    backstop_fires(eq);
     assert(dmesh_poll_qp(qp, ev, 8) == 1 && ev[0].type == DMESH_EVENT_RECV);
     dmesh_release_rx_buffer(ch, &ev[0]);
-    (void)empty_poll(qp);
-    assert(atomic_load(&wait_stats.backstop_wakes) == wakes + 3);
-    assert(atomic_load(&wait_stats.backstop_work) == 1);
+    empty_poll(qp);
+    assert(atomic_load(&eq->st.backstop_wakes) == wakes + 3);
+    assert(atomic_load(&eq->st.backstop_work) == 1);
 
-    /* DPUMESH_NAP_US=0 skips the naps; with no linger the EQ sleeps. */
-    ctx->nap_min_ns = 0;
-    atomic_store(&eq->kick, 1);
-    (void)empty_poll(qp);
-    assert(eq->timer_backstop);
-
-    /* Oversubscribed (more live EQs than allowed CPUs): no naps, no linger. */
-    ctx->nap_min_ns = 10000;
-    ctx->linger_ns = 1000000000ull;
-    atomic_store(&ctx->live_eqs, 1 << 20);
-    atomic_store(&eq->kick, 1);
-    (void)empty_poll(qp);
-    assert(eq->timer_backstop);
-    atomic_store(&ctx->live_eqs, 1);
+    /* A re-poll's firing is not a backstop. */
+    test_native_retiring(1);
+    empty_poll(qp);
+    assert(eq->repoll);
+    test_native_retiring(0);
+    struct pollfd p = {.fd = eq->epfd, .events = POLLIN};
+    assert(poll(&p, 1, 1000) == 1);
+    empty_poll(qp);
+    assert(atomic_load(&eq->st.backstop_wakes) == wakes + 3 && backstop_only(eq));
 
     test_native_sleepable(0);
     assert(dmesh_destroy_qp(sq) == 0);
     assert(dmesh_destroy_qp(qp) == 0);
     assert(dmesh_destroy_channel(ch) == 0);
     assert(dmesh_destroy_channel(server) == 0);
-    unsetenv("DPUMESH_LINGER_US");
-    unsetenv("DPUMESH_SPIN_US");
-    puts("native_polling_test: naps, linger, custody polling, sleep on its own stripe, submit wake, "
+    puts("native_polling_test: periodic backstop, sleep on its own stripe, quiet send, retiring re-poll, "
          "channel doorbell re-poll, backstop and missed-wake count: PASS");
 }

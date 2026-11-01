@@ -60,7 +60,6 @@ _Static_assert(CHANNEL_MODE_BACKEND_DPU_DMA == DMESH_FLOW_MODE_BACKEND, "backend
 _Static_assert(CHANNEL_MODE_CLIENT_DPU_DMA == DMESH_FLOW_MODE_INGRESS_PUSH, "ingress push mode");
 _Static_assert(CHANNEL_MODE_BACKEND_HOST_DPA == DMESH_FLOW_MODE_BACKEND_PULL, "backend host-dpa mode");
 
-#define CHANNEL_RING_SIZE 1024u            /* Forward ring depth of the host library */
 #define CHANNEL_REV_READY_MS 5000          /* Wait for the DPU's EXPORT_RCV_RING */
 #define CHANNEL_RX_CONSUMED_POS_BATCH (64u * 1024u) /* Pull: bytes released between rx_consumed_pos publications */
 #define CHANNEL_DEFAULT_REV_PCI "0b:00.0"  /* Pull: the host PF that runs the DPA process */

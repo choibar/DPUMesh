@@ -779,7 +779,7 @@ static int shim_try_drain(pfd_t *self, enum drain_target target, int *drained) {
         dmesh_qp_t *c = self->conn;
         int failed;
         *drained = dispatcher_drain_qp(self, self, 1, &failed);
-        dpumesh_eq_kick_pending(c->eq);
+        dpumesh_qp_kick_pending(c);
         if (failed) pfd_fail(self, c);
     }
     pthread_mutex_unlock(&g_poll_mu);
