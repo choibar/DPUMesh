@@ -14,6 +14,8 @@ static unsigned client_creates, client_destroys, ring_allocs, ring_frees;
 static unsigned opens, closes;
 static unsigned shared_progress_calls;
 static int next_close_status;
+/* A slow DPU: OPEN or CLOSE gets no answer; a refused CLOSE is not queued. */
+static int silent_open, silent_close, refuse_close;
 static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
 /* Idle wake: the last ARM the host sent, and the control PE notification. */
@@ -92,14 +94,15 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
     case DMESH_SESSION_OPEN:
         assert(h.payload_len == sizeof(struct dmesh_export_metadata_msg));
         ++opens;
-        reply(DMESH_SESSION_READY, h.flow_id, h.generation, 0);
+        if (!silent_open) reply(DMESH_SESSION_READY, h.flow_id, h.generation, 0);
         break;
     case DMESH_SESSION_CLOSE: {
+        if (refuse_close) return DOCA_ERROR_AGAIN;
         struct channel_dev *dev = objs->owner;
         struct channel_conn *flow = dev->flows[h.flow_id];
         assert(flow && !flow->reverse && !flow->tx_mmap && !flow->ring_mmap);
         ++closes;
-        reply(DMESH_SESSION_CLOSED, h.flow_id, h.generation, next_close_status);
+        if (!silent_close) reply(DMESH_SESSION_CLOSED, h.flow_id, h.generation, next_close_status);
         next_close_status = 0;
         break;
     }
@@ -395,6 +398,53 @@ static void test_checked_close(void)
     assert(ring_allocs == ring_frees);
 }
 
+/* An OPEN the DPU answers only after the host stopped waiting: the
+ * unconfirmed close keeps the id, which channel_flow_free releases for the
+ * next open once CLOSED arrives. */
+static void test_late_open(void)
+{
+    struct channel_dev dev = {0};
+    pthread_mutex_init(&dev.session_lock, NULL);
+    assert(channel_session_open(&dev, "unit-session") == 0);
+    struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
+    struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW), .bytes = CHANNEL_WINDOW};
+    assert(tx.buf && rx.buf);
+    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx,
+                                      .mode = CHANNEL_MODE_CLIENT_DPU_DMA};
+    struct channel_conn *flow = NULL;
+    unsigned freed = ring_frees;
+
+    silent_open = silent_close = 1;
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == ETIMEDOUT && !flow);
+    struct channel_conn *held = dev.flows[1];
+    assert(held && held->abandoned && held->close_sent && ring_frees == freed);
+    assert(!channel_flow_free(&dev, 1));
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == EBUSY);
+    silent_open = silent_close = 0;
+    dispatch(&dev, DMESH_SESSION_READY, 1, held->generation, 0);
+    assert(!channel_flow_free(&dev, 1) && dev.flows[1] == held);
+    dispatch(&dev, DMESH_SESSION_CLOSED, 1, held->generation, 0);
+    assert(channel_flow_free(&dev, 1) && !dev.flows[1] && ring_frees == freed + 1);
+    assert(channel_conn_open(&dev, &cfg, &flow) == 0 && flow->ready);
+    assert(channel_conn_close(flow) == 0);
+
+    /* A CLOSE the queue refused is sent by the next check. */
+    silent_open = refuse_close = 1;
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == ETIMEDOUT);
+    held = dev.flows[1];
+    assert(held && held->abandoned && !held->close_sent);
+    silent_open = refuse_close = 0;
+    unsigned sent = closes;
+    assert(!channel_flow_free(&dev, 1) && held->close_sent && closes == sent + 1);
+    assert(channel_dev_progress(&dev) == 0);
+    assert(channel_flow_free(&dev, 1) && !dev.flows[1]);
+
+    assert(channel_session_close(&dev) == 0);
+    pthread_mutex_destroy(&dev.session_lock);
+    free(tx.buf); free(rx.buf);
+    assert(ring_allocs == ring_frees);
+}
+
 static void test_backend_requests(struct channel_dev *dev)
 {
     unsigned before = opens;
@@ -516,6 +566,7 @@ int main(void)
     pthread_mutex_destroy(&dev.session_lock);
     free(tx.buf); free(rx.buf);
     test_checked_close();
+    test_late_open();
     puts("channel session: isolated flows, checked cleanup failures and retry verified");
     return 0;
 }

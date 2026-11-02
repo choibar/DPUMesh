@@ -163,6 +163,14 @@ static uint16_t next_uport(struct dmesh_native_transport *t)
     }
     return 0;
 }
+/* The first free slot whose flow id the channel holds no more: a timed-out
+ * open keeps its id until the DPU confirms the close. Caller holds t->lock. */
+static struct slot *free_slot(struct dmesh_native_transport *t)
+{
+    for (int i = 0; i < SLOTS; ++i)
+        if (t->slots[i].state == SLOT_FREE && channel_flow_free(t->dev, (uint32_t)i + 1)) return &t->slots[i];
+    return NULL;
+}
 /* Listener-only startup; service one DPU request per progress pass. The
  * session callback queues work and never recursively opens a flow. */
 static void backend_progress(struct dmesh_native_transport *t)
@@ -171,18 +179,15 @@ static void backend_progress(struct dmesh_native_transport *t)
     if (!channel_backend_next(t->dev, &worker, &token)) return;
     pthread_mutex_lock(&t->lock);
     int total = 0, error = 0;
-    struct slot *free_slot = NULL;
-    for (int i = 0; i < SLOTS; ++i) {
-        struct slot *s = &t->slots[i];
-        if (s->state == SLOT_FREE) { if (!free_slot) free_slot = s; }
-        else if (s->backend) ++total;
-    }
+    struct slot *s = NULL;
+    for (int i = 0; i < SLOTS; ++i)
+        if (t->slots[i].state != SLOT_FREE && t->slots[i].backend) ++total;
     if (t->service_id == DMESH_SVC_NONE) error = ECONNREFUSED;
-    else if (!free_slot || total >= t->backend_max) error = ENOSPC;
+    else if (total >= t->backend_max || !(s = free_slot(t))) error = ENOSPC;
     else {
         uint16_t up = next_uport(t);
         if (!up) error = ENOSPC;
-        else if (slot_open(t, free_slot, CHANNEL_MODE_BACKEND_DPU_DMA,
+        else if (slot_open(t, s, CHANNEL_MODE_BACKEND_DPU_DMA,
                           up, t->service_id, worker, token) != 0) error = errno;
     }
     pthread_mutex_unlock(&t->lock);
@@ -265,8 +270,7 @@ int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int se
 {
     pthread_mutex_lock(&t->lock);
     if (t->port_slot[port]) { pthread_mutex_unlock(&t->lock); errno = EADDRINUSE; return -1; }
-    struct slot *s = NULL;
-    for (int i = 0; i < SLOTS; ++i) if (t->slots[i].state == SLOT_FREE) { s = &t->slots[i]; break; }
+    struct slot *s = free_slot(t);
     if (!s) { pthread_mutex_unlock(&t->lock); errno = ENOSPC; return -1; }
     int rc = slot_open(t, s, CHANNEL_MODE_CLIENT_DPU_DMA, port, service_id, 0, 0);
     pthread_mutex_unlock(&t->lock);

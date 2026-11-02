@@ -89,6 +89,10 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 /* Quiesce reverse DMA, wait for CLOSED, then release the private ring.
  * Failure leaves the handle and exported memory live for safe retry. */
 int channel_conn_close(struct channel_conn *conn);
+/* Whether flow_id can open. An open that failed after OPEN was sent, and whose
+ * close the DPU did not confirm, holds the id and its receive window; this
+ * releases them once the DPU's CLOSED has arrived. */
+int channel_flow_free(struct channel_dev *dev, uint32_t flow_id);
 /* End the forward stream (SHUTDOWN): the DPU's reader sees end of stream
  * after every descriptor posted so far; the flow keeps receiving. */
 int channel_conn_shutdown(struct channel_conn *conn);

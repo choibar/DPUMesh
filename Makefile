@@ -77,7 +77,7 @@ $(TESTDIR)/session_flow_test: tests/session_flow_test.c $(TRANSPORT)/common/obje
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+	$(CC) $(HOST_CFLAGS) -DCHANNEL_REV_READY_MS=20 -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/channel_flow_wake_test: tests/channel_flow_wake_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@

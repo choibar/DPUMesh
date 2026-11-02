@@ -60,7 +60,9 @@ _Static_assert(CHANNEL_MODE_BACKEND_DPU_DMA == DMESH_FLOW_MODE_BACKEND, "backend
 _Static_assert(CHANNEL_MODE_CLIENT_DPU_DMA == DMESH_FLOW_MODE_INGRESS_PUSH, "ingress push mode");
 _Static_assert(CHANNEL_MODE_BACKEND_HOST_DPA == DMESH_FLOW_MODE_BACKEND_PULL, "backend host-dpa mode");
 
+#ifndef CHANNEL_REV_READY_MS
 #define CHANNEL_REV_READY_MS 5000          /* Wait for the DPU's EXPORT_RCV_RING */
+#endif
 #define CHANNEL_RX_CONSUMED_POS_BATCH (64u * 1024u) /* Pull: bytes released between rx_consumed_pos publications */
 #define CHANNEL_DEFAULT_REV_PCI "0b:00.0"  /* Pull: the host PF that runs the DPA process */
 #define CHANNEL_CTX_STOP_SPINS 100000      /* Bound on progressing a stopping ctx to IDLE */
@@ -146,6 +148,7 @@ struct channel_conn {
 	int rx_ended;                       /* Push: end of stream or a malformed batch was read */
 	uint32_t flow_id, generation;
 	int open_sent, ready, peer_closed, error, close_sent, close_error;
+	int abandoned;                      /* a failed open whose close is unconfirmed: holds its id */
 	struct channel_flow_wake *wake;     /* its slot's flow wake, or NULL */
 	/* host-dpa reverse path */
     struct dmesh_dpa_endpoint *reverse;
@@ -1517,8 +1520,14 @@ int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config 
 	int saved = errno;
 	pthread_mutex_unlock(&dev->session_lock);
 	if (rc != 0) {
-		/* On failed cleanup the session retains the map entry and all mmaps. */
-		(void)channel_conn_close(conn);
+		/* The DPU may still finish the OPEN after the wait gave up. A close it
+		 * does not confirm keeps the map entry, its ring and the window under
+		 * the id until CLOSED arrives; channel_flow_free releases them then. */
+		if (channel_conn_close(conn) != 0) {
+			pthread_mutex_lock(&dev->session_lock);
+			conn->abandoned = 1;
+			pthread_mutex_unlock(&dev->session_lock);
+		}
 		errno = saved;
 		return -1;
 	}
@@ -1566,6 +1575,26 @@ int channel_conn_close(struct channel_conn *conn)
 	}
 	pthread_mutex_unlock(&dev->session_lock);
 	return rc;
+}
+
+int channel_flow_free(struct channel_dev *dev, uint32_t flow_id)
+{
+	pthread_mutex_lock(&dev->session_lock);
+	struct channel_conn *conn = dev->flows[flow_id];
+	if (conn != NULL && conn->abandoned) {
+		/* A CLOSE the queue refused is sent now; the DPU confirms it after the OPEN. */
+		if (!conn->close_sent && !conn->peer_closed &&
+		    session_send_locked(dev, DMESH_SESSION_CLOSE, conn->flow_id, conn->generation, NULL, 0) == 0)
+			conn->close_sent = 1;
+		struct channel_flow_wake *fw = conn->wake;
+		if (conn->peer_closed && conn_teardown(conn) == 0) {
+			dev->flows[flow_id] = NULL;
+			if (fw != NULL) fw->conn = NULL;
+			conn = NULL;
+		}
+	}
+	pthread_mutex_unlock(&dev->session_lock);
+	return conn == NULL;
 }
 
 int channel_conn_shutdown(struct channel_conn *conn)

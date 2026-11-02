@@ -21,10 +21,16 @@ int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *to
 { (void)dev; (void)worker; (void)token; return 0; }
 void channel_backend_finish(struct channel_dev *dev, uint32_t worker, uint32_t token, int error)
 { (void)dev; (void)worker; (void)token; (void)error; assert(!"unexpected request"); }
+/* Opens are refused; a test that expects one reads the flow id it got. */
+static int expect_open;
+static uint32_t held_ids, opened_id;   /* held: bit (flow id - 1) the channel keeps */
 int dmesh_target_addr(int service, uint32_t *ip, uint16_t *port)
-{ (void)service; (void)ip; (void)port; assert(!"unexpected open"); return -1; }
+{ (void)service; assert(expect_open); *ip = 0; *port = 0; return 0; }
 int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
-{ (void)dev; (void)cfg; (void)out; assert(!"unexpected open"); return -1; }
+{ (void)dev; (void)out; assert(expect_open); opened_id = cfg->flow_id; errno = ECONNREFUSED; return -1; }
+int channel_dev_host_dpa(const struct channel_dev *dev) { (void)dev; return 0; }
+int channel_flow_free(struct channel_dev *dev, uint32_t flow_id)
+{ (void)dev; return !(held_ids & (UINT32_C(1) << (flow_id - 1))); }
 int channel_conn_fds(struct channel_conn *conn, int *fds, int max)
 { (void)conn; (void)fds; (void)max; return 0; }
 void channel_conn_clear(struct channel_conn *conn, int fd) { (void)conn; (void)fd; }
@@ -244,6 +250,24 @@ static void test_half_close_and_held_buffers(void)
     assert(dmesh_native_close(t) == 0);
 }
 
+/* A free slot whose flow id the channel still holds (an open that timed
+ * out, its close unconfirmed) is skipped, not retried into EBUSY. */
+static void test_held_id_skipped(void)
+{
+    struct dmesh_native_transport *t = calloc(1, sizeof(*t));
+    assert(t);
+    expect_open = 1;
+    held_ids = 1;
+    assert(dmesh_native_connect(t, 40000, 1) == -1 && errno == ECONNREFUSED && opened_id == 2);
+    held_ids = 0;
+    assert(dmesh_native_connect(t, 40000, 1) == -1 && opened_id == 1);
+    held_ids = UINT32_MAX;
+    opened_id = 0;
+    assert(dmesh_native_connect(t, 40000, 1) == -1 && errno == ENOSPC && opened_id == 0);
+    expect_open = 0; held_ids = 0;
+    free(t);
+}
+
 int main(void)
 {
     test_closed_stripe_stays_pollable_until_retired();
@@ -251,6 +275,7 @@ int main(void)
     test_flow_consumer_rearmed_after_close();
     test_batched_poll();
     test_half_close_and_held_buffers();
+    test_held_id_skipped();
     uint32_t p[2];
     assert(carrier_chunks(0, p) == 0);
     assert(carrier_chunks(1, p) == 1 && p[0] == 1);
@@ -281,6 +306,6 @@ int main(void)
         assert(carrier_window_release(&v, (uint32_t)(k * 64u % 4096u)) == 0);
         assert(carrier_window_advance(&v, &seq, &bytes) && seq == k && bytes == k * 64u);
     }
-    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close and held buffers: PASS");
+    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close, held buffers and held flow ids: PASS");
     return 0;
 }
