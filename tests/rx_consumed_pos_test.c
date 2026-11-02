@@ -77,6 +77,11 @@ int main(void)
     assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_SUCCESS && pos == 64);
     assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
     assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
+    /* A mux flow has no msgq of its own: its ring's DMA_DONE count gates it. */
+    conn->dpa_comch = NULL; conn->mux = true; conn->mux_received = 1;
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_EMPTY);
+    conn->mux_received = 2;
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
     free(objs);
     puts("rx_consumed_pos_test: batching, SDK lock, failure retry, staging wraps and end of stream: PASS");
 }
