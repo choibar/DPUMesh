@@ -38,6 +38,7 @@ static uint64_t doca_dpa_dev_thread_get_local_storage(void) { ++tls_reads;return
 static void doca_dpa_dev_device_set(uint64_t dev) { selected_device=dev; }
 static void doca_dpa_dev_thread_retrigger(void) { ++retriggers; }
 static void doca_dpa_dev_thread_reschedule(void) { ++reschedules; }
+static uint64_t __dpa_thread_time(void) { return 0; } /* run_dma_mux only; not run here */
 static unsigned char src[256][8064], dst[1024*1024];
 static struct { uint64_t src, dst; uint32_t len, type; } pending[1024];
 static void __dpa_thread_window_writeback(void) {}

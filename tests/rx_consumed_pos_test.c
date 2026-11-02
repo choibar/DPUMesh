@@ -8,6 +8,15 @@ static unsigned copies;
 static uint32_t published;
 static doca_error_t copy_error;
 
+/* The flow here has its own DPA thread; a mux flow's slot is not this test's. */
+doca_error_t dmesh_dpa_mux_rx_consumed(struct dmesh_conn *conn, uint32_t pos)
+{
+    (void)conn;
+    (void)pos;
+    assert(!"a per-flow thread's position went to a mux slot");
+    return DOCA_ERROR_UNEXPECTED;
+}
+
 doca_error_t doca_dpa_h2d_memcpy(struct doca_dpa *dpa,
                                doca_dpa_dev_uintptr_t dst, void *src, size_t size)
 {
