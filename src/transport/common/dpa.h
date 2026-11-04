@@ -21,6 +21,8 @@ struct doca_comch_connection;
 
 /* DOCA DPA thread related objects */
 struct dmesh_conn;
+struct objects;
+struct dmesh_dma_engine;
 
 struct dmesh_doca_dpa_thread {
     struct doca_dpa *dpa;           /* DOCA DPA */
@@ -35,6 +37,13 @@ struct dmesh_doca_dpa_thread {
     doca_dpa_dev_uintptr_t buf;     /* buffer to be used by DPA thread */
     uint32_t bench_mode;           /* CPU launch selection; 0 = native kernel */
 	doca_dpa_dev_buf_arr_t dpa_buf_arr; /* DPA buffer array */
+    /* DMESH_DPA_REUSE=1: a closed flow leaves its completions and msgqs here,
+     * and the thread started, for the next flow on this slot, so flow open
+     * and close create and destroy no SDK objects (no firmware commands). */
+    struct dmesh_doca_dpa_comch *kept_comch;
+    bool reused;                   /* this run adopted kept_comch */
+    /* The same for the flow's DMA engine (DPU side, opaque here). */
+    struct dmesh_dma_engine *kept_dma;
 };
 
 /* Pool of pre-created DPA threads, all sharing one doca_dpa instance. Threads
@@ -46,6 +55,8 @@ struct dmesh_dpa_thread_pool {
     int size;                                      /* number of usable slots */
     struct dmesh_doca_dpa_thread threads[DPA_THREAD_POOL_SIZE];
     struct dmesh_conn *owner[DPA_THREAD_POOL_SIZE]; /* NULL = free */
+    /* Destroys a kept DMA engine; set by the DPU side that keeps them. */
+    doca_error_t (*release_kept_dma)(struct objects *objs, struct dmesh_dma_engine *engine);
 };
 
 struct dmesh_doca_dpa_msgq {
@@ -93,6 +104,10 @@ struct dmesh_dpa_endpoint {
 
 doca_error_t dmesh_dpa_comch_create(struct dmesh_doca_dpa_thread *thread,
                                    struct dmesh_doca_dpa_comch **out);
+/* Both msgqs of a created comch (comch_msgq.c). */
+doca_error_t dmesh_dpa_comch_init_msgqs(struct doca_dev *dev, struct doca_pe *pe,
+                                       struct dmesh_doca_dpa_thread *thread,
+                                       struct dmesh_doca_dpa_comch *comch);
 doca_error_t dmesh_dpa_quiesce_step(struct dmesh_doca_dpa_thread *thread,
                                    struct dmesh_doca_dpa_comch *comch, struct doca_pe *pe);
 doca_error_t dmesh_dpa_quiesce_checked(struct dmesh_doca_dpa_thread *thread,
@@ -155,6 +170,21 @@ struct objects;
 struct dmesh_conn;
 doca_error_t
 dmesh_doca_dpa_comch_create(struct dmesh_conn *conn);
+
+/* DMESH_DPA_REUSE=1: pooled threads keep their completions and msgqs. */
+bool dmesh_dpa_reuse_enabled(void);
+/* Adopts the comch the slot's previous flow kept; false if there is none. */
+bool dmesh_doca_dpa_comch_adopt(struct dmesh_conn *conn);
+/* After a successful quiesce: keeps the comch and the started thread on the
+ * slot instead of destroying them; false if they must be destroyed. */
+bool dmesh_doca_dpa_comch_keep(struct dmesh_conn *conn);
+/* Pool slots to prepare at startup (DMESH_DPA_PREWARM, default 8; reuse only). */
+int dmesh_dpa_prewarm_count(void);
+/* Prepares an idle pool thread for reuse before any flow: its completions
+ * and msgqs, the consumer's receive credits, and a runnable kernel that
+ * waits stopped for the first flow's request. */
+doca_error_t dmesh_dpa_thread_prewarm(struct dmesh_doca_dpa_thread *thread,
+                                      struct doca_dev *dev, struct doca_pe *pe);
 
 /* Upper bound on one stop handshake. A kernel that has not stopped by then is
  * treated as stuck: its flow keeps its objects instead of releasing them. */

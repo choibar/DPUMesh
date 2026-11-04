@@ -24,8 +24,16 @@ static doca_error_t init_msgqs(struct doca_dev *dev, struct doca_pe *pe,
     return dmesh_doca_dpa_msgq_create(&attr, &comch->recv);
 }
 
+doca_error_t dmesh_dpa_comch_init_msgqs(struct doca_dev *dev, struct doca_pe *pe,
+                                       struct dmesh_doca_dpa_thread *thread,
+                                       struct dmesh_doca_dpa_comch *comch)
+{
+    return init_msgqs(dev, pe, thread, comch);
+}
+
 doca_error_t init_comch_dpa_msgq(struct dmesh_conn *conn, struct doca_pe *pe)
 {
+    if (dmesh_doca_dpa_comch_adopt(conn)) return DOCA_SUCCESS;
     doca_error_t result = dmesh_doca_dpa_comch_create(conn);
     if (result != DOCA_SUCCESS) return result;
     return init_msgqs(conn->objs->dev, pe, conn->dpa_thread, conn->dpa_comch);

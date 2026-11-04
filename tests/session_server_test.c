@@ -95,6 +95,22 @@ bool dmesh_doca_dpa_failed(struct doca_dpa *dpa)
     return false;
 }
 
+/* A pool thread for the slots under test; teardown reads it (kept_comch). */
+static struct dmesh_doca_dpa_thread fake_dpa_thread;
+
+/* DMESH_DPA_REUSE is off here: teardown destroys, never keeps. */
+bool dmesh_dma_engine_keep(struct dmesh_conn *conn)
+{
+    (void)conn;
+    return false;
+}
+
+bool dmesh_doca_dpa_comch_keep(struct dmesh_conn *conn)
+{
+    (void)conn;
+    return false;
+}
+
 doca_error_t cleanup_dma_tasks(struct dmesh_conn *conn)
 {
     doca_error_t result = cleanup_phase('D');
@@ -421,7 +437,7 @@ static void checked_close_test(void)
     struct dmesh_conn *sibling = new_test_flow(objs, peer, 2, 1);
     sibling->state = DMESH_CONN_RUNNING;
     struct dmesh_session *s = conn->session;
-    conn->dpa_thread = (void *)(uintptr_t)1;
+    conn->dpa_thread = &fake_dpa_thread;
     conn->dpa_comch = (void *)(uintptr_t)2;
     conn->dma_ctx = (void *)(uintptr_t)3;
     conn->buf_arr = (void *)(uintptr_t)4;
@@ -480,7 +496,7 @@ static void checked_close_test(void)
 
     /* No-teardown remains an explicit resource-retaining close error. */
     conn = new_test_flow(objs, peer, 1, 8);
-    conn->dpa_thread = (void *)(uintptr_t)1;
+    conn->dpa_thread = &fake_dpa_thread;
     reset_cleanup();
     assert(setenv("DMESH_NO_TEARDOWN", "1", 1) == 0);
     dmesh_flow_close_advance(conn);

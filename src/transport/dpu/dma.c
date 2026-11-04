@@ -243,8 +243,11 @@ static void dmesh_doca_dpa_dma_task_completed_cb(struct doca_dma_task_memcpy *dm
 					  union doca_data task_user_data,
 					  union doca_data ctx_user_data)
 {
-    struct dmesh_conn *conn = (struct dmesh_conn *)ctx_user_data.ptr;
+    (void)ctx_user_data;
     struct dma_task_entry *entry = (struct dma_task_entry *)task_user_data.ptr;
+    /* The engine can outlive a flow (DMESH_DPA_REUSE): the task's owner, not
+     * the ctx user data, is the flow it serves now. */
+    struct dmesh_conn *conn = entry->owner;
     int kind = entry->kind;
     doca_error_t result;
 
@@ -317,9 +320,10 @@ static void dmesh_doca_dpa_dma_task_error_cb(struct doca_dma_task_memcpy *dma_ta
 				      union doca_data task_user_data,
 				      union doca_data ctx_user_data)
 {
-    struct dmesh_conn *conn = (struct dmesh_conn *)ctx_user_data.ptr;
+    (void)ctx_user_data;
 	struct doca_task *task = doca_dma_task_memcpy_as_task(dma_task);
     struct dma_task_entry *entry = (struct dma_task_entry *)task_user_data.ptr;
+    struct dmesh_conn *conn = entry->owner;
     int kind = entry->kind;
     doca_error_t result;
 
@@ -392,6 +396,168 @@ static void dma_state_changed_cb(const union doca_data user_data,
 	}
 }
 
+/* A running, idle DMA engine parked on a DPA pool slot between flows
+ * (DMESH_DPA_REUSE): every task is allocated and holds no buffer. */
+struct dmesh_dma_engine {
+    struct doca_dma *dma_ctx;
+    struct doca_buf_inventory *buf_inv;
+    struct dma_task_entry *entries;
+    int num_tasks;
+    struct dma_pending_copy *pending;
+    struct dmesh_recv_seg *recv_segs;
+};
+
+static void dma_engine_reset_queues(struct dmesh_conn *conn)
+{
+    TAILQ_INIT(&conn->free_dma_tasks);
+    TAILQ_INIT(&conn->submission_dma_tasks);
+    conn->num_free_dma_tasks = 0;
+    conn->num_submission_dma_tasks = 0;
+    conn->dma_pending_head = 0;
+    conn->dma_pending_cnt = 0;
+    conn->recv_seg_head = 0;
+    conn->recv_seg_cnt = 0;
+    conn->push_state = 0;
+    conn->cursor_state = 0;
+}
+
+/* Moves an idle engine (no task in flight) from the flow to a new record. */
+static struct dmesh_dma_engine *dma_engine_detach(struct dmesh_conn *conn)
+{
+    struct dmesh_dma_engine *e = calloc(1, sizeof(*e));
+    if (e == NULL)
+        return NULL;
+    for (int i = 0; i < conn->num_dma_tasks; ++i) {
+        struct dma_task_entry *entry = &conn->dma_task_entries[i];
+        if (entry->task == NULL || entry->in_flight ||
+            dma_release_task_buffers(entry->task) != DOCA_SUCCESS) {
+            free(e);
+            return NULL;
+        }
+    }
+    for (int i = 0; i < conn->num_dma_tasks; ++i) {
+        struct dma_task_entry *entry = &conn->dma_task_entries[i];
+        entry->in_free_queue = entry->in_submission_queue = false;
+        entry->owner = NULL;
+    }
+    *e = (struct dmesh_dma_engine){
+        .dma_ctx = conn->dma_ctx, .buf_inv = conn->buf_inv,
+        .entries = conn->dma_task_entries, .num_tasks = conn->num_dma_tasks,
+        .pending = conn->dma_pending, .recv_segs = conn->recv_segs,
+    };
+    conn->dma_ctx = NULL;
+    conn->buf_inv = NULL;
+    conn->dma_task_entries = NULL;
+    conn->num_dma_tasks = 0;
+    conn->dma_pending = NULL;
+    conn->recv_segs = NULL;
+    dma_engine_reset_queues(conn);
+    return e;
+}
+
+static void dma_engine_attach(struct dmesh_conn *conn, struct dmesh_dma_engine *e)
+{
+    conn->dma_ctx = e->dma_ctx;
+    conn->buf_inv = e->buf_inv;
+    conn->dma_task_entries = e->entries;
+    conn->num_dma_tasks = e->num_tasks;
+    conn->dma_pending = e->pending;
+    conn->recv_segs = e->recv_segs;
+    dma_engine_reset_queues(conn);
+    conn->dma_closing = false;
+    for (int i = 0; i < e->num_tasks; ++i) {
+        e->entries[i].owner = conn;
+        e->entries[i].result = DOCA_SUCCESS;
+        (void)put_free_dma_task(conn, e->entries[i].task); /* holds no buffer */
+    }
+    free(e);
+}
+
+static bool dma_engine_adopt(struct dmesh_conn *conn)
+{
+    struct dmesh_doca_dpa_thread *thread = conn->dpa_thread;
+    if (thread == NULL || thread->kept_dma == NULL || conn->dma_ctx != NULL)
+        return false;
+    struct dmesh_dma_engine *e = thread->kept_dma;
+    thread->kept_dma = NULL;
+    dma_engine_attach(conn, e);
+    DOCA_LOG_INFO("Reusing DMA engine for connection %p", (void *)conn);
+    return true;
+}
+
+static doca_error_t dma_engine_release(struct objects *objs, struct dmesh_dma_engine *e)
+{
+    struct dmesh_conn *tmp = calloc(1, sizeof(*tmp));
+    if (tmp == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    tmp->objs = objs;
+    dma_engine_attach(tmp, e);
+    doca_error_t result = cleanup_dma_tasks(tmp);
+    if (result == DOCA_SUCCESS)
+        free(tmp);
+    /* else: the engine stays referenced by tmp; leak rather than free live state. */
+    return result;
+}
+
+bool dmesh_dma_engine_keep(struct dmesh_conn *conn)
+{
+    struct dmesh_doca_dpa_thread *thread = conn->dpa_thread;
+    struct objects *objs = conn->objs;
+    if (!dmesh_dpa_reuse_enabled() || thread == NULL || thread->kept_dma != NULL ||
+        conn->dma_ctx == NULL || conn->dma_task_entries == NULL || objs == NULL ||
+        objs->consumer_pe == NULL || objs->dpa_pool == NULL)
+        return false;
+    enum doca_ctx_states state;
+    if (doca_ctx_get_state(doca_dma_as_ctx(conn->dma_ctx), &state) != DOCA_SUCCESS ||
+        state != DOCA_CTX_STATE_RUNNING)
+        return false;
+    /* Admission is closed; let submitted copies complete. */
+    conn->dma_closing = true;
+    conn->dma_pending_cnt = 0;
+    for (unsigned poll = 0;; ++poll) {
+        bool in_flight = false;
+        for (int i = 0; i < conn->num_dma_tasks && !in_flight; ++i)
+            in_flight = conn->dma_task_entries[i].in_flight;
+        if (!in_flight)
+            break;
+        if (poll == DMESH_DMA_STOP_MAX_POLLS)
+            return false;
+        (void)doca_pe_progress(objs->consumer_pe);
+    }
+    for (int i = 0; i < conn->num_dma_tasks; ++i)
+        if (conn->dma_task_entries[i].result != DOCA_SUCCESS)
+            return false; /* an errored engine is not reused */
+    struct dmesh_dma_engine *e = dma_engine_detach(conn);
+    if (e == NULL)
+        return false;
+    objs->dpa_pool->release_kept_dma = dma_engine_release;
+    thread->kept_dma = e;
+    return true;
+}
+
+doca_error_t dmesh_dma_engine_prewarm(struct objects *objs, struct dmesh_doca_dpa_thread *thread)
+{
+    if (thread == NULL || thread->kept_dma != NULL)
+        return DOCA_SUCCESS;
+    struct dmesh_conn *tmp = calloc(1, sizeof(*tmp));
+    if (tmp == NULL)
+        return DOCA_ERROR_NO_MEMORY;
+    tmp->objs = objs;
+    doca_error_t result = init_dma_tasks(tmp, DMA_TASKS_PER_CONN);
+    if (result == DOCA_SUCCESS) {
+        struct dmesh_dma_engine *e = dma_engine_detach(tmp);
+        if (e == NULL) {
+            result = DOCA_ERROR_NO_MEMORY;
+            (void)cleanup_dma_tasks(tmp);
+        } else {
+            objs->dpa_pool->release_kept_dma = dma_engine_release;
+            thread->kept_dma = e;
+        }
+    }
+    free(tmp);
+    return result;
+}
+
 doca_error_t
 init_dma_tasks(struct dmesh_conn *conn, int num_tasks)
 {
@@ -407,6 +573,8 @@ init_dma_tasks(struct dmesh_conn *conn, int num_tasks)
         DOCA_LOG_ERR("Requested number of DMA tasks must be greater than zero");
         return DOCA_ERROR_INVALID_VALUE;
     }
+    if (dma_engine_adopt(conn))
+        return DOCA_SUCCESS;
 
     /* Each in-flight DMA task holds two bufs (src + dst); size the inventory so
      * the free-task queue, not the inventory, is what limits in-flight work. */

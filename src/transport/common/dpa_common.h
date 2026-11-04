@@ -41,6 +41,15 @@ struct dpa_thread_ctx {
     volatile uint32_t stop;
     volatile uint32_t stopped;
     volatile uint32_t dma_error;
+    /* Pooled (DMESH_DPA_REUSE): a stopped kernel reschedules instead of
+     * finishing, so the next flow's request on this thread activates it. */
+    uint32_t pooled;
+
+    /* CPU -> DPA msgq consumer and its completion (0: not drained). A pooled
+     * thread is woken by the next flow's request, so every activation reads
+     * the request completions, returns their receive credits and re-arms. */
+    uint64_t dpa_consumer_comp;
+    uint64_t dpa_consumer;
 };
 
 enum comch_msg_type {
