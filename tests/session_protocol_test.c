@@ -11,7 +11,7 @@
 static void test_wire_layout(void)
 {
     static const uint8_t golden[] = {
-        0x48, 0x53, 0x4d, 0x44, 0x05, 0x00, 0x03, 0x00,
+        0x48, 0x53, 0x4d, 0x44, 0x07, 0x00, 0x03, 0x00,
         0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
         0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
         0xa5, 0x00, 0x7e,
@@ -28,7 +28,7 @@ static void test_wire_layout(void)
     assert(memcmp(frame, golden, sizeof(golden)) == 0);
     assert(storage[0] == 0xcc && storage[sizeof(storage) - 1] == 0xcc);
     assert(dmesh_session_decode(frame, sizeof(golden), &h, &payload) == 0);
-    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 5);
+    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 7);
     assert(h.type == DMESH_SESSION_OPEN && h.flow_id == 2);
     assert(h.generation == UINT32_C(0x12345678) && h.status == 0);
     assert(h.payload_len == 3 && payload == frame + 24);

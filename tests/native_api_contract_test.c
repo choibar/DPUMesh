@@ -54,6 +54,11 @@ void dpumesh_eq_arm(struct dmesh_eq *eq) { assert(eq != NULL); }
 int dpumesh_lost(dpumesh_ctx_t *ctx) { (void)ctx; return 0; }
 void dpumesh_eq_awake(struct dmesh_eq *eq) { assert(eq != NULL); }
 void dpumesh_eq_note_work(struct dmesh_eq *eq) { assert(eq != NULL); }
+/* No DPU here: never a migration PREPARE or a SCALE. */
+int dpumesh_prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len) { (void)ctx; (void)target; (void)len; return 0; }
+int dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port) { (void)ctx; (void)port; return 0; }
+int dpumesh_scale_next(dpumesh_ctx_t *ctx, dmesh_scale_t *out) { (void)ctx; (void)out; return 0; }
+int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied) { (void)ctx; (void)token; (void)applied; return 0; }
 void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
 {
     assert(eq != NULL && (delta == 1 || delta == -1));
