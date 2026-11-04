@@ -82,3 +82,61 @@ func TestTransportCloseClosesUntakenSpare(t *testing.T) {
 		_ = peer.Close()
 	}
 }
+
+// A PREPARE on a client stream opens a spare to its target: the spare sends
+// the HTTP/2 preface, takes the server's first bytes, reports itself ready,
+// and the next dial to the target returns it with those bytes.
+func TestPrepareEventOpensSpare(t *testing.T) {
+	fn := newFakeNet(1<<20, 8064, 64<<10)
+	srv := newTransport(fn.native(true))
+	defer srv.close()
+	l, err := srv.listen(&net.TCPAddr{Port: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	cn := fn.native(false)
+	tr := newTransport(cn)
+	defer tr.close()
+	c, err := tr.dial(context.Background(), "svc:1", &net.TCPAddr{}, &net.TCPAddr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	own, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer own.Close()
+
+	const target = "10.0.0.7:8080"
+	cn.request(c.qp, nativeEvent{kind: evPrepare, target: target, token: -1})
+	go func() { _, _ = c.Read(make([]byte, 1)) }() // a reader polls the stream, as gRPC's always does
+	sp, err := l.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sp.Close()
+	preface := make([]byte, len(http2Preface))
+	if _, err := io.ReadFull(sp, preface); err != nil || !bytes.Equal(preface, http2Preface) {
+		t.Fatalf("spare's first bytes %q, %v; want the HTTP/2 preface", preface, err)
+	}
+	settings := []byte{0, 0, 0, 4, 0, 0, 0, 0, 0}
+	if _, err := sp.Write(settings); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the spare reported ready", func() bool {
+		cn.mu.Lock()
+		defer cn.mu.Unlock()
+		return len(cn.spareReadies) == 1 && cn.spareReadies[0] != c.qp
+	})
+	got := tr.takeSpare(target)
+	if got == nil {
+		t.Fatal("no spare for the target")
+	}
+	defer got.Close()
+	b := make([]byte, len(settings))
+	if _, err := io.ReadFull(got, b); err != nil || !bytes.Equal(b, settings) {
+		t.Fatalf("spare read %x, %v; want the held server bytes", b, err)
+	}
+}

@@ -16,6 +16,7 @@
 #include "dpa.h"
 #include "buffer.h"
 #include "ring.h"
+#include "comch_wake.h"
 
 DOCA_LOG_REGISTER(DMA);
 
@@ -796,7 +797,7 @@ submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca
 
 /* Backend (안 2) push: DPU -> host with this connection's doca_dma engine, no
  * host DPA. The batch is ALREADY staged at tx_staging+src_pos (the Rust writer
- * put it there); this DMAs up to <=8KB of it into the host's data ring
+ * put it there); this DMAs up to DMESH_PUSH_MAX_BATCH of it into the host's data ring
  * (rcvbuf + DMESH_PUSH_DATA_OFF) and - from that copy's completion callback -
  * DMAs a 16B dmesh_push_desc into slot seq % N. The host busy-polls the slots
  * in order. One batch outstanding at a time. Returns bytes accepted (0 while a
@@ -963,6 +964,20 @@ dmesh_dma_push_submit_desc(struct dmesh_conn *conn)
 
     if (dma_admission_closed(conn))
         return;
+    if (conn->wake != NULL) {
+        /* Fast-path wake: the descriptor travels as the immediate data of a
+         * producer message; its completion lands in the host's control PE
+         * (and wakes it), where it is written into the slot ring. */
+        result = dmesh_wake_send_desc(conn, next_seq, conn->push_pos, conn->push_len);
+        conn->wake_desc_pending = result == DOCA_ERROR_AGAIN;
+        if (result == DOCA_SUCCESS) {
+            conn->push_state = 2;
+            return;
+        }
+        if (result == DOCA_ERROR_AGAIN)
+            return;                     /* retried from the flow's advance */
+        goto failed;
+    }
     conn->push_shadow = (struct dmesh_push_desc *)((uint8_t *)conn->tx_staging +
                                                    conn->tx_staging_len - 64);
     conn->push_shadow->seq = next_seq;
@@ -986,9 +1001,10 @@ dmesh_dma_push_submit_desc(struct dmesh_conn *conn)
         return;
     }
 
+failed:
     /* Batch is lost to the stream if we cannot publish it - log loudly. */
-    DOCA_LOG_ERR("backend push: failed to submit desc DMA (seq=%lu): %s",
-                 next_seq, doca_error_get_descr(result));
+    DOCA_LOG_ERR("backend push: failed to submit desc %s (seq=%lu): %s",
+                 conn->wake != NULL ? "message" : "DMA", next_seq, doca_error_get_descr(result));
     if (dbuf != NULL)
         (void)doca_buf_dec_refcount(dbuf, NULL);
     if (sbuf != NULL)
@@ -1013,6 +1029,31 @@ dmesh_dma_push_desc_done(struct dmesh_conn *conn)
     if ((conn->push_seq & 0xf) == 0 || conn->push_seq < 4)
         dmesh_dma_pull_cursor(conn);
     (void)dmesh_dma_push_fin(conn);
+}
+
+void dmesh_dma_push_desc_sent(struct dmesh_conn *conn)
+{
+    dmesh_dma_push_desc_done(conn);
+}
+
+/* The same terminal fault as a failed desc DMA: the batch cannot be
+ * published, so the stream is broken. */
+void dmesh_dma_push_desc_failed(struct dmesh_conn *conn)
+{
+    conn->push_state = 0;
+    conn->dma_closing = true;
+    conn->state = DMESH_CONN_ERROR;
+    conn->error_status = EIO;
+}
+
+void dmesh_dma_push_retry_desc(struct dmesh_conn *conn)
+{
+    if (!conn->wake_desc_pending)
+        return;
+    if (conn->push_state == 1)
+        dmesh_dma_push_submit_desc(conn);   /* a data batch waits for its descriptor */
+    else
+        conn->wake_desc_pending = false;    /* a FIN: dmesh_dma_push_fin repeats it */
 }
 
 int

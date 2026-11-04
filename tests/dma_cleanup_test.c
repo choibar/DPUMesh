@@ -9,6 +9,13 @@
 #define DMESH_DMA_STOP_MAX_POLLS 4u
 #include "../src/transport/dpu/dma.c"
 
+/* The fast-path producer is exercised on hardware, not here. */
+doca_error_t dmesh_wake_send_desc(struct dmesh_conn *c, uint64_t seq, uint32_t pos, uint32_t len)
+{
+    (void)c; (void)seq; (void)pos; (void)len;
+    return DOCA_ERROR_BAD_STATE;
+}
+
 struct test_buffer { int refs, releases; };
 struct test_task {
     struct dma_task_entry *entry;

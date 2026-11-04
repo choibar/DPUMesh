@@ -74,6 +74,13 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len);
 int
 dmesh_dma_push_fin(struct dmesh_conn *conn);
 
+/* Comch fast-path wake (comch_wake.h): the descriptor send completed or
+ * failed; and a send the producer could not take yet, retried from the
+ * flow's advance. */
+void dmesh_dma_push_desc_sent(struct dmesh_conn *conn);
+void dmesh_dma_push_desc_failed(struct dmesh_conn *conn);
+void dmesh_dma_push_retry_desc(struct dmesh_conn *conn);
+
 doca_error_t
 enqueue_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 

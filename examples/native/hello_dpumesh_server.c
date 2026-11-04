@@ -1,5 +1,7 @@
-/* Minimal native DPUmesh byte-stream echo server. For clarity it admits one
- * connection at a time; apps/echo_dpumesh.c shows the multi-connection form. */
+/* Minimal native DPUmesh byte-stream echo server. The channel is its
+ * listening socket: dmesh_accept() returns each inbound stream as a QP with
+ * its own fd. For clarity it serves one connection at a time and closes a
+ * stream that arrives meanwhile. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
@@ -14,24 +16,20 @@
 #define EVENT_BATCH 16
 #define PENDING_MAX 4096
 
-static int wait_eq(int fd)
+/* Waits for the channel and, when serving one, the connection. */
+static int wait_fds(int channel_fd, int qp_fd)
 {
-    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    struct pollfd pfd[2] = {
+        { .fd = channel_fd, .events = POLLIN },
+        { .fd = qp_fd, .events = POLLIN },
+    };
     int rc;
     do {
-        rc = poll(&pfd, 1, -1);
+        rc = poll(pfd, qp_fd >= 0 ? 2 : 1, -1);
     } while (rc < 0 && errno == EINTR);
     if (rc <= 0)
         return -1;
     return 0;
-}
-
-static void close_later(dmesh_qp_t **list, int *count, dmesh_qp_t *qp)
-{
-    for (int i = 0; i < *count; i++)
-        if (list[i] == qp)
-            return;
-    list[(*count)++] = qp;
 }
 
 int main(void)
@@ -41,60 +39,62 @@ int main(void)
         return 2;
     }
     dmesh_channel_t *channel = dmesh_create_channel();
-    dmesh_eq_t *eq = channel ? dmesh_create_eq(channel) : NULL;
-    int eq_fd = eq ? dmesh_eq_fd(eq) : -1;
-    if (!channel || !eq || eq_fd < 0) {
+    int channel_fd = channel ? dmesh_channel_fd(channel) : -1;
+    if (!channel || channel_fd < 0) {
         perror("DPUmesh setup");
         return 1;
     }
 
     dmesh_qp_t *active = NULL;
+    int active_fd = -1;
     uint8_t pending[PENDING_MAX];
     size_t pending_len = 0;
     fprintf(stderr, "hello server ready as %s\n", getenv("DPUMESH_SERVICE"));
 
     for (;;) {
-        if (wait_eq(eq_fd) != 0)
+        if (wait_fds(channel_fd, active_fd) != 0)
             break;
+        dmesh_qp_t *qp;
+        while ((qp = dmesh_accept(channel)) != NULL) {
+            if (active) {
+                dmesh_destroy_qp(qp);
+                continue;
+            }
+            active = qp;
+            active_fd = dmesh_qp_fd(qp);
+        }
+        if (errno != EAGAIN)
+            break;                       /* the session is gone */
+        if (!active)
+            continue;
+
         dmesh_event_t events[EVENT_BATCH];
-        int n;
-        while ((n = dmesh_poll_eq(eq, events, EVENT_BATCH)) > 0) {
-            dmesh_qp_t *close_after_batch[EVENT_BATCH];
-            int close_count = 0;
+        int n, close_active = 0;
+        while ((n = dmesh_poll_qp(active, events, EVENT_BATCH)) > 0) {
             for (int i = 0; i < n; i++) {
                 dmesh_event_t *event = &events[i];
-                if (event->type == DMESH_EVENT_CONN_REQ) {
-                    if (!active)
-                        active = event->qp;
-                    else
-                        close_later(close_after_batch, &close_count, event->qp);
-                } else if (event->type == DMESH_EVENT_RECV) {
-                    if (event->qp != active ||
-                        event->len > PENDING_MAX - pending_len) {
-                        if (event->qp == active)
-                            close_later(close_after_batch, &close_count, active);
+                if (event->type == DMESH_EVENT_RECV) {
+                    if (event->len > PENDING_MAX - pending_len) {
+                        close_active = 1;
                     } else {
                         memcpy(pending + pending_len, event->buf, event->len);
                         pending_len += event->len;
                     }
                     dmesh_release_rx_buffer(channel, event);
-                } else if (event->qp == active &&
-                           (event->type == DMESH_EVENT_RECV_FIN ||
-                            event->type == DMESH_EVENT_TX_ERROR)) {
-                    close_later(close_after_batch, &close_count, active);
+                } else if (event->type == DMESH_EVENT_RECV_FIN ||
+                           event->type == DMESH_EVENT_TX_ERROR) {
+                    close_active = 1;
                 }
-            }
-
-            for (int i = 0; i < close_count; i++) {
-                dmesh_qp_t *qp = close_after_batch[i];
-                if (qp == active) {
-                    active = NULL;
-                    pending_len = 0;
-                }
-                dmesh_destroy_qp(qp);
             }
         }
-        if (!active || !pending_len)
+        if (n < 0 || close_active) {
+            dmesh_destroy_qp(active);
+            active = NULL;
+            active_fd = -1;
+            pending_len = 0;
+            continue;
+        }
+        if (!pending_len)
             continue;
 
         void *tx = dmesh_alloc(active, (uint32_t)pending_len);
@@ -103,6 +103,7 @@ int main(void)
                 continue;
             dmesh_destroy_qp(active);
             active = NULL;
+            active_fd = -1;
             pending_len = 0;
             continue;
         }
@@ -111,12 +112,12 @@ int main(void)
             dmesh_flush(active) != 0) {
             dmesh_destroy_qp(active);
             active = NULL;
+            active_fd = -1;
         }
         pending_len = 0;
     }
 
     dmesh_destroy_qp(active);
-    dmesh_destroy_eq(eq);
     dmesh_destroy_channel(channel);
     return 1;
 }
