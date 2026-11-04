@@ -272,9 +272,6 @@ struct dpumesh_ctx {
      * a one-shot timerfd for re-polls and the backstop. */
     int listen_epfd, listen_timer;
     uint32_t spare_rang;                /* unowned stripes acknowledged, not yet rearmed */
-    /* dmesh_poll_channel's PREPARE text and SCALE body, valid until its next call */
-    char prepare_target[24];
-    dmesh_scale_t scale;
     uint64_t listen_doorbells;          /* channel DOORBELLs its poller has reacted to */
     /* Every receive raises the wake fd by itself (dmesh_native_rx_signaled);
      * otherwise receives wake the channel after an ARM/DOORBELL round trip. */
@@ -426,36 +423,40 @@ int dpumesh_lost(dpumesh_ctx_t *ctx)
     return ctx ? atomic_load(&ctx->lost) : 0;
 }
 
-static int prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len)
+int dpumesh_qp_requests(dmesh_qp_t *c, dmesh_event_t *events, int max)
 {
-    uint32_t ip; uint16_t port;
-    char host[INET_ADDRSTRLEN];
-    if (!ctx || !ctx->transport || !dmesh_native_prepare_next(ctx->transport, &ip, &port))
-        return 0;
-    if (!inet_ntop(AF_INET, &ip, host, sizeof(host))) return 0;
-    snprintf(target, len, "%s:%u", host, (unsigned)port);
-    return 1;
+    struct dmesh_eq *eq = c->eq;
+    char target[24], host[INET_ADDRSTRLEN];
+    uint32_t ip, count, token;
+    uint16_t port;
+    int n = 0, kind;
+    while (n < max && dmesh_native_take_request(c->ep->ctx->transport, c->local_port, &kind,
+                                                &ip, &port, &count, &token)) {
+        if (!inet_ntop(AF_INET, &ip, host, sizeof(host))) continue;
+        snprintf(target, sizeof(target), "%s:%u", host, (unsigned)port);
+        dmesh_event_t *e = &events[n++];
+        *e = (dmesh_event_t){ .qp = c, ._rx_token = -1 };
+        if (kind == DMESH_REQ_PREPARE) {
+            memcpy(eq->prepare_target, target, sizeof(target));
+            e->type = DMESH_EVENT_PREPARE;
+            e->buf = (const uint8_t *)eq->prepare_target;
+            e->len = (uint32_t)strlen(eq->prepare_target);
+        } else {
+            eq->scale = (dmesh_scale_t){ .token = token, .count = count };
+            memcpy(eq->scale.target, target, sizeof(target));
+            e->type = DMESH_EVENT_SCALE;
+            e->buf = (const uint8_t *)&eq->scale;
+            e->len = (uint32_t)sizeof(eq->scale);
+        }
+    }
+    if (n == max) eq_raise(eq, DMESH_EQ_REQUEST, eq);   /* more may wait for the next poll */
+    return n;
 }
 
-static int scale_next(dpumesh_ctx_t *ctx, dmesh_scale_t *out)
-{
-    uint32_t ip, count, token; uint16_t port;
-    char host[INET_ADDRSTRLEN];
-    if (!ctx || !ctx->transport ||
-        !dmesh_native_scale_next(ctx->transport, &ip, &port, &count, &token))
-        return 0;
-    if (!inet_ntop(AF_INET, &ip, host, sizeof(host))) return 0;
-    memset(out, 0, sizeof(*out));
-    out->token = token;
-    out->count = count;
-    snprintf(out->target, sizeof(out->target), "%s:%u", host, (unsigned)port);
-    return 1;
-}
-
-int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied)
+int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint16_t port, uint32_t token, uint32_t applied)
 {
     if (!ctx || !ctx->transport) { errno = EINVAL; return -1; }
-    return dmesh_native_scale_ack(ctx->transport, token, applied);
+    return dmesh_native_scale_ack(ctx->transport, port, token, applied);
 }
 
 int dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port)
@@ -828,6 +829,11 @@ static uint32_t drain_stripe(dpumesh_ctx_t *ctx, int stripe, uint32_t budget,
             } else if (ev->kind == DMESH_NATIVE_ERROR) {
                 struct dmesh_port_slot *psl = &ctx->ports[ev->port];
                 tx_error_publish(psl, ev->error ? ev->error : EIO, self);
+            } else if (ev->kind == DMESH_NATIVE_REQUEST) {
+                struct dmesh_port_slot *psl = &ctx->ports[ev->port];
+                struct dmesh_eq *eq = __atomic_load_n(&psl->eq, __ATOMIC_ACQUIRE);
+                if (eq && __atomic_load_n(&psl->role, __ATOMIC_ACQUIRE) == DMESH_ROLE_CLIENT)
+                    eq_raise(eq, DMESH_EQ_REQUEST, self);
             }
         }
         drained += (uint32_t)n;
@@ -1020,6 +1026,7 @@ int dpumesh_qp_take(dmesh_qp_t *c, unsigned event)
     if (!(atomic_load_explicit(&eq->events, memory_order_acquire) & event) ||
         !(atomic_fetch_and_explicit(&eq->events, ~event, memory_order_acq_rel) & event))
         return 0;
+    if (event == DMESH_EQ_REQUEST) return 1;
     struct dmesh_port_slot *psl = &c->ep->ctx->ports[c->local_port];
     if (event == DMESH_EQ_TX_READY) {
         /* READY->IDLE takes the one-shot; a retry that already succeeded
@@ -2402,27 +2409,6 @@ dmesh_qp_t *dmesh_accept(dmesh_channel_t *ch) {
     int lost = dpumesh_lost(ctx);
     if (!c && errno == EAGAIN && lost) errno = lost;
     return c;
-}
-
-/* The control requests dmesh_accept's pass took from the session, at most one
- * of each kind per call: their text lives in the channel until the next. */
-int dmesh_poll_channel(dmesh_channel_t *ch, dmesh_event_t *events, int max_events) {
-    if (!ch || !ch->ctx || !events || max_events <= 0) { errno = EINVAL; return -1; }
-    dpumesh_ctx_t *ctx = ch->ctx;
-    int n = 0;
-    if (prepare_next(ctx, ctx->prepare_target, sizeof(ctx->prepare_target))) {
-        events[n] = (dmesh_event_t){ .type = DMESH_EVENT_PREPARE, ._rx_token = -1,
-                                     .buf = (const uint8_t *)ctx->prepare_target,
-                                     .len = (uint32_t)strlen(ctx->prepare_target) };
-        n++;
-    }
-    if (n < max_events && scale_next(ctx, &ctx->scale)) {
-        events[n] = (dmesh_event_t){ .type = DMESH_EVENT_SCALE, ._rx_token = -1,
-                                     .buf = (const uint8_t *)&ctx->scale,
-                                     .len = (uint32_t)sizeof(ctx->scale) };
-        n++;
-    }
-    return n;
 }
 
 /* Integer entry point (internal, dmesh_core.h) for the shim and for the

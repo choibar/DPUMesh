@@ -788,6 +788,11 @@ class DmeshReactor::Impl final
       return;
     }
 
+    /* The DPU's migration and scaling requests ask for streams this adapter
+     * does not open: without a spare the DPU drains the stream (GOAWAY) and
+     * gRPC reconnects; a SCALE goes unapplied. */
+    if (event->type == DMESH_EVENT_PREPARE || event->type == DMESH_EVENT_SCALE) return;
+
     FailConnectionOwner(
         connection, absl::InternalError("unknown DPUmesh event type"));
   }

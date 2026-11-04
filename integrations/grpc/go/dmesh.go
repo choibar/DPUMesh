@@ -80,8 +80,7 @@ type nativeEvent struct {
 
 // native is the libdpumesh surface. A QP has one poller at a time: pollWait
 // and destroy run on whichever goroutine currently owns it. The channel
-// goroutine alone calls accept, pollChannel and waitChannel. send is
-// serialized per QP;
+// goroutine alone calls accept and waitChannel. send is serialized per QP;
 // the others may run on any goroutine.
 type native interface {
 	postMax() int
@@ -98,9 +97,6 @@ type native interface {
 	// stream, whose first bytes its own poll returns. syscall.EAGAIN when
 	// none waits.
 	accept() (qp qpID, remotePort int, err error)
-	// pollChannel returns the DPU's requests (evPrepare, evScale) the last
-	// accept took, or 0.
-	pollChannel(events []nativeEvent) (int, error)
 	// waitChannel returns once the channel has work for accept, or after
 	// wakeChannel.
 	waitChannel() error
@@ -110,14 +106,12 @@ type native interface {
 	destroy(qp qpID, abort bool) error // consumes qp and its fd even on error
 	close() error                      // retryable
 	spareReady(qp qpID) error          // migration: qp is a ready spare
-	scaleAck(token uint32, applied int) error
+	scaleAck(qp qpID, token uint32, applied int) error
 }
 
 const (
 	// Events one connection's poll returns.
 	connBatch = 16
-	// Requests one channel poll returns: a PREPARE and a SCALE.
-	requestBatch = 2
 	// Inbound streams held for a listener that has not been created yet.
 	maxPrelisten = 64
 )
@@ -144,7 +138,6 @@ type transport struct {
 	// session's liveness and, serving, inbound streams.
 	stop     chan struct{} // closed to stop the channel goroutine
 	stopOnce sync.Once
-	requests []nativeEvent // the channel goroutine's
 	done     chan struct{} // closed when the channel goroutine exits (at once without one)
 }
 
@@ -155,7 +148,7 @@ var process struct {
 
 func newTransport(n native) *transport {
 	t := &transport{n: n, postMax: n.postMax(), serves: n.serves(), conns: make(map[qpID]*Conn),
-		spares: make(map[string]*spare), requests: make([]nativeEvent, requestBatch),
+		spares: make(map[string]*spare),
 		failed: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{})}
 	if t.postMax <= 0 {
 		t.failLocked(fmt.Errorf("dmesh: native post size %d", t.postMax))
@@ -235,33 +228,12 @@ func (t *transport) channelLoop() {
 			continue
 		}
 		if errors.Is(err, syscall.EAGAIN) {
-			if err = t.serveRequests(); err == nil {
-				err = t.n.waitChannel()
-			}
+			err = t.n.waitChannel()
 		}
 		if err != nil {
 			t.fail(fmt.Errorf("dmesh: accept: %w", err))
 			<-t.stop
 			return
-		}
-	}
-}
-
-// serveRequests starts each DPU request the last accept took on a goroutine
-// of its own: a spare or a SCALE opens streams, which waits for the DPU.
-func (t *transport) serveRequests() error {
-	for {
-		n, err := t.n.pollChannel(t.requests)
-		if err != nil || n == 0 {
-			return err
-		}
-		for _, ev := range t.requests[:n] {
-			switch ev.kind {
-			case evPrepare:
-				go t.prepareSpare(ev.target)
-			case evScale:
-				go t.scale(ev.target, ev.count, ev.scaleToken)
-			}
 		}
 	}
 }
@@ -520,6 +492,12 @@ func (c *Conn) apply(ev *nativeEvent) {
 		c.signalWriter()
 	case evTxError:
 		c.fail(syscall.EIO)
+	case evPrepare:
+		// The DPU moves this stream: a spare to its target takes over. Each
+		// request runs on its own goroutine, since it opens streams.
+		go c.t.prepareSpare(ev.target)
+	case evScale:
+		go c.t.scale(c.qp, ev.target, ev.count, ev.scaleToken)
 	default:
 		if ev.token >= 0 {
 			c.t.n.release(ev.token)

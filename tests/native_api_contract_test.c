@@ -53,9 +53,10 @@ int dpumesh_eq_drain(struct dmesh_eq *eq) { assert(eq != NULL); return 0; }
 void dpumesh_eq_arm(struct dmesh_eq *eq) { assert(eq != NULL); }
 int dpumesh_qp_pending(dmesh_qp_t *qp) { assert(qp != NULL); return 0; }
 int dpumesh_lost(dpumesh_ctx_t *ctx) { (void)ctx; return 0; }
-/* No DPU here: no spare is reported and no SCALE answered. */
+/* No DPU here: no request arrives, no spare is reported and no SCALE answered. */
+int dpumesh_qp_requests(dmesh_qp_t *c, dmesh_event_t *events, int max) { (void)c; (void)events; (void)max; return 0; }
 int dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port) { (void)ctx; (void)port; return 0; }
-int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied) { (void)ctx; (void)token; (void)applied; return 0; }
+int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint16_t port, uint32_t token, uint32_t applied) { (void)ctx; (void)port; (void)token; (void)applied; return 0; }
 
 int dpumesh_qp_take(dmesh_qp_t *qp, unsigned event)
 {

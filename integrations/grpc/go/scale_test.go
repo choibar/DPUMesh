@@ -7,8 +7,9 @@ import (
 	"time"
 )
 
-// A SCALE event reaches the installed handler and is answered with the count
-// of clients the handler applied it to.
+// A SCALE event on a client stream reaches the installed handler and is
+// answered, on that stream, with the count of clients the handler applied it
+// to.
 func TestScaleEventReachesHandlerAndIsAcked(t *testing.T) {
 	type call struct {
 		target string
@@ -39,7 +40,8 @@ func TestScaleEventReachesHandlerAndIsAcked(t *testing.T) {
 	}
 	defer c.Close()
 
-	cn.request(nativeEvent{kind: evScale, target: "10.0.0.7:8080", count: 2, scaleToken: 41, token: -1})
+	cn.request(c.qp, nativeEvent{kind: evScale, target: "10.0.0.7:8080", count: 2, scaleToken: 41, token: -1})
+	go func() { _, _ = c.Read(make([]byte, 1)) }() // a reader polls the stream, as gRPC's always does
 	select {
 	case got := <-calls:
 		if got != (call{"10.0.0.7:8080", 2, 41}) {
@@ -51,7 +53,7 @@ func TestScaleEventReachesHandlerAndIsAcked(t *testing.T) {
 	eventually(t, "the SCALE ack", func() bool {
 		cn.mu.Lock()
 		defer cn.mu.Unlock()
-		return len(cn.scaleAcks) == 1 && cn.scaleAcks[0] == [2]int{41, 3}
+		return len(cn.scaleAcks) == 1 && cn.scaleAcks[0] == scaleAck{c.qp, 41, 3}
 	})
 	if peer, err := l.Accept(); err == nil {
 		_ = peer.Close()

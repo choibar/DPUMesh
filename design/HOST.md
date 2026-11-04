@@ -41,6 +41,7 @@ exports rcv_ring + tx_staging instead of pushing).
 | `dmesh_poll_qp` receive | One push batch `{seq, pos, len}` becomes one receive event pointing into the flow's data ring. No copy. |
 | `dmesh_release_rx_buffer` | Marks the batch released; the consumption cursor advances over the released prefix and the DPU pulls it for flow control. A long-held batch blocks only its own QP. |
 | `dmesh_destroy_qp`, `dmesh_abort_qp` | Retain the current FIN behavior. Transport cleanup sends flow CLOSE after local reverse DMA stops; matching CLOSED permits resource release. A flow close leaves the channel's Comch session and siblings alive. The flow's window is reused only after the application releases every batch it still holds. |
+| `PREPARE`, `SCALE` events | The DPU sends them on the client flow they concern. The session's progress records the request on the flow, whose control news wakes the QP owning it; its `dmesh_poll_qp` takes the request. `dmesh_spare_ready` answers with SPARE_READY on the spare's flow, `dmesh_scale_ack` with SCALE_ACK on the flow the SCALE came on. |
 | preload `shutdown(SHUT_WR)` | Sends SHUTDOWN with the count of descriptors posted on the flow; the proxy reads end of stream after all of them, and the flow keeps receiving until the QP closes. |
 
 ### DPU-side guarantees

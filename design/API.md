@@ -1,6 +1,6 @@
 # Native API
 
-`include/dpumesh/dmesh.h` declares seventeen calls with ABI major 6. They
+`include/dpumesh/dmesh.h` declares sixteen calls with ABI major 6. They
 describe reliable full-duplex byte streams as sockets: a channel per process,
 which is also its listening socket, and queue pairs (QPs), each with its own
 readiness fd, over registered buffers. They expose no remote-memory
@@ -22,7 +22,7 @@ belongs to the application.
 
 | Surface | Calls |
 |---|---|
-| Channel | `dmesh_create_channel`, `dmesh_destroy_channel`, `dmesh_post_max`, `dmesh_channel_fd`, `dmesh_accept`, `dmesh_poll_channel` |
+| Channel | `dmesh_create_channel`, `dmesh_destroy_channel`, `dmesh_post_max`, `dmesh_channel_fd`, `dmesh_accept` |
 | QP | `dmesh_create_qp`, `dmesh_qp_fd`, `dmesh_destroy_qp`, `dmesh_abort_qp` |
 | TX | `dmesh_alloc`, `dmesh_post_send`, `dmesh_flush` |
 | Events | `dmesh_poll_qp`, `dmesh_release_rx_buffer` |
@@ -59,10 +59,28 @@ Each post is submitted at once, a partial unit included, like a socket with
 so a post never waits for ring space. An event may carry part of a write.
 
 `dmesh_poll_qp` returns the QP's `RECV`, `RECV_FIN`, `TX_READY` and
-`TX_ERROR` events; an accepted QP's first poll returns its first bytes. A
-`RECV` event holds its buffer until `dmesh_release_rx_buffer`; `RECV_FIN` and
-readiness events hold nothing. Process a returned batch before destroying
-the QP.
+`TX_ERROR` events, and on a client QP the DPU's requests ([below](#dpu-requests));
+an accepted QP's first poll returns its first bytes. A `RECV` event holds its
+buffer until `dmesh_release_rx_buffer`; the other events hold nothing.
+Process a returned batch before destroying the QP.
+
+## DPU requests
+
+The DPU can ask a client QP for more streams to its target. `dmesh_poll_qp`
+returns the request on that QP; `buf` stays valid until the QP's next poll.
+
+- `PREPARE`: the DPU is about to move the QP's stream to another worker. Open
+  a spare stream to the target in `buf` (`"ip:port"`) and call
+  `dmesh_spare_ready` on the spare once its server's first bytes are in; the
+  DPU then drains the QP's stream (an HTTP/2 GOAWAY), and the reconnect takes
+  the spare.
+- `SCALE`: keep `count` streams to the target (`buf` points to a
+  `dmesh_scale_t`), then call `dmesh_scale_ack` on the same QP with how many
+  clients applied it. The DPU places one service pair's streams on distinct
+  workers, so the streams spread the pair over that many cores.
+
+The DPU sends them only with migration (`DMESH_MIGRATE_SPARE`) or flow
+scaling (`DMESH_SCALE_AFTER_MS`) enabled.
 
 ## Close
 
@@ -83,11 +101,6 @@ libuv).
   control messages, keepalive and loss, the flows no QP owns, and inbound
   streams. `dmesh_accept` does that work and returns the next inbound stream,
   until `EAGAIN`, which arms the fd. Every process polls it, a client too.
-  `dmesh_poll_channel` then returns the requests that pass took from the
-  DPU, until 0: a migration `PREPARE` (open a spare stream to the target in
-  `buf`, then `dmesh_spare_ready` once its server's first bytes are in) and a
-  flow-scaling `SCALE` (keep `count` streams to the target, then
-  `dmesh_scale_ack`).
 - A QP's fd is readable when that QP has events. `dmesh_poll_qp` until it
   returns 0 settles the fd and arms the QP's doorbell.
 

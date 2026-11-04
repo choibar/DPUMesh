@@ -2,6 +2,7 @@
  * Models custody separately from RX lease return and can hold ACK publication. */
 #include "src/core/native_transport.h"
 #include <assert.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -228,15 +229,38 @@ int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int se
     return 0;
 }
 int dmesh_native_disconnect(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return 0; }
-/* No DPU here: never a migration PREPARE or a SCALE. */
-int dmesh_native_prepare_next(struct dmesh_native_transport *t, uint32_t *ip, uint16_t *port) {
-    (void)t; (void)ip; (void)port; return 0;
+/* DPU requests a test raises on a port's flow (test_native_request): the
+ * port's stripe announces them, and its QP takes them in order. Answers are
+ * recorded for the test to read. */
+static struct { uint16_t port; int kind; uint32_t count, token; } requests[4];
+static unsigned n_requests;
+uint32_t test_native_answers[3];   /* port of the last SPARE_READY, token and applied of the last SCALE_ACK */
+void test_native_request(struct dmesh_native_transport *t, uint16_t port, int kind, uint32_t count, uint32_t token)
+{
+    pthread_mutex_lock(&lock);
+    assert(n_requests < 4);
+    requests[n_requests++] = (__typeof__(requests[0])){port, kind, count, token};
+    push(t, (struct dmesh_native_event){.kind = DMESH_NATIVE_REQUEST, .port = port});
+    pthread_mutex_unlock(&lock);
 }
-int dmesh_native_spare_ready(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return 0; }
-int dmesh_native_scale_next(struct dmesh_native_transport *t, uint32_t *ip, uint16_t *port,
-                            uint32_t *count, uint32_t *token) {
-    (void)t; (void)ip; (void)port; (void)count; (void)token; return 0;
+int dmesh_native_take_request(struct dmesh_native_transport *t, uint16_t port, int *kind,
+                              uint32_t *ip, uint16_t *dst_port, uint32_t *count, uint32_t *token) {
+    (void)t;
+    *ip = htonl(0x0a630101); *dst_port = 80;   /* echo:80 is 10.99.1.1:80 here */
+    pthread_mutex_lock(&lock);
+    int found = 0;
+    for (unsigned i = 0; i < n_requests && !found; ++i) {
+        if (requests[i].port != port) continue;
+        *kind = requests[i].kind; *count = requests[i].count; *token = requests[i].token;
+        memmove(&requests[i], &requests[i + 1], (n_requests - i - 1) * sizeof(requests[0]));
+        --n_requests; found = 1;
+    }
+    pthread_mutex_unlock(&lock);
+    return found;
 }
-int dmesh_native_scale_ack(struct dmesh_native_transport *t, uint32_t token, uint32_t applied) {
-    (void)t; (void)token; (void)applied; return 0;
+int dmesh_native_spare_ready(struct dmesh_native_transport *t, uint16_t port) {
+    (void)t; test_native_answers[0] = port; return 0;
+}
+int dmesh_native_scale_ack(struct dmesh_native_transport *t, uint16_t port, uint32_t token, uint32_t applied) {
+    (void)t; (void)port; test_native_answers[1] = token; test_native_answers[2] = applied; return 0;
 }

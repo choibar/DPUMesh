@@ -54,8 +54,7 @@ import (
 type cgoNative struct {
 	serving  bool // the channel serves DPUMESH_SERVICE
 	ch       *C.dmesh_channel_t
-	listener *fdWaiter        // the channel's fd on Go's netpoller
-	requests *C.dmesh_event_t // the channel poll's buffer
+	listener *fdWaiter // the channel's fd on Go's netpoller
 }
 
 // cgoQP is one native QP with its fd on Go's netpoller and a C-allocated poll
@@ -86,10 +85,7 @@ func openCgoNative() (*cgoNative, error) {
 		return nil, fmt.Errorf("dmesh: create channel: %w", err)
 	}
 	n.ch = ch
-	n.requests = (*C.dmesh_event_t)(C.calloc(requestBatch, C.sizeof_dmesh_event_t))
-	if n.requests == nil {
-		err = syscall.ENOMEM
-	} else if fd := C.dmesh_channel_fd(ch); fd < 0 {
+	if fd := C.dmesh_channel_fd(ch); fd < 0 {
 		err = syscall.EIO
 	} else {
 		n.listener, err = newFDWaiter(int(fd), nil)
@@ -159,6 +155,15 @@ func (n *cgoNative) pollWait(id qpID, out []nativeEvent, maxWaitNs int64) (int, 
 			o.kind = evTxReady
 		case C.DMESH_EVENT_TX_ERROR:
 			o.kind = evTxError
+		case C.DMESH_EVENT_PREPARE:
+			o.kind = evPrepare
+			o.target = C.GoStringN((*C.char)(unsafe.Pointer(ev.buf)), C.int(ev.len))
+		case C.DMESH_EVENT_SCALE:
+			sc := (*C.dmesh_scale_t)(unsafe.Pointer(ev.buf))
+			o.kind = evScale
+			o.target = C.GoString(&sc.target[0])
+			o.count = int(sc.count)
+			o.scaleToken = uint32(sc.token)
 		}
 	}
 	return int(r), nil
@@ -194,31 +199,6 @@ func (n *cgoNative) accept() (qpID, int, error) {
 	return unsafe.Pointer(q), port, nil
 }
 
-// pollChannel copies the DPU's requests out of the channel's storage, which
-// the next poll reuses.
-func (n *cgoNative) pollChannel(out []nativeEvent) (int, error) {
-	r, err := C.dmesh_poll_channel(n.ch, n.requests, C.int(min(len(out), requestBatch)))
-	if r < 0 {
-		return 0, err
-	}
-	for i, ev := range unsafe.Slice(n.requests, int(r)) {
-		o := &out[i]
-		*o = nativeEvent{token: -1}
-		switch ev._type {
-		case C.DMESH_EVENT_PREPARE:
-			o.kind = evPrepare
-			o.target = C.GoStringN((*C.char)(unsafe.Pointer(ev.buf)), C.int(ev.len))
-		case C.DMESH_EVENT_SCALE:
-			sc := (*C.dmesh_scale_t)(unsafe.Pointer(ev.buf))
-			o.kind = evScale
-			o.target = C.GoString(&sc.target[0])
-			o.count = int(sc.count)
-			o.scaleToken = uint32(sc.token)
-		}
-	}
-	return int(r), nil
-}
-
 func (n *cgoNative) waitChannel() error {
 	_, err := n.listener.waitUntil(time.Time{})
 	return err
@@ -244,8 +224,8 @@ func (n *cgoNative) spareReady(qp qpID) error {
 	return nil
 }
 
-func (n *cgoNative) scaleAck(token uint32, applied int) error {
-	if rc, err := C.dmesh_scale_ack(n.ch, C.uint32_t(token), C.uint32_t(applied)); rc != 0 {
+func (n *cgoNative) scaleAck(qp qpID, token uint32, applied int) error {
+	if rc, err := C.dmesh_scale_ack((*cgoQP)(qp).qp, C.uint32_t(token), C.uint32_t(applied)); rc != 0 {
 		return err
 	}
 	return nil
@@ -285,7 +265,5 @@ func (n *cgoNative) close() error {
 		}
 		n.ch = nil
 	}
-	C.free(unsafe.Pointer(n.requests))
-	n.requests = nil
 	return nil
 }

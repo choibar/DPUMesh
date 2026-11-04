@@ -61,9 +61,9 @@ type fakeNative struct {
 
 	polls, accepts, destroys, aborts atomic.Int64
 
-	requests  []nativeEvent // under net.mu: DPU requests the channel's next poll returns
-	mu        sync.Mutex
-	scaleAcks [][2]int // token, applied
+	mu           sync.Mutex
+	scaleAcks    []scaleAck
+	spareReadies []qpID
 }
 
 func newFakeNet(window, frag, maxPost int) *fakeNet {
@@ -184,10 +184,22 @@ func (f *fakeNative) pollWait(id qpID, out []nativeEvent, maxWaitNs int64) (int,
 
 func (f *fakeNative) wake(id qpID) { signal((*fakeQP)(id).wakeCh) }
 
-func (f *fakeNative) spareReady(qp qpID) error { return nil }
-func (f *fakeNative) scaleAck(token uint32, applied int) error {
+func (f *fakeNative) spareReady(qp qpID) error {
 	f.mu.Lock()
-	f.scaleAcks = append(f.scaleAcks, [2]int{int(token), applied})
+	f.spareReadies = append(f.spareReadies, qp)
+	f.mu.Unlock()
+	return nil
+}
+
+// scaleAck is one SCALE_ACK: the QP it went out on, the token and applied.
+type scaleAck struct {
+	qp             qpID
+	token, applied int
+}
+
+func (f *fakeNative) scaleAck(qp qpID, token uint32, applied int) error {
+	f.mu.Lock()
+	f.scaleAcks = append(f.scaleAcks, scaleAck{qp, int(token), applied})
 	f.mu.Unlock()
 	return nil
 }
@@ -238,7 +250,7 @@ func (f *fakeNative) accept() (qpID, int, error) {
 func (f *fakeNative) waitChannel() error {
 	for {
 		f.net.mu.Lock()
-		ready := len(f.pending) != 0 || len(f.requests) != 0 || f.pollErr != nil
+		ready := len(f.pending) != 0 || f.pollErr != nil
 		f.net.mu.Unlock()
 		if ready {
 			return nil
@@ -253,20 +265,12 @@ func (f *fakeNative) waitChannel() error {
 
 func (f *fakeNative) wakeChannel() { signal(f.chWake) }
 
-// request queues a DPU request (PREPARE, SCALE) for the channel.
-func (f *fakeNative) request(ev nativeEvent) {
+// request delivers a DPU request (PREPARE, SCALE) on qp's flow, as its poll
+// returns it.
+func (f *fakeNative) request(qp qpID, ev nativeEvent) {
 	f.net.mu.Lock()
-	f.requests = append(f.requests, ev)
+	(*fakeQP)(qp).enqueueLocked(ev)
 	f.net.mu.Unlock()
-	signal(f.chNotify)
-}
-
-func (f *fakeNative) pollChannel(out []nativeEvent) (int, error) {
-	f.net.mu.Lock()
-	defer f.net.mu.Unlock()
-	n := copy(out, f.requests)
-	f.requests = f.requests[n:]
-	return n, nil
 }
 
 func (f *fakeNative) send(id qpID, p []byte) (int, error) {
