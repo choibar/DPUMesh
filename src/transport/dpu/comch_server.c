@@ -15,6 +15,7 @@
 #include "comch_consumer.h"
 #include "comch_msgq.h"
 #include "dma.h"
+#include "dpa_mux.h"
 #include "ring.h"
 #include "comch_wake.h"
 
@@ -1068,7 +1069,7 @@ static doca_error_t flow_local_buffer_destroy(struct doca_mmap **mmap, void **bu
 
 static bool flow_has_resources(const struct dmesh_conn *conn)
 {
-    return conn->dpa_thread || conn->dpa_comch || conn->dma_ctx || conn->buf_arr ||
+    return conn->dpa_thread || conn->dpa_comch || conn->mux || conn->dma_ctx || conn->buf_arr ||
            conn->ring_mmap || conn->sndbuf.mmap || conn->rcvbuf.mmap ||
            conn->local_mmap || conn->rcv_ring || conn->tx_staging_mmap;
 }
@@ -1079,7 +1080,8 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     if (getenv("DMESH_NO_TEARDOWN") != NULL && flow_has_resources(conn))
         return DOCA_ERROR_NOT_SUPPORTED;
     conn->dma_closing = true;
-    result = dmesh_doca_dpa_quiesce_step(conn);
+    /* A mux flow leaves its thread with DEL; DEL_ACK follows its last copy. */
+    result = conn->mux ? dmesh_dpa_mux_del_step(conn) : dmesh_doca_dpa_quiesce_step(conn);
     if (result != DOCA_SUCCESS)
         return result;
     if (!dmesh_dma_engine_keep(conn)) {
@@ -1123,6 +1125,7 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     result = flow_local_buffer_destroy(&conn->tx_staging_mmap, &conn->tx_staging);
     if (result != DOCA_SUCCESS)
         return result;
+    dmesh_dpa_mux_release(conn);
     dmesh_dpa_thread_pool_release(conn->objs, conn);
     conn->dpa_thread = NULL;
     free(conn->pending_metadata);
@@ -1282,12 +1285,15 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
             }
         }
 		/* The connection callback normally assigns a pool thread; retry here
-		 * in case the client connected before the pool existed. */
-		if (conn->dpa_thread == NULL)
-			conn->dpa_thread = dmesh_dpa_thread_pool_alloc(objs, conn);
-		if (conn->dpa_thread == NULL) {
-			DOCA_LOG_ERR("No DPA thread available for connection %p", (void *)conn->connection);
-			goto error;
+		 * in case the client connected before the pool existed. A session flow
+		 * on a worker running mux threads takes a ring slot later instead. */
+		if (!(conn->multiplexed && objs->mux != NULL)) {
+			if (conn->dpa_thread == NULL)
+				conn->dpa_thread = dmesh_dpa_thread_pool_alloc(objs, conn);
+			if (conn->dpa_thread == NULL) {
+				DOCA_LOG_ERR("No DPA thread available for connection %p", (void *)conn->connection);
+				goto error;
+			}
 		}
 
 		DOCA_LOG_INFO("Setting up DMA engine, datapath consumer and DPA msgq for connection %p",
@@ -1308,10 +1314,12 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 		}
 
         }
-		result = init_comch_dpa_msgq(conn, objs->consumer_pe);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to init comch DPA msgq: %s", doca_error_get_name(result));
-			goto error;
+		if (conn->dpa_thread != NULL) {
+			result = init_comch_dpa_msgq(conn, objs->consumer_pe);
+			if (result != DOCA_SUCCESS) {
+				DOCA_LOG_ERR("Failed to init comch DPA msgq: %s", doca_error_get_name(result));
+				goto error;
+			}
 		}
 
 		conn->state = conn->multiplexed ? DMESH_CONN_AWAIT_METADATA : DMESH_CONN_CONSUMER_STARTING;
@@ -1366,6 +1374,16 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			goto error;
 		}
 
+		if (conn->dpa_thread == NULL) {
+			/* A mux thread takes the ring on its next pass. */
+			result = dmesh_dpa_mux_add(conn);
+			if (result != DOCA_SUCCESS) {
+				DOCA_LOG_ERR("Failed to add the flow to a DPA mux thread: %s", doca_error_get_name(result));
+				goto error;
+			}
+			goto running;
+		}
+
 		result = dmesh_doca_run_dpa_thread(conn);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to run DPA thread: %s", doca_error_get_name(result));
@@ -1378,12 +1396,18 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			goto error;
 		}
 
+	running:
 		conn->state = DMESH_CONN_RUNNING;
 		DOCA_LOG_INFO("Connection %p is running", (void *)conn->connection);
 		/* fall through to export the reverse path metadata this same tick */
 		/* fallthrough */
 
 	case DMESH_CONN_RUNNING:
+		if (conn->mux && conn->mux_error != 0) {
+			/* The DPA stopped this flow's ring (dpa_mux.c logged why). */
+			conn->error_status = EIO;
+			goto error;
+		}
 		/* Reverse (DPU->host) path setup, once per connection.
 		 *
 		 * CLIENT flows (안 1): allocate rcv_ring + tx_staging and export them;
@@ -1584,6 +1608,12 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 				      (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
 		}
 
+		result = dmesh_dpa_mux_init(objs);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to start DPA mux threads: %s", doca_error_get_name(result));
+			goto error;
+		}
+
 		objs->phase = DMESH_DOCA_STATE_RUNNING;
 
         if (objs->mailbox) dmesh_dispatch_worker_ready(objs);
@@ -1599,6 +1629,8 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 
     if (objs->mailbox) dmesh_dispatch_worker_flush(objs);
     else dmesh_sessions_advance(objs);
+
+    dmesh_dpa_mux_watch(objs);
 
 	*out_state = objs->phase;
 	return DOCA_SUCCESS;

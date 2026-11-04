@@ -207,6 +207,14 @@ wrap the DOCA Comch consumer/producer used as the DPA↔host completion channel.
   pool (`DPA_THREAD_POOL_SIZE`, one thread handed out per connection) and the
   msgq/completion plumbing; `dma.c` builds each connection's private
   `doca_dma` engine + task pool.
+- **Multiplexed forward DMA (`DMESH_DPA_MUX=n`, off by default):** n DPA threads
+  per worker (`run_dma_mux`, `dpu/dpa_mux.c`) each drain up to 8 session flows'
+  forward rings, so EU use no longer grows with the flow count. The ARM opens and
+  closes a ring slot by writing its `cmd` into the thread's local storage, and
+  the DPA answers in the slot's `state`; host and Linkerd are unchanged.
+  Known limit: a copy from a host process that died blocks its thread's producer
+  for good, taking every flow on that thread with it (logged, not recovered;
+  fixed with the broker). Design and numbers: `docs/2026-10-13_dpa-mux-design.md`.
 - **Reverse (proxy→host):** the DPU exports its `rcv_ring` + `tx_staging`; the
   host launches its **own** DPA thread (on `94:00.0`) that mirrors the forward
   datapath in reverse, pulling response bytes back. See `setup_reverse_dpa()` in
