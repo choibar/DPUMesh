@@ -7,6 +7,9 @@
 //	rpc-size -role server -port 9000
 //	rpc-size -role client -target <ip>:<port> -sizes 64,1024,... -phases latency,rate,max
 //
+// -scheme dmesh dials "dmesh:///<ip>:<port>", which follows the DPU's flow
+// scaling (dmeshgrpc's resolver); the default dials the one address.
+//
 // Per size the client runs each phase in turn, every one after an unmeasured
 // warm-up:
 //
@@ -49,6 +52,7 @@ func main() {
 	role := flag.String("role", "", "server or client")
 	port := flag.Int("port", 9000, "server: TCP port (DPUMesh serves DPUMESH_SERVICE)")
 	target := flag.String("target", "", "client: <ip>:<port> of the server")
+	scheme := flag.String("scheme", "passthrough", "client: gRPC target scheme (dmesh: follow the DPU's flow scaling)")
 	sizes := flag.String("sizes", "64,1024,16384,262144", "client: message sizes in bytes")
 	phases := flag.String("phases", "latency,rate,max", "client: phases per size")
 	conns := flag.Int("conns", 4, "client: connections for the rate and max phases")
@@ -67,7 +71,7 @@ func main() {
 		if len(rs) != 0 && len(rs) != len(ss) {
 			log.Fatal("-rates needs one entry per size")
 		}
-		os.Exit(client(*target, ss, strings.Split(*phases, ","), *conns, *m, *rate, rs, *warm, *dur))
+		os.Exit(client(*scheme+":///"+*target, ss, strings.Split(*phases, ","), *conns, *m, *rate, rs, *warm, *dur))
 	default:
 		log.Fatal("-role server|client")
 	}
@@ -239,7 +243,7 @@ func open(ccs []*grpc.ClientConn, rps, size int, warm, dur time.Duration) result
 }
 
 func client(target string, sizes []int, phases []string, n, m, rate int, rates []int, warm, dur time.Duration) int {
-	if target == "" {
+	if strings.HasSuffix(target, ":///") {
 		log.Fatal("-target <ip>:<port>")
 	}
 	ccs := make([]*grpc.ClientConn, n)
@@ -247,7 +251,7 @@ func client(target string, sizes []int, phases []string, n, m, rate int, rates [
 		opts := append(dmeshgrpc.DialOptions(),
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsg), grpc.MaxCallSendMsgSize(maxMsg)))
-		cc, err := grpc.NewClient("passthrough:///"+target, opts...)
+		cc, err := grpc.NewClient(target, opts...)
 		if err != nil {
 			log.Fatalf("connection %d: %v", i, err)
 		}
