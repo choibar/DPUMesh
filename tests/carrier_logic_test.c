@@ -30,11 +30,12 @@ int dmesh_target_addr(int service, uint32_t *ip, uint16_t *port)
 { (void)service; assert(expect_open); *ip = 0; *port = 0; return 0; }
 int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
 { (void)dev; (void)out; assert(expect_open); opened_id = cfg->flow_id; errno = ECONNREFUSED; return -1; }
-/* A started open is outstanding until a test lets READY arrive. */
-static int open_outstanding;
+/* A started open is outstanding until a test lets READY arrive, or fails with open_error. */
+static int open_outstanding, open_error;
 int channel_conn_open_start(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out)
 { (void)dev; assert(expect_open); opened_id = cfg->flow_id; *out = (struct channel_conn *)cfg; return 0; }
-int channel_conn_open_finish(struct channel_conn *conn) { (void)conn; return open_outstanding; }
+int channel_conn_open_finish(struct channel_conn *conn)
+{ (void)conn; if (open_error) { errno = open_error; return -1; } return open_outstanding; }
 int channel_dev_host_dpa(const struct channel_dev *dev) { (void)dev; return 0; }
 int channel_flow_free(struct channel_dev *dev, uint32_t flow_id)
 { (void)dev; return !(held_ids & (UINT32_C(1) << (flow_id - 1))); }
@@ -204,10 +205,24 @@ static void test_batched_poll(void)
 static unsigned shutdowns, closes;
 int channel_conn_shutdown(struct channel_conn *conn) { (void)conn; ++shutdowns; return 0; }
 int channel_conn_close(struct channel_conn *conn) { (void)conn; ++closes; return 0; }
-/* A started close is outstanding until a test lets CLOSED arrive. */
-static int close_outstanding;
-int channel_conn_close_start(struct channel_conn *conn) { (void)conn; ++closes; return 0; }
-int channel_conn_close_finish(struct channel_conn *conn) { (void)conn; return close_outstanding; }
+/* A CLOSE is sent once (closes counts it) unless the session refuses it; it
+ * is then outstanding until a test lets CLOSED arrive, or fails with close_errno. */
+static int close_outstanding, close_refusals, close_errno, close_asked;
+int channel_conn_close_start(struct channel_conn *conn)
+{
+    (void)conn;
+    if (close_refusals) { --close_refusals; errno = EAGAIN; return -1; }
+    if (!close_asked) { close_asked = 1; ++closes; }
+    return 0;
+}
+int channel_conn_close_finish(struct channel_conn *conn)
+{
+    (void)conn;
+    if (close_errno) { errno = close_errno; return -1; }
+    if (close_outstanding) return 1;
+    close_asked = 0;
+    return 0;
+}
 uint32_t channel_conn_ring_free(const struct channel_conn *conn) { (void)conn; return CHANNEL_RING_SIZE; }
 uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t bytes)
 { (void)conn; (void)addr; (void)bytes; return 0; }
@@ -301,7 +316,34 @@ static void test_backend_opens_async(void)
     rx_next_seq = rx_last = 1;      /* its first batch is published already */
     assert(dmesh_native_poll(t, 0, ev, 8) == 1 && ev[0].kind == DMESH_NATIVE_RX);
     assert(s->state == SLOT_OPEN && s->claimed && backend_answer == 0);
-    expect_open = 0; backend_answer = -1;
+    backend_answer = -1;
+    pthread_mutex_destroy(&s->lock);
+    free(t);
+}
+
+/* A backend open that timed out keeps its slot, and so its flow id, until the
+ * DPU confirms the close, however late: a refused CLOSE is sent again, and a
+ * CLOSED after the deadline still frees the slot. */
+static void test_backend_open_timeout_waits_for_closed(void)
+{
+    struct dmesh_native_transport *t = calloc(1, sizeof(*t));
+    assert(t);
+    struct slot *s = &t->slots[0];
+    assert(pthread_mutex_init(&s->lock, NULL) == 0 && pthread_mutex_init(&t->lock, NULL) == 0);
+    struct dmesh_native_event ev[8];
+    t->service_id = 1; t->backend_max = SLOTS; t->next_uport = UPORT_BASE;
+    backend_requests = 1; open_error = ETIMEDOUT; close_refusals = 2; close_outstanding = 1;
+    unsigned before = closes;
+    (void)dmesh_native_progress(t);
+    assert(dmesh_native_poll(t, 0, ev, 8) == 0 && backend_answer == ETIMEDOUT);
+    assert(s->state == SLOT_CLOSING && closes == before);          /* both sends of that pass refused */
+    assert(dmesh_native_poll(t, 0, ev, 8) == 0 && closes == before + 1 && s->state == SLOT_CLOSING);
+    close_errno = ETIMEDOUT;                                      /* no CLOSED in time */
+    assert(dmesh_native_poll(t, 0, ev, 8) == 0 && s->state == SLOT_CLOSING && !s->close_failed);
+    close_errno = 0; close_outstanding = 0;                       /* the late CLOSED */
+    assert(dmesh_native_poll(t, 0, ev, 8) == 0 && s->state == SLOT_FREE && t->active_stripes == 0);
+    assert(closes == before + 1);
+    expect_open = 0; open_error = 0; backend_answer = -1;
     pthread_mutex_destroy(&s->lock);
     free(t);
 }
@@ -315,6 +357,7 @@ int main(void)
     test_half_close_and_held_buffers();
     test_held_id_skipped();
     test_backend_opens_async();
+    test_backend_open_timeout_waits_for_closed();
     uint32_t p[2];
     assert(carrier_chunks(0, p) == 0);
     assert(carrier_chunks(1, p) == 1 && p[0] == 1);
@@ -345,6 +388,6 @@ int main(void)
         assert(carrier_window_release(&v, (uint32_t)(k * 64u % 4096u)) == 0);
         assert(carrier_window_advance(&v, &seq, &bytes) && seq == k && bytes == k * 64u);
     }
-    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close, async close and open, held buffers and held flow ids: PASS");
+    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close, async close and open, held buffers and held flow ids (sync and async opens): PASS");
     return 0;
 }

@@ -195,24 +195,25 @@ static void slot_opened(struct dmesh_native_transport *t, struct slot *s)
     } else {
         fprintf(stderr, "dpumesh: backend flow %d port %u did not open (%s)\n",
                 slot_index(t, s) + 1, s->port, strerror(error));
-        /* A failed CLOSE send quarantines the slot like a failed close. */
-        if (channel_conn_close_start(s->conn) != 0) s->close_failed = 1;
+        (void)channel_conn_close_start(s->conn);   /* a refused CLOSE is asked again */
         s->state = SLOT_CLOSING;
     }
     if (s->backend) channel_backend_finish(t->dev, s->open_worker, s->open_token, error);
 }
-/* CLOSING -> CLOSED once the DPU confirmed. Under the slot lock. */
+/* CLOSING -> CLOSED once the DPU confirmed. A CLOSE the session refused is
+ * sent again, and one unconfirmed in time keeps the slot until CLOSED comes:
+ * the DPU may still finish an OPEN it sat on. Under the slot lock. */
 static void slot_closed(struct dmesh_native_transport *t, struct slot *s)
 {
-    if (s->close_failed) return;
+    if (s->close_failed || channel_conn_close_start(s->conn) != 0) return;
     int rc = channel_conn_close_finish(s->conn);
     if (rc == 0) {
         s->conn = NULL;
         s->state = SLOT_CLOSED;
         TRACE("slot %d closed port %u", slot_index(t, s), s->port);
-    } else if (rc < 0) {
-        /* The DPU may still read the ring: keep it, and the slot, until
-         * dmesh_native_close retries the close. */
+    } else if (rc < 0 && errno != ETIMEDOUT) {
+        /* CLOSED with an error, or a lost session: the DPU may still read
+         * the ring; keep it, and the slot, until dmesh_native_close retries. */
         s->close_failed = 1;
         fprintf(stderr, "dpumesh: flow %d port %u close failed (%s); slot quarantined\n",
                 slot_index(t, s) + 1, s->port, strerror(errno));
