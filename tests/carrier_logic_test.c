@@ -371,11 +371,10 @@ static void test_flow_requests(void)
     assert(dmesh_native_poll(t, 0, ev, 8) == 1 && ev[0].kind == DMESH_NATIVE_REQUEST && ev[0].port == 11);
     assert(dmesh_native_poll(t, 0, ev, 8) == 0);           /* announced once */
     int kind; uint32_t ip = 1, count, token; uint16_t dst = 1;
-    expect_open = 1;                                         /* the flow's destination is looked up */
+    s->dst_ip = 0x0109630a; s->dst_port = 9000;            /* the destination it opened to */
     assert(dmesh_native_take_request(t, 11, &kind, &ip, &dst, &count, &token) == 1);
-    assert(kind == DMESH_REQ_SCALE && count == 3 && token == 9 && ip == 0 && dst == 0);
+    assert(kind == DMESH_REQ_SCALE && count == 3 && token == 9 && ip == 0x0109630a && dst == 9000);
     assert(dmesh_native_take_request(t, 11, &kind, &ip, &dst, &count, &token) == 0);
-    expect_open = 0;
     assert(dmesh_native_scale_ack(t, 11, 9, 2) == 0 && dmesh_native_spare_ready(t, 11) == 0);
     assert(scale_acks == 1 && spare_readies == 1);
     s->backend = 1;                                          /* never on a backend flow */
