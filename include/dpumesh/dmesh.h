@@ -72,11 +72,12 @@ typedef enum {
     DMESH_EVENT_RECV_FIN = 2, /* peer closed the conn (EOF); no credit held */
     DMESH_EVENT_TX_READY = 3, /* an EAGAIN-blocked QP should retry dmesh_alloc */
     DMESH_EVENT_TX_ERROR = 4, /* deferred buffered-tail submission failed */
-    DMESH_EVENT_PREPARE  = 5, /* migration: open a spare stream to the "ip:port" in
-                               * buf/len (dmesh_poll_channel); qp is NULL */
-    DMESH_EVENT_SCALE    = 6, /* flow scaling: buf points to a dmesh_scale_t
-                               * (dmesh_poll_channel); qp is NULL. Answer with
-                               * dmesh_scale_ack. */
+    DMESH_EVENT_PREPARE  = 5, /* migration: the DPU moves this client QP's stream;
+                               * open a spare stream to its target, the "ip:port"
+                               * in buf/len, then dmesh_spare_ready the spare */
+    DMESH_EVENT_SCALE    = 6, /* flow scaling: buf points to a dmesh_scale_t for
+                               * this client QP's target; answer with
+                               * dmesh_scale_ack on this QP */
 } dmesh_event_type_t;
 
 /* A SCALE request: each client of target should keep count streams to it. The
@@ -93,8 +94,11 @@ typedef struct dmesh_event {
                                    * per-conn context) */
     dmesh_event_type_t  type;
     const uint8_t      *buf;      /* RECV: points INTO the RX mmap (zero-copy); valid
-                                   * until dmesh_release_rx_buffer. Else NULL. */
-    uint32_t            len;      /* RECV: byte-stream fragment length. Else 0. */
+                                   * until dmesh_release_rx_buffer. PREPARE / SCALE:
+                                   * the request, valid until the QP's next poll.
+                                   * Else NULL. */
+    uint32_t            len;      /* RECV: byte-stream fragment length; PREPARE /
+                                   * SCALE: the request's size. Else 0. */
     int32_t             _rx_token; /* internal release token; -1 = nothing held */
 } dmesh_event_t;
 
@@ -123,12 +127,6 @@ int dmesh_channel_fd(dmesh_channel_t *ch);
  * transport loss (see dmesh_poll_qp). On a client it does the work alone. One
  * thread at a time. */
 dmesh_qp_t *dmesh_accept(dmesh_channel_t *ch);
-
-/* The DPU's requests to the process that dmesh_accept() took from the
- * session: a migration PREPARE or a flow-scaling SCALE, qp NULL, buf valid
- * until the next call. Call it after dmesh_accept() returns EAGAIN, on the
- * same thread, until it returns 0. */
-int dmesh_poll_channel(dmesh_channel_t *ch, dmesh_event_t *events, int max_events);
 
 /* ===== QP: a connected socket (rdma_cm) ===== */
 
@@ -191,10 +189,10 @@ int dmesh_poll_qp(dmesh_qp_t *qp, dmesh_event_t *events, int max_events);
  * the spare replaces. */
 int dmesh_spare_ready(dmesh_qp_t *c);
 
-/* Answer a SCALE event: applied is how many of the application's clients of
- * the target now keep the requested count (0: none can, e.g. no client uses a
- * scaling-aware resolver). */
-int dmesh_scale_ack(dmesh_channel_t *s, uint32_t token, uint32_t applied);
+/* Answer a SCALE event on the QP it came on: applied is how many of the
+ * application's clients of the target now keep the requested count (0: none
+ * can, e.g. no client uses a scaling-aware resolver). */
+int dmesh_scale_ack(dmesh_qp_t *c, uint32_t token, uint32_t applied);
 
 /* Release the zero-copy RX buffer held by a RECV event and invalidate event->buf.
  * Idempotent, valid after QP closure, and a no-op for other event types. */

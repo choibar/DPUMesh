@@ -29,6 +29,8 @@ SIGNATURE(dmesh_post_send, int (*)(dmesh_qp_t *, const void *, uint32_t));
 SIGNATURE(dmesh_flush, int (*)(dmesh_qp_t *));
 SIGNATURE(dmesh_poll_qp, int (*)(dmesh_qp_t *, dmesh_event_t *, int));
 SIGNATURE(dmesh_release_rx_buffer, void (*)(dmesh_channel_t *, dmesh_event_t *));
+SIGNATURE(dmesh_spare_ready, int (*)(dmesh_qp_t *));
+SIGNATURE(dmesh_scale_ack, int (*)(dmesh_qp_t *, uint32_t, uint32_t));
 
 #define SIZE(type) do { \
     printf("sizeof.%s=%zu\n", #type, sizeof(type)); \
@@ -74,6 +76,12 @@ int main(void)
     VALUE(DMESH_EVENT_RECV_FIN);
     VALUE(DMESH_EVENT_TX_READY);
     VALUE(DMESH_EVENT_TX_ERROR);
+    VALUE(DMESH_EVENT_PREPARE);
+    VALUE(DMESH_EVENT_SCALE);
+    SIZE(dmesh_scale_t);
+    FIELD(dmesh_scale_t, token);
+    FIELD(dmesh_scale_t, count);
+    FIELD(dmesh_scale_t, target);
     VALUE(DMESH_POD_BLANK);
     VALUE(DMESH_POD_REMOTE);
     VALUE(DMESH_POD_ABORT);

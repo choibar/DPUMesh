@@ -65,6 +65,8 @@ static int poll_qp_once(dmesh_qp_t *c, dmesh_event_t *events, int max_events) {
         emit_tx(c, &events[n++], DMESH_EVENT_TX_ERROR);
     if (n < max_events && dpumesh_qp_take(c, DMESH_EQ_TX_READY))
         emit_tx(c, &events[n++], DMESH_EVENT_TX_READY);
+    if (n < max_events && dpumesh_qp_take(c, DMESH_EQ_REQUEST))
+        n += dpumesh_qp_requests(c, events + n, max_events - n);
     if (n < max_events && c->rx_slot >= 0) {
         eq_emit(s, c, &events[n++], c->rx_slot, c->rx_len);
         c->rx_slot = -1; c->rx_buf = NULL; c->rx_len = 0; c->rx_pos = 0;
@@ -106,9 +108,9 @@ int dmesh_spare_ready(dmesh_qp_t *c) {
     return dpumesh_spare_ready(c->ep->ctx, c->local_port);
 }
 
-int dmesh_scale_ack(dmesh_channel_t *s, uint32_t token, uint32_t applied) {
-    if (!s || !s->ctx) { errno = EINVAL; return -1; }
-    return dpumesh_scale_ack(s->ctx, token, applied);
+int dmesh_scale_ack(dmesh_qp_t *c, uint32_t token, uint32_t applied) {
+    if (!c || !c->ep || c->role != DMESH_ROLE_CLIENT) { errno = EINVAL; return -1; }
+    return dpumesh_scale_ack(c->ep->ctx, c->local_port, token, applied);
 }
 
 void dmesh_release_rx_buffer(dmesh_channel_t *s, dmesh_event_t *event) {

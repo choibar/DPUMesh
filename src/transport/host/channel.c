@@ -81,12 +81,6 @@ struct channel_dev {
 	int hello_ready, listen_ready, listen_error;
     struct { uint32_t token; int state, error; } backend[DMESH_SESSION_MAX_WORKERS];
     unsigned backend_pending, backend_rejections;
-    /* PREPARE requests (migration spares) not yet taken by the core. */
-    struct { uint32_t ip; uint16_t port; } prepare[8];
-    unsigned prepare_head, prepare_count;
-    /* SCALE requests (flow scaling) not yet taken by the core. */
-    struct { uint32_t ip, count, token; uint16_t port; } scale[8];
-    unsigned scale_head, scale_count;
     /* state: 1=pending, 2=processing, 3=done, 4=reject pending */
 	int session_error;
 	uint64_t last_send_ms;              /* Last control message submitted (keepalive) */
@@ -156,6 +150,9 @@ struct channel_conn {
 	int open_sent, ready, peer_closed, error, close_sent, close_error;
 	int abandoned;                      /* a failed open whose close is unconfirmed: holds its id */
 	struct channel_flow_wake *wake;     /* its slot's flow wake, or NULL */
+	uint32_t requests;                  /* CHANNEL_REQ_* not taken yet (session lock) */
+	uint32_t scale_count, scale_token;  /* the SCALE waiting in requests */
+	int announce;                       /* a request arrived since channel_conn_announced */
 	uint64_t close_deadline_ms;         /* CLOSE sent: CLOSED expected by then */
 	uint64_t open_deadline_ms;          /* OPEN sent: READY expected by then */
 	/* host-dpa reverse path */
@@ -293,25 +290,6 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
 		dev->wake_ready = 1;
 		return;
 	}
-    if (h.type == DMESH_SESSION_PREPARE) {
-        if (dev->prepare_count < 8) {
-            unsigned i = (dev->prepare_head + dev->prepare_count++) % 8;
-            dev->prepare[i].ip = dmesh_session_get_u32(payload);
-            dev->prepare[i].port = (uint16_t)dmesh_session_get_u32(payload + 4);
-        }
-        return;
-    }
-    if (h.type == DMESH_SESSION_SCALE) {
-        uint32_t count = dmesh_session_get_u32(payload + 8);
-        if (count != 0 && dev->scale_count < 8) {
-            unsigned i = (dev->scale_head + dev->scale_count++) % 8;
-            dev->scale[i].ip = dmesh_session_get_u32(payload);
-            dev->scale[i].port = (uint16_t)dmesh_session_get_u32(payload + 4);
-            dev->scale[i].count = count;
-            dev->scale[i].token = h.generation;
-        }
-        return;
-    }
 	if (h.flow_id == 0) {
 		dev->session_error = h.status ? h.status : EPROTO;
 		return;
@@ -347,12 +325,24 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
 		conn->error = h.status ? h.status : EIO;
 		if (conn->close_sent) conn->close_error = conn->error;
 		break;
+	case DMESH_SESSION_PREPARE:
+		conn->requests |= CHANNEL_REQ_PREPARE;
+		__atomic_store_n(&conn->announce, 1, __ATOMIC_RELEASE);
+		break;
+	case DMESH_SESSION_SCALE:
+		if (dmesh_session_get_u32(payload) == 0) break;
+		conn->scale_count = dmesh_session_get_u32(payload);
+		conn->scale_token = dmesh_session_get_u32(payload + 4);
+		conn->requests |= CHANNEL_REQ_SCALE;
+		__atomic_store_n(&conn->announce, 1, __ATOMIC_RELEASE);
+		break;
 	default:
 		conn->error = EPROTO;
 		break;
 	}
 	/* A flow-wake flow's doorbell carries receives only: report the news. */
-	if (conn->wake != NULL && (h.type == DMESH_SESSION_CLOSED || h.type == DMESH_SESSION_ERROR))
+	if (conn->wake != NULL && (h.type == DMESH_SESSION_CLOSED || h.type == DMESH_SESSION_ERROR ||
+				   h.type == DMESH_SESSION_PREPARE || h.type == DMESH_SESSION_SCALE))
 		__atomic_fetch_or(&dev->news, UINT32_C(1) << (h.flow_id - 1), __ATOMIC_RELEASE);
 }
 
@@ -881,41 +871,31 @@ int channel_backend_next(struct channel_dev *dev, uint32_t *worker, uint32_t *to
     pthread_mutex_unlock(&dev->session_lock);
     return found;
 }
-int channel_prepare_next(struct channel_dev *dev, uint32_t *ip, uint16_t *port)
+int channel_conn_announced(struct channel_conn *conn)
 {
-    pthread_mutex_lock(&dev->session_lock);
-    int found = dev->prepare_count != 0;
-    if (found) {
-        *ip = dev->prepare[dev->prepare_head].ip;
-        *port = dev->prepare[dev->prepare_head].port;
-        dev->prepare_head = (dev->prepare_head + 1) % 8;
-        --dev->prepare_count;
-    }
-    pthread_mutex_unlock(&dev->session_lock);
-    return found;
+    return __atomic_load_n(&conn->announce, __ATOMIC_ACQUIRE) &&
+           __atomic_exchange_n(&conn->announce, 0, __ATOMIC_ACQ_REL);
 }
-int channel_scale_next(struct channel_dev *dev, uint32_t *ip, uint16_t *port,
-                       uint32_t *count, uint32_t *token)
+int channel_conn_take_request(struct channel_conn *conn, int *kind, uint32_t *count, uint32_t *token)
 {
+    struct channel_dev *dev = conn->dev;
     pthread_mutex_lock(&dev->session_lock);
-    int found = dev->scale_count != 0;
-    if (found) {
-        unsigned i = dev->scale_head;
-        *ip = dev->scale[i].ip; *port = dev->scale[i].port;
-        *count = dev->scale[i].count; *token = dev->scale[i].token;
-        dev->scale_head = (dev->scale_head + 1) % 8;
-        --dev->scale_count;
-    }
+    *kind = conn->requests & CHANNEL_REQ_PREPARE ? CHANNEL_REQ_PREPARE : conn->requests & CHANNEL_REQ_SCALE;
+    conn->requests &= ~(uint32_t)*kind;
+    *count = conn->scale_count; *token = conn->scale_token;
     pthread_mutex_unlock(&dev->session_lock);
-    return found;
+    return *kind != 0;
 }
-int channel_scale_ack(struct channel_dev *dev, uint32_t token, uint32_t applied)
+int channel_conn_scale_ack(struct channel_conn *conn, uint32_t token, uint32_t applied)
 {
     if (!token) { errno = EINVAL; return -1; }
-    uint8_t payload[4];
-    dmesh_session_put_u32(payload, applied);
+    struct channel_dev *dev = conn->dev;
+    uint8_t payload[8];
+    dmesh_session_put_u32(payload, token);
+    dmesh_session_put_u32(payload + 4, applied);
     pthread_mutex_lock(&dev->session_lock);
-    int rc = session_send_locked(dev, DMESH_SESSION_SCALE_ACK, 0, token, payload, sizeof(payload));
+    int rc = session_send_locked(dev, DMESH_SESSION_SCALE_ACK, conn->flow_id, conn->generation,
+                                 payload, sizeof(payload));
     pthread_mutex_unlock(&dev->session_lock);
     return rc;
 }
@@ -1784,7 +1764,8 @@ int channel_conn_idle(const struct channel_conn *conn)
 	    __atomic_load_n(&conn->error, __ATOMIC_ACQUIRE) ||
 	    __atomic_load_n(&conn->peer_closed, __ATOMIC_ACQUIRE))
 		return 0;
-	if (conn->forward_ring && __atomic_load_n(&conn->forward_ring->ctrl->error, __ATOMIC_ACQUIRE))
+	if ((conn->forward_ring && __atomic_load_n(&conn->forward_ring->ctrl->error, __ATOMIC_ACQUIRE)) ||
+	    __atomic_load_n(&conn->announce, __ATOMIC_ACQUIRE))
 		return 0;
 	/* push: the slot channel_conn_rx_next would read next is not filled */
 	return __atomic_load_n(&conn->descs[conn->expected % DMESH_PUSH_DESC_N].seq, __ATOMIC_ACQUIRE) !=

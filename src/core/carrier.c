@@ -286,27 +286,42 @@ static struct slot *slot_of_port(struct dmesh_native_transport *t, uint16_t port
     uint16_t i = t->port_slot[port];
     return i ? &t->slots[i - 1] : NULL;
 }
-int dmesh_native_prepare_next(struct dmesh_native_transport *t, uint32_t *ip, uint16_t *port)
-{
-    return channel_prepare_next(t->dev, ip, port);
-}
-int dmesh_native_scale_next(struct dmesh_native_transport *t, uint32_t *ip, uint16_t *port,
-                            uint32_t *count, uint32_t *token)
-{
-    return channel_scale_next(t->dev, ip, port, count, token);
-}
-int dmesh_native_scale_ack(struct dmesh_native_transport *t, uint32_t token, uint32_t applied)
-{
-    return channel_scale_ack(t->dev, token, applied);
-}
-int dmesh_native_spare_ready(struct dmesh_native_transport *t, uint16_t port)
+/* The open client slot of port, locked, or NULL. */
+static struct slot *client_slot(struct dmesh_native_transport *t, uint16_t port)
 {
     pthread_mutex_lock(&t->lock);
     struct slot *s = slot_of_port(t, port);
-    struct channel_conn *c = s && s->state == SLOT_OPEN && !s->backend ? s->conn : NULL;
+    if (s) pthread_mutex_lock(&s->lock);
     pthread_mutex_unlock(&t->lock);
-    if (!c) { errno = ENOTCONN; return -1; }
-    return channel_conn_spare_ready(c);
+    if (s && (s->state != SLOT_OPEN || s->backend)) { pthread_mutex_unlock(&s->lock); s = NULL; }
+    return s;
+}
+int dmesh_native_take_request(struct dmesh_native_transport *t, uint16_t port, int *kind,
+                              uint32_t *ip, uint16_t *dst_port, uint32_t *count, uint32_t *token)
+{
+    struct slot *s = client_slot(t, port);
+    if (!s) return 0;
+    int k, found = channel_conn_take_request(s->conn, &k, count, token) &&
+                   dmesh_target_addr(s->service_id, ip, dst_port) == 0;
+    pthread_mutex_unlock(&s->lock);
+    if (found) *kind = k == CHANNEL_REQ_PREPARE ? DMESH_REQ_PREPARE : DMESH_REQ_SCALE;
+    return found;
+}
+int dmesh_native_spare_ready(struct dmesh_native_transport *t, uint16_t port)
+{
+    struct slot *s = client_slot(t, port);
+    if (!s) { errno = ENOTCONN; return -1; }
+    int rc = channel_conn_spare_ready(s->conn);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
+}
+int dmesh_native_scale_ack(struct dmesh_native_transport *t, uint16_t port, uint32_t token, uint32_t applied)
+{
+    struct slot *s = client_slot(t, port);
+    if (!s) { errno = ENOTCONN; return -1; }
+    int rc = channel_conn_scale_ack(s->conn, token, applied);
+    pthread_mutex_unlock(&s->lock);
+    return rc;
 }
 
 int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_config *cfg)
@@ -498,6 +513,12 @@ int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh
         if (s->t_head == s->t_tail && channel_conn_idle(s->conn)) {
             pthread_mutex_unlock(&s->lock);
             return 0;
+        }
+        /* A DPU request on the flow is announced once; the QP's poll takes it. */
+        if (channel_conn_announced(s->conn)) {
+            memset(&e[n], 0, sizeof(e[n]));
+            e[n].kind = DMESH_NATIVE_REQUEST; e[n].port = s->port;
+            n++;
         }
         int gone = channel_conn_poll(s->conn), error = gone < 0 ? (errno ? errno : EIO) : 0;
         uint64_t consumed = channel_conn_consumed(s->conn);

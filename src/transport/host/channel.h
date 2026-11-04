@@ -63,15 +63,18 @@ int channel_session_close(struct channel_dev *dev);
  * outside control callbacks; completion retains errors until Comch accepts. */
 int channel_session_listen(struct channel_dev *, uint32_t ip, uint16_t port);
 int channel_backend_next(struct channel_dev *, uint32_t *worker, uint32_t *token);
-/* Migration spares: take one PREPARE (destination ip/port, network order ip),
- * and report that a spare flow has its server's first bytes. */
-int channel_prepare_next(struct channel_dev *, uint32_t *ip, uint16_t *port);
+/* The DPU's requests on a client flow, which concern that flow's
+ * destination: PREPARE (open a spare stream to it) and SCALE (keep count
+ * streams to it, answered with token). The session's progress records them;
+ * channel_conn_announced reports once that one arrived since the last call,
+ * and channel_conn_take_request returns the next (1) or none (0). */
+enum { CHANNEL_REQ_PREPARE = 1, CHANNEL_REQ_SCALE = 2 };
+int channel_conn_announced(struct channel_conn *);
+int channel_conn_take_request(struct channel_conn *, int *kind, uint32_t *count, uint32_t *token);
+/* Answers on the flow: a spare has its server's first bytes (SPARE_READY,
+ * on the spare), and how many clients took a SCALE (SCALE_ACK). */
 int channel_conn_spare_ready(struct channel_conn *);
-/* Flow scaling: take one SCALE (destination ip/port, network order ip; the
- * stream count each client keeps; the token to answer), and answer it. */
-int channel_scale_next(struct channel_dev *, uint32_t *ip, uint16_t *port,
-                       uint32_t *count, uint32_t *token);
-int channel_scale_ack(struct channel_dev *, uint32_t token, uint32_t applied);
+int channel_conn_scale_ack(struct channel_conn *, uint32_t token, uint32_t applied);
 void channel_backend_finish(struct channel_dev *, uint32_t worker, uint32_t token, int error);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);

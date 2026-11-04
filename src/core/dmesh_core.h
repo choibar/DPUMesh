@@ -69,7 +69,8 @@ _Static_assert(DMESH_PORT_SPACE == (UINT16_MAX + 1),
 #define DMESH_MAX_EQ      64
 
 /* Events other threads raise for a QP, in dmesh_eq.events. */
-enum { DMESH_EQ_TX_READY = 1, DMESH_EQ_TX_ERROR = 2 };
+/* DMESH_EQ_REQUEST: the DPU raised a request on the QP's flow. */
+enum { DMESH_EQ_TX_READY = 1, DMESH_EQ_TX_ERROR = 2, DMESH_EQ_REQUEST = 4 };
 
 /* Idle-wake counters of one EQ (DPUMESH_WAIT_STATS). Its poller alone writes
  * them, with plain stores; the channel's dump reads them. */
@@ -84,6 +85,8 @@ typedef struct dmesh_eq dmesh_eq_t;
 struct dmesh_eq {
     dmesh_channel_t   *ch;
     atomic_uint_fast32_t stripes;   /* stripes bound here (stripe_bind) */
+    char               prepare_target[24]; /* PREPARE event text, valid until the next poll */
+    dmesh_scale_t      scale;              /* SCALE event body, valid until the next poll */
     struct dmesh_qp *accept_spare; /* preallocated before consuming an accept descriptor;
                                     * prevents OOM from stranding SERVER_PENDING */
     int                epfd;        /* the QP's readiness fd (dmesh_qp_fd): an epoll set
@@ -189,6 +192,10 @@ int dpumesh_conn_recv(dpumesh_ctx_t *ctx, uint16_t port, sw_descriptor_t *out);
  * taken only while the QP's armed dmesh_alloc(EAGAIN) is still waiting;
  * TX_ERROR leaves the failure sticky. Single-consumer (the QP's poller). */
 int dpumesh_qp_take(dmesh_qp_t *c, unsigned event);
+/* The DPU's requests on a client QP's flow (after DMESH_EQ_REQUEST), as up to
+ * max PREPARE / SCALE events whose text lives in the EQ; what does not fit
+ * stays raised. */
+int dpumesh_qp_requests(dmesh_qp_t *c, dmesh_event_t *events, int max);
 
 /* The reverse path has no background thread. A QP's poller drains its stripe:
  * dpumesh_eq_drain interprets the stripe's published reverse entries under its
@@ -216,10 +223,10 @@ static inline void dpumesh_eq_awake(struct dmesh_eq *eq)
  * the process exits with DMESH_EXIT_LOST when the loss is first seen. */
 #define DMESH_EXIT_LOST 75   /* EX_TEMPFAIL */
 int  dpumesh_lost(dpumesh_ctx_t *ctx);
-/* Migration spares: report a client port's stream as a ready spare. Flow
- * scaling: answer a SCALE (dmesh_poll_channel hands both requests out). */
+/* Answers to the DPU's requests on a client port's flow: the stream is a
+ * ready spare (PREPARE), and how many clients took a SCALE. */
 int  dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port);
-int  dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied);
+int  dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint16_t port, uint32_t token, uint32_t applied);
 
 /* ====== Connection lifecycle — internal, shared by both surfaces ======
  *

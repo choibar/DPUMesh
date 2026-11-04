@@ -134,8 +134,15 @@ static void test_flow_consumer_rearmed_after_close(void)
 
 /* A connection whose receives, custody and close the poll test scripts. */
 static uint64_t conn_consumed, rx_next_seq = 1, rx_last;
-static int conn_gone;
-int channel_conn_idle(const struct channel_conn *conn) { (void)conn; return rx_next_seq > rx_last && !conn_gone; }
+static int conn_gone, conn_announce, conn_request;
+int channel_conn_idle(const struct channel_conn *conn) { (void)conn; return rx_next_seq > rx_last && !conn_gone && !conn_announce; }
+int channel_conn_announced(struct channel_conn *conn) { (void)conn; int a = conn_announce; conn_announce = 0; return a; }
+int channel_conn_take_request(struct channel_conn *conn, int *kind, uint32_t *count, uint32_t *token)
+{ (void)conn; *kind = conn_request; conn_request = 0; *count = 3; *token = 9; return *kind != 0; }
+static unsigned spare_readies, scale_acks;
+int channel_conn_spare_ready(struct channel_conn *conn) { (void)conn; ++spare_readies; return 0; }
+int channel_conn_scale_ack(struct channel_conn *conn, uint32_t token, uint32_t applied)
+{ (void)conn; assert(token == 9 && applied == 2); ++scale_acks; return 0; }
 int channel_conn_poll(struct channel_conn *conn) { (void)conn; return conn_gone; }
 uint64_t channel_conn_consumed(const struct channel_conn *conn) { (void)conn; return conn_consumed; }
 int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len)
@@ -348,6 +355,38 @@ static void test_backend_open_timeout_waits_for_closed(void)
     free(t);
 }
 
+/* A DPU request on a client flow is announced once by its stripe's poll and
+ * taken by the port's QP; answers go out on the open client flow only. */
+static void test_flow_requests(void)
+{
+    struct dmesh_native_transport *t = calloc(1, sizeof(*t));
+    assert(t);
+    struct slot *s = &t->slots[0];
+    assert(pthread_mutex_init(&s->lock, NULL) == 0 && pthread_mutex_init(&t->lock, NULL) == 0);
+    struct dmesh_native_event ev[8];
+    s->state = SLOT_OPEN; s->port = 11; s->conn = (struct channel_conn *)t;
+    t->port_slot[11] = 1;
+    rx_next_seq = 1; rx_last = 0;
+    conn_announce = 1; conn_request = CHANNEL_REQ_SCALE;
+    assert(dmesh_native_poll(t, 0, ev, 8) == 1 && ev[0].kind == DMESH_NATIVE_REQUEST && ev[0].port == 11);
+    assert(dmesh_native_poll(t, 0, ev, 8) == 0);           /* announced once */
+    int kind; uint32_t ip = 1, count, token; uint16_t dst = 1;
+    expect_open = 1;                                         /* the flow's destination is looked up */
+    assert(dmesh_native_take_request(t, 11, &kind, &ip, &dst, &count, &token) == 1);
+    assert(kind == DMESH_REQ_SCALE && count == 3 && token == 9 && ip == 0 && dst == 0);
+    assert(dmesh_native_take_request(t, 11, &kind, &ip, &dst, &count, &token) == 0);
+    expect_open = 0;
+    assert(dmesh_native_scale_ack(t, 11, 9, 2) == 0 && dmesh_native_spare_ready(t, 11) == 0);
+    assert(scale_acks == 1 && spare_readies == 1);
+    s->backend = 1;                                          /* never on a backend flow */
+    assert(dmesh_native_spare_ready(t, 11) == -1 && errno == ENOTCONN);
+    s->backend = 0; s->state = SLOT_CLOSING;
+    assert(dmesh_native_scale_ack(t, 11, 9, 2) == -1 && errno == ENOTCONN);
+    assert(dmesh_native_spare_ready(t, 12) == -1 && errno == ENOTCONN);
+    pthread_mutex_destroy(&s->lock);
+    free(t);
+}
+
 int main(void)
 {
     test_closed_stripe_stays_pollable_until_retired();
@@ -358,6 +397,7 @@ int main(void)
     test_held_id_skipped();
     test_backend_opens_async();
     test_backend_open_timeout_waits_for_closed();
+    test_flow_requests();
     uint32_t p[2];
     assert(carrier_chunks(0, p) == 0);
     assert(carrier_chunks(1, p) == 1 && p[0] == 1);
@@ -388,6 +428,6 @@ int main(void)
         assert(carrier_window_release(&v, (uint32_t)(k * 64u % 4096u)) == 0);
         assert(carrier_window_advance(&v, &seq, &bytes) && seq == k && bytes == k * 64u);
     }
-    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close, async close and open, held buffers and held flow ids (sync and async opens): PASS");
+    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close, async close and open, held buffers, held flow ids (sync and async opens) and flow requests: PASS");
     return 0;
 }

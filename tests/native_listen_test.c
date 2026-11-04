@@ -136,6 +136,27 @@ int main(void)
     idle(client);
     assert(readable(b->eq->notify_efd) && !readable(a->eq->notify_efd));
 
+    /* The DPU's requests on a client flow: the news wakes the QP owning it,
+     * whose own poll returns them, one at a time if it asks for one, naming
+     * its target; the answers go out on its flow. */
+    settle(a); settle(b);
+    test_native_request(client->ctx->transport, a->local_port, DMESH_REQ_PREPARE, 0, 0);
+    test_native_request(client->ctx->transport, a->local_port, DMESH_REQ_SCALE, 2, 41);
+    test_native_news(bit(a));
+    idle(client);
+    assert(readable(a->eq->notify_efd) && !readable(b->eq->notify_efd));
+    assert(dmesh_poll_qp(b, &ev, 1) == 0);
+    assert(dmesh_poll_qp(a, &ev, 1) == 1 && ev.type == DMESH_EVENT_PREPARE && ev.qp == a);
+    assert(ev.len == strlen("10.99.1.1:80") && memcmp(ev.buf, "10.99.1.1:80", ev.len + 1) == 0);
+    char prepared[24];
+    memcpy(prepared, ev.buf, ev.len + 1);
+    assert(dmesh_poll_qp(a, &ev, 1) == 1 && ev.type == DMESH_EVENT_SCALE && ev.qp == a);
+    const dmesh_scale_t *req = (const dmesh_scale_t *)ev.buf;
+    assert(ev.len == sizeof(*req) && req->token == 41 && req->count == 2 && strcmp(req->target, prepared) == 0);
+    assert(dmesh_poll_qp(a, &ev, 1) == 0);
+    assert(dmesh_spare_ready(a) == 0 && test_native_answers[0] == a->local_port);
+    assert(dmesh_scale_ack(a, 41, 1) == 0 && test_native_answers[1] == 41 && test_native_answers[2] == 1);
+
     /* An empty QP arms its own stripe, never the session; the channel arms
      * the session and the stripes no QP owns, and its fd wakes on the
      * session's doorbell, which accepting acknowledges. */
@@ -175,6 +196,6 @@ int main(void)
     dmesh_qp_t *qps2[] = {c, sc};
     teardown(server, client, qps2, 2);
     printf("native_listen_test: the channel accepts each stream as a QP with its own fd; a QP drains its "
-           "own stripe, never the session, and gets its control news: PASS\n");
+           "own stripe, never the session, and gets its control news and DPU requests: PASS\n");
     return 0;
 }

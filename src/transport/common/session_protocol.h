@@ -5,8 +5,9 @@
  * are independent of this version. Integers in the envelope are little endian;
  * v2 adds listener registration and worker-pinned backend requests, v4 the
  * ARM/DOORBELL idle wake, v5 the PING keepalive, v6 PREPARE/SPARE_READY, v7
- * SCALE/SCALE_ACK, v8 WAKE_READY and the SHUTDOWN half close. DMA metadata
- * payloads retain the existing LP64 host/DPU layout. */
+ * SCALE/SCALE_ACK, v8 WAKE_READY, the SHUTDOWN half close, and PREPARE and
+ * SCALE on the flow they concern. DMA metadata payloads retain the existing
+ * LP64 host/DPU layout. */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -43,18 +44,17 @@ enum dmesh_session_message_type {
      * DPU proxy fails the send, and only a send notices one: the Comch
      * client gets no event when its server process exits. */
     DMESH_SESSION_PING = 16,
-    /* Migration with a spare connection. PREPARE (DPU -> host; flow 0,
-     * generation = token, payload u32 dst_ip, u32 dst_port): open a spare
-     * stream to that destination now; the dispatcher steers its OPEN to the
-     * target worker. SPARE_READY (host -> DPU, on the spare flow): the spare
-     * has its server's first bytes; drain the flow it replaces. */
+    /* Migration with a spare connection. PREPARE (DPU -> host, on the client
+     * flow to be moved, no payload): open a spare stream to that flow's
+     * destination now; the dispatcher steers its OPEN to the target worker.
+     * SPARE_READY (host -> DPU, on the spare flow): the spare has its server's
+     * first bytes; drain the flow it replaces. */
     DMESH_SESSION_PREPARE = 17,
     DMESH_SESSION_SPARE_READY = 18,
-    /* Flow scaling. SCALE (DPU -> host; flow 0, generation = token, payload
-     * u32 dst_ip, u32 dst_port, u32 count >= 1): each client of that
-     * destination should keep count streams to it. SCALE_ACK (host -> DPU;
-     * flow 0, generation = the token, payload u32 applied): how many clients
-     * of it took the count. */
+    /* Flow scaling. SCALE (DPU -> host, on a client flow; payload u32 count
+     * >= 1, u32 token): each client of that flow's destination should keep
+     * count streams to it. SCALE_ACK (host -> DPU, on the same flow; payload
+     * u32 token, u32 applied): how many clients of it took the count. */
     DMESH_SESSION_SCALE = 19,
     DMESH_SESSION_SCALE_ACK = 20,
     /* WAKE_READY (DPU -> host, session level): the host's Comch consumer is
@@ -127,11 +127,6 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
                                      DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE &&
                (h->payload_len - DMESH_SESSION_ARM_HEADER_SIZE) % DMESH_SESSION_ARM_FLOW_SIZE == 0;
     }
-    if (h->type == DMESH_SESSION_PREPARE)
-        return h->flow_id == 0 && h->generation != 0 && h->payload_len == 8 && h->status == 0;
-    if (h->type == DMESH_SESSION_SCALE || h->type == DMESH_SESSION_SCALE_ACK)
-        return h->flow_id == 0 && h->generation != 0 && h->status == 0 &&
-               h->payload_len == (h->type == DMESH_SESSION_SCALE ? 12u : 4u);
     if (h->type == DMESH_SESSION_PING || h->type == DMESH_SESSION_WAKE_READY)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 && h->status == 0;
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)
@@ -153,9 +148,12 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
         return h->payload_len != 0 && h->status == 0;
     case DMESH_SESSION_READY:
     case DMESH_SESSION_CLOSE:
+    case DMESH_SESSION_PREPARE:
     case DMESH_SESSION_SPARE_READY:
         return h->payload_len == 0 && h->status == 0;
     case DMESH_SESSION_SHUTDOWN:
+    case DMESH_SESSION_SCALE:
+    case DMESH_SESSION_SCALE_ACK:
         return h->payload_len == 8 && h->status == 0;
     case DMESH_SESSION_CLOSED:
         return h->payload_len == 0;
