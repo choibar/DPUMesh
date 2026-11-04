@@ -23,7 +23,7 @@ DOCA_LOG_REGISTER(DPA);
 
 _Static_assert(DMESH_DPA_MAX_INFLIGHT <= CC_DPA_MAX_MSG_NUM,
                "DPA inflight window must fit the producer SQ and CQ");
-_Static_assert(sizeof(struct dpa_thread_ctx) == 96, "native DPA TLS layout");
+_Static_assert(sizeof(struct dpa_thread_ctx) == 112, "native DPA TLS layout");
 _Static_assert(offsetof(struct dpa_bench_state, dma) == 0, "shared cleanup prefix");
 
 /* Kernel function declaration */
@@ -191,6 +191,14 @@ static doca_error_t release_dpa_objects(struct objects *objs)
     for (int i = 0; i < DPA_THREAD_POOL_SIZE; ++i)
         if (pool->owner[i]) return DOCA_ERROR_IN_USE;
     for (int i = 0; i < DPA_THREAD_POOL_SIZE; ++i) {
+        if (pool->threads[i].kept_dma != NULL && pool->release_kept_dma != NULL) {
+            result = pool->release_kept_dma(objs, pool->threads[i].kept_dma);
+            if (result != DOCA_SUCCESS) return result;
+            pool->threads[i].kept_dma = NULL;
+        }
+        result = dmesh_dpa_comch_destroy_checked(&pool->threads[i], &pool->threads[i].kept_comch,
+                                                 objs->consumer_pe);
+        if (result != DOCA_SUCCESS) return result;
         result = dmesh_doca_dpa_thread_destroy_checked(&pool->threads[i]);
         if (result != DOCA_SUCCESS) return result;
     }
@@ -1185,11 +1193,20 @@ dmesh_fill_dpa_thread_ctx(struct dmesh_conn *conn, struct dpa_thread_ctx *arg,
 
     result = DMESH_DPA_CALL(doca_comch_producer_get_dpa_handle(comch->recv.producer, &dpa_producer));
     if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to get producer DPA handle: %s",   
+        DOCA_LOG_ERR("Failed to get producer DPA handle: %s",
                 doca_error_get_name(result));
         return result;
     }
-    
+
+    doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
+    result = DMESH_DPA_CALL(doca_comch_consumer_completion_get_dpa_handle(comch->consumer_comp,
+                                                                          &dpa_consumer_comp));
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get consumer completion DPA handle: %s",
+                doca_error_get_name(result));
+        return result;
+    }
+
 #ifdef DOCA_ARCH_DPU
     result = DMESH_DPA_CALL(doca_buf_arr_get_dpa_handle(conn->buf_arr, &dpa_buf_arr));
     if (result != DOCA_SUCCESS) {
@@ -1227,6 +1244,9 @@ dmesh_fill_dpa_thread_ctx(struct dmesh_conn *conn, struct dpa_thread_ctx *arg,
         .pos = 0,
         .rx_consumed_pos = 0,
 #endif
+        .pooled = dmesh_dpa_reuse_enabled(),
+        .dpa_consumer_comp = dpa_consumer_comp,
+        .dpa_consumer = dpa_consumer,
     };
 
 
@@ -1289,23 +1309,31 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
         state_size = sizeof(storage);
     }
 
-    uint64_t rpc_ret;
-    uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
-    result = DMESH_DPA_CALL(doca_dpa_rpc(dpa_thread->dpa,
-                        thread_init_rpc,
-                        &rpc_ret,
-                        consumer,
-                        num_msg,
-                        (uint64_t)0));
-    if (result != DOCA_SUCCESS) {
-        DOCA_LOG_ERR("Failed to issue init thread RPC - %s",
-            doca_error_get_name(result));
-        return result;
-    }
+    /* An adopted consumer keeps its receive credits: the kernel returns one
+     * for every request it reads. */
+    bool reused = dpa_thread->reused;
+    if (reused) {
+        DOCA_LOG_INFO("Reusing DPA thread comch for connection %p", (void *)conn);
+        dpa_thread->reused = false;
+    } else {
+        uint64_t rpc_ret;
+        uint32_t num_msg = CC_DPA_MAX_MSG_NUM;
+        result = DMESH_DPA_CALL(doca_dpa_rpc(dpa_thread->dpa,
+                            thread_init_rpc,
+                            &rpc_ret,
+                            consumer,
+                            num_msg,
+                            (uint64_t)0));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to issue init thread RPC - %s",
+                doca_error_get_name(result));
+            return result;
+        }
 
-    if (rpc_ret != 0) {
-        DOCA_LOG_ERR("Failed to init thread RPC");
-        return DOCA_ERROR_IO_FAILED;
+        if (rpc_ret != 0) {
+            DOCA_LOG_ERR("Failed to init thread RPC");
+            return DOCA_ERROR_IO_FAILED;
+        }
     }
 
     result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(dpa_thread->dpa, dpa_thread->local_storage,
@@ -1318,12 +1346,16 @@ dmesh_doca_run_dpa_thread(struct dmesh_conn *conn)
 
     dpa_thread->running = true;
     dpa_thread_run_reset(dpa_thread);
+    /* A pooled kernel rescheduled at its last stop and is still runnable:
+     * this flow's first request activates it. */
+    if (reused)
+        return DOCA_SUCCESS;
     result = DMESH_DPA_CALL(doca_dpa_thread_run(dpa_thread->thread));
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to run DPA thread - %s",
 			     doca_error_get_name(result));
 		return result;
-	}             
+	}
 
     return DOCA_SUCCESS;
 }
@@ -1469,6 +1501,114 @@ doca_error_t dmesh_doca_dpa_comch_create(struct dmesh_conn *conn)
     }
     return result;
 }
+
+bool dmesh_dpa_reuse_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DMESH_DPA_REUSE");
+        on = v != NULL && v[0] == '1';
+    }
+    return on;
+}
+
+int dmesh_dpa_prewarm_count(void)
+{
+    if (!dmesh_dpa_reuse_enabled()) return 0;
+    const char *v = getenv("DMESH_DPA_PREWARM");
+    int n = v != NULL ? atoi(v) : 8;
+    return n < 0 ? 0 : n > DPA_THREAD_POOL_SIZE ? DPA_THREAD_POOL_SIZE : n;
+}
+
+doca_error_t dmesh_dpa_thread_prewarm(struct dmesh_doca_dpa_thread *thread,
+                                      struct doca_dev *dev, struct doca_pe *pe)
+{
+    struct dmesh_doca_dpa_comch *comch = NULL;
+    doca_dpa_dev_comch_consumer_t consumer;
+    doca_dpa_dev_comch_consumer_completion_t consumer_comp;
+    doca_error_t result;
+    uint64_t rpc_ret;
+
+    if (thread == NULL || !thread->started || thread->bench_mode || thread->running)
+        return DOCA_ERROR_BAD_STATE;
+    if (thread->kept_comch != NULL)
+        return DOCA_SUCCESS;
+    result = dmesh_dpa_comch_create(thread, &comch);
+    if (result == DOCA_SUCCESS)
+        result = dmesh_dpa_comch_init_msgqs(dev, pe, thread, comch);
+    if (result == DOCA_SUCCESS)
+        result = DMESH_DPA_CALL(doca_comch_consumer_get_dpa_handle(comch->send.consumer, &consumer));
+    if (result == DOCA_SUCCESS)
+        result = DMESH_DPA_CALL(doca_comch_consumer_completion_get_dpa_handle(comch->consumer_comp,
+                                                                              &consumer_comp));
+    if (result == DOCA_SUCCESS) {
+        result = DMESH_DPA_CALL(doca_dpa_rpc(thread->dpa, thread_init_rpc, &rpc_ret, consumer,
+                                             (uint32_t)CC_DPA_MAX_MSG_NUM, (uint64_t)0));
+        if (result == DOCA_SUCCESS && rpc_ret != 0)
+            result = DOCA_ERROR_IO_FAILED;
+    }
+    if (result == DOCA_SUCCESS) {
+        /* The TLS allocation is uninitialized: an activation before the
+         * first flow finds a stopped, pooled run and only re-arms. */
+        struct dpa_thread_ctx idle = {
+            .stopped = 1, .pooled = 1,
+            .dpa_consumer_comp = consumer_comp, .dpa_consumer = consumer,
+        };
+        result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(thread->dpa, thread->local_storage,
+                                                    &idle, sizeof(idle)));
+    }
+    if (result == DOCA_SUCCESS)
+        result = DMESH_DPA_CALL(doca_dpa_thread_run(thread->thread));
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to prewarm DPA pool thread: %s", doca_error_get_name(result));
+        if (comch != NULL)
+            (void)dmesh_dpa_comch_destroy_checked(thread, &comch, pe);
+        return result;
+    }
+    /* Runnable and idle: the stop fence of a run that submitted nothing. */
+    thread->running = true;
+    thread->quiesced = true;
+    thread->kept_comch = comch;
+    return DOCA_SUCCESS;
+}
+
+bool dmesh_doca_dpa_comch_adopt(struct dmesh_conn *conn)
+{
+    struct dmesh_doca_dpa_thread *thread = conn->dpa_thread;
+    struct dmesh_doca_dpa_comch *comch = thread ? thread->kept_comch : NULL;
+    if (comch == NULL || conn->dpa_comch != NULL)
+        return false;
+    thread->kept_comch = NULL;
+    thread->reused = true;
+    comch->dma_completed = 0;
+    comch->completion_error = false;
+    comch->owner = conn;
+    comch->received = conn_received;
+    comch->sent = conn_sent;
+    conn->dpa_comch = comch;
+    return true;
+}
+
+bool dmesh_doca_dpa_comch_keep(struct dmesh_conn *conn)
+{
+    struct dmesh_doca_dpa_thread *thread = conn->dpa_thread;
+    struct dmesh_doca_dpa_comch *comch = conn->dpa_comch;
+    if (!dmesh_dpa_reuse_enabled() || thread == NULL || comch == NULL ||
+        thread->kept_comch != NULL || !thread->started || !thread->quiesced ||
+        thread->bench_mode || comch->completion_error || comch->stopping ||
+        dmesh_doca_dpa_failed(thread->dpa))
+        return false;
+    /* The kernel finished after its stop; until the next run nothing
+     * activates it, and the Arm receive tasks stay posted, unowned. */
+    comch->owner = NULL;
+    comch->received = NULL;
+    comch->sent = NULL;
+    thread->kept_comch = comch;
+    thread->reused = false;
+    conn->dpa_comch = NULL;
+    return true;
+}
+
 doca_error_t dmesh_doca_dpa_quiesce_checked(struct dmesh_conn *conn)
 {
     return conn ? dmesh_dpa_quiesce_checked(conn->dpa_thread, conn->dpa_comch,

@@ -63,6 +63,15 @@ int channel_session_close(struct channel_dev *dev);
  * outside control callbacks; completion retains errors until Comch accepts. */
 int channel_session_listen(struct channel_dev *, uint32_t ip, uint16_t port);
 int channel_backend_next(struct channel_dev *, uint32_t *worker, uint32_t *token);
+/* Migration spares: take one PREPARE (destination ip/port, network order ip),
+ * and report that a spare flow has its server's first bytes. */
+int channel_prepare_next(struct channel_dev *, uint32_t *ip, uint16_t *port);
+int channel_conn_spare_ready(struct channel_conn *);
+/* Flow scaling: take one SCALE (destination ip/port, network order ip; the
+ * stream count each client keeps; the token to answer), and answer it. */
+int channel_scale_next(struct channel_dev *, uint32_t *ip, uint16_t *port,
+                       uint32_t *count, uint32_t *token);
+int channel_scale_ack(struct channel_dev *, uint32_t token, uint32_t applied);
 void channel_backend_finish(struct channel_dev *, uint32_t worker, uint32_t token, int error);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);
@@ -86,9 +95,23 @@ void channel_mem_free(struct channel_mem *mem);
 
 /* Connection: tagged OPEN/READY on the shared session, private DMA rings. */
 int channel_conn_open(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out);
+/* The same open in two steps, for a caller that must not wait: start sends
+ * OPEN and returns the handle; finish reports READY (0), still outstanding
+ * (1), or -1 with errno (refused, lost session, or no READY within
+ * CHANNEL_REV_READY_MS), after which the handle is closed like an open one.
+ * Neither progresses the session. Not on the host-dpa path (ENOTSUP). */
+int channel_conn_open_start(struct channel_dev *dev, const struct channel_conn_config *cfg, struct channel_conn **out);
+int channel_conn_open_finish(struct channel_conn *conn);
 /* Quiesce reverse DMA, wait for CLOSED, then release the private ring.
  * Failure leaves the handle and exported memory live for safe retry. */
 int channel_conn_close(struct channel_conn *conn);
+/* The same close in two steps, for a caller that must not wait: start sends
+ * CLOSE; finish releases the ring once CLOSED arrived (0), reports 1 while it
+ * is outstanding, or -1 with errno (CLOSED with an error, a lost session, or
+ * no CLOSED in time), leaving the handle live for channel_conn_close. Neither
+ * progresses the session; CLOSED lands through channel_dev_progress. */
+int channel_conn_close_start(struct channel_conn *conn);
+int channel_conn_close_finish(struct channel_conn *conn);
 /* Whether flow_id can open. An open that failed after OPEN was sent, and whose
  * close the DPU did not confirm, holds the id and its receive window; this
  * releases them once the DPU's CLOSED has arrived. */

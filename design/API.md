@@ -1,6 +1,6 @@
 # Native API
 
-`include/dpumesh/dmesh.h` declares fourteen calls with ABI major 6. They
+`include/dpumesh/dmesh.h` declares seventeen calls with ABI major 6. They
 describe reliable full-duplex byte streams as sockets: a channel per process,
 which is also its listening socket, and queue pairs (QPs), each with its own
 readiness fd, over registered buffers. They expose no remote-memory
@@ -22,10 +22,11 @@ belongs to the application.
 
 | Surface | Calls |
 |---|---|
-| Channel | `dmesh_create_channel`, `dmesh_destroy_channel`, `dmesh_post_max`, `dmesh_channel_fd`, `dmesh_accept` |
+| Channel | `dmesh_create_channel`, `dmesh_destroy_channel`, `dmesh_post_max`, `dmesh_channel_fd`, `dmesh_accept`, `dmesh_poll_channel` |
 | QP | `dmesh_create_qp`, `dmesh_qp_fd`, `dmesh_destroy_qp`, `dmesh_abort_qp` |
 | TX | `dmesh_alloc`, `dmesh_post_send`, `dmesh_flush` |
 | Events | `dmesh_poll_qp`, `dmesh_release_rx_buffer` |
+| DPU requests | `dmesh_spare_ready`, `dmesh_scale_ack` |
 
 ## Naming
 
@@ -82,6 +83,11 @@ libuv).
   control messages, keepalive and loss, the flows no QP owns, and inbound
   streams. `dmesh_accept` does that work and returns the next inbound stream,
   until `EAGAIN`, which arms the fd. Every process polls it, a client too.
+  `dmesh_poll_channel` then returns the requests that pass took from the
+  DPU, until 0: a migration `PREPARE` (open a spare stream to the target in
+  `buf`, then `dmesh_spare_ready` once its server's first bytes are in) and a
+  flow-scaling `SCALE` (keep `count` streams to the target, then
+  `dmesh_scale_ack`).
 - A QP's fd is readable when that QP has events. `dmesh_poll_qp` until it
   returns 0 settles the fd and arms the QP's doorbell.
 

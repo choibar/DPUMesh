@@ -48,6 +48,8 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection.
  * This is the per-worker-thread limit; total = num_threads x this. */
 #define DMESH_MAX_CONNECTIONS 64
+/* Per-flow statistics the proxy exports (struct dmesh_conn.flow_stats). */
+#define DMESH_FLOW_STATS 5
 #define DMESH_MAX_SESSIONS 64
 /* Host flow slots per session that may each bring a flow wake consumer. */
 #define DMESH_SESSION_FLOW_CONSUMERS 32
@@ -152,7 +154,16 @@ struct dmesh_conn {
     struct dmesh_session *session;
     uint32_t flow_id, generation;
     bool multiplexed, ready_sent, error_sent, close_requested, quarantined;
+    /* Dispatcher asked the proxy to drain this flow (GOAWAY) so the host
+     * reconnects on another worker; taken once by the proxy driver. */
+    bool migrate_requested;
     bool readers_detached; /* proxy acknowledged local staging pointer retirement */
+    /* Flow statistics the proxy copies in (dmesh_dispatch_worker_flow_stats)
+     * and the dispatcher samples: cumulative requests, CPU ns, residence ns,
+     * backend ns and retired instructions (0 unless the proxy counts them) of
+     * the client connection on this slot. Accessed with __atomic builtins;
+     * OPEN clears them with the slot. */
+    uint64_t flow_stats[DMESH_FLOW_STATS];
     int32_t error_status;
     struct dmesh_export_metadata_msg *pending_metadata;
 
@@ -269,6 +280,7 @@ struct objects {
     struct dmesh_worker_mailbox *mailbox;
     struct dmesh_comch_client legacy_client; /* compatibility adapter, not used by native channels */
     int worker_idx;                 /* index of the owning worker thread */
+    bool migrate_pending;           /* some conn has migrate_requested set */
     struct doca_dev *dev;
     struct doca_dev_rep *rep_dev;
     struct doca_pe *pe;

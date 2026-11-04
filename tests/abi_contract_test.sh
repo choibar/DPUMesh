@@ -32,7 +32,8 @@ symbols=$(nm -D --defined-only "$lib" | awk '{ print $3 }')
 for symbol in \
     dmesh_create_channel dmesh_destroy_channel dmesh_post_max dmesh_channel_fd \
     dmesh_accept dmesh_create_qp dmesh_qp_fd dmesh_destroy_qp dmesh_abort_qp \
-    dmesh_alloc dmesh_post_send dmesh_flush dmesh_poll_qp dmesh_release_rx_buffer
+    dmesh_alloc dmesh_post_send dmesh_flush dmesh_poll_qp dmesh_release_rx_buffer \
+    dmesh_poll_channel dmesh_spare_ready dmesh_scale_ack
 do
     if ! printf '%s\n' "$symbols" | grep -Fqx "$symbol"; then
         fail "missing public symbol: $symbol"

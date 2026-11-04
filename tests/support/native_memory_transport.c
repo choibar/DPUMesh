@@ -228,3 +228,15 @@ int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int se
     return 0;
 }
 int dmesh_native_disconnect(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return 0; }
+/* No DPU here: never a migration PREPARE or a SCALE. */
+int dmesh_native_prepare_next(struct dmesh_native_transport *t, uint32_t *ip, uint16_t *port) {
+    (void)t; (void)ip; (void)port; return 0;
+}
+int dmesh_native_spare_ready(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return 0; }
+int dmesh_native_scale_next(struct dmesh_native_transport *t, uint32_t *ip, uint16_t *port,
+                            uint32_t *count, uint32_t *token) {
+    (void)t; (void)ip; (void)port; (void)count; (void)token; return 0;
+}
+int dmesh_native_scale_ack(struct dmesh_native_transport *t, uint32_t token, uint32_t applied) {
+    (void)t; (void)token; (void)applied; return 0;
+}

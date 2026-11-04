@@ -61,6 +61,8 @@ const (
 	evFin
 	evTxReady
 	evTxError
+	evPrepare
+	evScale
 )
 
 // qpID is a native QP handle, used as an opaque key.
@@ -70,11 +72,16 @@ type nativeEvent struct {
 	kind  eventKind
 	buf   []byte // evRecv: native memory, valid until release(token)
 	token int32  // receive lease; -1 when the event holds none
+
+	target     string // evPrepare, evScale: "ip:port"
+	count      int    // evScale: streams each client keeps to target
+	scaleToken uint32 // evScale: answered by scaleAck
 }
 
 // native is the libdpumesh surface. A QP has one poller at a time: pollWait
 // and destroy run on whichever goroutine currently owns it. The channel
-// goroutine alone calls accept and waitChannel. send is serialized per QP;
+// goroutine alone calls accept, pollChannel and waitChannel. send is
+// serialized per QP;
 // the others may run on any goroutine.
 type native interface {
 	postMax() int
@@ -91,6 +98,9 @@ type native interface {
 	// stream, whose first bytes its own poll returns. syscall.EAGAIN when
 	// none waits.
 	accept() (qp qpID, remotePort int, err error)
+	// pollChannel returns the DPU's requests (evPrepare, evScale) the last
+	// accept took, or 0.
+	pollChannel(events []nativeEvent) (int, error)
 	// waitChannel returns once the channel has work for accept, or after
 	// wakeChannel.
 	waitChannel() error
@@ -99,11 +109,15 @@ type native interface {
 	release(token int32)
 	destroy(qp qpID, abort bool) error // consumes qp and its fd even on error
 	close() error                      // retryable
+	spareReady(qp qpID) error          // migration: qp is a ready spare
+	scaleAck(token uint32, applied int) error
 }
 
 const (
 	// Events one connection's poll returns.
 	connBatch = 16
+	// Requests one channel poll returns: a PREPARE and a SCALE.
+	requestBatch = 2
 	// Inbound streams held for a listener that has not been created yet.
 	maxPrelisten = 64
 )
@@ -120,15 +134,17 @@ type transport struct {
 	// Once a listener has existed, a stream with none is refused.
 	prelisten []*Conn
 	listened  bool
-	dials     int           // native dials in flight
-	err       error         // sticky: transport failure or closed
-	failed    chan struct{} // closed when err is first set
+	dials     int               // native dials in flight
+	spares    map[string]*spare // migration spares by "ip:port"
+	err       error             // sticky: transport failure or closed
+	failed    chan struct{}     // closed when err is first set
 
 	// The channel goroutine. QPs never do the channel's work, so it polls
 	// the channel for the transport's whole life: control messages, the
 	// session's liveness and, serving, inbound streams.
 	stop     chan struct{} // closed to stop the channel goroutine
 	stopOnce sync.Once
+	requests []nativeEvent // the channel goroutine's
 	done     chan struct{} // closed when the channel goroutine exits (at once without one)
 }
 
@@ -139,6 +155,7 @@ var process struct {
 
 func newTransport(n native) *transport {
 	t := &transport{n: n, postMax: n.postMax(), serves: n.serves(), conns: make(map[qpID]*Conn),
+		spares: make(map[string]*spare), requests: make([]nativeEvent, requestBatch),
 		failed: make(chan struct{}), stop: make(chan struct{}), done: make(chan struct{})}
 	if t.postMax <= 0 {
 		t.failLocked(fmt.Errorf("dmesh: native post size %d", t.postMax))
@@ -218,12 +235,33 @@ func (t *transport) channelLoop() {
 			continue
 		}
 		if errors.Is(err, syscall.EAGAIN) {
-			err = t.n.waitChannel()
+			if err = t.serveRequests(); err == nil {
+				err = t.n.waitChannel()
+			}
 		}
 		if err != nil {
 			t.fail(fmt.Errorf("dmesh: accept: %w", err))
 			<-t.stop
 			return
+		}
+	}
+}
+
+// serveRequests starts each DPU request the last accept took on a goroutine
+// of its own: a spare or a SCALE opens streams, which waits for the DPU.
+func (t *transport) serveRequests() error {
+	for {
+		n, err := t.n.pollChannel(t.requests)
+		if err != nil || n == 0 {
+			return err
+		}
+		for _, ev := range t.requests[:n] {
+			switch ev.kind {
+			case evPrepare:
+				go t.prepareSpare(ev.target)
+			case evScale:
+				go t.scale(ev.target, ev.count, ev.scaleToken)
+			}
 		}
 	}
 }
@@ -389,15 +427,21 @@ func CloseTransport() error {
 
 // close stops the channel goroutine of an idle transport, then closes the native. A
 // failed native close keeps the transport closed to new work and retryable.
-// Inbound streams no listener ever took belong to the transport and are
-// aborted here.
+// Inbound streams no listener ever took, and migration spares no dial took,
+// belong to the transport and are closed here.
 func (t *transport) close() error {
 	t.mu.Lock()
 	unclaimed := t.prelisten
 	t.prelisten = nil
+	spares := t.spares
+	t.spares = make(map[string]*spare)
 	t.mu.Unlock()
 	for _, c := range unclaimed {
 		_ = c.shutdown(true)
+	}
+	for _, s := range spares {
+		s.expiry.Stop()
+		_ = s.conn.Close()
 	}
 	t.mu.Lock()
 	if len(t.conns) != 0 || t.listener != nil || t.dials != 0 {
@@ -814,7 +858,11 @@ func dialContext(ctx context.Context, server, srcIP string, dstIP string, dstPor
 	// caller label only and never overrides the QP allocator.
 	local := &net.TCPAddr{IP: net.ParseIP(envOr("DPUMESH_POD_IP", srcIP))}
 	remote := &net.TCPAddr{IP: net.ParseIP(dstIP), Port: dstPort}
-	c, err := t.dial(ctx, net.JoinHostPort(dstIP, strconv.Itoa(dstPort)), local, remote)
+	target := net.JoinHostPort(dstIP, strconv.Itoa(dstPort))
+	if c := t.takeSpare(target); c != nil {
+		return c, nil
+	}
+	c, err := t.dial(ctx, target, local, remote)
 	if err != nil {
 		return nil, err
 	}

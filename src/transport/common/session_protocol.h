@@ -4,14 +4,15 @@
 /* Host/DPU control protocol. The public native ABI and DMA descriptor format
  * are independent of this version. Integers in the envelope are little endian;
  * v2 adds listener registration and worker-pinned backend requests, v4 the
- * ARM/DOORBELL idle wake, v5 the PING keepalive, v6 the SHUTDOWN half close.
- * DMA metadata payloads retain the existing LP64 host/DPU layout. */
+ * ARM/DOORBELL idle wake, v5 the PING keepalive, v6 PREPARE/SPARE_READY, v7
+ * SCALE/SCALE_ACK, v8 WAKE_READY and the SHUTDOWN half close. DMA metadata
+ * payloads retain the existing LP64 host/DPU layout. */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #define DMESH_SESSION_MAGIC UINT32_C(0x444d5348)
-#define DMESH_SESSION_VERSION 6u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING + SHUTDOWN */
+#define DMESH_SESSION_VERSION 8u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING + spare + scale + wake + SHUTDOWN */
 #define DMESH_SESSION_HEADER_SIZE 24u
 #define DMESH_SESSION_MAX_PAYLOAD 2048u
 #define DMESH_SESSION_MAX_FRAME (DMESH_SESSION_HEADER_SIZE + DMESH_SESSION_MAX_PAYLOAD)
@@ -42,18 +43,32 @@ enum dmesh_session_message_type {
      * DPU proxy fails the send, and only a send notices one: the Comch
      * client gets no event when its server process exits. */
     DMESH_SESSION_PING = 16,
+    /* Migration with a spare connection. PREPARE (DPU -> host; flow 0,
+     * generation = token, payload u32 dst_ip, u32 dst_port): open a spare
+     * stream to that destination now; the dispatcher steers its OPEN to the
+     * target worker. SPARE_READY (host -> DPU, on the spare flow): the spare
+     * has its server's first bytes; drain the flow it replaces. */
+    DMESH_SESSION_PREPARE = 17,
+    DMESH_SESSION_SPARE_READY = 18,
+    /* Flow scaling. SCALE (DPU -> host; flow 0, generation = token, payload
+     * u32 dst_ip, u32 dst_port, u32 count >= 1): each client of that
+     * destination should keep count streams to it. SCALE_ACK (host -> DPU;
+     * flow 0, generation = the token, payload u32 applied): how many clients
+     * of it took the count. */
+    DMESH_SESSION_SCALE = 19,
+    DMESH_SESSION_SCALE_ACK = 20,
     /* WAKE_READY (DPU -> host, session level): the host's Comch consumer is
      * known, so every push flow opened from now on publishes its descriptors
      * as fast-path messages to it (struct dmesh_wake_desc). Such a message
      * is a completion on the host, so an idle host needs no ARM. Sent only
      * to a host that created a consumer, so a host without one never sees
      * this type. */
-    DMESH_SESSION_WAKE_READY = 17,
+    DMESH_SESSION_WAKE_READY = 21,
     /* SHUTDOWN (host -> DPU, flow): the host closed its sending half. The
      * u64 payload counts the descriptors it posted on the flow's forward ring;
      * the proxy reads end of stream after all of them, and the flow stays
      * open until CLOSE. */
-    DMESH_SESSION_SHUTDOWN = 18,
+    DMESH_SESSION_SHUTDOWN = 22,
 };
 
 /* ARM payload: u64 epoch, u32 count, u32 zero, then count entries of
@@ -112,6 +127,11 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
                                      DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE &&
                (h->payload_len - DMESH_SESSION_ARM_HEADER_SIZE) % DMESH_SESSION_ARM_FLOW_SIZE == 0;
     }
+    if (h->type == DMESH_SESSION_PREPARE)
+        return h->flow_id == 0 && h->generation != 0 && h->payload_len == 8 && h->status == 0;
+    if (h->type == DMESH_SESSION_SCALE || h->type == DMESH_SESSION_SCALE_ACK)
+        return h->flow_id == 0 && h->generation != 0 && h->status == 0 &&
+               h->payload_len == (h->type == DMESH_SESSION_SCALE ? 12u : 4u);
     if (h->type == DMESH_SESSION_PING || h->type == DMESH_SESSION_WAKE_READY)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 && h->status == 0;
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)
@@ -133,6 +153,7 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
         return h->payload_len != 0 && h->status == 0;
     case DMESH_SESSION_READY:
     case DMESH_SESSION_CLOSE:
+    case DMESH_SESSION_SPARE_READY:
         return h->payload_len == 0 && h->status == 0;
     case DMESH_SESSION_SHUTDOWN:
         return h->payload_len == 8 && h->status == 0;

@@ -216,6 +216,10 @@ static inline void dpumesh_eq_awake(struct dmesh_eq *eq)
  * the process exits with DMESH_EXIT_LOST when the loss is first seen. */
 #define DMESH_EXIT_LOST 75   /* EX_TEMPFAIL */
 int  dpumesh_lost(dpumesh_ctx_t *ctx);
+/* Migration spares: report a client port's stream as a ready spare. Flow
+ * scaling: answer a SCALE (dmesh_poll_channel hands both requests out). */
+int  dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port);
+int  dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied);
 
 /* ====== Connection lifecycle — internal, shared by both surfaces ======
  *

@@ -19,6 +19,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
+#include <arpa/inet.h>
 #include <dpumesh/dmesh_topology.h>
 
 #define DOCA_LOG_ERR(...) do { fprintf(stderr, "dpumesh: "); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
@@ -271,6 +272,9 @@ struct dpumesh_ctx {
      * a one-shot timerfd for re-polls and the backstop. */
     int listen_epfd, listen_timer;
     uint32_t spare_rang;                /* unowned stripes acknowledged, not yet rearmed */
+    /* dmesh_poll_channel's PREPARE text and SCALE body, valid until its next call */
+    char prepare_target[24];
+    dmesh_scale_t scale;
     uint64_t listen_doorbells;          /* channel DOORBELLs its poller has reacted to */
     /* Every receive raises the wake fd by itself (dmesh_native_rx_signaled);
      * otherwise receives wake the channel after an ARM/DOORBELL round trip. */
@@ -420,6 +424,44 @@ static void transport_check(dpumesh_ctx_t *ctx)
 int dpumesh_lost(dpumesh_ctx_t *ctx)
 {
     return ctx ? atomic_load(&ctx->lost) : 0;
+}
+
+static int prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len)
+{
+    uint32_t ip; uint16_t port;
+    char host[INET_ADDRSTRLEN];
+    if (!ctx || !ctx->transport || !dmesh_native_prepare_next(ctx->transport, &ip, &port))
+        return 0;
+    if (!inet_ntop(AF_INET, &ip, host, sizeof(host))) return 0;
+    snprintf(target, len, "%s:%u", host, (unsigned)port);
+    return 1;
+}
+
+static int scale_next(dpumesh_ctx_t *ctx, dmesh_scale_t *out)
+{
+    uint32_t ip, count, token; uint16_t port;
+    char host[INET_ADDRSTRLEN];
+    if (!ctx || !ctx->transport ||
+        !dmesh_native_scale_next(ctx->transport, &ip, &port, &count, &token))
+        return 0;
+    if (!inet_ntop(AF_INET, &ip, host, sizeof(host))) return 0;
+    memset(out, 0, sizeof(*out));
+    out->token = token;
+    out->count = count;
+    snprintf(out->target, sizeof(out->target), "%s:%u", host, (unsigned)port);
+    return 1;
+}
+
+int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied)
+{
+    if (!ctx || !ctx->transport) { errno = EINVAL; return -1; }
+    return dmesh_native_scale_ack(ctx->transport, token, applied);
+}
+
+int dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port)
+{
+    if (!ctx || !ctx->transport) { errno = EINVAL; return -1; }
+    return dmesh_native_spare_ready(ctx->transport, port);
 }
 
 /* A failed flow's event is one-shot; tx_error itself remains sticky. */
@@ -2360,6 +2402,27 @@ dmesh_qp_t *dmesh_accept(dmesh_channel_t *ch) {
     int lost = dpumesh_lost(ctx);
     if (!c && errno == EAGAIN && lost) errno = lost;
     return c;
+}
+
+/* The control requests dmesh_accept's pass took from the session, at most one
+ * of each kind per call: their text lives in the channel until the next. */
+int dmesh_poll_channel(dmesh_channel_t *ch, dmesh_event_t *events, int max_events) {
+    if (!ch || !ch->ctx || !events || max_events <= 0) { errno = EINVAL; return -1; }
+    dpumesh_ctx_t *ctx = ch->ctx;
+    int n = 0;
+    if (prepare_next(ctx, ctx->prepare_target, sizeof(ctx->prepare_target))) {
+        events[n] = (dmesh_event_t){ .type = DMESH_EVENT_PREPARE, ._rx_token = -1,
+                                     .buf = (const uint8_t *)ctx->prepare_target,
+                                     .len = (uint32_t)strlen(ctx->prepare_target) };
+        n++;
+    }
+    if (n < max_events && scale_next(ctx, &ctx->scale)) {
+        events[n] = (dmesh_event_t){ .type = DMESH_EVENT_SCALE, ._rx_token = -1,
+                                     .buf = (const uint8_t *)&ctx->scale,
+                                     .len = (uint32_t)sizeof(ctx->scale) };
+        n++;
+    }
+    return n;
 }
 
 /* Integer entry point (internal, dmesh_core.h) for the shim and for the

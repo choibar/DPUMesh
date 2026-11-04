@@ -40,7 +40,9 @@ the proxy's reverse TX source is held until `completed_bytes` (host-DPA) or
 `pushed_bytes` (DPU-DMA) advances. The historical hardware report predates v3
 and does not validate this completion protocol on devices. v4 adds the
 ARM/DOORBELL idle wake on top of v3. v5 adds the PING an idle host sends, the only way it
-notices a DPU proxy that exited. v6 adds the SHUTDOWN half close.
+notices a DPU proxy that exited. v6 adds the migration spare (PREPARE/SPARE_READY), v7
+flow scaling (SCALE/SCALE_ACK), v8 the Comch fast-path WAKE_READY and the SHUTDOWN half
+close.
 
 `support/native_memory_transport.c` is a deterministic loopback carrier for the
 core: it implements the private carrier contract in memory, can hold custody

@@ -1082,18 +1082,26 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     result = dmesh_doca_dpa_quiesce_step(conn);
     if (result != DOCA_SUCCESS)
         return result;
-    result = cleanup_dma_tasks(conn);
-    if (result != DOCA_SUCCESS)
-        return result;
+    if (!dmesh_dma_engine_keep(conn)) {
+        result = cleanup_dma_tasks(conn);
+        if (result != DOCA_SUCCESS)
+            return result;
+    }
     /* The last flow of a session stops its producer before the flow retires:
      * the dispatcher may disconnect the session right after. */
     dmesh_wake_detach(conn);
-    result = dmesh_doca_dpa_comch_destroy_checked(conn);
-    if (result != DOCA_SUCCESS)
-        return result;
-    result = dmesh_doca_dpa_thread_destroy_checked(conn->dpa_thread);
-    if (result != DOCA_SUCCESS)
-        return result;
+    /* DMESH_DPA_REUSE=1: the pool slot keeps the comch and the started thread
+     * (a retried close finds them kept and skips both). */
+    if (!dmesh_doca_dpa_comch_keep(conn)) {
+        result = dmesh_doca_dpa_comch_destroy_checked(conn);
+        if (result != DOCA_SUCCESS)
+            return result;
+    }
+    if (conn->dpa_thread == NULL || conn->dpa_thread->kept_comch == NULL) {
+        result = dmesh_doca_dpa_thread_destroy_checked(conn->dpa_thread);
+        if (result != DOCA_SUCCESS)
+            return result;
+    }
     if (conn->buf_arr != NULL) {
         result = DMESH_DPA_CALL(doca_buf_arr_destroy(conn->buf_arr)); /* also stops the array */
         if (result != DOCA_SUCCESS)
@@ -1554,6 +1562,27 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 		}
 
 		/* DMA engines are per connection now (created in DMESH_CONN_NEW) */
+
+		/* DMESH_DPA_REUSE=1: prepare the first pool slots now, so the flows
+		 * that take them (including a migration or scale target) create no
+		 * DPA comch or DMA engine; creating them stalls every flow's DPA
+		 * messages. A failed slot is left to on-demand creation. */
+		int prewarm = dmesh_dpa_prewarm_count();
+		if (prewarm > 0) {
+			struct timespec t0, t1;
+			int ready = 0;
+			clock_gettime(CLOCK_MONOTONIC, &t0);
+			for (i = 0; i < prewarm && i < objs->dpa_pool->size; i++) {
+				struct dmesh_doca_dpa_thread *thread = &objs->dpa_pool->threads[i];
+				if (dmesh_dpa_thread_prewarm(thread, objs->dev, objs->consumer_pe) != DOCA_SUCCESS ||
+				    dmesh_dma_engine_prewarm(objs, thread) != DOCA_SUCCESS)
+					break;
+				ready++;
+			}
+			clock_gettime(CLOCK_MONOTONIC, &t1);
+			DOCA_LOG_INFO("Prewarmed %d/%d DPA pool slots in %ld ms", ready, prewarm,
+				      (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+		}
 
 		objs->phase = DMESH_DOCA_STATE_RUNNING;
 

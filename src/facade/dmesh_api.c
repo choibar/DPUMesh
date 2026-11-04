@@ -101,6 +101,16 @@ int dmesh_poll_qp(dmesh_qp_t *qp, dmesh_event_t *events, int max_events) {
     return 0;
 }
 
+int dmesh_spare_ready(dmesh_qp_t *c) {
+    if (!c || !c->ep || c->role != DMESH_ROLE_CLIENT) { errno = EINVAL; return -1; }
+    return dpumesh_spare_ready(c->ep->ctx, c->local_port);
+}
+
+int dmesh_scale_ack(dmesh_channel_t *s, uint32_t token, uint32_t applied) {
+    if (!s || !s->ctx) { errno = EINVAL; return -1; }
+    return dpumesh_scale_ack(s->ctx, token, applied);
+}
+
 void dmesh_release_rx_buffer(dmesh_channel_t *s, dmesh_event_t *event) {
     if (!s || !event || event->_rx_token < 0) return;
     dpumesh_rx_free(s->ctx, event->_rx_token);
