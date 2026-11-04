@@ -107,15 +107,22 @@ int main(void)
     flush_scales(&d);
     assert(n_sent == 3 && sent[2].flow == 2 && !e->pending);
 
+    /* Unacknowledged (its flow may have closed under it), it is sent again. */
+    flush_scales(&d);
+    assert(n_sent == 3);
+    e->sent_ms -= SCALE_RESEND_MS;
+    flush_scales(&d);
+    assert(n_sent == 4 && sent[3].flow == 2 && sent[3].token == sent[2].token);
+
     /* A spare migration: PREPARE goes on the flow it moves, with no payload. */
     d.migrate_period_ms = 1; d.migrate_spare = true; d.steer_ms = 1000;
     a3->ready_ms = 0;                        /* due; a1 is closing and a2 just became ready */
     a2->ready_ms = membership_now_ms();
     migrate_due(&d);
-    assert(n_sent == 4 && sent[3].type == DMESH_SESSION_PREPARE && sent[3].flow == 3 &&
-           sent[3].generation == 7 && sent[3].len == 0 && a3->awaiting_spare);
+    assert(n_sent == 5 && sent[4].type == DMESH_SESSION_PREPARE && sent[4].flow == 3 &&
+           sent[4].generation == 7 && sent[4].len == 0 && a3->awaiting_spare);
 
-    printf("dispatch requests: SCALE on its flow, then another to the destination, waits for one; "
-           "SCALE_ACK by token; PREPARE on the moved flow: PASS\n");
+    printf("dispatch requests: SCALE on its flow, then another to the destination, waits for one, "
+           "sent again until acknowledged; SCALE_ACK by token; PREPARE on the moved flow: PASS\n");
     return 0;
 }

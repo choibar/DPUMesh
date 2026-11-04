@@ -123,7 +123,7 @@ func (t *transport) prepareSpare(target string) {
 	t.spares[target] = s
 	t.mu.Unlock()
 	// Registered first: the GOAWAY this triggers makes gRPC redial at once.
-	if err := t.n.spareReady(c.qp); err != nil {
+	if err := c.answer(t.n.spareReady); err != nil {
 		log.Printf("DMESH_SPARE ready %s: %v", target, err)
 	}
 	log.Printf("DMESH_SPARE ready target=%s setup_us=%d unix_ns=%d", target,

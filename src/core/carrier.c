@@ -63,6 +63,8 @@ struct slot {
     int fin_pending, peer_gone_reported;
     int close_failed;                  /* CLOSING without CLOSED: quarantined, ring kept */
     uint32_t open_worker, open_token;  /* OPENING backend: the DPU request it answers */
+    uint32_t dst_ip;                   /* the flow's destination, network order */
+    uint16_t dst_port;
     uint16_t fin_seq, rx_seq;
     struct carrier_rx_window window;
 };
@@ -125,6 +127,7 @@ static int slot_open_mode(struct dmesh_native_transport *t, struct slot *s, uint
     s->t_head = s->t_tail = 0; s->fin_pending = 0; s->peer_gone_reported = 0; s->claimed = 0;
     s->fin_seq = 0; s->rx_seq = 0; s->close_failed = 0;
     s->open_worker = worker; s->open_token = token;
+    s->dst_ip = dst_ip; s->dst_port = dst_port;
     carrier_window_init(&s->window);
     /* Published last: a drainer that reads OPEN without the slot lock sees
      * the connection it describes. Dials can run beside another EQ's drain. */
@@ -301,8 +304,8 @@ int dmesh_native_take_request(struct dmesh_native_transport *t, uint16_t port, i
 {
     struct slot *s = client_slot(t, port);
     if (!s) return 0;
-    int k, found = channel_conn_take_request(s->conn, &k, count, token) &&
-                   dmesh_target_addr(s->service_id, ip, dst_port) == 0;
+    int k, found = channel_conn_take_request(s->conn, &k, count, token);
+    *ip = s->dst_ip; *dst_port = s->dst_port;
     pthread_mutex_unlock(&s->lock);
     if (found) *kind = k == CHANNEL_REQ_PREPARE ? DMESH_REQ_PREPARE : DMESH_REQ_SCALE;
     return found;

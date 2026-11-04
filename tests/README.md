@@ -23,7 +23,7 @@
 | `channel_flow_wake_test` | Flow wake consumers against a Comch connection with few internal tasks: started one at a time, stopped through the control PE, all or none |
 | `session_server_test` | Production DPU session progress: HELLO timeout, distinct OPEN metadata, stale requests, close failure/retry, reader detachment, no-teardown and quarantine |
 | `backend_dispatch_test` | Backend dispatch: lazy allocation, pinned owner, dedup, backpressure, stale fencing; a retired listener address stays DMA-known for `DMESH_LISTENER_GRACE_MS` only |
-| `dispatch_request_test` | DPU requests on their flow: PREPARE on the flow a migration moves, SCALE on the flow it was asked on, then another client flow to the destination, or waiting for one; SCALE_ACK matched by token |
+| `dispatch_request_test` | DPU requests on their flow: PREPARE on the flow a migration moves, SCALE on the flow it was asked on, then another client flow to the destination, or waiting for one, and sent again until acknowledged; SCALE_ACK matched by token |
 | `dispatch_wake_test` | Dispatcher idle wake: ARM reaches each listed flow's worker, one DOORBELL per ARM, immediate ring, stale epochs/generations ignored, full worker queue rings at once, malformed ARM fails the session |
 | `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression, TX completion cursors and descriptor-publication failure |
 | `dpa_cleanup_test` | DPA issued/completed close fence, kernel error retention, MsgQ/context/thread cleanup failures and retryable ownership |

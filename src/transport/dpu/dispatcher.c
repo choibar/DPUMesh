@@ -592,10 +592,17 @@ static struct assignment *scale_flow(struct dmesh_dispatcher *d, struct scale *e
     return NULL;
 }
 
+/* A SCALE unacknowledged this long is sent again: the flow it went on may
+ * have closed before its host took it. A host applies a count idempotently. */
+#define SCALE_RESEND_MS 1000
+
 static void flush_scales(struct dmesh_dispatcher *d)
 {
+    uint64_t now = membership_now_ms();
     for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
         struct scale *e = &d->scales[i];
+        if (e->session && !e->pending && !e->acked && e->sent_ms && now - e->sent_ms >= SCALE_RESEND_MS)
+            e->pending = true;
         if (!e->pending) continue;
         if (!e->session->occupied || e->session->closing || e->session->epoch != e->session_epoch) {
             e->pending = false;
@@ -609,7 +616,7 @@ static void flush_scales(struct dmesh_dispatcher *d)
         if (dmesh_session_send(e->control, e->session, DMESH_SESSION_SCALE, a->key.flow_id,
                                a->key.generation, payload, sizeof(payload), 0) != DOCA_SUCCESS) continue;
         e->pending = false;
-        e->sent_ms = membership_now_ms();
+        e->sent_ms = now;
         fprintf(stderr, "[dispatcher] scale session=%lu/%lu flow=%u/%u dst=%08x:%u count=%u token=%u unix_ns=%llu\n",
                 session_id(d, e->control, e->session), e->session_epoch, a->key.flow_id,
                 a->key.generation, e->dst_ip, e->dst_port, e->count, e->token,

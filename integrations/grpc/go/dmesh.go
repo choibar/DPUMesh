@@ -497,7 +497,7 @@ func (c *Conn) apply(ev *nativeEvent) {
 		// request runs on its own goroutine, since it opens streams.
 		go c.t.prepareSpare(ev.target)
 	case evScale:
-		go c.t.scale(c.qp, ev.target, ev.count, ev.scaleToken)
+		go c.t.scale(c, ev.target, ev.count, ev.scaleToken)
 	default:
 		if ev.token >= 0 {
 			c.t.n.release(ev.token)
@@ -761,6 +761,21 @@ func (c *Conn) shutdown(abort bool) error {
 		return nil
 	}
 	return c.closeErr
+}
+
+// answer sends one answer to the DPU (a ready spare, a SCALE_ACK) on the
+// QP's flow. It is a transmit of the QP: Close waits for it, and a closed
+// connection answers nothing.
+func (c *Conn) answer(send func(qpID) error) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return net.ErrClosed
+	}
+	return send(c.qp)
 }
 
 func (c *Conn) LocalAddr() net.Addr  { return c.local }

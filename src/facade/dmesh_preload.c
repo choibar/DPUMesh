@@ -498,6 +498,11 @@ static int dispatcher_drain_qp(pfd_t *e, pfd_t *self, int max_batches, int *fail
             case DMESH_EVENT_TX_ERROR:
                 pfd_tx_error(e);
                 break;
+            case DMESH_EVENT_PREPARE:
+            case DMESH_EVENT_SCALE:
+                /* A socket opens no streams of its own: without a spare the
+                 * DPU drains the stream, and a SCALE goes unapplied. */
+                break;
             default:
                 dmesh_release_rx_buffer(g_ch, &events[i]);
                 pthread_mutex_lock(&e->mu);
