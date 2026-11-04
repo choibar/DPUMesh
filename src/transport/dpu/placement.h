@@ -26,6 +26,14 @@ struct dmesh_worker_load {
      * busy minus flow CPU is work no flow is charged for, such as backend
      * connections and the DMA driver). */
     unsigned rps, flow_cpu_permille, busy_permille;
+    /* Sum over the worker's client flows of rps x instructions per request:
+     * the instructions per second its flows were measured to retire (0 when
+     * the proxy does not count instructions). */
+    uint64_t flow_instr_ps;
+    /* The same assumed for its client flows not yet measured (each at the
+     * mean measured flow), and what its thread retired in all
+     * (DMESH_WORKER_INSTR=1, else 0). */
+    uint64_t pending_instr_ps, worker_instr_ps;
 };
 struct dmesh_placement_policy {
     int (*select)(const struct dmesh_flow_spec *, const struct dmesh_worker_load *,
@@ -34,6 +42,7 @@ struct dmesh_placement_policy {
 };
 extern const struct dmesh_placement_policy dmesh_placement_least_flows;
 extern const struct dmesh_placement_policy dmesh_placement_round_robin;
+extern const struct dmesh_placement_policy dmesh_placement_least_instructions;
 extern const struct dmesh_placement_policy dmesh_placement_first_eligible; /* test only */
 
 #endif

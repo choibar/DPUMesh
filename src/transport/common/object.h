@@ -48,6 +48,8 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* Keep in sync with DPA_THREAD_POOL_SIZE (dpa.h): one DPA thread per connection.
  * This is the per-worker-thread limit; total = num_threads x this. */
 #define DMESH_MAX_CONNECTIONS 64
+/* Per-flow statistics the proxy exports (struct dmesh_conn.flow_stats). */
+#define DMESH_FLOW_STATS 5
 #define DMESH_MAX_SESSIONS 64
 
 /* A Comch peer is a channel, independently of its logical data flows. */
@@ -130,9 +132,10 @@ struct dmesh_conn {
     bool readers_detached; /* proxy acknowledged local staging pointer retirement */
     /* Flow statistics the proxy copies in (dmesh_dispatch_worker_flow_stats)
      * and the dispatcher samples: cumulative requests, CPU ns, residence ns,
-     * backend ns of the client connection on this slot. Accessed with
-     * __atomic builtins; OPEN clears them with the slot. */
-    uint64_t flow_stats[4];
+     * backend ns and retired instructions (0 unless the proxy counts them) of
+     * the client connection on this slot. Accessed with __atomic builtins;
+     * OPEN clears them with the slot. */
+    uint64_t flow_stats[DMESH_FLOW_STATS];
     int32_t error_status;
     struct dmesh_export_metadata_msg *pending_metadata;
 

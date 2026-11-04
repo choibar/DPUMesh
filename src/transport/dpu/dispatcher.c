@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/perf_event.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -41,6 +42,10 @@ struct dmesh_worker_mailbox {
     struct objects *objs;       /* the worker's objects: its slots' flow_stats */
     _Atomic int tid;            /* the worker thread, for its busy time */
     uint64_t busy_ticks;        /* its CPU ticks at the last flow-stat sample */
+    /* DMESH_WORKER_INSTR=1: a counter of the thread's retired instructions
+     * (instr_tid's), and its value at the last sample. */
+    int instr_fd, instr_tid;
+    uint64_t instr_prev;
 };
 struct assignment {
     bool used, opening, ready, close_pending, lost_pending;
@@ -58,8 +63,13 @@ struct assignment {
     uint64_t ready_ms;
     /* Flow statistics: the proxy's counters at the last sample, and the
      * rates over the last DMESH_FLOWSTAT_MS. */
-    uint64_t stat_ns, stat_prev[4];
+    uint64_t stat_ns, stat_prev[DMESH_FLOW_STATS];
     unsigned rps, cpu_permille, cpu_ns_per_req, residence_us, backend_us;
+    /* Retired instructions per request over the last period that had
+     * requests (kept through idle periods); 0 while the proxy counts none.
+     * stat_valid: rps and instr_per_req hold a measured period. */
+    unsigned instr_per_req;
+    bool stat_valid;
     /* Spare mode: the old flow waits (until spare_deadline_ms) for the spare
      * that replaces it; the spare remembers the flow it replaces. */
     bool awaiting_spare, replaces;
@@ -76,6 +86,7 @@ struct steer {
     bool replaces;              /* spare mode: the flow at `replaced` waits */
     size_t replaced;
     struct dmesh_flow_key replaced_key;
+    uint64_t instr_ps;          /* the migrating flow's measured cost */
 };
 /* Flow scaling: the stream count asked of one session's clients of a
  * destination. The entry stays after its ACK, so a count is asked once. */
@@ -117,7 +128,10 @@ struct dmesh_dispatcher {
      * statistics and each worker's busy time this often; DMESH_FLOWSTAT_LOG=1
      * also logs them. */
     uint64_t flowstat_ms, flowstat_next_ms, flowstat_ns;
-    bool flowstat_log;
+    bool flowstat_log, worker_instr;
+    /* Mean instructions per second of the client flows measured last period:
+     * the cost placement assumes for a flow not yet measured. */
+    uint64_t flow_instr_mean;
     int fd;
     pthread_t thread;
     _Atomic unsigned remaining;
@@ -438,6 +452,32 @@ static uint64_t pair_key(const struct dmesh_flow_id *flow)
     return h ? h : 1;
 }
 
+/* Fills loads[].pending_instr_ps: each client flow placed but not yet
+ * measured (opening, or ready less than two statistics periods) is assumed to
+ * cost the mean measured flow, and a migration steered to a worker but not yet
+ * reconnected costs what the migrating flow measured, so placements between
+ * two samples spread instead of all landing on the worker that looked least
+ * loaded. */
+static void pending_instr(struct dmesh_dispatcher *d)
+{
+    for (size_t w = 0; w < d->count; ++w) {
+        unsigned pending = 0;
+        for (size_t s = 0; s < DMESH_MAX_CONNECTIONS; ++s) {
+            const struct assignment *a = &d->flows[w * DMESH_MAX_CONNECTIONS + s];
+            if (a->used && !a->backend_token && !a->stat_valid &&
+                (a->mode == DMESH_FLOW_MODE_CLIENT || a->mode == DMESH_FLOW_MODE_INGRESS_PUSH))
+                ++pending;
+        }
+        d->loads[w].pending_instr_ps = pending * d->flow_instr_mean;
+    }
+    uint64_t now = membership_now_ms();
+    for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
+        const struct steer *st = &d->steers[i];
+        if (st->session && now < st->expires_ms && st->worker < d->count)
+            d->loads[st->worker].pending_instr_ps += st->instr_ps;
+    }
+}
+
 /* Fills loads[].pair_flows with the pair's client flows per worker, opening
  * ones included, and leaves eligible only the workers holding the fewest: a
  * pair never doubles up on a worker while another has room and none of it.
@@ -477,9 +517,6 @@ static bool take_steer(struct dmesh_dispatcher *d, struct dmesh_session *s,
     }
     return false;
 }
-/* Drain each client flow ready for migrate_period_ms; steer its reconnect to
- * the next eligible worker with a free slot. The old flow keeps its worker and
- * slot until the host closes it, so no live state ever changes owner. */
 static struct scale *find_scale(struct dmesh_dispatcher *d, const struct dmesh_session *s,
                                 uint32_t ip, uint16_t port)
 {
@@ -588,6 +625,34 @@ static uint64_t thread_ticks(int tid)
     return (uint64_t)utime + stime;
 }
 
+/* DMESH_WORKER_INSTR: the instructions per second worker w's thread retired
+ * over the last period, all of its work counted (flows, backend connections,
+ * the DMA driver), from a counter opened on the thread when its tid is known.
+ * The event matches the proxy's per-flow counter (INST_RETIRED, user and
+ * kernel), so the two compare. */
+static void worker_instr_sample(struct dmesh_dispatcher *d, size_t w, int tid, uint64_t period)
+{
+    struct dmesh_worker_mailbox *m = &d->workers[w];
+    d->loads[w].worker_instr_ps = 0;
+    if (tid != m->instr_tid) {
+        if (m->instr_fd >= 0) close(m->instr_fd);
+        m->instr_fd = -1;
+        m->instr_tid = tid;
+        if (!tid) return;
+        struct perf_event_attr attr = {.type = PERF_TYPE_RAW, .size = sizeof(attr),
+                                       .config = 0x08 /* INST_RETIRED */, .exclude_hv = 1};
+        m->instr_fd = (int)syscall(SYS_perf_event_open, &attr, tid, -1, -1, PERF_FLAG_FD_CLOEXEC);
+        if (m->instr_fd < 0)
+            fprintf(stderr, "[dispatcher] worker=%zu instruction counter: %s\n", w, strerror(errno));
+        m->instr_prev = 0;
+    }
+    uint64_t v;
+    if (m->instr_fd < 0 || read(m->instr_fd, &v, sizeof(v)) != (ssize_t)sizeof(v)) return;
+    if (period && m->instr_prev && v >= m->instr_prev)
+        d->loads[w].worker_instr_ps = (v - m->instr_prev) * 1000000000ull / period;
+    m->instr_prev = v;
+}
+
 /* Samples every ready client flow's statistics and each worker's busy time,
  * into the assignments and loads[] that placement sees. */
 static void flowstat_due(struct dmesh_dispatcher *d)
@@ -599,8 +664,10 @@ static void flowstat_due(struct dmesh_dispatcher *d)
     uint64_t now = monotonic_ns(), period = d->flowstat_ns ? now - d->flowstat_ns : 0;
     d->flowstat_ns = now;
     unsigned flows[d->count];
+    uint64_t instr_total = 0, measured = 0;
     for (size_t w = 0; w < d->count; ++w) {
         d->loads[w].rps = d->loads[w].flow_cpu_permille = 0;
+        d->loads[w].flow_instr_ps = 0;
         flows[w] = 0;
     }
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
@@ -610,8 +677,9 @@ static void flowstat_due(struct dmesh_dispatcher *d)
             continue;
         size_t w = a->location.worker;
         const struct dmesh_conn *c = &d->workers[w].objs->conns[a->location.slot];
-        uint64_t v[4];
-        for (int k = 0; k < 4; ++k) v[k] = __atomic_load_n(&c->flow_stats[k], __ATOMIC_RELAXED);
+        uint64_t v[DMESH_FLOW_STATS];
+        for (int k = 0; k < DMESH_FLOW_STATS; ++k)
+            v[k] = __atomic_load_n(&c->flow_stats[k], __ATOMIC_RELAXED);
         /* The first sample, or counters that restarted, only set a baseline. */
         bool baseline = !a->stat_ns || v[0] < a->stat_prev[0] || v[1] < a->stat_prev[1];
         uint64_t dt = now - a->stat_ns;
@@ -622,19 +690,25 @@ static void flowstat_due(struct dmesh_dispatcher *d)
             a->cpu_ns_per_req = req ? (unsigned)(cpu / req) : 0;
             a->residence_us = req ? (unsigned)((v[2] - a->stat_prev[2]) / req / 1000) : 0;
             a->backend_us = req ? (unsigned)((v[3] - a->stat_prev[3]) / req / 1000) : 0;
+            if (req) a->instr_per_req = (unsigned)((v[4] - a->stat_prev[4]) / req);
+            a->stat_valid = true;
             d->loads[w].rps += a->rps;
             d->loads[w].flow_cpu_permille += a->cpu_permille;
+            d->loads[w].flow_instr_ps += (uint64_t)a->rps * a->instr_per_req;
+            instr_total += (uint64_t)a->rps * a->instr_per_req;
+            ++measured;
             ++flows[w];
             if (d->flowstat_log)
-                fprintf(stderr, "[dispatcher] flowstat worker=%zu slot=%u flow=%u/%u session=%lu/%lu pair=%016llx rps=%u cpu_permille=%u cpu_ns_per_req=%u residence_us=%u backend_us=%u unix_ns=%llu\n",
+                fprintf(stderr, "[dispatcher] flowstat worker=%zu slot=%u flow=%u/%u session=%lu/%lu pair=%016llx rps=%u cpu_permille=%u cpu_ns_per_req=%u residence_us=%u backend_us=%u instr_per_req=%u unix_ns=%llu\n",
                         w, a->location.slot, a->key.flow_id, a->key.generation,
                         a->key.session_id, a->key.session_epoch, (unsigned long long)a->pair,
                         a->rps, a->cpu_permille, a->cpu_ns_per_req, a->residence_us,
-                        a->backend_us, (unsigned long long)realtime_ns());
+                        a->backend_us, a->instr_per_req, (unsigned long long)realtime_ns());
         }
         a->stat_ns = now;
         memcpy(a->stat_prev, v, sizeof(v));
     }
+    d->flow_instr_mean = measured ? instr_total / measured : 0;
     long hz = sysconf(_SC_CLK_TCK);
     for (size_t w = 0; w < d->count; ++w) {
         int tid = atomic_load(&d->workers[w].tid);
@@ -643,13 +717,53 @@ static void flowstat_due(struct dmesh_dispatcher *d)
             d->loads[w].busy_permille = (unsigned)((ticks - d->workers[w].busy_ticks) *
                 1000000000000ull / (uint64_t)hz / period);
         d->workers[w].busy_ticks = ticks;
+        if (d->worker_instr) worker_instr_sample(d, w, tid, period);
         if (d->flowstat_log && period)
-            fprintf(stderr, "[dispatcher] workerstat worker=%zu flows=%u rps=%u flow_cpu_permille=%u busy_permille=%u unix_ns=%llu\n",
+            fprintf(stderr, "[dispatcher] workerstat worker=%zu flows=%u rps=%u flow_cpu_permille=%u busy_permille=%u flow_instr_ps=%llu worker_instr_ps=%llu unix_ns=%llu\n",
                     w, flows[w], d->loads[w].rps, d->loads[w].flow_cpu_permille,
-                    d->loads[w].busy_permille, (unsigned long long)realtime_ns());
+                    d->loads[w].busy_permille, (unsigned long long)d->loads[w].flow_instr_ps,
+                    (unsigned long long)d->loads[w].worker_instr_ps,
+                    (unsigned long long)realtime_ns());
     }
 }
 
+/* Where migrating flow a goes: the placement policy's choice among the
+ * workers other than its own, under the same svc-to-svc pair rule an OPEN
+ * sees, with flows not yet measured and migrations not yet reconnected
+ * counted (pending_instr). -1 when no other worker can take it. */
+static int migration_target(struct dmesh_dispatcher *d, const struct assignment *a)
+{
+    size_t from = a->location.worker;
+    for (size_t w = 0; w < d->count; ++w)
+        d->loads[w].eligible = w != from && atomic_load(&d->workers[w].ready) &&
+                               !atomic_load(&d->workers[w].departed);
+    pending_instr(d);
+    pair_restrict(d, a->pair);
+    struct dmesh_flow_spec spec = {
+        .session_id = a->key.session_id, .session_epoch = a->key.session_epoch,
+        .flow_id = a->key.flow_id, .generation = a->key.generation, .mode = a->mode,
+        .service_ip = a->dst_ip, .service_port = a->dst_port,
+    };
+    int to = d->policy.select(&spec, d->loads, d->count, (from + 1) % d->count, d->policy.context);
+    if (d->flowstat_log) {
+        /* Each worker as eligible:measured+pending instructions per second. */
+        char loads[1024];
+        size_t n = 0;
+        for (size_t w = 0; w < d->count && n < sizeof(loads); ++w)
+            n += (size_t)snprintf(loads + n, sizeof(loads) - n, "%s%d:%llu+%llu", w ? "," : "",
+                                  d->loads[w].eligible, (unsigned long long)d->loads[w].flow_instr_ps,
+                                  (unsigned long long)d->loads[w].pending_instr_ps);
+        fprintf(stderr, "[dispatcher] migrate-target flow=%u/%u from=%zu to=%d loads=%s unix_ns=%llu\n",
+                a->key.flow_id, a->key.generation, from, to, loads, (unsigned long long)realtime_ns());
+    }
+    for (size_t w = 0; w < d->count; ++w)
+        d->loads[w].eligible = atomic_load(&d->workers[w].ready) && !atomic_load(&d->workers[w].departed);
+    return to >= 0 && (size_t)to != from ? to : -1;
+}
+
+/* Drain each client flow ready for migrate_period_ms; steer its reconnect to
+ * migration_target(). The old flow keeps its worker and slot until the host
+ * closes it, so no live state ever changes owner. */
 static void migrate_due(struct dmesh_dispatcher *d)
 {
     if (!d->migrate_period_ms || d->count < 2) return;
@@ -672,21 +786,19 @@ static void migrate_due(struct dmesh_dispatcher *d)
             (a->mode != DMESH_FLOW_MODE_CLIENT && a->mode != DMESH_FLOW_MODE_INGRESS_PUSH) ||
             now - a->ready_ms < d->migrate_period_ms)
             continue;
-        size_t from = a->location.worker, to = from;
-        for (size_t k = 1; k < d->count; ++k) {
-            size_t w = (from + k) % d->count;
-            if (atomic_load(&d->workers[w].ready) && !atomic_load(&d->workers[w].departed) &&
-                d->loads[w].assigned < DMESH_MAX_CONNECTIONS) { to = w; break; }
-        }
-        if (to == from) continue;
+        size_t from = a->location.worker;
         struct steer *st = NULL;
         for (unsigned j = 0; j < DMESH_MAX_CONNECTIONS && !st; ++j)
             if (!d->steers[j].session || now >= d->steers[j].expires_ms) st = &d->steers[j];
         if (!st) continue;
+        int target = migration_target(d, a);
+        if (target < 0) continue;
+        size_t to = (size_t)target;
+        uint64_t cost = a->stat_valid ? (uint64_t)a->rps * a->instr_per_req : d->flow_instr_mean;
         *st = (struct steer){.session = a->session, .session_epoch = a->session->epoch,
             .expires_ms = now + d->steer_ms, .dst_ip = a->dst_ip, .dst_port = a->dst_port,
             .worker = (uint32_t)to, .replaces = d->migrate_spare, .replaced = i,
-            .replaced_key = a->key};
+            .replaced_key = a->key, .instr_ps = cost};
         a->draining = true;
         if (d->migrate_spare) {
             uint8_t target[8];
@@ -836,6 +948,7 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     uint64_t pair = backend ? 0 : pair_key(&metadata.flow);
     for (size_t i = 0; i < d->count; ++i)
         d->loads[i].eligible = atomic_load(&d->workers[i].ready) && !atomic_load(&d->workers[i].departed);
+    if (!backend) pending_instr(d);
     unsigned pair_fewest = backend ? 0 : pair_restrict(d, pair);
     int owner = backend ? (int)requested_worker :
         d->policy.select(&spec, d->loads, d->count, d->cursor, d->policy.context);
@@ -1050,10 +1163,10 @@ void dmesh_dispatch_worker_drain(struct objects *o)
         }
     }
 }
-void dmesh_dispatch_worker_flow_stats(struct objects *o, int slot, const uint64_t counters[4])
+void dmesh_dispatch_worker_flow_stats(struct objects *o, int slot, const uint64_t *counters)
 {
     if (!o || slot < 0 || slot >= DMESH_MAX_CONNECTIONS) return;
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < DMESH_FLOW_STATS; ++i)
         __atomic_store_n(&o->conns[slot].flow_stats[i], counters[i], __ATOMIC_RELAXED);
 }
 
@@ -1182,6 +1295,7 @@ static void *dispatch_main(void *arg)
     free(fds);
     for (size_t i = 0; i < d->count; ++i) {
         close(d->workers[i].fd);
+        if (d->workers[i].instr_fd >= 0) close(d->workers[i].instr_fd);
         pthread_mutex_destroy(&d->workers[i].requests.lock);
         pthread_mutex_destroy(&d->workers[i].replies.lock);
     }
@@ -1203,7 +1317,7 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
     d->pollfds = calloc(count + 1, sizeof(*d->pollfds));
     if (!d->controls || !d->workers || !d->loads || !d->flows || !d->pollfds) goto fail;
     size_t initialized = 0;
-    d->policy = dmesh_placement_least_flows;
+    d->policy = dmesh_placement_least_instructions;
     d->migrate_period_ms = env_u64("DMESH_MIGRATE_PERIOD_MS", 0);
     d->migrate_max = (unsigned long)env_u64("DMESH_MIGRATE_MAX", 0);
     d->steer_ms = env_u64("DMESH_MIGRATE_STEER_MS", 5000);
@@ -1214,6 +1328,7 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
                 (unsigned long long)d->steer_ms, d->migrate_spare);
     d->flowstat_ms = env_u64("DMESH_FLOWSTAT_MS", 1000);
     d->flowstat_log = env_u64("DMESH_FLOWSTAT_LOG", 0) != 0;
+    d->worker_instr = env_u64("DMESH_WORKER_INSTR", 0) != 0;
     d->scale_after_ms = env_u64("DMESH_SCALE_AFTER_MS", 0);
     d->scale_in_after_ms = env_u64("DMESH_SCALE_IN_AFTER_MS", 0);
     d->scale_count = (unsigned)env_u64("DMESH_SCALE_COUNT", 2);
@@ -1221,14 +1336,18 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
         fprintf(stderr, "[dispatcher] scaling after=%llums count=%u in_after=%llums\n",
                 (unsigned long long)d->scale_after_ms, d->scale_count,
                 (unsigned long long)d->scale_in_after_ms);
+    /* DMESH_FLOW_PLACEMENT: where OPENs (scale-out streams included) and
+     * migrations go. least-instr (default) without instruction counting
+     * places as least-flows does. */
     const char *policy = getenv("DMESH_FLOW_PLACEMENT");
     if (policy && strcmp(policy, "round-robin") == 0) d->policy = dmesh_placement_round_robin;
     else if (policy && strcmp(policy, "first-eligible") == 0) d->policy = dmesh_placement_first_eligible;
-    else if (policy && strcmp(policy, "least-flows") != 0) goto fail;
+    else if (policy && strcmp(policy, "least-flows") == 0) d->policy = dmesh_placement_least_flows;
+    else if (policy && strcmp(policy, "least-instr") != 0) goto fail;
     d->fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (d->fd < 0) goto fail;
     d->pollfds[0] = (struct pollfd){.fd = d->fd, .events = POLLIN};
-    for (size_t i = 0; i < count; ++i) d->workers[i].fd = -1;
+    for (size_t i = 0; i < count; ++i) d->workers[i].fd = d->workers[i].instr_fd = -1;
     for (size_t i = 0; i < count; ++i) {
         struct dmesh_worker_mailbox *b = &d->workers[i];
         b->dispatcher = d;
