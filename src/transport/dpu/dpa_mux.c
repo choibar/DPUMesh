@@ -30,7 +30,7 @@ extern doca_dpa_func_t run_dma_mux;
 extern doca_dpa_func_t thread_init_rpc;
 
 #define MUX_MAX_THREADS 16
-#define MUX_WATCH_NS 1000000000ull
+#define MUX_WATCH_NS 1000000000ull /* each thread is checked once per period */
 
 struct mux_thread {
     struct objects *objs;
@@ -49,6 +49,7 @@ struct dmesh_mux {
     uint32_t next_gen;
     uint64_t stall_us;
     uint64_t next_watch_ns;
+    int watch_next;            /* the thread the next check reads */
     bool stats;                /* DMESH_DPA_MUX_STATS=1: one line per thread per second */
     struct mux_thread t[MUX_MAX_THREADS];
 };
@@ -395,71 +396,79 @@ doca_error_t dmesh_dpa_mux_rx_consumed(struct dmesh_conn *conn, uint32_t pos)
                     offsetof(struct dpa_mux_ring, rx_consumed_pos), pos);
 }
 
+/* Runs on the worker's own thread, which serves none of its flows meanwhile:
+ * a check is a synchronous d2h_memcpy (about 1 ms with the error check). So
+ * one call checks one thread, and the n checks are spread over MUX_WATCH_NS;
+ * checking every thread at once stopped the worker for n ms each second. */
 void dmesh_dpa_mux_watch(struct objects *objs)
 {
     struct dmesh_mux *mux = objs->mux;
+    struct mux_thread *t;
+    /* The whole context (about 3.6 KB): the header and the ring slots. */
+    struct dpa_mux_ctx ctx;
+    const struct dpa_mux_ctx *h = &ctx;
+    const struct dpa_mux_ring *rings = ctx.ring;
+    char slots[DMESH_MUX_RINGS * 6 + 1] = "";
+    size_t len = 0;
+    bool stalled, stopped;
     uint64_t now;
+    int i;
 
-    if (mux == NULL)
+    if (mux == NULL || mux->n == 0)
         return;
     now = now_ns();
     if (now < mux->next_watch_ns)
         return;
-    mux->next_watch_ns = now + MUX_WATCH_NS;
+    mux->next_watch_ns = now + MUX_WATCH_NS / (uint64_t)mux->n;
+    i = mux->watch_next;
+    mux->watch_next = (i + 1) % mux->n;
+    t = &mux->t[i];
 
-    for (int i = 0; i < mux->n; i++) {
-        struct mux_thread *t = &mux->t[i];
-        /* The whole context (about 3.6 KB): the header and the ring slots. */
-        struct dpa_mux_ctx ctx;
-        const struct dpa_mux_ctx *h = &ctx;
-        const struct dpa_mux_ring *rings = ctx.ring;
-        char slots[DMESH_MUX_RINGS * 6 + 1] = "";
-        size_t len = 0;
-        bool stalled, stopped;
-
-        if (DMESH_DPA_CALL(doca_dpa_d2h_memcpy(t->thread.dpa, &ctx, t->thread.local_storage,
-                                               sizeof(ctx))) != DOCA_SUCCESS)
-            continue;
-
-        /* A ring the DPA stopped: its flow is closed with an error. */
-        for (unsigned r = 0; r < DMESH_MUX_RINGS; r++) {
-            struct dmesh_conn *conn = t->ring_conn[r];
-
-            if (conn != NULL && !conn->mux_close_sent && conn->mux_error == 0 &&
-                rings[r].state == DMESH_MUX_ERROR && (uint32_t)rings[r].generation == conn->mux_gen) {
-                conn->mux_error = rings[r].error != 0 ? (uint32_t)rings[r].error : DMESH_MUX_ERR_COPY;
-                DOCA_LOG_ERR("DPA mux thread %d ring %u (slot %ld): forward ring stopped, error %u",
-                             i, r, conn - objs->conns, conn->mux_error);
-            }
-        }
-
-        stopped = h->heartbeat == t->last_heartbeat; /* dmesh_doca_dpa_failed logs a dead context itself */
+    /* The threads share the worker's DPA context: one check per round, which
+     * logs a dead context itself. */
+    if (i == 0)
         (void)dmesh_doca_dpa_failed(t->thread.dpa);
-        stalled = h->oldest_age_us > mux->stall_us;
-        if (mux->stats)
-            DOCA_LOG_INFO("DPA mux thread %d: rings=%u passes/s=%llu credit_waits/s=%llu in_flight=%llu "
-                          "oldest_us=%llu err_cqes=%llu bad_cqes=%llu stale_msgs=%llu bad_msgs=%llu",
-                          i, t->rings_used, (unsigned long long)(h->heartbeat - t->last_heartbeat),
-                          (unsigned long long)(h->credit_waits - t->last_credit_waits),
-                          (unsigned long long)(h->fifo_tail - h->fifo_head), (unsigned long long)h->oldest_age_us,
-                          (unsigned long long)h->err_cqes, (unsigned long long)h->bad_cqes,
-                          (unsigned long long)t->stale_msgs, (unsigned long long)t->bad_msgs);
-        t->last_heartbeat = h->heartbeat;
-        t->last_credit_waits = h->credit_waits;
-        if ((stalled || stopped) && !t->stalled) {
-            for (unsigned r = 0; r < DMESH_MUX_RINGS; r++)
-                if (t->ring_conn[r] != NULL && len + 6 < sizeof(slots))
-                    len += (size_t)snprintf(slots + len, sizeof(slots) - len, "%s%ld", len ? "," : "",
-                                            t->ring_conn[r] - objs->conns);
-            DOCA_LOG_ERR("DPA mux thread %d %s: oldest copy in flight %llu ms; flows on it: slots %s. "
-                         "A copy from a host process that died blocks the thread for good (dpa_mux.h)",
-                         i, stopped ? "is not running" : "is stalled",
-                         (unsigned long long)(h->oldest_age_us / 1000), len ? slots : "none");
-            t->stalled = true;
-        } else if (!stalled && !stopped && t->stalled) {
-            DOCA_LOG_WARN("DPA mux thread %d is moving again", i);
-            t->stalled = false;
+    if (DMESH_DPA_CALL(doca_dpa_d2h_memcpy(t->thread.dpa, &ctx, t->thread.local_storage,
+                                           sizeof(ctx))) != DOCA_SUCCESS)
+        return;
+
+    /* A ring the DPA stopped: its flow is closed with an error. */
+    for (unsigned r = 0; r < DMESH_MUX_RINGS; r++) {
+        struct dmesh_conn *conn = t->ring_conn[r];
+
+        if (conn != NULL && !conn->mux_close_sent && conn->mux_error == 0 &&
+            rings[r].state == DMESH_MUX_ERROR && (uint32_t)rings[r].generation == conn->mux_gen) {
+            conn->mux_error = rings[r].error != 0 ? (uint32_t)rings[r].error : DMESH_MUX_ERR_COPY;
+            DOCA_LOG_ERR("DPA mux thread %d ring %u (slot %ld): forward ring stopped, error %u",
+                         i, r, conn - objs->conns, conn->mux_error);
         }
+    }
+
+    stopped = h->heartbeat == t->last_heartbeat;
+    stalled = h->oldest_age_us > mux->stall_us;
+    if (mux->stats)
+        DOCA_LOG_INFO("DPA mux thread %d: rings=%u passes/s=%llu credit_waits/s=%llu in_flight=%llu "
+                      "oldest_us=%llu err_cqes=%llu bad_cqes=%llu stale_msgs=%llu bad_msgs=%llu",
+                      i, t->rings_used, (unsigned long long)(h->heartbeat - t->last_heartbeat),
+                      (unsigned long long)(h->credit_waits - t->last_credit_waits),
+                      (unsigned long long)(h->fifo_tail - h->fifo_head), (unsigned long long)h->oldest_age_us,
+                      (unsigned long long)h->err_cqes, (unsigned long long)h->bad_cqes,
+                      (unsigned long long)t->stale_msgs, (unsigned long long)t->bad_msgs);
+    t->last_heartbeat = h->heartbeat;
+    t->last_credit_waits = h->credit_waits;
+    if ((stalled || stopped) && !t->stalled) {
+        for (unsigned r = 0; r < DMESH_MUX_RINGS; r++)
+            if (t->ring_conn[r] != NULL && len + 6 < sizeof(slots))
+                len += (size_t)snprintf(slots + len, sizeof(slots) - len, "%s%ld", len ? "," : "",
+                                        t->ring_conn[r] - objs->conns);
+        DOCA_LOG_ERR("DPA mux thread %d %s: oldest copy in flight %llu ms; flows on it: slots %s. "
+                     "A copy from a host process that died blocks the thread for good (dpa_mux.h)",
+                     i, stopped ? "is not running" : "is stalled",
+                     (unsigned long long)(h->oldest_age_us / 1000), len ? slots : "none");
+        t->stalled = true;
+    } else if (!stalled && !stopped && t->stalled) {
+        DOCA_LOG_WARN("DPA mux thread %d is moving again", i);
+        t->stalled = false;
     }
 }
 

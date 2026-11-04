@@ -36,10 +36,11 @@ doca_error_t dmesh_dpa_mux_del_step(struct dmesh_conn *conn);
 void dmesh_dpa_mux_release(struct dmesh_conn *conn);
 /* Publishes how far the reader released this flow's staging. */
 doca_error_t dmesh_dpa_mux_rx_consumed(struct dmesh_conn *conn, uint32_t pos);
-/* At most once a second: marks flows whose ring the DPA stopped (bad
- * descriptor, failed copy), and logs a thread whose oldest copy is older than
- * DMESH_DPA_MUX_STALL_MS (100) or that stopped running, and its recovery.
- * DMESH_DPA_MUX_STATS=1 adds one line per thread: passes, credit waits, FIFO. */
+/* Checks one thread per call, each thread about once a second: marks flows
+ * whose ring the DPA stopped (bad descriptor, failed copy), and logs a thread
+ * whose oldest copy is older than DMESH_DPA_MUX_STALL_MS (100) or that stopped
+ * running, and its recovery. DMESH_DPA_MUX_STATS=1 adds one line per check:
+ * passes, credit waits, FIFO. */
 void dmesh_dpa_mux_watch(struct objects *objs);
 
 #endif
