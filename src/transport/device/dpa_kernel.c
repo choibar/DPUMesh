@@ -156,7 +156,10 @@ __dpa_global__ void run_dma_manager(void)
     if (state->dpa_dev != 0)
         doca_dpa_dev_device_set((doca_dpa_dev_t)state->dpa_dev);
 
-    if (state->dpa_consumer_comp != 0) {
+    /* A pooled thread keeps its comch across flows, and the next flow's first
+     * request must wake it: ack what earlier flows left and re-arm. A per-flow
+     * thread ends with its comch and has nothing to drain. */
+    if (state->pooled && state->dpa_consumer_comp != 0) {
         doca_dpa_dev_comch_consumer_completion_element_t e;
         uint32_t n = 0;
         while (doca_dpa_dev_comch_consumer_get_completion(state->dpa_consumer_comp, &e)) {
