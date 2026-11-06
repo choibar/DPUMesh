@@ -48,39 +48,39 @@ session으로 다중화된 연결(지금의 host 라이브러리)에만 적용�
 
 ## 측정
 
-2026-11-06, jet2(SMT off) ↔ jet2-dpu PF1. 마이크로벤치는 `dpumesh_host` ↔ `dpumesh_dpu`(echo), 64 B 메시지, 연결마다 창 4 KiB(포화) 또는 64 B(한 번에 하나), 실행마다 DPU 쪽을 새로 띄우고 각 구성을 2번씩 번갈아 돌렸다. "worker마다 thread"는 같은 날의 4fc2153(worker마다 thread n개, 새 flow는 ring이 가장 적은 thread로)이다. DPU 지표는 `DMESH_DPA_MUX_STATS=1`의 초당 줄의 중앙값이다. 자료는 `microservices-demo/mesh-bench/results/podmux-20261106-micro-fix`.
+2026-11-06, jet2(SMT off) ↔ jet2-dpu PF1. 마이크로벤치는 `dpumesh_host` ↔ `dpumesh_dpu`(echo), 64 B 메시지, 연결마다 창 4 KiB(포화) 또는 64 B(한 번에 하나), 실행마다 DPU 쪽을 새로 띄우고 각 구성을 2번씩 번갈아 돌렸다. "worker마다 thread"는 같은 날의 4fc2153(worker마다 thread n개, 새 flow는 ring이 가장 적은 thread로)이다. DPU 지표는 `DMESH_DPA_MUX_STATS=1`의 초당 줄의 중앙값이다. 자료는 `microservices-demo/mesh-bench/results/podmux-20261106-micro-fix2`(OB는 `dpumesh-20261106-smtoff-podfix`).
 
 **공정성.** pod B(연결 1개, 메시지 하나씩 왕복)를 혼자, 다음에 pod A(연결 7개, 창 4 KiB) 옆에서 돌린다. worker마다 thread는 `DMESH_DPA_MUX=1`이라 A와 B의 ring이 한 thread에 있다.
 
 | | B 혼자: 처리량 / p50 / p99 | A 옆의 B: 처리량 / p50 / p99 | A의 처리량 |
 |---|---|---|---|
-| worker마다 thread | 23.7k msg/s / 36 µs / 157 µs | 855 msg/s / 485–492 µs / 3,429–3,434 µs | 218.7k msg/s |
-| pod마다 thread | 23.4k / 35–36 / 152–155 | 20.4–20.6k / 35 / 193 | 209.8k |
+| worker마다 thread | 22.2–22.4k msg/s / 39 µs / 158–163 µs | 856 msg/s / 485 µs / 3,446–3,449 µs | 218.8k msg/s |
+| pod마다 thread | 22.9–23.0k / 38 / 161 | 21.4–21.6k / 34 / 201–204 | 206.1k |
 
-- worker마다 thread에서 B는 처리량이 1/28, p99가 22배가 된다. A의 ring 7개가 바퀴마다 각각 32개씩 복사하는 동안 B의 ring이 차례를 기다린다.
-- pod마다 thread에서 B는 p50이 그대로, p99 +40 µs, 처리량 −12%다. 남은 차이는 같은 DPU worker와 DMA 엔진을 나눠 쓰는 몫이다. A는 4% 낮다.
+- worker마다 thread에서 B는 처리량이 1/26, p99가 21배가 된다. A의 ring 7개가 바퀴마다 각각 32개씩 복사하는 동안 B의 ring이 차례를 기다린다.
+- pod마다 thread에서 B는 p50이 그대로, p99 +40 µs, 처리량 −6%다. 남은 차이는 같은 DPU worker와 DMA 엔진을 나눠 쓰는 몫이다. A는 6% 낮다.
 
 **polling.** 연결 8개(한 프로세스), 포화.
 
 | | 처리량 | RTT p50 / p99 | 바퀴/s | ring 확인 읽기/바퀴 | ring 확인 읽기/s |
 |---|---|---|---|---|---|
-| worker마다 thread(thread 1개, ring 8개) | 219.8–220.0k msg/s | 2.21–2.28 / 3.84 ms | 1,718 | 8 | 13,740 |
-| pod마다 thread | 213.9–214.0k | 2.39 / 2.55 ms | 1,754–1,771 | 1 | 1,754–1,771 (−87%) |
+| worker마다 thread(thread 1개, ring 8개) | 219.8–219.9k msg/s | 2.22–2.25 / 3.86 ms | 1,717–1,719 | 8 | 13,736–13,752 |
+| pod마다 thread | 209.7–209.8k | 2.44 / 2.61–2.62 ms | 1,679–1,680 | 1 | 1,679–1,680 (−88%) |
 
 - 바퀴마다 일이 있던 ring은 5.1개다. 일이 없으면 바퀴마다 1번 읽고 초당 약 38만 바퀴를 돈다. ring 16개도 1번이다.
-- 처리량은 3% 낮고 p99는 34% 낮다.
+- 처리량은 5% 낮고 p99는 32% 낮다.
 
-**한 pod의 처리량은 thread 하나로 묶인다.** 연결 16개(한 프로세스)에서 worker마다 thread(thread 2개, 각 ring 8개)는 434.9k msg/s, pod마다 thread는 213.8–213.9k msg/s다. 한 pod가 thread 하나의 copy 속도(64 B에서 약 21만 msg/s)를 넘게 보내면 pod마다 thread가 느리다.
+**한 pod의 처리량은 thread 하나로 묶인다.** 연결 16개(한 프로세스)에서 worker마다 thread(thread 2개, 각 ring 8개)는 434.6k msg/s, pod마다 thread는 209.7k msg/s다. 한 pod가 thread 하나의 copy 속도(64 B에서 약 21만 msg/s)를 넘게 보내면 pod마다 thread가 느리다.
 
 **Online Boutique.** SMT off, 32 pod, 2.3 GHz, uncore 고정, DPU worker 15개, `DMESH_DPA_MUX=64`(thread 32개). 500–6,000 req/s에서 drop이 없다. host busy core는 같은 날 sidecar 없는 구성보다 2–4% 적다.
 
 | req/s | host / DPU busy core | p50 |
 |---|---|---|
-| 500 | 5.01 / 5.93 | 17.8 ms |
-| 1,000 | 8.40 / 8.43 | 17.4 ms |
-| 1,500 | 10.76 / 10.74 | 18.7 ms |
-| 2,000 | 12.06 / 12.38 | 21.5 ms |
-| 3,000 | 14.03 / 14.38 | 29.5 ms |
-| 6,000 | 15.92 / 14.70 | 177.5 ms |
+| 500 | 5.04 / 4.83 | 17.0 ms |
+| 1,000 | 8.41 / 7.65 | 16.9 ms |
+| 1,500 | 10.74 / 10.36 | 18.2 ms |
+| 2,000 | 12.00 / 11.69 | 20.1 ms |
+| 3,000 | 13.98 / 14.00 | 28.2 ms |
+| 6,000 | 15.94 / 14.58 | 201.2 ms |
 
 - 같은 시각 PF0에서 다른 프로세스가 DPA thread 약 1,040개를 잡고 있었다. worker마다 thread는 시작 때 만드는 thread 105개 중 일부가 `DOCA_ERROR_DRIVER`로 실패했고(mux worker 15개 중 6개), pod마다 thread는 pod가 올 때 32개만 만들어 모두 떴다.
