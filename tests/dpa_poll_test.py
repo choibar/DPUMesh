@@ -65,6 +65,8 @@ static uint64_t doca_dpa_dev_buf_get_external_ptr(unsigned b) {
  if(a>=2&&a<5){assert(i<=16);return (uintptr_t)(i ? (void *)&mring[a-2].desc[i-1] : (void *)&mring[a-2].ctrl);}
  assert(a==1&&i<=256);return (uintptr_t)(i ? (void *)&descriptors[i-1] : (void *)&ring);
 }
+/* The mux thread's status window: the handle is unused, the address is the ARM's copy. */
+static uint64_t doca_dpa_dev_mmap_get_external_ptr(uint64_t h,uint64_t addr) { assert(h==1);return addr; }
 static void doca_dpa_dev_completion_request_notification(uint64_t c) { (void)c;++arms; }
 static int doca_dpa_dev_get_completion(uint64_t c,unsigned *comp) {
  (void)c;assert(arms);if(read_cq==ready)return 0;*comp=read_cq++;return 1;
@@ -107,6 +109,7 @@ prefix = prefix.replace('#define DMA_POLL_ACTIVATION_BUDGET 65536u',
     re.search(r'^#define DMA_POLL_ACTIVATION_BUDGET .+$', source, re.M)[0])
 tests = r'''
 static struct dpa_mux_ctx mctx;
+static struct dpa_mux_status mstatus; /* what the ARM reads */
 static const unsigned mux_ring[3] = {0, 1, 17};
 static void mux_open(unsigned k) {
  unsigned r=mux_ring[k];
@@ -114,7 +117,7 @@ static void mux_open(unsigned k) {
  mctx.cfg[r]=(struct dpa_mux_ring_cfg){.buf_arr=2+k,.staging_addr=(uintptr_t)(dst+k*65536),
   .buf_size=65536,.ring_size=16,.host_base=(uintptr_t)src,.host_len=sizeof(src),
   .slot=10+k,.generation=100+k,.consumer=1+k,.cmd=DMESH_MUX_CMD_OPEN};
- memset(&mctx.st[r],0,sizeof(mctx.st[r]));
+ memset(&mctx.s.st[r],0,sizeof(mctx.s.st[r]));memset(&mstatus.st[r],0,sizeof(mstatus.st[r]));
  mtails[r]=0;mctx.ctl_seq++;
 }
 /* The host's post: descriptors, the ring's producer_tail, then its table slot. */
@@ -130,60 +133,68 @@ static void mux_post(unsigned k,unsigned n,unsigned len) {
 static void mux_tests(void) {
  memset(pending,0,sizeof(pending));memset(dst,0,sizeof(dst));
  copies=finished=ready=read_cq=acked=arms=0;credit_limit=1024;
- mctx.tails=100;tls=(void *)&mctx;
+ mctx.tails=100;mctx.status=1;mctx.status_addr=(uintptr_t)&mstatus;tls=(void *)&mctx;
  for(unsigned k=0;k<3;k++)mux_open(k);
  unsigned rt=retriggers,f=finished;
  /* Idle: one read per tail line with an open ring, no ring visited. */
  run_dma_mux();
- assert(retriggers==rt+1 && !copies && mctx.heartbeat>1);
- assert(mctx.open_mask==(1ull|2ull|1ull<<17) && mctx.ctl_seen==mctx.ctl_seq);
- assert(mctx.tail_reads==2*mctx.heartbeat && mctx.visits==0);
- for(unsigned k=0;k<3;k++)assert(mctx.st[mux_ring[k]].state==DMESH_MUX_ACTIVE);
+ assert(retriggers==rt+1 && !copies && mctx.s.heartbeat>1);
+ assert(mctx.s.open_mask==(1ull|2ull|1ull<<17) && mctx.s.ctl_seen==mctx.ctl_seq);
+ assert(mctx.s.tail_reads==2*mctx.s.heartbeat && mctx.s.visits==0);
+ for(unsigned k=0;k<3;k++)assert(mctx.s.st[mux_ring[k]].state==DMESH_MUX_ACTIVE);
+ /* Every activation publishes the counters and the thread's state; ring
+  * lines are published only when a ring stops or closes. */
+ assert(memcmp(&mstatus,&mctx.s,offsetof(struct dpa_mux_status,st))==0 && mstatus.heartbeat==mctx.s.heartbeat);
+ assert(mstatus.st[0].state==DMESH_MUX_IDLE && mstatus.st[17].state==DMESH_MUX_IDLE);
  /* Only the ring whose tail moved is visited; its copies and messages go to
   * its worker's consumer, and its custody ACK waits for their completion. */
  mux_post(1,3,64);run_dma_mux();
- assert(copies==3 && mctx.visits==1 && mctx.copies==3 && mctx.st[1].submit==3 && mctx.st[1].inflight==3);
+ assert(copies==3 && mctx.s.visits==1 && mctx.s.copies==3 && mctx.s.st[1].submit==3 && mctx.s.st[1].inflight==3);
  for(unsigned i=0;i<3;i++) {
   assert(pending[i].consumer==2 && pending[i].msg.type==DMESH_MUX_MSG_DMA_DONE && pending[i].msg.ring==1);
   assert(pending[i].msg.slot==11 && pending[i].msg.generation==101 && pending[i].msg.pos==i*64);
   assert(pending[i].msg.length==64 && pending[i].dst==(uintptr_t)(dst+65536+i*64));
  }
- assert(mring[1].ctrl.consumer_head==0 && !mctx.st[0].submit && !mctx.st[17].submit);
+ assert(mring[1].ctrl.consumer_head==0 && !mctx.s.st[0].submit && !mctx.s.st[17].submit);
  complete_to(3);run_dma_mux();
- assert(mring[1].ctrl.consumer_head==3 && mring[1].ctrl.completed_bytes==192 && !mctx.st[1].inflight);
- assert(dst[65536]==1 && dst[65536+128]==3 && mctx.visits==1);
+ assert(mring[1].ctrl.consumer_head==3 && mring[1].ctrl.completed_bytes==192 && !mctx.s.st[1].inflight);
+ assert(dst[65536]==1 && dst[65536+128]==3 && mctx.s.visits==1);
  /* A worker without receive credit holds back only its own rings. */
  consumer_blocked[3]=1;
  mux_post(0,2,32);mux_post(2,2,32);
- unsigned c0=copies,waits=mctx.credit_waits;
+ unsigned c0=copies,waits=mctx.s.credit_waits;
  run_dma_mux();
- assert(copies==c0+2 && mctx.credit_waits>waits && mctx.st[0].submit==2 && !mctx.st[17].submit);
+ assert(copies==c0+2 && mctx.s.credit_waits>waits && mctx.s.st[0].submit==2 && !mctx.s.st[17].submit);
  assert(pending[c0].consumer==1 && pending[c0].msg.ring==0 && pending[c0+1].msg.ring==0);
  consumer_blocked[3]=0;run_dma_mux();
- assert(copies==c0+4 && mctx.st[17].submit==2 && pending[c0+2].consumer==3 && pending[c0+2].msg.ring==17);
+ assert(copies==c0+4 && mctx.s.st[17].submit==2 && pending[c0+2].consumer==3 && pending[c0+2].msg.ring==17);
  assert(pending[c0+2].msg.slot==12 && pending[c0+3].dst==(uintptr_t)(dst+2*65536+32));
  complete_to(copies);run_dma_mux();
- assert(mring[0].ctrl.consumer_head==2 && mring[2].ctrl.consumer_head==2 && mctx.fifo_tail==mctx.fifo_head);
+ assert(mring[0].ctrl.consumer_head==2 && mring[2].ctrl.consumer_head==2 && mctx.s.fifo_tail==mctx.s.fifo_head);
  /* A tail past the ring stops that ring alone, with the error in its ctrl. */
- mtails[1]=(uint32_t)mctx.st[1].submit+17;run_dma_mux();
- assert(mctx.st[1].state==DMESH_MUX_ERROR && mctx.st[1].error==DMESH_MUX_ERR_TAIL);
- assert(mring[1].ctrl.error==DMESH_MUX_ERR_TAIL && !(mctx.open_mask&2) && (mctx.open_mask&1));
+ mtails[1]=(uint32_t)mctx.s.st[1].submit+17;run_dma_mux();
+ assert(mctx.s.st[1].state==DMESH_MUX_ERROR && mctx.s.st[1].error==DMESH_MUX_ERR_TAIL);
+ assert(mring[1].ctrl.error==DMESH_MUX_ERR_TAIL && !(mctx.s.open_mask&2) && (mctx.s.open_mask&1));
+ assert(mstatus.st[1].state==DMESH_MUX_ERROR && mstatus.st[1].error==DMESH_MUX_ERR_TAIL);
  /* Close: CLOSED once the ring's last copy completed; the ERROR ring too. */
- mux_post(0,1,32);run_dma_mux();assert(mctx.st[0].inflight==1);
+ mux_post(0,1,32);run_dma_mux();assert(mctx.s.st[0].inflight==1);
  mctx.cfg[0].cmd=DMESH_MUX_CMD_CLOSE;mctx.cfg[1].cmd=DMESH_MUX_CMD_CLOSE;mctx.ctl_seq++;
  run_dma_mux();
- assert(mctx.st[1].state==DMESH_MUX_CLOSED && mctx.st[0].state==DMESH_MUX_ACTIVE && (mctx.closing_mask&1));
+ assert(mctx.s.st[1].state==DMESH_MUX_CLOSED && mctx.s.st[0].state==DMESH_MUX_ACTIVE && (mctx.s.closing_mask&1));
  mux_post(0,1,32);unsigned c1=copies;run_dma_mux();assert(copies==c1); /* closing: no new copies */
  complete_to(copies);run_dma_mux();
- assert(mctx.st[0].state==DMESH_MUX_CLOSED && !mctx.closing_mask && mring[0].ctrl.consumer_head==3);
- assert(mctx.open_mask==1ull<<17);
+ assert(mctx.s.st[0].state==DMESH_MUX_CLOSED && !mctx.s.closing_mask && mring[0].ctrl.consumer_head==3);
+ assert(mstatus.st[0].state==DMESH_MUX_CLOSED && mstatus.st[0].submit==3 && !mstatus.st[0].inflight);
+ assert(mstatus.st[1].state==DMESH_MUX_CLOSED && mstatus.closing_mask==0);
+ assert(mctx.s.open_mask==1ull<<17);
  /* The ARM fills ring 0 again for the session's next flow on that id. */
  mux_open(0);mctx.cfg[0].generation=200;mux_post(0,1,16);run_dma_mux();
  assert(copies==c1+1 && pending[c1].msg.ring==0 && pending[c1].msg.generation==200 && pending[c1].msg.pos==0);
  /* Stop waits for the copy in flight, then the thread finishes. */
- mctx.stop=1;run_dma_mux();assert(!mctx.stopped && finished==f);
- complete_to(copies);run_dma_mux();assert(mctx.stopped && finished==f+1);
- puts("DPA pod mux: tail lines read once per pass, only moved rings visited, per-worker consumers and credit, ring errors, close, refill, stop PASS");
+ mctx.stop=1;run_dma_mux();assert(!mctx.s.stopped && finished==f);
+ assert(!mstatus.stopped);
+ complete_to(copies);run_dma_mux();assert(mctx.s.stopped && finished==f+1 && mstatus.stopped);
+ puts("DPA pod mux: tail lines read once per pass, only moved rings visited, per-worker consumers and credit, ring errors, close, refill, stop, status published PASS");
 }
 
 int main(void) {

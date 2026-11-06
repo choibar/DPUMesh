@@ -6,6 +6,7 @@
 #ifdef DOCA_ARCH_DPU
 
 #include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -21,6 +22,7 @@
 #include <doca_mmap.h>
 #include <doca_pe.h>
 
+#include "buffer.h"
 #include "dispatcher.h"
 #include "dma.h"
 #include "dpa.h"
@@ -65,6 +67,8 @@ struct dmesh_pod_thread {
     struct doca_comch_producer *producer;
     struct doca_mmap *tails_mmap;       /* the host's table, imported */
     struct doca_buf_arr *tails_arr;     /* one buf per line, read by the DPA */
+    struct doca_mmap *status_mmap;
+    struct dpa_mux_status *status;      /* the DPA publishes its state here */
     struct pod_consumer *cons;          /* one per worker */
     struct dmesh_conn *ring_conn[DMESH_MUX_RINGS]; /* NULL = free */
     uint32_t ring_error[DMESH_MUX_RINGS];          /* the watch's finding, taken by the ring's worker */
@@ -83,7 +87,6 @@ struct dmesh_mux {
     bool stats;
     uint64_t next_watch_ns;             /* 0 until the first thread started */
     int watch_next;
-    struct dpa_mux_ctx sample;          /* the watch's copy of one thread's header and rings */
     struct dmesh_pod_thread t[MUX_MAX_THREADS];
 };
 
@@ -138,7 +141,7 @@ static size_t cfg_off(unsigned r, size_t field)
 
 static size_t st_off(unsigned r)
 {
-    return offsetof(struct dpa_mux_ctx, st) + r * sizeof(struct dpa_mux_ring_state);
+    return offsetof(struct dpa_mux_ctx, s.st) + r * sizeof(struct dpa_mux_ring_state);
 }
 
 /* After a command: the DPA reads the commands again once ctl_seq moved.
@@ -296,15 +299,14 @@ static doca_error_t pod_retire(struct dmesh_pod_thread *p)
         if (p->cons[w].consumer != NULL)
             return DOCA_ERROR_IN_USE;
     if (th->running && !th->quiesced) {
-        uint64_t stopped = 0, deadline = now_ns() + MUX_STOP_NS;
+        uint64_t deadline = now_ns() + MUX_STOP_NS;
 
         result = tls_set(p, offsetof(struct dpa_mux_ctx, stop), 1);
-        while (result == DOCA_SUCCESS && stopped == 0 && now_ns() < deadline)
-            result = DMESH_DPA_CALL(doca_dpa_d2h_memcpy(th->dpa, &stopped,
-                th->local_storage + offsetof(struct dpa_mux_ctx, stopped), sizeof(stopped)));
         if (result != DOCA_SUCCESS)
             return result;
-        if (stopped == 0)
+        while (!__atomic_load_n(&p->status->stopped, __ATOMIC_ACQUIRE) && now_ns() < deadline)
+            sched_yield();
+        if (!__atomic_load_n(&p->status->stopped, __ATOMIC_ACQUIRE))
             return DOCA_ERROR_TIME_OUT;
         th->quiesced = true;
     }
@@ -352,6 +354,12 @@ static doca_error_t pod_retire(struct dmesh_pod_thread *p)
             return result;
         p->tails_mmap = NULL;
     }
+    if (p->status_mmap != NULL) {
+        if ((result = destroy_mmap_and_free_buffer(p->status_mmap, p->status)) != DOCA_SUCCESS)
+            return result;
+        p->status_mmap = NULL;
+        p->status = NULL;
+    }
     DOCA_LOG_INFO("DPA mux thread %d of session %llx/%llu released", p->idx,
                   (unsigned long long)p->key, (unsigned long long)p->epoch);
     free(p->cons);
@@ -372,6 +380,7 @@ static doca_error_t pod_start(struct dmesh_pod_thread *p, struct objects *objs,
     doca_dpa_dev_comch_producer_t producer;
     doca_dpa_dev_notification_completion_t notify;
     doca_dpa_dev_buf_arr_t tails_arr;
+    doca_dpa_dev_mmap_t status;
     const char *pin = getenv("DMESH_DPA_PIN_EU_BASE");
     uint64_t rpc_ret = 0;
     doca_error_t result;
@@ -397,6 +406,16 @@ static doca_error_t pod_start(struct dmesh_pod_thread *p, struct objects *objs,
         result = DMESH_DPA_CALL(doca_buf_arr_get_dpa_handle(p->tails_arr, &tails_arr));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("DPA mux thread %d: tail table: %s", p->idx, doca_error_get_name(result));
+        return result;
+    }
+
+    /* The ARM's copy of the thread's state, which the DPA writes. */
+    result = alloc_buffer_and_set_mmap(&p->status_mmap, objs->dev, (void **)&p->status,
+                                       sizeof(struct dpa_mux_status), DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result == DOCA_SUCCESS)
+        result = DMESH_DPA_CALL(doca_mmap_dev_get_dpa_handle(p->status_mmap, objs->dev, &status));
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("DPA mux thread %d: status: %s", p->idx, doca_error_get_name(result));
         return result;
     }
 
@@ -480,6 +499,8 @@ static doca_error_t pod_start(struct dmesh_pod_thread *p, struct objects *objs,
     ctx->producer = producer;
     ctx->producer_comp = producer_comp;
     ctx->tails = tails_arr;
+    ctx->status = status;
+    ctx->status_addr = (uint64_t)(uintptr_t)p->status;
     result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(th->dpa, th->local_storage, ctx, sizeof(*ctx)));
     free(ctx);
     if (result == DOCA_SUCCESS) {
@@ -659,6 +680,10 @@ doca_error_t dmesh_dpa_mux_add(struct dmesh_conn *conn)
     if (result == DOCA_SUCCESS)
         result = DMESH_DPA_CALL(doca_dpa_h2d_memcpy(p->thread.dpa, p->thread.local_storage + st_off(r),
                                                     &st, sizeof(st)));
+    /* The previous flow's CLOSED record goes before this flow's ring opens;
+     * the DPA writes the line again only when this ring stops or closes. */
+    memset(&p->status->st[r], 0, sizeof(p->status->st[r]));
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     if (result == DOCA_SUCCESS)
         result = tls_set(p, cfg_off(r, offsetof(struct dpa_mux_ring_cfg, cmd)), DMESH_MUX_CMD_OPEN);
     if (result == DOCA_SUCCESS)
@@ -713,11 +738,10 @@ doca_error_t dmesh_dpa_mux_del_step(struct dmesh_conn *conn)
         return DOCA_ERROR_BAD_STATE;
     /* CLOSED: no copy of the ring is left in flight. Every copy that
      * succeeded sent one message; the ring is done once they all arrived
-     * (the consumer PE may still hold some). */
-    result = DMESH_DPA_CALL(doca_dpa_d2h_memcpy(p->thread.dpa, &g,
-                                                p->thread.local_storage + st_off(conn->mux_ring), sizeof(g)));
-    if (result != DOCA_SUCCESS)
-        return result;
+     * (the consumer PE may still hold some). The DPA publishes the line
+     * when the ring closes. */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    memcpy(&g, &p->status->st[conn->mux_ring], sizeof(g));
     if (g.state == DMESH_MUX_CLOSED && conn->mux_received + g.failed == g.submit) {
         struct pod_consumer *c = &p->cons[worker_of(conn->objs)];
 
@@ -780,7 +804,8 @@ uint32_t dmesh_dpa_mux_error(struct dmesh_conn *conn)
 /* One check: the header and the rings' DPA lines in one copy. Registry lock held. */
 static void pod_check(struct dmesh_pod_thread *p, uint64_t now)
 {
-    const struct dpa_mux_ctx *h = &registry.sample;
+    struct dpa_mux_status snap;
+    const struct dpa_mux_status *h = &snap;
     uint64_t cur[MUX_COUNTERS], d[MUX_COUNTERS], stale = 0, bad = 0, errors = 0;
     double secs;
     char rings[DMESH_MUX_RINGS * 4 + 1] = "";
@@ -788,9 +813,8 @@ static void pod_check(struct dmesh_pod_thread *p, uint64_t now)
     bool stalled, stopped;
 
     (void)dmesh_doca_dpa_failed(p->thread.dpa); /* logs a dead context itself */
-    if (DMESH_DPA_CALL(doca_dpa_d2h_memcpy(p->thread.dpa, &registry.sample, p->thread.local_storage,
-                                           offsetof(struct dpa_mux_ctx, fifo))) != DOCA_SUCCESS)
-        return;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    memcpy(&snap, p->status, sizeof(snap));
 
     /* A ring the DPA stopped: its worker closes the flow with an error. */
     for (unsigned r = 0; r < DMESH_MUX_RINGS; r++) {
@@ -856,10 +880,9 @@ static void pod_check(struct dmesh_pod_thread *p, uint64_t now)
 }
 
 /* Called by every worker's advance: one check per call when one is due, by
- * whichever worker comes first. A check is a synchronous d2h_memcpy (about
- * 1 ms), during which that worker serves none of its flows, so the checks
- * are spread over MUX_WATCH_NS rather than made all at once. Threads whose
- * release failed are retried here. */
+ * whichever worker comes first; each thread is checked about once per
+ * MUX_WATCH_NS. A check reads the thread's published status from ARM
+ * memory. Threads whose release failed are retried here. */
 void dmesh_dpa_mux_watch(struct objects *objs)
 {
     uint64_t now, due = __atomic_load_n(&registry.next_watch_ns, __ATOMIC_RELAXED);
