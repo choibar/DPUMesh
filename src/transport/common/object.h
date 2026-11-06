@@ -90,6 +90,10 @@ struct dmesh_session {
     /* Flow wake: the session's further host consumers, one per host flow
      * slot, any of which an OPEN may name (0 = free entry). */
     uint32_t flow_consumers[DMESH_SESSION_FLOW_CONSUMERS];
+    /* TAILS: the export descriptor of the host's tail table (0 = none yet).
+     * Every flow of the session carries a copy to its worker, whose pod mux
+     * thread maps the table once. */
+    struct dmesh_tails_export tails;
 };
 
 /* Flow wake consumers of a session: record an arrival or an expiry, and
@@ -167,15 +171,18 @@ struct dmesh_conn {
     uint64_t flow_stats[DMESH_FLOW_STATS];
     int32_t error_status;
     struct dmesh_export_metadata_msg *pending_metadata;
+    struct dmesh_tails_export *pending_tails; /* the session's TAILS, until its pod thread maps it */
 
     struct dmesh_doca_dpa_thread *dpa_thread; /* assigned from objs->dpa_pool */
     uint32_t rx_consumed_pos_published; /* last DPU RX consumed position sent to the DPA */
     struct dmesh_doca_dpa_comch *dpa_comch;   /* msgqs bound to dpa_thread */
 
-    /* Multiplexed forward DMA (dpu/dpa_mux.h) instead of dpa_thread/dpa_comch:
-     * this flow's forward ring is slot mux_ring of the worker's thread mux_thread. */
+    /* Pod-multiplexed forward DMA (dpu/dpa_mux.h) instead of dpa_thread/dpa_comch:
+     * this flow's forward ring is ring mux_ring (flow id - 1) of its session's
+     * thread mux_pod. */
     bool mux, mux_close_sent;
-    uint8_t mux_thread, mux_ring;
+    struct dmesh_pod_thread *mux_pod;
+    uint8_t mux_ring;
     uint32_t mux_gen;                 /* echoed by every message of this ring */
     uint32_t mux_error;               /* enum dmesh_mux_ring_error the DPA reported */
     uint64_t mux_received;            /* DMA_DONE messages taken for this flow */

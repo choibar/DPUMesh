@@ -249,6 +249,16 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
     }
     if (h.type == DMESH_SESSION_PING && s->negotiated)
         return; /* its delivery is all the host asked for */
+    if (h.type == DMESH_SESSION_TAILS) {
+        /* Once per session, before its first OPEN; pod threads map it once. */
+        if (!s->negotiated || s->tails.desc_len != 0) {
+            session_fail(objs, s);
+            return;
+        }
+        memcpy(s->tails.desc, payload, h.payload_len);
+        s->tails.desc_len = h.payload_len;
+        return;
+    }
     if (h.type == DMESH_SESSION_ARM && s->negotiated && !objs->dispatcher) {
         session_arm(objs, s, connection, payload, h.payload_len);
         return;
@@ -303,7 +313,9 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
         }
         conn->session = s;
         conn->pending_metadata = malloc(sizeof(*conn->pending_metadata));
-        if (conn->pending_metadata == NULL) {
+        if (s->tails.desc_len != 0 && (conn->pending_tails = malloc(sizeof(s->tails))) != NULL)
+            *conn->pending_tails = s->tails;
+        if (conn->pending_metadata == NULL || (s->tails.desc_len != 0 && conn->pending_tails == NULL)) {
             conn->error_status = ENOMEM;
             conn->state = DMESH_CONN_ERROR;
         } else {
@@ -1130,6 +1142,8 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     conn->dpa_thread = NULL;
     free(conn->pending_metadata);
     conn->pending_metadata = NULL;
+    free(conn->pending_tails);
+    conn->pending_tails = NULL;
     conn->sndbuf.buf = conn->rcvbuf.buf = NULL;
     return DOCA_SUCCESS;
 }
@@ -1403,7 +1417,7 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 		/* fallthrough */
 
 	case DMESH_CONN_RUNNING:
-		if (conn->mux && conn->mux_error != 0) {
+		if (conn->mux && dmesh_dpa_mux_error(conn) != 0) {
 			/* The DPA stopped this flow's ring (dpa_mux.c logged why). */
 			conn->error_status = EIO;
 			goto error;

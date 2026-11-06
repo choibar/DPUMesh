@@ -31,6 +31,8 @@ struct message {
      * producer on this connection (under the SDK lock). */
     struct doca_comch_connection *wake_connection;
     uint32_t wake_consumer;
+    /* OPEN: the session's tail table, for the worker's pod mux thread. */
+    struct dmesh_tails_export tails;
     unsigned char payload[DMESH_SESSION_MAX_PAYLOAD];
 };
 struct queue {
@@ -1032,7 +1034,8 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         .dst_ip = metadata.flow.dst_ip, .dst_port = metadata.flow.dst_port, .pair = pair,
         .replaces = steered >= 0 && steer.replaces, .replaced = steer.replaced,
         .replaced_key = steer.replaced_key};
-    struct message m = {.key = a->key, .location = a->location, .type = OPEN, .length = sizeof(metadata)};
+    struct message m = {.key = a->key, .location = a->location, .type = OPEN, .length = sizeof(metadata),
+                        .tails = s->tails};
     memcpy(m.payload, &metadata, sizeof(metadata));
     if (s->wake_consumer && s->connection && DMESH_FLOW_USES_PUSH(metadata.flow.mode)) {
         m.wake_connection = s->connection;
@@ -1185,6 +1188,10 @@ pthread_mutex_t *dmesh_dispatch_sdk_lock(struct objects *o)
 {
     return o && o->mailbox ? &o->mailbox->dispatcher->sdk_lock : NULL;
 }
+unsigned dmesh_dispatch_worker_count(struct objects *o)
+{
+    return o && o->mailbox ? (unsigned)o->mailbox->dispatcher->count : 1;
+}
 int dmesh_dispatch_worker_fd(struct objects *o) { return o->mailbox->fd; }
 void dmesh_dispatch_worker_arm(struct objects *o) { clear(o->mailbox->fd); }
 void dmesh_dispatch_worker_ready(struct objects *o)
@@ -1215,7 +1222,9 @@ void dmesh_dispatch_worker_drain(struct objects *o)
             c->session = &o->sessions[m.location.slot];
             memset(c->session, 0, sizeof(*c->session));
             c->pending_metadata = malloc(sizeof(*c->pending_metadata));
-            if (c->pending_metadata) {
+            if (m.tails.desc_len && (c->pending_tails = malloc(sizeof(m.tails))) != NULL)
+                *c->pending_tails = m.tails;
+            if (c->pending_metadata && (!m.tails.desc_len || c->pending_tails)) {
                 memcpy(c->pending_metadata, m.payload, sizeof(*c->pending_metadata));
                 c->state = DMESH_CONN_NEW;
             } else { c->error_status = ENOMEM; c->state = DMESH_CONN_ERROR; }

@@ -19,6 +19,14 @@ __dpa_rpc__ uint64_t thread_init_rpc(doca_dpa_dev_comch_consumer_t consumer, uin
 	return 0;
 }
 
+/* Starts a pod mux thread: it has no msgq from the ARM, so its first run is
+ * this notification. */
+__dpa_rpc__ uint64_t mux_kick_rpc(doca_dpa_dev_notification_completion_t notify)
+{
+    doca_dpa_dev_thread_notify(notify);
+    return 0;
+}
+
 /* Bound every activation, including idle and credit-starved polling. The SDK
  * watchdog forbids indefinitely scheduled kernels. Retrigger retains this
  * flow's thread/EU ownership model; it does not multiplex other rings. */
@@ -196,38 +204,39 @@ __dpa_global__ void run_dma_manager(void)
 }
 
 /*
- * Flow-multiplexed forward DMA (dpa_common.h, DMESH_DPA_MUX). One thread
- * drains up to DMESH_MUX_RINGS connections' forward rings in turn through a
- * single producer. Every copy has its own CQE; the FIFO records the copies in
- * submission order, so a CQE is matched to its ring and a ring's custody ACK
- * still advances only after its copy landed. The ARM opens and closes a slot
- * through its cmd field; this thread answers in the slot's state. A ring that
- * cannot proceed (staging full, bad descriptor) is skipped; only the shared
- * ARM credit and the FIFO cut a whole pass short.
+ * Pod-multiplexed forward DMA (dpa_common.h, DMESH_DPA_MUX). One thread
+ * drains the forward rings of one host session through a single producer.
+ * Every copy has its own CQE; the FIFO records the copies in submission
+ * order, so a CQE is matched to its ring and a ring's custody ACK still
+ * advances only after its copy landed. A pass reads the session's tail lines
+ * once and visits only the rings whose tail moved. A ring that cannot
+ * proceed (staging full, its worker's consumer out of credits, bad
+ * descriptor) is skipped; only a full FIFO cuts the pass short.
  */
 #define MUX_ACTIVATION_US 20000u /* bounded activation, like the native kernel's budget */
 
-static volatile struct dma_ring_ctrl *mux_ctrl(const struct dpa_mux_ring *g)
+static volatile struct dma_ring_ctrl *mux_ctrl(const struct dpa_mux_ring_cfg *c)
 {
     /* Resolved on every access: a pointer kept across rings of other mmaps
      * costs about twice as much per read (docs/2026-10-13_dpa-mux-probe.md). */
     return (void *)doca_dpa_dev_buf_get_external_ptr(
-        doca_dpa_dev_buf_array_get_buf((doca_dpa_dev_buf_arr_t)g->buf_arr, 0));
+        doca_dpa_dev_buf_array_get_buf((doca_dpa_dev_buf_arr_t)c->buf_arr, 0));
 }
 
-static const volatile struct dma_desc *mux_desc(const struct dpa_mux_ring *g, uint64_t ticket)
+static const volatile struct dma_desc *mux_desc(const struct dpa_mux_ring_cfg *c, uint64_t ticket)
 {
     return (void *)doca_dpa_dev_buf_get_external_ptr(
-        doca_dpa_dev_buf_array_get_buf((doca_dpa_dev_buf_arr_t)g->buf_arr,
-                                       (uint32_t)(ticket & (g->ring_size - 1)) + 1));
+        doca_dpa_dev_buf_array_get_buf((doca_dpa_dev_buf_arr_t)c->buf_arr,
+                                       (uint32_t)(ticket & (c->ring_size - 1)) + 1));
 }
 
-static void mux_fail(struct dpa_mux_ring *g, uint64_t error)
+static void mux_fail(struct dpa_mux_ctx *m, uint32_t r, uint64_t error)
 {
-    volatile struct dma_ring_ctrl *ctrl = mux_ctrl(g);
+    volatile struct dma_ring_ctrl *ctrl = mux_ctrl(&m->cfg[r]);
 
-    g->error = error;
-    g->state = DMESH_MUX_ERROR;
+    m->st[r].error = error;
+    m->st[r].state = DMESH_MUX_ERROR;
+    m->open_mask &= ~(1ull << r);
     ctrl->error = (uint32_t)error;
     __dpa_thread_window_writeback();
 }
@@ -239,7 +248,8 @@ static void mux_drain(struct dpa_mux_ctx *m)
 
     while (doca_dpa_dev_get_completion(m->producer_comp, &comp)) {
         int ok = doca_dpa_dev_get_completion_type(comp) == DOCA_DPA_DEV_COMP_SEND;
-        struct dpa_mux_ring *g;
+        struct dpa_mux_ring_state *s;
+        uint32_t r;
         uint64_t e;
 
         doca_dpa_dev_completion_ack(m->producer_comp, 1);
@@ -250,84 +260,149 @@ static void mux_drain(struct dpa_mux_ctx *m)
         }
         e = m->fifo[m->fifo_head % DMESH_MUX_FIFO];
         m->fifo_head++;
-        g = &m->ring[(uint32_t)(e >> 32) % DMESH_MUX_RINGS];
-        g->inflight--;
+        r = (uint32_t)(e >> 32) % DMESH_MUX_RINGS;
+        s = &m->st[r];
+        s->inflight--;
         if (!ok) {
             m->err_cqes++;
-            g->failed++;
-            if (g->state == DMESH_MUX_ACTIVE)
-                mux_fail(g, DMESH_MUX_ERR_COPY);
-        } else if (g->state == DMESH_MUX_ACTIVE) {
-            volatile struct dma_ring_ctrl *ctrl = mux_ctrl(g);
+            s->failed++;
+            if (s->state == DMESH_MUX_ACTIVE)
+                mux_fail(m, r, DMESH_MUX_ERR_COPY);
+        } else if (s->state == DMESH_MUX_ACTIVE) {
+            volatile struct dma_ring_ctrl *ctrl = mux_ctrl(&m->cfg[r]);
 
-            g->complete++;
-            g->completed_bytes += (uint32_t)e;
-            ctrl->completed_bytes = g->completed_bytes;
-            ctrl->consumer_head = g->complete;
+            s->complete++;
+            s->completed_bytes += (uint32_t)e;
+            ctrl->completed_bytes = s->completed_bytes;
+            ctrl->consumer_head = s->complete;
             __dpa_thread_window_writeback();
         }
     }
 }
 
-/* Up to DMESH_MUX_QUANTUM copies from one ring. Returns -1 when the ARM has
- * no receive posted, which ends the pass for every ring. */
-static int mux_service(struct dpa_mux_ctx *m, uint32_t r, uint64_t now)
+/* The ARM changed a command: open, close or leave rings. */
+static void mux_commands(struct dpa_mux_ctx *m)
 {
-    struct dpa_mux_ring *g = &m->ring[r];
-    volatile struct dma_ring_ctrl *ctrl = mux_ctrl(g);
-    uint64_t tail = ctrl->producer_tail;
+    m->ctl_seen = m->ctl_seq;
+    for (uint32_t r = 0; r < DMESH_MUX_RINGS; r++) {
+        struct dpa_mux_ring_state *s = &m->st[r];
+        uint64_t cmd = m->cfg[r].cmd, bit = 1ull << r;
+
+        if (cmd == DMESH_MUX_CMD_OPEN && s->state == DMESH_MUX_IDLE) {
+            s->state = DMESH_MUX_ACTIVE;
+            m->open_mask |= bit;
+        } else if (cmd == DMESH_MUX_CMD_CLOSE && s->state != DMESH_MUX_CLOSED) {
+            m->open_mask &= ~bit;
+            m->closing_mask |= bit;
+        }
+    }
+}
+
+/* Up to DMESH_MUX_QUANTUM copies from ring r up to tail. Returns -1 when the
+ * FIFO is full, which ends the pass. */
+static int mux_service(struct dpa_mux_ctx *m, uint32_t r, uint64_t tail, uint64_t now)
+{
+    const struct dpa_mux_ring_cfg *c = &m->cfg[r];
+    struct dpa_mux_ring_state *s = &m->st[r];
     uint32_t n = 0;
 
-    if (tail == g->submit)
-        return 0;
-    if (tail < g->submit || tail - g->complete > g->ring_size) {
-        mux_fail(g, DMESH_MUX_ERR_TAIL);
+    if (tail - s->complete > c->ring_size) {
+        mux_fail(m, r, DMESH_MUX_ERR_TAIL);
         return 0;
     }
-    while (n < DMESH_MUX_QUANTUM && g->submit != tail && m->fifo_tail - m->fifo_head < DMESH_MUX_FIFO) {
-        const volatile struct dma_desc *d = mux_desc(g, g->submit);
-        uint64_t addr = d->addr, size = d->size;
+    while (n < DMESH_MUX_QUANTUM && s->submit != tail) {
+        const volatile struct dma_desc *d;
+        uint64_t addr, size;
         uint32_t len, unread, free_space, remaining, wrap_padding;
 
-        if (size == 0 || size > 8064u || size > g->buf_size || addr < g->host_base ||
-            addr - g->host_base > g->host_len || size > g->host_len - (addr - g->host_base)) {
-            mux_fail(g, DMESH_MUX_ERR_DESC);
+        if (m->fifo_tail - m->fifo_head >= DMESH_MUX_FIFO) {
+            m->fifo_full++;
+            return -1;
+        }
+        d = mux_desc(c, s->submit);
+        addr = d->addr;
+        size = d->size;
+        if (size == 0 || size > 8064u || size > c->buf_size || addr < c->host_base ||
+            addr - c->host_base > c->host_len || size > c->host_len - (addr - c->host_base)) {
+            mux_fail(m, r, DMESH_MUX_ERR_DESC);
             return 0;
         }
         len = (uint32_t)size;
         /* Staging stays owned until the reader releases it; keep one byte
          * free so equal positions only ever mean empty. */
-        unread = (uint32_t)((g->pos + g->buf_size - g->rx_consumed_pos) % g->buf_size);
-        free_space = (uint32_t)g->buf_size - unread;
-        remaining = (uint32_t)(g->buf_size - g->pos);
+        unread = (uint32_t)((s->pos + c->buf_size - c->rx_consumed_pos) % c->buf_size);
+        free_space = (uint32_t)c->buf_size - unread;
+        remaining = (uint32_t)(c->buf_size - s->pos);
         wrap_padding = len > remaining ? remaining : 0;
         if (free_space <= wrap_padding + len)
             return 0; /* this ring waits for its reader; the others go on */
-        if (doca_dpa_dev_comch_producer_is_consumer_empty(m->producer, 1)) {
+        if (doca_dpa_dev_comch_producer_is_consumer_empty(m->producer, (uint32_t)c->consumer)) {
             m->credit_waits++;
-            return -1;
+            return 0; /* its worker has no receive posted; other workers' rings go on */
         }
         if (wrap_padding != 0)
-            g->pos = 0;
+            s->pos = 0;
         struct dmesh_mux_msg msg = {
-            .type = DMESH_MUX_MSG_DMA_DONE, .ring = (uint8_t)r, .slot = (uint16_t)g->slot,
-            .generation = (uint32_t)g->generation, .pos = (uint32_t)g->pos, .length = len,
+            .type = DMESH_MUX_MSG_DMA_DONE, .ring = (uint8_t)r, .slot = (uint16_t)c->slot,
+            .generation = (uint32_t)c->generation, .pos = (uint32_t)s->pos, .length = len,
         };
-        doca_dpa_dev_comch_producer_dma_copy(m->producer, 1,
-            (doca_dpa_dev_mmap_t)g->dpu_mmap, g->staging_addr + g->pos,
-            (doca_dpa_dev_mmap_t)g->host_mmap, addr, len,
+        doca_dpa_dev_comch_producer_dma_copy(m->producer, (uint32_t)c->consumer,
+            (doca_dpa_dev_mmap_t)c->dpu_mmap, c->staging_addr + s->pos,
+            (doca_dpa_dev_mmap_t)c->host_mmap, addr, len,
             (uint8_t *)&msg, sizeof(msg), DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
         m->fifo[m->fifo_tail % DMESH_MUX_FIFO] = (uint64_t)r << 32 | len;
         m->fifo_us[m->fifo_tail % DMESH_MUX_FIFO] = now;
         m->fifo_tail++;
-        g->inflight++;
-        g->submit++;
-        g->pos += len;
-        if (g->pos == g->buf_size)
-            g->pos = 0;
+        m->copies++;
+        s->inflight++;
+        s->submit++;
+        s->pos += len;
+        if (s->pos == c->buf_size)
+            s->pos = 0;
         n++;
     }
     return (int)n;
+}
+
+/* One read per tail line holding an open ring, then a visit to each open ring
+ * whose published tail differs from what it has submitted. */
+static void mux_pass(struct dpa_mux_ctx *m, uint64_t now)
+{
+    uint32_t tails[DMESH_MUX_RINGS];
+
+    __dpa_thread_window_read_inv();
+    for (uint32_t l = 0; l < DMESH_TAILS_LINES; l++) {
+        const volatile uint32_t *line;
+
+        if (((m->open_mask >> (l * DMESH_TAILS_PER_LINE)) & ((1ull << DMESH_TAILS_PER_LINE) - 1)) == 0)
+            continue;
+        line = (void *)doca_dpa_dev_buf_get_external_ptr(
+            doca_dpa_dev_buf_array_get_buf((doca_dpa_dev_buf_arr_t)m->tails, l));
+        for (uint32_t i = 0; i < DMESH_TAILS_PER_LINE; i++)
+            tails[l * DMESH_TAILS_PER_LINE + i] = line[i];
+        m->tail_reads++;
+    }
+    for (uint32_t k = 0; k < DMESH_MUX_RINGS; k++) {
+        uint32_t r = (uint32_t)((m->rr + k) % DMESH_MUX_RINGS);
+        struct dpa_mux_ring_state *s = &m->st[r];
+        uint32_t ahead;
+
+        if (!(m->open_mask & (1ull << r)))
+            continue;
+        /* The table holds the tail's low 32 bits; a ring is never more than
+         * ring_size ahead, so the difference is exact. */
+        ahead = tails[r] - (uint32_t)s->submit;
+        if (ahead == 0)
+            continue;
+        if (ahead > m->cfg[r].ring_size) {
+            mux_fail(m, r, DMESH_MUX_ERR_TAIL);
+            continue;
+        }
+        m->visits++;
+        if (mux_service(m, r, s->submit + ahead, now) < 0)
+            break;
+    }
+    m->rr = (m->rr + 1) % DMESH_MUX_RINGS;
 }
 
 __dpa_global__ void run_dma_mux(void)
@@ -346,8 +421,6 @@ __dpa_global__ void run_dma_mux(void)
     doca_dpa_dev_completion_request_notification(m->producer_comp);
     start = __dpa_thread_time();
     for (;;) {
-        int credit = 1;
-
         now = __dpa_thread_time();
         if (now - start > MUX_ACTIVATION_US)
             break;
@@ -364,22 +437,16 @@ __dpa_global__ void run_dma_mux(void)
             continue;
         }
 
-        __dpa_thread_window_read_inv();
-        for (uint32_t k = 0; k < DMESH_MUX_RINGS; k++) {
-            uint32_t r = (uint32_t)((m->rr + k) % DMESH_MUX_RINGS);
-            struct dpa_mux_ring *g = &m->ring[r];
-            uint64_t cmd = g->cmd;
-
-            if (cmd == DMESH_MUX_CMD_OPEN) {
-                if (g->state == DMESH_MUX_IDLE)
-                    g->state = DMESH_MUX_ACTIVE;
-                if (credit && g->state == DMESH_MUX_ACTIVE && mux_service(m, r, now) < 0)
-                    credit = 0; /* no more copies this pass; closes still answered */
-            } else if (cmd == DMESH_MUX_CMD_CLOSE && g->state != DMESH_MUX_CLOSED && g->inflight == 0) {
-                g->state = DMESH_MUX_CLOSED;
-            }
-        }
-        m->rr = (m->rr + 1) % DMESH_MUX_RINGS;
+        if (m->ctl_seq != m->ctl_seen)
+            mux_commands(m);
+        if (m->closing_mask != 0)
+            for (uint32_t r = 0; r < DMESH_MUX_RINGS; r++)
+                if ((m->closing_mask & (1ull << r)) && m->st[r].inflight == 0) {
+                    m->st[r].state = DMESH_MUX_CLOSED;
+                    m->closing_mask &= ~(1ull << r);
+                }
+        if (m->open_mask != 0)
+            mux_pass(m, now);
         m->heartbeat++;
         m->oldest_age_us = m->fifo_head == m->fifo_tail ? 0 :
                            now - m->fifo_us[m->fifo_head % DMESH_MUX_FIFO];
