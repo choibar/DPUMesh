@@ -382,6 +382,10 @@ static void mux_pass(struct dpa_mux_ctx *m, uint64_t now)
             tails[l * DMESH_TAILS_PER_LINE + i] = line[i];
         m->tail_reads++;
     }
+    /* The next pass starts after the last ring served, or at the ring the
+     * full FIFO stopped, so every ring with work gets the first turn in
+     * order, however many of the 32 are open. */
+    uint32_t next = m->rr;
     for (uint32_t k = 0; k < DMESH_MUX_RINGS; k++) {
         uint32_t r = (uint32_t)((m->rr + k) % DMESH_MUX_RINGS);
         struct dpa_mux_ring_state *s = &m->st[r];
@@ -399,10 +403,13 @@ static void mux_pass(struct dpa_mux_ctx *m, uint64_t now)
             continue;
         }
         m->visits++;
-        if (mux_service(m, r, s->submit + ahead, now) < 0)
+        if (mux_service(m, r, s->submit + ahead, now) < 0) {
+            next = r;
             break;
+        }
+        next = (r + 1) % DMESH_MUX_RINGS;
     }
-    m->rr = (m->rr + 1) % DMESH_MUX_RINGS;
+    m->rr = next;
 }
 
 __dpa_global__ void run_dma_mux(void)
