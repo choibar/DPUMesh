@@ -583,12 +583,13 @@ doca_error_t dmesh_dpa_mux_init(struct objects *objs)
         registry.workers = dmesh_dispatch_worker_count(objs);
         registry.stall_us = (stall != NULL && atoi(stall) > 0 ? (uint64_t)atoi(stall) : 100) * 1000;
         registry.stats = stats != NULL && atoi(stats) != 0;
-        DOCA_LOG_INFO("DPA mux: one thread per session, at most %d, consumers on %u workers",
-                      dmesh_dpa_mux_threads(), registry.workers);
     }
     pthread_mutex_unlock(&registry.lock);
     objs->mux = &registry;
     objs->release_mux = mux_release;
+    /* The shape start.sh waits for once per worker; the threads are per process. */
+    DOCA_LOG_INFO("DPA mux: %d threads on worker %d, one per host session, shared by the process's %u workers",
+                  dmesh_dpa_mux_threads(), objs->worker_idx, registry.workers);
     return DOCA_SUCCESS;
 }
 
