@@ -275,6 +275,16 @@ run**):
   jemalloc, the C++ one glibc malloc. Suspect a use-after-free/double-free in
   the slot teardown rather than a hard null deref. BACKEND-mode teardown is
   clean in both — only the forward-DPA/consumer slot is affected.
+- **Destroying a context of an armed PE.** A completion on a context whose PE
+  was armed (`doca_pe_request_notification`) queues an event that refers to
+  that context, and the SDK reads the queue on the next request or clear. If
+  the context was destroyed in between, the read dereferences freed memory and
+  the process dies inside `doca_pe_request_notification`. A host that dies
+  with a DMA in flight leaves such an event (the failed task's completion); with
+  a control plane that removes a terminating pod's endpoints the proxy writes to
+  dying pods on every pod deletion. Every destroy of a context on the consumer
+  PE is therefore preceded by `dmesh_pe_read_events()` (`common/object.h`), once
+  the context is idle. Do the same for any new context on that PE.
 - Editing `device/dpa_kernel.c` requires a `ninja` rebuild (dpacc reruns); DPA
   device code uses the `doca_dpa_dev_*` API and `dpaintrin.h`, a different world
   from host DOCA code.

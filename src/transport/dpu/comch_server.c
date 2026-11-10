@@ -954,6 +954,7 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
                    doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE)
                 doca_pe_progress(objs->consumer_pe);
         }
+        dmesh_pe_read_events(objs->consumer_pe);
         (void)DMESH_DPA_CALL(doca_comch_consumer_destroy(conn->consumer));
         conn->consumer = NULL;
     }
@@ -1509,6 +1510,7 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			 * the DPA thread itself is kept (that destroy is the flexio
 			 * hazard) - the slot leaks its pool thread, as parking always did. */
 			if (conn->consumer != NULL) {
+				dmesh_pe_read_events(objs->consumer_pe);
 				(void)DMESH_DPA_CALL(doca_comch_consumer_destroy(conn->consumer));
 				conn->consumer = NULL;
 			}
