@@ -996,12 +996,13 @@ dmesh_doca_dpa_msgq_destroy(struct dmesh_doca_dpa_msgq *msgq, struct doca_pe *pe
     if (msgq->consumer != NULL)
         stop_ctx_bounded(doca_comch_consumer_as_ctx(msgq->consumer), pe);
 
-    dmesh_pe_read_events(pe);
     if (msgq->producer != NULL) {
+        dmesh_pe_read_events(pe);
         (void)DMESH_DPA_CALL(doca_comch_producer_destroy(msgq->producer));
         msgq->producer = NULL;
     }
     if (msgq->consumer != NULL) {
+        dmesh_pe_read_events(pe);
         (void)DMESH_DPA_CALL(doca_comch_consumer_destroy(msgq->consumer));
         msgq->consumer = NULL;
     }

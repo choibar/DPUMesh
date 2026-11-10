@@ -33,6 +33,7 @@ struct test_fixture {
     bool complete_on_progress;
     unsigned lend_buffers;  /* buffers[4..] handed to chained submissions */
     unsigned task_count, free_count, progress_count, submit_count, destroy_count, inventory_count;
+    unsigned event_reads; /* doca_pe_request_notification: once before each destroy */
 };
 static struct test_fixture *fixture;
 
@@ -124,10 +125,19 @@ uint8_t doca_pe_progress(struct doca_pe *pe)
         fixture->state = DOCA_CTX_STATE_IDLE;
     return 0;
 }
+doca_error_t doca_pe_request_notification(struct doca_pe *pe)
+{
+    /* The idle context's waiting events are read while it still exists. */
+    assert(pe == (void *)&fixture->objs && fixture->state == DOCA_CTX_STATE_IDLE);
+    assert(fixture->event_reads == fixture->destroy_count);
+    ++fixture->event_reads;
+    return DOCA_SUCCESS;
+}
 doca_error_t doca_dma_destroy(struct doca_dma *dma)
 {
     assert(dma == (void *)fixture && fixture->state == DOCA_CTX_STATE_IDLE);
     assert(fixture->free_count == fixture->task_count);
+    assert(fixture->event_reads == fixture->destroy_count + 1);
     ++fixture->destroy_count;
     return fixture->destroy_error;
 }
