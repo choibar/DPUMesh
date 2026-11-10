@@ -104,7 +104,8 @@ typedef struct dmesh_event {
 
 /* ===== Channel: the process's listening socket (ibv_open_device + PD) ===== */
 
-/* Create a channel using $DPUMESH_SERVICE identity. NULL indicates failure. */
+/* Create a channel serving $DPUMESH_SERVICE, or "<pod ip>:$DPUMESH_PORT" when
+ * only the port is set (a client with neither). NULL indicates failure. */
 dmesh_channel_t *dmesh_create_channel(void);
 
 /* Destroy an idle channel. Returns EBUSY while a QP remains, changing nothing,
