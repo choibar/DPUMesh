@@ -34,6 +34,7 @@ session으로 다중화된 연결(지금의 host 라이브러리)에만 적용�
   3. `cmd = OPEN`을 쓰고 `ctl_seq`를 올린다. 각 `h2d_memcpy`는 다음 것이 시작하기 전에 끝난다.
   - DPA는 다음 바퀴에 OPEN과 IDLE을 보고 ACTIVE로 바꾸고 열린 ring에 넣는다. 연결은 OPEN을 쓰자마자 `RUNNING`으로 간다.
 - **ring 닫기.** ARM이 `cmd = CLOSE`를 쓰고 `ctl_seq`를 올린다. DPA는 그 ring을 열린 ring에서 빼고, 진행 중 copy가 0이 되면 `state = CLOSED`로 바꾸고 그 line을 내보낸다. ARM은 내보낸 line이 CLOSED이고 `받은 DMA_DONE 수 + failed == submit`일 때 끝난 것으로 본다. 그 worker의 마지막 ring이면 consumer를 그 worker의 PE에서 멈추고 없앤다. 그다음 DMA task, `buf_arr`, mmap, staging을 해제하고 ring을 돌려준다. session의 마지막 ring이면 thread를 멈추고(`stop`, 내보낸 `stopped`) 모든 객체를 없앤다. 실패한 해제는 점검이 다시 시도한다. 1초 안에 닫히지 않으면 quiesce 시간 초과와 같이 다루고, ring은 남겨 둔다.
+- **consumer 정리.** worker의 consumer는 그 worker가 thread에 가진 마지막 ring이 닫히면 멈추고 없앤다. Comch consumer는 idle이 되는 순간 SDK 객체가 끝나고, 멈출 때 걸어 둔 receive가 flush되면서 이벤트를 하나 올린다. 그래서 `doca_ctx_stop` 앞에서 PE에 쌓인 이벤트를 읽고, stop 직후 PE를 progress하기 전에 한 번 더 읽는다(`dmesh_pe_take_events`). 이벤트가 남은 채 객체가 끝나면 다음 `doca_pe_request_notification`이 해제된 객체를 건드린다.
 - **검사.** descriptor 크기, tail이 거꾸로 가거나 ring보다 앞서는지, `addr`가 그 연결의 TX 풀 범위 안인지 본다. 어긋나거나 copy가 실패하면 그 ring만 `state = ERROR`가 되고, 오류 값은 host ring의 `ctrl.error`에도 남는다.
 - **점검(`dmesh_dpa_mux_watch`).** 모든 worker가 advance마다 부르고, 때가 된 첫 worker가 thread 하나를 점검한다(나머지는 lock을 얻지 못하면 바로 돌아간다). thread마다 약 1초에 한 번이다. 점검은 그 thread가 내보낸 상태를 ARM 메모리에서 읽는다.
   - ring이 ERROR면 그 ring을 가진 worker가 다음 advance에 그 연결을 EIO로 닫는다. 메시지 방식보다 알아채는 데 최대 1초 늦다.

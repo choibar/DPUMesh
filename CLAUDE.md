@@ -284,7 +284,11 @@ run**):
   a control plane that removes a terminating pod's endpoints the proxy writes to
   dying pods on every pod deletion. Every destroy of a context on the consumer
   PE is therefore preceded by `dmesh_pe_read_events()` (`common/object.h`), once
-  the context is idle. Do the same for any new context on that PE.
+  the context is idle. Do the same for any new context on that PE. A Comch
+  consumer is different: its SDK object ends when the context reaches idle, and
+  stopping it flushes its posted receives, which raises an event of its own. Its
+  events are read around the stop instead, before the PE is progressed
+  (`dmesh_pe_take_events()`; the pod mux's worker consumers, `dpu/dpa_mux.c`).
 - Editing `device/dpa_kernel.c` requires a `ninja` rebuild (dpacc reruns); DPA
   device code uses the `doca_dpa_dev_*` API and `dpaintrin.h`, a different world
   from host DOCA code.

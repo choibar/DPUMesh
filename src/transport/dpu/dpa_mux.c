@@ -202,7 +202,8 @@ static void pod_recv_error_cb(struct doca_comch_consumer_task_post_recv *task, u
 }
 
 /* Stops ctx; with a PE, progresses it until idle (a consumer flushes its
- * receives through its PE). */
+ * receives through its PE). The PE's events are read around the stop
+ * (dmesh_pe_take_events): the consumer ends at idle and must leave none. */
 static doca_error_t ctx_stop_checked(struct doca_ctx *ctx, struct doca_pe *pe)
 {
     enum doca_ctx_states state;
@@ -211,9 +212,11 @@ static doca_error_t ctx_stop_checked(struct doca_ctx *ctx, struct doca_pe *pe)
     if (result != DOCA_SUCCESS || state == DOCA_CTX_STATE_IDLE)
         return result;
     if (state != DOCA_CTX_STATE_STOPPING) {
+        dmesh_pe_take_events(pe, 0);
         result = DMESH_DPA_CALL(doca_ctx_stop(ctx));
         if (result != DOCA_SUCCESS && result != DOCA_ERROR_IN_PROGRESS)
             return result;
+        dmesh_pe_take_events(pe, 1);
     }
     for (unsigned spins = 0; spins < 100000; ++spins) {
         result = doca_ctx_get_state(ctx, &state);
@@ -278,10 +281,8 @@ static doca_error_t consumer_destroy(struct pod_consumer *c)
         return DOCA_SUCCESS;
     c->stopping = true;
     result = ctx_stop_checked(doca_comch_consumer_as_ctx(c->consumer), c->objs->consumer_pe);
-    if (result == DOCA_SUCCESS) {
-        dmesh_pe_read_events(c->objs->consumer_pe);
+    if (result == DOCA_SUCCESS)
         result = DMESH_DPA_CALL(doca_comch_consumer_destroy(c->consumer));
-    }
     if (result != DOCA_SUCCESS)
         return result;
     c->consumer = NULL;
