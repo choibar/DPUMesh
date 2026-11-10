@@ -91,11 +91,12 @@ static int env_int(const char *name, int fallback, int lo, int hi)
     int v = atoi(s);
     return v < lo || v > hi ? fallback : v;
 }
-/* The Pod's IPv4 address, network order: $DPUMESH_POD_IP, or else the address
- * this network namespace sends from toward the Kubernetes API Service
+/* The Pod's IPv4 address, network order: $DPUMESH_POD_IP; else the address a
+ * verifying broker established for this process; else the address this
+ * network namespace sends from toward the Kubernetes API Service
  * ($KUBERNETES_SERVICE_HOST, which kubelet sets in every container), which is
  * the Pod IP. Connecting a UDP socket only picks the route; nothing is sent. */
-static int pod_ip_lookup(uint32_t *out)
+static int pod_ip_lookup(uint32_t *out, uint32_t verified)
 {
     const char *env = getenv("DPUMESH_POD_IP"), *api = getenv("KUBERNETES_SERVICE_HOST");
     if (env && *env) {
@@ -104,6 +105,8 @@ static int pod_ip_lookup(uint32_t *out)
         errno = EINVAL;
         return -1;
     }
+    /* A verifying broker read the address from this process's namespace. */
+    if (verified) { *out = verified; return 0; }
     struct sockaddr_in dst = { .sin_family = AF_INET, .sin_port = htons(443) }, src;
     socklen_t len = sizeof(src);
     if (api && inet_pton(AF_INET, api, &dst.sin_addr) == 1) {
@@ -377,14 +380,18 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     for (int i = 0; i < SLOTS; ++i) if ((t->slots[i].epfd = epoll_create1(EPOLL_CLOEXEC)) < 0) goto fail;
     const char *pci = getenv("DPUMESH_PCI_ADDR"), *server = getenv("DPUMESH_SERVER");
     const char *workload = getenv("DPUMESH_WORKLOAD");
-    if (!pci || !*pci) { errno = EINVAL; goto fail; }
-    if (pod_ip_lookup(&t->pod_ip) != 0) goto fail;
+    /* Only a channel that opens the device in this process (no broker, or the
+     * host-dpa path) needs the PCI address; channel_dev_open checks it. */
     snprintf(t->server, sizeof(t->server), "%s", server && *server ? server : "DPUMesh0");
     snprintf(t->workload, sizeof(t->workload), "%s", workload ? workload : "");
     t->pod_id = env_int("DPUMESH_POD_ID", 0, 0, 126);
     t->backend_max = env_int("DPUMESH_BACKEND_MAX", BACKEND_MAX_DEFAULT, 1, SLOTS);
     t->next_uport = UPORT_BASE;
     t->service_id = DMESH_SVC_NONE;
+    if (channel_dev_open(pci, &t->dev) != 0) goto fail;
+    if (channel_session_open(t->dev, t->server) != 0) goto fail;
+    t->flow_wake = channel_dev_flow_wake(t->dev);
+    if (pod_ip_lookup(&t->pod_ip, channel_dev_verified_addr(t->dev)) != 0) goto fail;
     /* The served address is resolved once: every BACKEND flow carries it. */
     char served_buf[INET_ADDRSTRLEN + 6];
     const char *served = served_target(served_buf, sizeof(served_buf), cfg->service_name, t->pod_ip,
@@ -398,9 +405,6 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
             goto fail;
         }
     }
-    if (channel_dev_open(pci, &t->dev) != 0) goto fail;
-    if (channel_session_open(t->dev, t->server) != 0) goto fail;
-    t->flow_wake = channel_dev_flow_wake(t->dev);
     if (channel_mem_alloc(t->dev, cfg->bytes, &t->tx) != 0) goto fail;
     if (channel_mem_alloc(t->dev, (size_t)SLOTS * CHANNEL_WINDOW, &t->rx) != 0) goto fail;
     if (t->service_id != DMESH_SVC_NONE) {

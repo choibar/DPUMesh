@@ -19,6 +19,7 @@
  *                   process to an SF (ibdev name) that then owns the DPA objects
  */
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -52,7 +53,11 @@ struct channel_conn_config {
 	size_t rx_offset;       /* This connection's window inside rx */
 };
 
-/* Device: opens the Comch device (and, on the host-dpa reverse path, the DPA process) */
+/* Device. A dpu-dma channel is a broker client when DPUMESH_BROKER names the
+ * broker's socket, or when it is unset and /run/dpumesh/broker.sock exists;
+ * the broker owns the device and `pci` is unused. Otherwise (DPUMESH_BROKER=off,
+ * no broker socket, or the host-dpa reverse path) this process opens the Comch
+ * device, and on host-dpa the DPA process, at `pci`: the direct path. */
 int channel_dev_open(const char *pci, struct channel_dev **out);
 void channel_dev_close(struct channel_dev *dev);
 /* One serialized control connection per device/channel. */
@@ -76,6 +81,11 @@ int channel_conn_take_request(struct channel_conn *, int *kind, uint32_t *count,
 int channel_conn_spare_ready(struct channel_conn *);
 int channel_conn_scale_ack(struct channel_conn *, uint32_t token, uint32_t applied);
 void channel_backend_finish(struct channel_dev *, uint32_t worker, uint32_t token, int error);
+/* This process's IPv4 address (network byte order) as a verifying broker
+ * established it after channel_session_open: the only address it may LISTEN on
+ * or send from. 0 when the device is opened in-process or the broker verifies
+ * none. */
+uint32_t channel_dev_verified_addr(const struct channel_dev *dev);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);
 /* Idle wake. The fd is readable after channel_dev_arm when a control message
@@ -83,7 +93,9 @@ int channel_dev_host_dpa(const struct channel_dev *dev);
  * the push flows, so the DPU rings for descriptors this host has not read.
  * It fails, leaving the caller to keep polling, when the session is down or
  * the ARM cannot be queued. The control PE runs in PROGRESS_ALL, so the next
- * channel_dev_arm also clears a raised fd. */
+ * channel_dev_arm also clears a raised fd. On a broker client the fd is an
+ * eventfd the broker raises and the broker sends the ARM; a failure it meets
+ * there raises the fd, so the caller polls again. */
 int channel_dev_fd(struct channel_dev *dev);
 int channel_dev_arm(struct channel_dev *dev);
 void channel_dev_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells);
@@ -176,5 +188,13 @@ uint64_t channel_conn_consumed(const struct channel_conn *conn);
 int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos, uint32_t *len);
 /* Publishes the consumption cursor: every batch up to `seq` is released */
 void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes);
+
+/* Broker: serves one client connection (dpumesh_broker's per-client child)
+ * with the device at `pci`, until the client disconnects or SIGTERM/SIGINT;
+ * `unblock` (may be NULL) is unblocked once those handlers are installed.
+ * Every request is checked against `rules` (broker_ipc.h; NULL trusts the
+ * client). Closing the connection closes every flow the client left open. */
+struct broker_peer_rules;
+int channel_broker_serve(int sock, const char *pci, const sigset_t *unblock, const struct broker_peer_rules *rules);
 
 #endif // CHANNEL_H

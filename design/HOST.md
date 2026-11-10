@@ -141,6 +141,12 @@ no hop through the channel's. Control messages still arrive on the control
 PE; a flow's CLOSED or ERROR marks its stripe, and the channel's poller wakes
 the QP through its eventfd.
 
+A broker's client has no PE, so its session has neither the fast path nor flow
+wake: the broker opens the session without the consumers, the channel reports
+flow wake off, and push batches wake the client through `ARM` and `DOORBELL`
+(the broker relays both: the arm page and kick eventfd one way, the wake
+eventfd the other).
+
 ### Host-dpa reverse path
 
 `DPUMESH_HOST_DPA_PCI` names the host function whose DPA runs the reverse threads
@@ -250,8 +256,22 @@ in the proxy's notification handling, not in this library.
 ## Configuration
 
 All values come from the environment; `.env.example` lists them with
-placeholders. `DPUMESH_PCI_ADDR`, `DPUMESH_SERVER` (default `DPUMesh0`),
-`DPUMESH_POD_IP` (found in a Pod when unset), `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
+placeholders. On the dpu-dma reverse path a host broker can own the DOCA device
+(`dpumesh_broker --listen <socket> --pci <addr>`, [plan](../docs/2026-09-29_host-broker-plan.md)):
+the channel is its client when `DPUMESH_BROKER` names the socket, or when it is
+unset and `/run/dpumesh/broker.sock` exists, and maps the memory the broker
+registered; its idle wake is `ARM`/`DOORBELL` through the broker (see Flow
+wake). Otherwise the application opens the device itself at
+`DPUMESH_PCI_ADDR` (the direct path); `DPUMESH_BROKER=off` forces that, and the
+host-dpa path always takes it. The broker trusts its clients' addresses and
+workload unless `--verify addr` (LISTEN and source addresses must be the
+client's own network namespace's) or `--verify pod` (also: the client runs in a
+Pod, and its flows carry the Pod's mesh identity from the kubelet's service
+account token). A client registers at most `--client-mem-mib` (256) of pinned
+memory, and `--max-clients` (64) are served at once. A lost Comch session or
+broker reaches the application as a transport loss (`design/API.md`).
+`DPUMESH_SERVER` (default `DPUMesh0`),
+`DPUMESH_POD_IP` (when unset: the address a verifying broker established, else the Pod's route source), `DPUMESH_WORKLOAD`, `DPUMESH_POD_ID` (default 0),
 `DPUMESH_PORT` (the port a server serves on its pod IP), `DPUMESH_SERVICE`
 (a `<host>:<port>` target served instead),
 `DPUMESH_TARGETS` (the targets the preload shim carries),
@@ -265,6 +285,7 @@ descriptor and event traces to stderr.
 
 ```sh
 make lib            # host library and preload shim
+make broker         # build/bin/dpumesh_broker, the process that owns the DOCA device
 make test           # host-only checks and ABI contract
 make examples       # native and preload examples; see examples/README.md
 cd src/transport && meson setup build && meson compile -C build   # transport, on the DPU
