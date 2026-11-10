@@ -278,8 +278,10 @@ static doca_error_t consumer_destroy(struct pod_consumer *c)
         return DOCA_SUCCESS;
     c->stopping = true;
     result = ctx_stop_checked(doca_comch_consumer_as_ctx(c->consumer), c->objs->consumer_pe);
-    if (result == DOCA_SUCCESS)
+    if (result == DOCA_SUCCESS) {
+        dmesh_pe_read_events(c->objs->consumer_pe);
         result = DMESH_DPA_CALL(doca_comch_consumer_destroy(c->consumer));
+    }
     if (result != DOCA_SUCCESS)
         return result;
     c->consumer = NULL;
