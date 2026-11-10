@@ -417,4 +417,20 @@ bool dmesh_objects_have_live_flows(const struct objects *);
 void
 dmesh_conn_close(struct objects *objs, struct doca_comch_connection *connection);
 
+/* Reads the events waiting in a progress engine's notification channel.
+ *
+ * A completion on a context of an armed PE queues an event that refers to
+ * that context's completion queue; the SDK reads the queue on the next
+ * doca_pe_request_notification(). An event still waiting when its context is
+ * destroyed then refers to freed memory, and reading it crashes inside
+ * doca_pe_request_notification() (a host that dies with a DMA in flight
+ * leaves exactly that: the failed task's completion). Call this for a
+ * context that is idle, so it completes nothing more, right before
+ * destroying it. */
+static inline void dmesh_pe_read_events(struct doca_pe *pe)
+{
+    if (pe != NULL)
+        (void)doca_pe_request_notification(pe);
+}
+
 #endif // OBJECT_H_

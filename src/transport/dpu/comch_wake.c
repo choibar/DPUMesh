@@ -155,6 +155,7 @@ static void wake_stop(struct dmesh_wake_producer *p)
         (void)doca_pe_progress(o->consumer_pe);
     if (!p->idle && st != DOCA_CTX_STATE_IDLE)
         return;
+    dmesh_pe_read_events(o->consumer_pe);
     if (lock) pthread_mutex_lock(lock);
     doca_error_t r = doca_comch_producer_destroy(p->producer);
     if (lock) pthread_mutex_unlock(lock);

@@ -1330,6 +1330,8 @@ cleanup_dma_tasks(struct dmesh_conn *conn)
                 return DOCA_ERROR_BAD_STATE;
             (void)doca_pe_progress(conn->objs->consumer_pe);
         }
+        if (conn->objs != NULL)
+            dmesh_pe_read_events(conn->objs->consumer_pe);
         result = doca_dma_destroy(conn->dma_ctx);
         if (result != DOCA_SUCCESS)
             return result;
