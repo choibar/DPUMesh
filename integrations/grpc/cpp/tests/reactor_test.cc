@@ -603,7 +603,7 @@ void TestLargeWriteCompletesAcrossPumpYields() {
   CHECK_EQ(sent, payload);
 }
 
-void TestEqPollFailureFailsAndClosesConnection() {
+void TestQpPollFailureFailsAndClosesConnection() {
   Fixture fixture;
   SliceBuffer buffer;
   AsyncStatus status;
@@ -612,7 +612,7 @@ void TestEqPollFailureFailsAndClosesConnection() {
       &buffer,
       EventEngine::Endpoint::ReadArgs()));
 
-  fixture.state->FailNextPoll(EIO);
+  fixture.state->FailNextPoll(fixture.qp, EIO);
   CHECK_TRUE(fixture.callbacks.WaitForSize(1, 2s));
   fixture.callbacks.RunAll();
   CHECK_EQ(status.Get().code(), absl::StatusCode::kUnavailable);
@@ -677,7 +677,9 @@ void TestUnknownServiceMapsToUnavailable() {
   runtime.reset();
 }
 
-void TestUnownedConnectionRequestIsReleasedAndRejectedPostBatch() {
+// With no accept callback an inbound stream is destroyed unpolled, which
+// returns the credit of its first receive.
+void TestUnownedConnectionIsDestroyedAndItsReceiveReclaimed() {
   ManualExecutor callbacks;
   auto state = std::make_shared<FakeDmeshState>();
   auto created = DmeshRuntime::Create(MakeFakeDmeshApiOps(state), UnownedExecutor(&callbacks));
@@ -920,7 +922,7 @@ void TestGrpcChannelChurnKeepsOneRuntime() {
     CHECK_TRUE(state->WaitForDestroyCount(cycle + 1, 2s));
     CHECK_EQ(state->abort_count(), cycle + 1);
     CHECK_EQ(runtime->stats().receive_credit_hold_dropped, uint64_t{0});
-    CHECK_EQ(runtime->stats().eq_drain_budget_exhausted, uint64_t{0});
+    CHECK_EQ(runtime->stats().drain_budget_exhausted, uint64_t{0});
   }
 
   CHECK_EQ(state->destroy_count(), kCycles);
@@ -928,10 +930,8 @@ void TestGrpcChannelChurnKeepsOneRuntime() {
   const auto targets = state->ClientTargets();
   CHECK_EQ(targets.size(), kCycles);
   for (const auto& target : targets) CHECK_EQ(target, std::string("greeter"));
-  const size_t reactors = runtime->reactor_count();
   runtime.reset();
   CHECK_TRUE(state->WaitForChannelDestroyCount(1, 45s));
-  CHECK_EQ(state->eq_destroy_count(), reactors);
   CHECK_EQ(state->channel_destroy_count(), size_t{1});
 }
 
@@ -971,23 +971,32 @@ void TestConcurrentGrpcChannelsSameServiceCloseIndependently() {
   CHECK_EQ(state->abort_count(), kChannels);
   CHECK_EQ(state->destroy_count(), kChannels);
   CHECK_EQ(runtime->stats().receive_credit_hold_dropped, uint64_t{0});
-  CHECK_EQ(runtime->stats().eq_drain_budget_exhausted, uint64_t{0});
+  CHECK_EQ(runtime->stats().drain_budget_exhausted, uint64_t{0});
   runtime.reset();
 }
 
-void TestRuntimeDestroysEqBeforeChannel() {
+// The fake channel, like the native one, refuses to go while a QP is live.
+void TestRuntimeDestroysQpsBeforeChannel() {
   ManualExecutor callbacks;
   auto state = std::make_shared<FakeDmeshState>();
   auto created = DmeshRuntime::Create(MakeFakeDmeshApiOps(state), UnownedExecutor(&callbacks));
   CHECK_TRUE(created.ok());
   auto runtime = std::move(*created);
-  const size_t reactors = runtime->reactor_count();
+  std::optional<DmeshReactor::ConnectedTransport> connected;
+  runtime->Connect(
+      "greeter",
+      [&connected](absl::StatusOr<DmeshReactor::ConnectedTransport> result) {
+        if (result.ok()) connected.emplace(std::move(*result));
+      });
+  CHECK_TRUE(callbacks.WaitForSize(1, 2s));
+  callbacks.RunAll();
+  CHECK_TRUE(connected.has_value());
   runtime.reset();
-  CHECK_EQ(state->eq_destroy_count(), reactors);
+  CHECK_EQ(state->destroy_count(), size_t{1});
   CHECK_EQ(state->channel_destroy_count(), size_t{1});
 }
 
-void TestRuntimeRoundRobinsAcrossEqReactors() {
+void TestRuntimeRoundRobinsAcrossReactors() {
   ManualExecutor callbacks;
   auto state = std::make_shared<FakeDmeshState>();
   DmeshRuntime::Options options;
@@ -1018,12 +1027,49 @@ void TestRuntimeRoundRobinsAcrossEqReactors() {
   CHECK_EQ(transports.size(), size_t{2});
   const auto qps = state->ClientQps();
   CHECK_EQ(qps.size(), size_t{2});
-  CHECK_TRUE(qps[0]->eq != qps[1]->eq);
+  std::thread::id first, second;
+  CHECK_TRUE(state->WaitForPollThread(qps[0], 2s, &first));
+  CHECK_TRUE(state->WaitForPollThread(qps[1], 2s, &second));
+  CHECK_TRUE(first != second);
 
   transports.clear();
   CHECK_TRUE(state->WaitForDestroyCount(2, 2s));
   runtime.reset();
-  CHECK_EQ(state->eq_destroy_count(), size_t{2});
+  CHECK_EQ(state->channel_destroy_count(), size_t{1});
+  CHECK_EQ(state->poll_thread_violation_count(), size_t{0});
+}
+
+// The first reactor accepts; the streams it accepts are spread like dials.
+void TestRuntimeRoundRobinsInboundAcrossReactors() {
+  ManualExecutor callbacks;
+  auto state = std::make_shared<FakeDmeshState>();
+  DmeshRuntime::Options options;
+  options.reactor_count = 2;
+  auto created = DmeshRuntime::Create(MakeFakeDmeshApiOps(state),
+                                      UnownedExecutor(&callbacks), options);
+  CHECK_TRUE(created.ok());
+  auto runtime = std::move(*created);
+
+  std::vector<DmeshReactor::ConnectedTransport> accepted;
+  CHECK_TRUE(runtime
+                 ->SetAcceptCallback(
+                     [&accepted](DmeshReactor::ConnectedTransport transport) {
+                       accepted.push_back(std::move(transport));
+                     })
+                 .ok());
+  dmesh_qp_t* first_qp = state->InjectConnectionRequest("one");
+  dmesh_qp_t* second_qp = state->InjectConnectionRequest("two");
+  CHECK_TRUE(callbacks.WaitForSize(2, 2s));
+  callbacks.RunAll();
+  CHECK_EQ(accepted.size(), size_t{2});
+  std::thread::id first, second;
+  CHECK_TRUE(state->WaitForPollThread(first_qp, 2s, &first));
+  CHECK_TRUE(state->WaitForPollThread(second_qp, 2s, &second));
+  CHECK_TRUE(first != second);
+
+  accepted.clear();
+  CHECK_TRUE(state->WaitForDestroyCount(2, 2s));
+  runtime.reset();
   CHECK_EQ(state->channel_destroy_count(), size_t{1});
   CHECK_EQ(state->poll_thread_violation_count(), size_t{0});
 }
@@ -1068,7 +1114,6 @@ void TestConcurrentConnectUsesMpscCommandQueues() {
   transports.clear();
   CHECK_TRUE(state->WaitForDestroyCount(kConnections, 2s));
   runtime.reset();
-  CHECK_EQ(state->eq_destroy_count(), size_t{4});
   CHECK_EQ(state->channel_destroy_count(), size_t{1});
   CHECK_EQ(state->poll_thread_violation_count(), size_t{0});
 }
@@ -1114,14 +1159,14 @@ int main() {
        TestAllocBackpressureAfterPeerFinFailsWrite},
       {"large write completes across pump yields",
        TestLargeWriteCompletesAcrossPumpYields},
-      {"EQ poll failure closes connection",
-       TestEqPollFailureFailsAndClosesConnection},
+      {"QP poll failure closes connection",
+       TestQpPollFailureFailsAndClosesConnection},
       {"reactor count follows DPUMESH_REACTORS",
        TestReactorCountFollowsEnvironment},
       {"unknown service maps to unavailable",
        TestUnknownServiceMapsToUnavailable},
-      {"unowned connection is rejected post-batch",
-       TestUnownedConnectionRequestIsReleasedAndRejectedPostBatch},
+      {"unowned connection is destroyed, its receive reclaimed",
+       TestUnownedConnectionIsDestroyedAndItsReceiveReclaimed},
       {"inbound connection becomes endpoint transport",
        TestInboundConnectionIsAcceptedAndBecomesEndpointTransport},
       {"gRPC server bridge injects accepted endpoint",
@@ -1136,9 +1181,11 @@ int main() {
        TestGrpcChannelChurnKeepsOneRuntime},
       {"concurrent same-service gRPC channels close independently",
        TestConcurrentGrpcChannelsSameServiceCloseIndependently},
-      {"runtime destroys EQ before channel", TestRuntimeDestroysEqBeforeChannel},
-      {"runtime round-robins EQ reactors",
-       TestRuntimeRoundRobinsAcrossEqReactors},
+      {"runtime destroys QPs before channel",
+       TestRuntimeDestroysQpsBeforeChannel},
+      {"runtime round-robins reactors", TestRuntimeRoundRobinsAcrossReactors},
+      {"runtime round-robins inbound streams",
+       TestRuntimeRoundRobinsInboundAcrossReactors},
       {"concurrent connect uses MPSC queues",
        TestConcurrentConnectUsesMpscCommandQueues},
   };

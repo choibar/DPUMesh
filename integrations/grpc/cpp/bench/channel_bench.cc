@@ -86,16 +86,21 @@ class CountingOps final : public dpumesh::grpc::DmeshApiOps {
     if (rc != 0) counters_->Failed("destroy channel", rc);
     return rc;
   }
-  dmesh_eq_t* CreateEq(dmesh_channel_t* channel) override {
-    return inner_->CreateEq(channel);
+  int PostMax(dmesh_channel_t* channel) override {
+    return inner_->PostMax(channel);
   }
-  int DestroyEq(dmesh_eq_t* eq) override { return inner_->DestroyEq(eq); }
-  int EqFd(dmesh_eq_t* eq) override { return inner_->EqFd(eq); }
-  dmesh_qp_t* CreateQp(dmesh_eq_t* eq, const char* service) override {
-    dmesh_qp_t* qp = inner_->CreateQp(eq, service);
+  int ChannelFd(dmesh_channel_t* channel) override {
+    return inner_->ChannelFd(channel);
+  }
+  dmesh_qp_t* Accept(dmesh_channel_t* channel) override {
+    return inner_->Accept(channel);
+  }
+  dmesh_qp_t* CreateQp(dmesh_channel_t* channel, const char* target) override {
+    dmesh_qp_t* qp = inner_->CreateQp(channel, target);
     if (qp != nullptr) counters_->dials.fetch_add(1);
     return qp;
   }
+  int QpFd(dmesh_qp_t* qp) override { return inner_->QpFd(qp); }
   int DestroyQp(dmesh_qp_t* qp) override {
     const int rc = inner_->DestroyQp(qp);
     counters_->closes.fetch_add(1);
@@ -115,19 +120,12 @@ class CountingOps final : public dpumesh::grpc::DmeshApiOps {
     return inner_->PostSend(qp, buffer, len);
   }
   int Flush(dmesh_qp_t* qp) override { return inner_->Flush(qp); }
-  int PollEq(dmesh_eq_t* eq, dmesh_event_t* events, int max_events) override {
-    return inner_->PollEq(eq, events, max_events);
+  int PollQp(dmesh_qp_t* qp, dmesh_event_t* events, int max_events) override {
+    return inner_->PollQp(qp, events, max_events);
   }
   void ReleaseRxBuffer(dmesh_channel_t* channel,
                        dmesh_event_t* event) override {
     inner_->ReleaseRxBuffer(channel, event);
-  }
-  int PostMax(dmesh_channel_t* channel) override {
-    return inner_->PostMax(channel);
-  }
-  int PodId(dmesh_channel_t* channel) override { return inner_->PodId(channel); }
-  int64_t EqNextDeadlineNs(dmesh_eq_t* eq) override {
-    return inner_->EqNextDeadlineNs(eq);
   }
 
  private:

@@ -5,7 +5,7 @@
 #include "dpaintrin.h"
 #include "dpa_common.h"
 
-_Static_assert(sizeof(struct dpa_thread_ctx) == 96, "native DPA argument layout");
+_Static_assert(sizeof(struct dpa_thread_ctx) == 112, "native DPA argument layout");
 
 /* dpa_dev: extended DPA context handle whose device the consumer belongs to
  * (0 = base context); an RPC runs outside the thread, so it must switch too. */
@@ -32,7 +32,10 @@ static void stop_desc_ring(struct dpa_thread_ctx *arg, uint64_t submitted)
     __dpa_thread_window_writeback();
     arg->stopped = 1;
     __dpa_thread_window_writeback();
-    doca_dpa_dev_thread_finish();
+    if (arg->pooled)
+        doca_dpa_dev_thread_reschedule();
+    else
+        doca_dpa_dev_thread_finish();
 }
 
 static void poll_desc_ring(struct dpa_thread_ctx *a)
@@ -152,6 +155,30 @@ __dpa_global__ void run_dma_manager(void)
     /* Extended context: select its device before accessing communication objects. */
     if (state->dpa_dev != 0)
         doca_dpa_dev_device_set((doca_dpa_dev_t)state->dpa_dev);
+
+    /* A pooled thread keeps its comch across flows, and the next flow's first
+     * request must wake it: ack what earlier flows left and re-arm. A per-flow
+     * thread ends with its comch and has nothing to drain. */
+    if (state->pooled && state->dpa_consumer_comp != 0) {
+        doca_dpa_dev_comch_consumer_completion_element_t e;
+        uint32_t n = 0;
+        while (doca_dpa_dev_comch_consumer_get_completion(state->dpa_consumer_comp, &e)) {
+            doca_dpa_dev_comch_consumer_completion_ack(state->dpa_consumer_comp, 1);
+            ++n;
+        }
+        if (n != 0)
+            doca_dpa_dev_comch_consumer_ack(state->dpa_consumer, n);
+        doca_dpa_dev_comch_consumer_completion_request_notification(state->dpa_consumer_comp);
+    }
+
+    /* A stopped run (a pooled thread between flows) touches no mapping. */
+    if (state->stopped) {
+        if (state->pooled)
+            doca_dpa_dev_thread_reschedule();
+        else
+            doca_dpa_dev_thread_finish();
+        return;
+    }
 
     /* An idle, host-driven thread may have no descriptor ring. */
     if (state->dpa_buf_arr == 0) {

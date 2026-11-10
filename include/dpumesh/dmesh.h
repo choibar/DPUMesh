@@ -1,8 +1,9 @@
 /* DPUmesh native C API.
  *
- * The API exposes channels, single-consumer event queues, full-duplex QPs,
- * registered TX reservations, zero-copy RX events, and one-shot TX-ready
- * notifications. See design/API.md for the complete contract. */
+ * Sockets over the DPU: a channel per process, which is also its listening
+ * socket, and full-duplex QPs, each with its own readiness fd, registered TX
+ * reservations, zero-copy RX events and one-shot TX-ready notifications. See
+ * design/API.md for the complete contract. */
 #ifndef DMESH_H
 #define DMESH_H
 
@@ -24,18 +25,16 @@ struct dpumesh_ctx;
 /* One transport channel per process. */
 typedef struct dmesh_channel {
     struct dpumesh_ctx *ctx;
-    int            pod_id;
-    int            slot_size;   /* max body per RECV event (wire DMA cap) */
     int            block_size;  /* max contiguous alloc/post reservation */
 } dmesh_channel_t;
 
-/* Single-consumer event queue. */
-typedef struct dmesh_eq dmesh_eq_t;
+/* A QP's private wait set (internal). */
+struct dmesh_eq;
 
 /* One persistent full-duplex service byte stream. */
 typedef struct dmesh_qp {
     dmesh_channel_t *ep;
-    dmesh_eq_t      *eq;       /* fixed event queue */
+    struct dmesh_eq *eq;       /* its readiness fd and event state (internal) */
     void     *user_data;       /* application-owned context */
     int       role;            /* DMESH_ROLE_CLIENT (connect) | DMESH_ROLE_SERVER (accept) */
 
@@ -71,64 +70,82 @@ typedef struct dmesh_qp {
 typedef enum {
     DMESH_EVENT_RECV     = 1, /* one inbound byte-stream fragment; holds an RX credit */
     DMESH_EVENT_RECV_FIN = 2, /* peer closed the conn (EOF); no credit held */
-    DMESH_EVENT_CONN_REQ = 3, /* new inbound conn (server side); no credit held */
-    DMESH_EVENT_TX_READY = 4, /* an EAGAIN-blocked QP should retry dmesh_alloc */
-    DMESH_EVENT_TX_ERROR = 5, /* deferred buffered-tail submission failed */
+    DMESH_EVENT_TX_READY = 3, /* an EAGAIN-blocked QP should retry dmesh_alloc */
+    DMESH_EVENT_TX_ERROR = 4, /* deferred buffered-tail submission failed */
+    DMESH_EVENT_PREPARE  = 5, /* migration: the DPU moves this client QP's stream;
+                               * open a spare stream to its target, the "ip:port"
+                               * in buf/len, then dmesh_spare_ready the spare */
+    DMESH_EVENT_SCALE    = 6, /* flow scaling: buf points to a dmesh_scale_t for
+                               * this client QP's target; answer with
+                               * dmesh_scale_ack on this QP */
 } dmesh_event_type_t;
 
+/* A SCALE request: each client of target should keep count streams to it. The
+ * DPU places one svc-to-svc pair's streams on distinct workers, so count
+ * streams spread the pair's traffic over count DPU cores. */
+typedef struct dmesh_scale {
+    uint32_t token;      /* echoed by dmesh_scale_ack */
+    uint32_t count;      /* >= 1 */
+    char     target[24]; /* "ip:port", NUL-terminated */
+} dmesh_scale_t;
+
 typedef struct dmesh_event {
-    dmesh_qp_t         *qp;       /* the QP this event belongs to (== the handle from
-                                   * dmesh_create_qp / CONN_REQ; use qp->user_data for
-                                   * your per-conn context) */
+    dmesh_qp_t         *qp;       /* the QP polled (use qp->user_data for your
+                                   * per-conn context) */
     dmesh_event_type_t  type;
     const uint8_t      *buf;      /* RECV: points INTO the RX mmap (zero-copy); valid
-                                   * until dmesh_release_rx_buffer. Else NULL. */
-    uint32_t            len;      /* RECV: byte-stream fragment length. Else 0. */
+                                   * until dmesh_release_rx_buffer. PREPARE / SCALE:
+                                   * the request, valid until the QP's next poll.
+                                   * Else NULL. */
+    uint32_t            len;      /* RECV: byte-stream fragment length; PREPARE /
+                                   * SCALE: the request's size. Else 0. */
     int32_t             _rx_token; /* internal release token; -1 = nothing held */
 } dmesh_event_t;
 
-/* ===== Channel lifecycle (ibv_open_device + PD) ===== */
+/* ===== Channel: the process's listening socket (ibv_open_device + PD) ===== */
 
 /* Create a channel serving $DPUMESH_SERVICE, or "<pod ip>:$DPUMESH_PORT" when
  * only the port is set (a client with neither). NULL indicates failure. */
 dmesh_channel_t *dmesh_create_channel(void);
 
-/* Destroy an idle channel. Returns EBUSY while an EQ remains. Safe on NULL. */
+/* Destroy an idle channel. Returns EBUSY while a QP remains, changing nothing,
+ * or while a receive buffer is still held, having stopped the channel: release
+ * it and destroy again. Safe on NULL. */
 int dmesh_destroy_channel(dmesh_channel_t *s);
 
-int dmesh_pod_id(dmesh_channel_t *s);      /* this node's DPU-assigned pod_id */
-int dmesh_msg_max(dmesh_channel_t *s);     /* max length arriving as ONE RECV (slot_size) */
 int dmesh_post_max(dmesh_channel_t *s);    /* max length of one alloc/post (block size) */
 
-/* ===== Event queue lifecycle ===== */
+/* Readiness fd (an epoll set, level-triggered) of the channel's own work: the
+ * session's control messages, keepalive and loss, and the streams the DPU
+ * routes to $DPUMESH_SERVICE. Every process polls it and calls dmesh_accept()
+ * whenever it is readable, a client too. It is readable from creation until
+ * the first dmesh_accept(). */
+int dmesh_channel_fd(dmesh_channel_t *ch);
 
-/* Create an EQ for one polling thread. Returns EINVAL, ENOMEM or EMFILE on failure. */
-dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *ch);
+/* Do the channel's work, then return the next inbound stream: a QP whose
+ * first bytes its own poll returns as RECV. NULL with EAGAIN when none waits
+ * (the fd is then armed for the next), or the session's errno after a
+ * transport loss (see dmesh_poll_qp). On a client it does the work alone. One
+ * thread at a time. */
+dmesh_qp_t *dmesh_accept(dmesh_channel_t *ch);
 
-/* Destroy an idle EQ. Returns EBUSY while a QP remains. Safe on NULL. */
-int dmesh_destroy_eq(dmesh_eq_t *eq);
+/* ===== QP: a connected socket (rdma_cm) ===== */
+
+/* Connect a QP to a "<host>:<port>" service target: host is a Service DNS name
+ * ("name" in this Pod's namespace, "name.namespace", or a full name) or an
+ * IPv4 literal, port the Service port. Returns EINVAL (malformed target),
+ * ENOENT (no such name), EAGAIN (DNS temporarily unavailable — retry), ENOSPC,
+ * ENOMEM, EMFILE, or the session's errno after a transport loss. */
+dmesh_qp_t *dmesh_create_qp(dmesh_channel_t *ch, const char *target);
 
 /* Readiness fd (an epoll set, level-triggered): poll it, then call
- * dmesh_poll_eq() until it returns 0, which settles the fd and arms the
- * transport's doorbells for the next sleep. -1 when unavailable. */
-int dmesh_eq_fd(dmesh_eq_t *eq);
+ * dmesh_poll_qp() until it returns 0, which settles the fd and arms the
+ * transport's doorbell for the next sleep. -1 when unavailable. */
+int dmesh_qp_fd(dmesh_qp_t *qp);
 
-/* Nanoseconds this EQ may wait before a QP's buffered transmit tail comes due,
- * or -1 when nothing is buffered. Bounds an event loop's own timeout. The tail
- * policy itself is internal. */
-int64_t dmesh_eq_next_deadline_ns(dmesh_eq_t *eq);
-
-/* ===== Connection setup (rdma_cm) ===== */
-
-/* Create a client QP for a "<host>:<port>" service target: host is a Service
- * DNS name ("name" in this Pod's namespace, "name.namespace", or a full name)
- * or an IPv4 literal, port the Service port. Returns EINVAL (malformed target),
- * ENOENT (no such name), EAGAIN (DNS temporarily unavailable — retry), ENOSPC,
- * ENOMEM, or the session's errno after a transport loss (see dmesh_poll_eq). */
-dmesh_qp_t *dmesh_create_qp(dmesh_eq_t *eq, const char *target);
-
-/* Flush, send FIN, release RX credit, and destroy the QP. The pointer is invalid
- * on return. Defer destruction until the current EQ batch is fully dispatched. */
+/* Flush, send FIN, release RX credit, and destroy the QP and its fd. The
+ * pointer is invalid on return. Defer destruction until the current poll
+ * batch is fully dispatched. */
 int dmesh_destroy_qp(dmesh_qp_t *c);
 
 /* Discard unsent bytes, reset the connected stream, and destroy the QP. */
@@ -144,47 +161,39 @@ int dmesh_abort_qp(dmesh_qp_t *c);
  *   EDEADLK  a transmit call is already open on this QP. */
 void *dmesh_alloc(dmesh_qp_t *c, uint32_t len);
 
-/* Commit bytes from the current dmesh_alloc() reservation and close the
- * transmit call. Complete transport batches submit immediately, as does an idle
- * tail. While earlier data is in flight the newest partial tail is retained and
- * published at the library's bounded deadline. `buf` must match the reservation
- * and `len` must fit it. Returns EINVAL for invalid input or no open transmit
- * call, or EBADMSG for a synchronous submission fault. Ownership transfers to
- * the transport on success. A deferred tail fault is reported once as
- * DMESH_EVENT_TX_ERROR and is sticky on the QP. */
+/* Commit bytes from the current dmesh_alloc() reservation, close the transmit
+ * call and submit them at once, a partial transport batch included. `buf` must
+ * match the reservation and `len` must fit it. Returns EINVAL for invalid input
+ * or no open transmit call, or EBADMSG for a submission fault, which leaves the
+ * bytes committed for the next post or dmesh_flush. Ownership transfers to the
+ * transport on success. A flow fault the transport reports later arrives once
+ * as DMESH_EVENT_TX_ERROR and is sticky on the QP. */
 int dmesh_post_send(dmesh_qp_t *c, const void *buf, uint32_t len);
 
-/* Submit all committed bytes, including the trailing partial batch. A
- * descriptor fault returns EBADMSG, an open transmit call returns EDEADLK; no
- * pending data is a no-op. */
+/* Submit committed bytes a failed post left behind; a post submits its own,
+ * so otherwise a no-op. A descriptor fault returns EBADMSG, an open transmit
+ * call EDEADLK. */
 int dmesh_flush(dmesh_qp_t *c);
-
-/* Nonzero while a published data or close-control unit on this QP awaits
- * acknowledgement. Diagnostic only; batching and port quarantine are
- * library-owned. */
-int dmesh_tx_inflight(dmesh_qp_t *c);
-
-/* ===== Diagnostics ===== */
-
-/* Cumulative TX block-pool allocation, return, reuse, wait, and padding counters. */
-typedef struct dmesh_tx_stats {
-    unsigned long long pool_grabs;
-    unsigned long long pool_returns;
-    unsigned long long recycle_hits;
-    unsigned long long grow_waits;
-    unsigned long long block_pads;
-} dmesh_tx_stats_t;
-void dmesh_get_tx_stats(dmesh_channel_t *s, dmesh_tx_stats_t *out);
 
 /* ===== Event polling ===== */
 
-/* Nonblocking single-consumer poll. Returns up to max_events events, 0 when empty,
- * or EINVAL. Per-connection order is preserved across partial batches. A
+/* Nonblocking single-consumer poll of one QP. Returns up to max_events events,
+ * 0 when empty, or EINVAL. Order is preserved across partial batches. A
  * TX_ERROR event has no RX buffer and makes later TX calls fail with the
  * latched transport error. A lost transport session ends the process (exit
  * status 75); with DPUMESH_EXIT_ON_LOSS=0 this returns -1 with the session's
  * errno instead, once the events that landed before the loss are drained. */
-int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events);
+int dmesh_poll_qp(dmesh_qp_t *qp, dmesh_event_t *events, int max_events);
+
+/* Tell the DPU that this client QP, opened for a PREPARE, is a ready spare
+ * (its server's first bytes have arrived); the DPU then drains the stream
+ * the spare replaces. */
+int dmesh_spare_ready(dmesh_qp_t *c);
+
+/* Answer a SCALE event on the QP it came on: applied is how many of the
+ * application's clients of the target now keep the requested count (0: none
+ * can, e.g. no client uses a scaling-aware resolver). */
+int dmesh_scale_ack(dmesh_qp_t *c, uint32_t token, uint32_t applied);
 
 /* Release the zero-copy RX buffer held by a RECV event and invalidate event->buf.
  * Idempotent, valid after QP closure, and a no-op for other event types. */

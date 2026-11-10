@@ -22,6 +22,7 @@ prefix = r'''
 #include "dpa_common.h"
 typedef unsigned doca_dpa_dev_buf_t;
 typedef unsigned doca_dpa_dev_completion_element_t;
+typedef unsigned doca_dpa_dev_comch_consumer_completion_element_t;
 typedef uint64_t doca_dpa_dev_t;
 #define __dpa_global__
 #define DOCA_DPA_DEV_LOG_ERR(...) ((void)0)
@@ -43,6 +44,11 @@ static struct { uint64_t src, dst; uint32_t len, type; } pending[1024];
 static void __dpa_thread_window_writeback(void) {}
 static void __dpa_thread_window_read_inv(void) {}
 static void doca_dpa_dev_thread_finish(void) { ++finished; }
+/* A pooled thread's consumer completions: none pending here. */
+static int doca_dpa_dev_comch_consumer_get_completion(uint64_t c,unsigned *e) { (void)c;(void)e;return 0; }
+static void doca_dpa_dev_comch_consumer_completion_ack(uint64_t c,unsigned n) { (void)c;(void)n; }
+static void doca_dpa_dev_comch_consumer_ack(uint64_t c,unsigned n) { (void)c;(void)n; }
+static void doca_dpa_dev_comch_consumer_completion_request_notification(uint64_t c) { (void)c; }
 static unsigned doca_dpa_dev_buf_array_get_buf(uint64_t a, unsigned i) { (void)a;return i; }
 static uint64_t doca_dpa_dev_buf_get_external_ptr(unsigned i) {
  assert(i<=256);return (uintptr_t)(i ? (void *)&descriptors[i-1] : (void *)&ring);

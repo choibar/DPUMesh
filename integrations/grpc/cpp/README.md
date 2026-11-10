@@ -39,7 +39,7 @@ transports and native doubles; device smoke executables are manual.
 [channel-bench](../go/cmd/channel-bench/README.md): the same wire, flags and
 JSON result, so either one can be the client or the server. It runs over the
 adapter with the normal DPUMesh environment, or over kernel TCP with
-`-tcp host:port`. `-reactors` sets the runtime's EQ reactor count (default:
+`-tcp host:port`. `-reactors` sets the runtime's reactor count (default:
 `DPUMESH_REACTORS`, else 1);
 `-start-file` is not supported. Over TCP `native_dials` stays empty, because
 gRPC C++ exposes no dial count.
@@ -51,9 +51,11 @@ build/grpc/dpumesh_channel_bench -mode client -connections 4 -concurrency 64
 
 ## Stream C ABI
 
-The EQ reactor (`dmesh_reactor.cc`, `dmesh_runtime.cc`) needs no gRPC: it
-reports each connection's events to a `ConnectionSink`, which is either the
-gRPC endpoint driver or a stream binding. The same build produces
+The reactor (`dmesh_reactor.cc`, `dmesh_runtime.cc`) needs no gRPC: each
+reactor thread waits on the fds of the QPs it owns, the first one also on the
+channel's to accept, and reports each connection's events to a
+`ConnectionSink`, which is either the gRPC endpoint driver or a stream
+binding. The same build produces
 `libdpumesh_stream.so`, the [stream C ABI](include/dpumesh_stream.h) that
 adapters for other runtimes use, and `libdpumesh_stream_loopback.so`,
 the same ABI over an in-process loopback for their tests. Both export only

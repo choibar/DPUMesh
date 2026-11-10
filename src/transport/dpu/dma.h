@@ -6,9 +6,12 @@
 #include <doca_dev.h>
 #include <doca_mmap.h>
 
+#include <stdbool.h>
+
 struct objects;
 struct dmesh_conn;
 struct doca_dma_task_memcpy;
+struct dmesh_doca_dpa_thread;
 
 /* Source bytes may be reused only up to this successful completion prefix. */
 doca_error_t dmesh_dma_tx_completed(struct dmesh_conn *conn, uint64_t *bytes);
@@ -38,6 +41,14 @@ init_dma_tasks(struct dmesh_conn *conn, int num_tasks);
 doca_error_t
 cleanup_dma_tasks(struct dmesh_conn *conn);
 
+/* DMESH_DPA_REUSE=1: a closing flow leaves its idle DMA engine (ctx, task
+ * pool, inventory) on its DPA pool slot instead of destroying it, and
+ * init_dma_tasks hands it to the slot's next flow. Returns false (nothing
+ * moved) when it must be cleaned up instead. */
+bool dmesh_dma_engine_keep(struct dmesh_conn *conn);
+/* Creates an idle DMA engine for a pool slot before any flow. */
+doca_error_t dmesh_dma_engine_prewarm(struct objects *objs, struct dmesh_doca_dpa_thread *thread);
+
 /* Successful submit/enqueue transfers the src/dst references to the task.
  * On failure both references remain with the caller. */
 doca_error_t
@@ -62,6 +73,13 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len);
  * when the flow no longer admits DMA. */
 int
 dmesh_dma_push_fin(struct dmesh_conn *conn);
+
+/* Comch fast-path wake (comch_wake.h): the descriptor send completed or
+ * failed; and a send the producer could not take yet, retried from the
+ * flow's advance. */
+void dmesh_dma_push_desc_sent(struct dmesh_conn *conn);
+void dmesh_dma_push_desc_failed(struct dmesh_conn *conn);
+void dmesh_dma_push_retry_desc(struct dmesh_conn *conn);
 
 doca_error_t
 enqueue_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -15,9 +16,10 @@ namespace dpumesh::grpc::testing {
 
 class FakeDmeshApiOps;
 
-// Thread-safe fake of the public DPUmesh API. Its EQ fd is a real eventfd, so
-// reactor tests exercise the production poll/eventfd owner-thread loop rather
-// than a separate test-only scheduler.
+// Thread-safe fake of the public DPUmesh API. The channel's fd and each QP's
+// fd are real eventfds, readable while an accept or a poll has something to
+// return, so reactor tests exercise the production epoll owner-thread loop
+// rather than a separate test-only scheduler.
 class FakeDmeshState final {
  public:
   FakeDmeshState();
@@ -31,7 +33,7 @@ class FakeDmeshState final {
   void FailNextAlloc(dmesh_qp_t* qp, int error_number);
   void SetAllocError(dmesh_qp_t* qp, int error_number);
   void FailNextPost(dmesh_qp_t* qp, int error_number);
-  void FailNextPoll(int error_number);
+  void FailNextPoll(dmesh_qp_t* qp, int error_number);
 
   bool WaitForClientQpCount(size_t count, std::chrono::milliseconds timeout);
   std::vector<dmesh_qp_t*> ClientQps() const;
@@ -46,6 +48,9 @@ class FakeDmeshState final {
   bool WaitForDestroyCount(size_t count, std::chrono::milliseconds timeout);
   bool WaitForChannelDestroyCount(size_t count,
                                   std::chrono::milliseconds timeout);
+  // The thread that polled the QP first; empty until it has been polled.
+  bool WaitForPollThread(dmesh_qp_t* qp, std::chrono::milliseconds timeout,
+                         std::thread::id* thread);
 
   void InjectReceive(dmesh_qp_t* qp, const std::string& bytes);
   void InjectReceiveBatch(dmesh_qp_t* qp,
@@ -53,6 +58,7 @@ class FakeDmeshState final {
   void InjectFin(dmesh_qp_t* qp);
   void InjectTxReady(dmesh_qp_t* qp);
   void InjectTxError(dmesh_qp_t* qp);
+  // A stream for the channel to accept, holding first_bytes as a receive.
   dmesh_qp_t* InjectConnectionRequest(const std::string& first_bytes);
 
   std::vector<std::vector<uint8_t>> Posts(dmesh_qp_t* qp) const;
@@ -64,7 +70,6 @@ class FakeDmeshState final {
   size_t mid_batch_destroy_count() const;
   size_t poll_thread_violation_count() const;
   size_t channel_destroy_count() const;
-  size_t eq_destroy_count() const;
 
  private:
   class Impl;

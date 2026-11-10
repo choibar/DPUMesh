@@ -2,15 +2,15 @@
 // With DPUMESH_ENABLE=1, Listen serves the process's target (DPUMESH_PORT on
 // the Pod IP, or DPUMESH_SERVICE) and DialOptions route "<ip>:<port>" targets
 // through the DPU. Otherwise both keep their TCP behavior, so one build runs
-// with or without the mesh.
+// with or without the mesh. A target written "dmesh:///<ip>:<port>" also
+// follows the DPU's flow scaling (see Scheme).
 package dmeshgrpc
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"os"
-	"strconv"
+	"sync"
 
 	"dmeshgo"
 	"google.golang.org/grpc"
@@ -33,24 +33,30 @@ func Listen(tcpAddr string) (net.Listener, error) {
 }
 
 // DialOptions returns the options that route a client's connections over
-// DPUMesh when Enabled, and none otherwise.
+// DPUMesh when Enabled. Otherwise a "dmesh:///" target still resolves, to its
+// one address over TCP.
 func DialOptions() []grpc.DialOption {
 	if !Enabled() {
-		return nil
+		return []grpc.DialOption{grpc.WithResolvers(scaleBuilder{})}
 	}
-	return []grpc.DialOption{grpc.WithContextDialer(Dial)}
+	installScale.Do(func() { dmeshgo.SetScaleHandler(applyScale) })
+	return []grpc.DialOption{grpc.WithContextDialer(Dial), grpc.WithResolvers(scaleBuilder{})}
 }
 
-// Dial opens a DPUMesh stream to an "<ip>:<port>" service address. It has the
-// signature grpc.WithContextDialer expects.
+var installScale sync.Once
+
+// Dial opens a DPUMesh stream to an "<ip>:<port>" service address, or to a
+// scaled target's "conn/<k>/<ip>:<port>". It has the signature
+// grpc.WithContextDialer expects.
 func Dial(ctx context.Context, addr string) (net.Conn, error) {
-	host, p, err := net.SplitHostPort(addr)
+	addr, err := dialAddress(addr)
 	if err != nil {
 		return nil, err
 	}
-	port, err := strconv.Atoi(p)
-	if err != nil || port < 1 || port > 65535 {
-		return nil, fmt.Errorf("dmeshgrpc: %q has no valid port", addr)
+	port, err := splitTarget(addr)
+	if err != nil {
+		return nil, err
 	}
+	host, _, _ := net.SplitHostPort(addr)
 	return dmeshgo.DialContext(ctx, host, port)
 }

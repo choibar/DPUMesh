@@ -15,6 +15,8 @@ static unsigned client_creates, client_destroys, ring_allocs, ring_frees;
 static unsigned opens, closes;
 static unsigned shared_progress_calls;
 static int next_close_status;
+/* A slow DPU: OPEN or CLOSE gets no answer; a refused CLOSE is not queued. */
+static int silent_open, silent_close, refuse_close;
 static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
 /* Idle wake: the last ARM the host sent, and the control PE notification. */
@@ -93,14 +95,15 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
     case DMESH_SESSION_OPEN:
         assert(h.payload_len == sizeof(struct dmesh_export_metadata_msg));
         ++opens;
-        reply(DMESH_SESSION_READY, h.flow_id, h.generation, 0);
+        if (!silent_open) reply(DMESH_SESSION_READY, h.flow_id, h.generation, 0);
         break;
     case DMESH_SESSION_CLOSE: {
+        if (refuse_close) return DOCA_ERROR_AGAIN;
         struct channel_dev *dev = objs->owner;
         struct channel_conn *flow = dev->flows[h.flow_id];
         assert(flow && !flow->reverse && !flow->tx_mmap && !flow->ring_mmap);
         ++closes;
-        reply(DMESH_SESSION_CLOSED, h.flow_id, h.generation, next_close_status);
+        if (!silent_close) reply(DMESH_SESSION_CLOSED, h.flow_id, h.generation, next_close_status);
         next_close_status = 0;
         break;
     }
@@ -267,7 +270,8 @@ static void dispatch_doorbell(struct channel_dev *dev)
 }
 
 /* ARM lists the unread descriptor of each live push flow, at most one ARM is
- * outstanding until a DOORBELL, and the control PE is armed then progressed. */
+ * outstanding until a DOORBELL, and the control PE is armed but not
+ * progressed: the caller's next drain progresses it. */
 static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, struct channel_conn *b)
 {
     control_notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -279,7 +283,7 @@ static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, stru
     assert(arm_flows_seen[0].flow_id == 1 && arm_flows_seen[0].generation == a->generation &&
            arm_flows_seen[0].expected_seq == 1);
     assert(arm_flows_seen[1].flow_id == 2 && arm_flows_seen[1].expected_seq == 5);
-    assert(notify_requests == requests + 1 && shared_progress_calls == progress + 1);
+    assert(notify_requests == requests + 1 && shared_progress_calls == progress);
     assert(dev->arm_outstanding);
 
     /* Outstanding: the next sleep re-arms the PE but sends nothing. */
@@ -310,14 +314,6 @@ static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, stru
     requests = notify_requests;
     assert(channel_dev_arm(dev) == 0 && arms_seen == arms + 2 && notify_requests == requests + 1);
     dev->host_dpa = 0;
-
-    /* A raised fd is cleared once; an idle one is left alone. */
-    uint64_t one = 1;
-    assert(write(control_notify_fd, &one, sizeof(one)) == sizeof(one));
-    unsigned clears = notify_clears;
-    channel_dev_clear(dev);
-    channel_dev_clear(dev);
-    assert(notify_clears == clears + 1);
 
     /* A failed session cannot arm. */
     dev->session_error = ECONNRESET;
@@ -454,9 +450,6 @@ static void test_broker_client_wake(void)
     assert(wake >= 0 && poll(&ready, 1, 0) == 0);
     assert(write(f.wake_fd, &one, sizeof(one)) == sizeof(one));
     assert(poll(&ready, 1, 0) == 1);
-    channel_dev_clear(dev);
-    channel_dev_clear(dev);
-    assert(poll(&ready, 1, 0) == 0);
 
     /* An open push flow is listed; one the broker reported CLOSED, or whose
      * stream ended, is not. */
@@ -468,6 +461,7 @@ static void test_broker_client_wake(void)
     f.status->flow[1] = (struct broker_flow_status){.generation = 4, .state = 0};
     f.status->flow[3] = (struct broker_flow_status){.generation = 2, .state = 1};
     assert(channel_dev_arm(dev) == 0);
+    assert(poll(&ready, 1, 0) == 0);    /* the arm cleared the last raise, as the in-process arm does */
     assert(read(f.kick_fd, &kicks, sizeof(kicks)) == sizeof(kicks) && kicks == 1);
     assert(f.arm->seq == 2 && f.arm->flow[1].armed && f.arm->flow[1].generation == 4 &&
            f.arm->flow[1].expected == 11);
@@ -613,6 +607,53 @@ static void test_checked_close(void)
     assert(ring_allocs == ring_frees);
 }
 
+/* An OPEN the DPU answers only after the host stopped waiting: the
+ * unconfirmed close keeps the id, which channel_flow_free releases for the
+ * next open once CLOSED arrives. */
+static void test_late_open(void)
+{
+    struct channel_dev dev = {0};
+    pthread_mutex_init(&dev.session_lock, NULL);
+    assert(channel_session_open(&dev, "unit-session") == 0);
+    struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
+    struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW), .bytes = CHANNEL_WINDOW};
+    assert(tx.buf && rx.buf);
+    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx,
+                                      .mode = CHANNEL_MODE_CLIENT_DPU_DMA};
+    struct channel_conn *flow = NULL;
+    unsigned freed = ring_frees;
+
+    silent_open = silent_close = 1;
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == ETIMEDOUT && !flow);
+    struct channel_conn *held = dev.flows[1];
+    assert(held && held->abandoned && held->close_sent && ring_frees == freed);
+    assert(!channel_flow_free(&dev, 1));
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == EBUSY);
+    silent_open = silent_close = 0;
+    dispatch(&dev, DMESH_SESSION_READY, 1, held->generation, 0);
+    assert(!channel_flow_free(&dev, 1) && dev.flows[1] == held);
+    dispatch(&dev, DMESH_SESSION_CLOSED, 1, held->generation, 0);
+    assert(channel_flow_free(&dev, 1) && !dev.flows[1] && ring_frees == freed + 1);
+    assert(channel_conn_open(&dev, &cfg, &flow) == 0 && flow->ready);
+    assert(channel_conn_close(flow) == 0);
+
+    /* A CLOSE the queue refused is sent by the next check. */
+    silent_open = refuse_close = 1;
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == ETIMEDOUT);
+    held = dev.flows[1];
+    assert(held && held->abandoned && !held->close_sent);
+    silent_open = refuse_close = 0;
+    unsigned sent = closes;
+    assert(!channel_flow_free(&dev, 1) && held->close_sent && closes == sent + 1);
+    assert(channel_dev_progress(&dev) == 0);
+    assert(channel_flow_free(&dev, 1) && !dev.flows[1]);
+
+    assert(channel_session_close(&dev) == 0);
+    pthread_mutex_destroy(&dev.session_lock);
+    free(tx.buf); free(rx.buf);
+    assert(ring_allocs == ring_frees);
+}
+
 static void test_backend_requests(struct channel_dev *dev)
 {
     unsigned before = opens;
@@ -661,6 +702,9 @@ static void test_broker_backend_publish(struct channel_dev *dev)
 
 int main(void)
 {
+    /* The fakes model the ARM/DOORBELL session; the fast-path consumer is
+     * exercised on hardware. */
+    setenv("DPUMESH_COMCH_WAKE", "0", 1);
     struct channel_dev dev = {0};
     pthread_mutex_init(&dev.session_lock, NULL);
     assert(channel_session_open(&dev, "unit-session") == 0);
@@ -753,6 +797,7 @@ int main(void)
     pthread_mutex_destroy(&dev.session_lock);
     free(tx.buf); free(rx.buf);
     test_checked_close();
+    test_late_open();
     puts("channel session: isolated flows, checked cleanup failures and retry verified");
     return 0;
 }

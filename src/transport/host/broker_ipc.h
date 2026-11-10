@@ -12,6 +12,7 @@
  *   MEM_ALLOC      register a region                       -> region memfd
  *   CONN_OPEN      open a flow on registered regions       -> forward ring memfd
  *   CONN_CLOSE     close a flow
+ *   CONN_SHUTDOWN  end a flow's forward stream after the descriptors posted so far
  *   SESSION_CLOSE  close the Comch session
  *   LISTEN         register the served endpoint with the DPU
  *   BACKEND_FINISH report how a backend request ended
@@ -28,6 +29,11 @@
  * application opens the backend flow with CONN_OPEN carrying its worker and
  * token, then reports the outcome with BACKEND_FINISH.
  *
+ * A brokered session runs on ARM/DOORBELL: the DPU fills each flow's slot ring
+ * by DMA, which the application reads in the shared window. The Comch fast
+ * path and flow wake are not used, since their descriptors would complete in
+ * the broker.
+ *
  * Idle wake runs beside the request socket, so it never waits behind a request:
  * the application writes each push flow's next unread descriptor into the arm
  * page and raises the kick eventfd; the broker sends the DPU one ARM for them
@@ -39,7 +45,7 @@
 #include <stdint.h>
 
 #define BROKER_IPC_MAGIC "DPMBRK01"
-#define BROKER_IPC_VERSION 4
+#define BROKER_IPC_VERSION 5
 #define BROKER_DEFAULT_SOCKET "/run/dpumesh/broker.sock"
 #define BROKER_FLOWS 33          /* flow ids 1..32, the channel's slots */
 #define BROKER_WORKERS 128       /* DPU workers that can request a backend flow */
@@ -64,6 +70,7 @@ enum broker_msg_type {
 	BROKER_LISTEN,
 	BROKER_BACKEND_FINISH,
 	BROKER_REPLY,
+	BROKER_CONN_SHUTDOWN,
 };
 
 struct broker_request {
@@ -71,8 +78,8 @@ struct broker_request {
 	uint8_t type;
 	uint8_t version;
 	uint16_t reserved;
-	uint32_t flow_id;             /* CONN_OPEN, CONN_CLOSE */
-	uint64_t bytes;               /* MEM_ALLOC */
+	uint32_t flow_id;             /* CONN_OPEN, CONN_CLOSE, CONN_SHUTDOWN */
+	uint64_t bytes;               /* MEM_ALLOC; CONN_SHUTDOWN: the forward ring head (descriptors posted) */
 	uint32_t mode;                /* CONN_OPEN: CHANNEL_MODE_* */
 	uint32_t src_ip, dst_ip;      /* CONN_OPEN; LISTEN (dst only): network byte order */
 	uint16_t src_port, dst_port;  /* CONN_OPEN; LISTEN (dst only): host order */

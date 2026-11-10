@@ -36,6 +36,10 @@
  *           with shared memory, and publishes what the DPU reports about each
  *           flow (CLOSED, errors) in the status page the client polls.
  *
+ * A brokered session runs on ARM/DOORBELL (channel.c opens it without the
+ * Comch fast path and flow wake): the DPU fills each flow's slot ring by DMA
+ * and the client reads it in the shared window.
+ *
  * Idle wake: the client's channel_dev_arm lists its push flows in the arm page
  * and kicks the broker, which sends the DPU the ARM; the DOORBELL, and any
  * status the broker publishes, raise the wake eventfd the client sleeps on.
@@ -443,6 +447,16 @@ int channel_broker_conn_close(struct channel_conn *conn)
 	return 0;
 }
 
+int channel_broker_conn_shutdown(struct channel_conn *conn)
+{
+	/* The broker never posts into the ring: it is told how far this process did. */
+	struct broker_request req = { .type = BROKER_CONN_SHUTDOWN, .flow_id = conn->flow_id,
+				      .bytes = conn->forward_ring->head };
+	struct broker_reply rep;
+
+	return broker_call(conn->dev->broker, &req, &rep, NULL, 0);
+}
+
 int channel_broker_dev_progress(struct channel_dev *dev)
 {
 	struct channel_broker *b = dev->broker;
@@ -490,6 +504,21 @@ int channel_broker_conn_progress(struct channel_conn *conn)
 	return state > 0;
 }
 
+int channel_broker_conn_idle(const struct channel_conn *conn)
+{
+	const struct channel_broker *b = conn->dev->broker;
+	const volatile struct broker_flow_status *f = &b->status->flow[conn->flow_id];
+
+	/* Anything channel_conn_poll or channel_conn_rx_next would report keeps the flow in the drain. */
+	if (broker_dead((struct channel_broker *)b) || __atomic_load_n(&b->status->session_error, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&conn->forward_ring->ctrl->error, __ATOMIC_ACQUIRE))
+		return 0;
+	if (__atomic_load_n(&f->generation, __ATOMIC_ACQUIRE) == conn->generation &&
+	    __atomic_load_n(&f->state, __ATOMIC_ACQUIRE) != 0)
+		return 0;
+	return __atomic_load_n(&conn->descs[conn->expected % DMESH_PUSH_DESC_N].seq, __ATOMIC_ACQUIRE) != conn->expected;
+}
+
 int channel_broker_dev_fd(struct channel_dev *dev)
 {
 	return dev->broker->wake_fd;
@@ -511,6 +540,11 @@ int channel_broker_dev_arm(struct channel_dev *dev)
 	if (channel_broker_dev_progress(dev) != 0)
 		return -1;
 	if (b->arm == NULL || b->kick_fd < 0) { errno = ENOTCONN; return -1; }
+	/* The last raise is cleared before the list is published, as the
+	 * in-process arm clears its PE's: the caller drains once more after
+	 * arming, so what raised it is not lost. */
+	uint64_t raised;
+	(void)!read(b->wake_fd, &raised, sizeof(raised)); /* nonblocking: a clear fd stays clear */
 
 	/* Same flows as the in-process ARM: each live push flow's next unread
 	 * descriptor. The broker sends the ARM; this only publishes the list. */
@@ -533,15 +567,6 @@ int channel_broker_dev_arm(struct channel_dev *dev)
 	if (write(b->kick_fd, &one, sizeof(one)) < 0 && errno != EAGAIN)
 		return -1;
 	return 0;
-}
-
-void channel_broker_dev_clear(struct channel_dev *dev)
-{
-	uint64_t count;
-	int fd = dev->broker->wake_fd;
-
-	if (fd >= 0)
-		(void)!read(fd, &count, sizeof(count)); /* nonblocking: a clear fd stays clear */
 }
 
 void channel_broker_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells)
@@ -796,6 +821,13 @@ static int serve_conn_close(struct broker_server *srv, const struct broker_reque
 	return channel_conn_close(srv->dev->flows[req->flow_id]) == 0 ? 0 : errno;
 }
 
+static int serve_conn_shutdown(struct broker_server *srv, const struct broker_request *req)
+{
+	if (req->flow_id == 0 || req->flow_id >= BROKER_FLOWS) return EINVAL;
+	if (srv->dev->flows[req->flow_id] == NULL) return ENOENT;
+	return channel_conn_shutdown_at(srv->dev->flows[req->flow_id], req->bytes) == 0 ? 0 : errno;
+}
+
 static int serve_backend_finish(struct broker_server *srv, const struct broker_request *req)
 {
 	if (req->worker >= BROKER_WORKERS || req->token == 0 || req->error < 0) return EINVAL;
@@ -829,6 +861,7 @@ static int serve_request(struct broker_server *srv, int sock)
 		case BROKER_MEM_ALLOC: status = serve_mem_alloc(srv, &req, &rep, fds, &nfds); break;
 		case BROKER_CONN_OPEN: status = serve_conn_open(srv, &req, &rep, fds, &nfds); break;
 		case BROKER_CONN_CLOSE: status = serve_conn_close(srv, &req); break;
+		case BROKER_CONN_SHUTDOWN: status = serve_conn_shutdown(srv, &req); break;
 		case BROKER_SESSION_CLOSE: status = channel_session_close(srv->dev) == 0 ? 0 : errno; break;
 		case BROKER_LISTEN:
 			status = channel_session_listen(srv->dev, req.dst_ip, req.dst_port) == 0 ? 0 : errno;

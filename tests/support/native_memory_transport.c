@@ -2,6 +2,7 @@
  * Models custody separately from RX lease return and can hold ACK publication. */
 #include "src/core/native_transport.h"
 #include <assert.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -62,7 +63,7 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     if (pod == CHANNELS) { pthread_mutex_unlock(&lock); free(t->tx); free(t->rx); free(t->leased); free(t); errno = ENOSPC; return -1; }
     t->pod = pod; channels[pod] = t;
     pthread_mutex_unlock(&lock);
-    c->tx = t->tx; c->rx = t->rx; c->stripes = t->stripes;
+    c->tx = t->tx; c->rx = t->rx; c->stripes = t->stripes; c->flow_depth = 1024;
     c->pod_id = pod; c->service_id = t->service; c->rx_bytes = c->bytes; *out = t;
     return 0;
 }
@@ -112,20 +113,29 @@ int dmesh_native_submit(struct dmesh_native_transport *t, const sw_descriptor_t 
     } else push(t, ack);
     pthread_mutex_unlock(&lock); return 0;
 }
+static unsigned session_progress;
+unsigned test_native_session_progress(void) { return session_progress; }
 uint32_t dmesh_native_progress(struct dmesh_native_transport *t)
-{ return (UINT32_C(1) << t->stripes) - 1; }
+{ ++session_progress; return (UINT32_C(1) << t->stripes) - 1; }
 /* A test fails the session of every channel with test_native_lose. */
 static int lost_errno;
 void test_native_lose(int error) { lost_errno = error; }
 int dmesh_native_lost(struct dmesh_native_transport *t) { (void)t; return lost_errno; }
-int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e) {
+static int flow_wake;
+static uint32_t progressed;
+int dmesh_native_poll(struct dmesh_native_transport *t, int stripe, struct dmesh_native_event *e, int max) {
     pthread_mutex_lock(&lock);
-    struct event_node *n = t->first[stripe];
-    if (!n) { pthread_mutex_unlock(&lock); return 0; }
-    t->first[stripe] = n->next; if (!n->next) t->last[stripe] = NULL;
-    *e = n->event;
-    if (e->kind == DMESH_NATIVE_RX) t->leased[e->desc.body_buf_slot / DPUMESH_SLOT_SIZE] = 1;
-    free(n); pthread_mutex_unlock(&lock); return 1;
+    if (flow_wake) progressed |= UINT32_C(1) << stripe;
+    int count = 0;
+    while (count < max && t->first[stripe]) {
+        struct event_node *n = t->first[stripe];
+        t->first[stripe] = n->next; if (!n->next) t->last[stripe] = NULL;
+        e[count] = n->event;
+        if (e[count].kind == DMESH_NATIVE_RX) t->leased[e[count].desc.body_buf_slot / DPUMESH_SLOT_SIZE] = 1;
+        free(n);
+        count++;
+    }
+    pthread_mutex_unlock(&lock); return count;
 }
 void dmesh_native_release(struct dmesh_native_transport *t, int pos) {
     pthread_mutex_lock(&lock);
@@ -136,21 +146,61 @@ void dmesh_native_release(struct dmesh_native_transport *t, int pos) {
 }
 /* No doorbells: every stripe keeps its consumer polling, unless a test lets
  * the channel sleep (test_native_sleepable), where idle_arm succeeds and the
- * wake fd is an eventfd the test raises. */
+ * wake fd is an eventfd the test raises with a DOORBELL. As a PROGRESS_ALL PE
+ * does, every arm clears the raised fd. */
 static int sleepable, wake_efd = -1;
-static unsigned idle_arms, wake_clears;
+static unsigned idle_arms, doorbells;
 void test_native_sleepable(int value) { sleepable = value; }
 unsigned test_native_idle_arms(void) { return idle_arms; }
-unsigned test_native_wake_clears(void) { return wake_clears; }
 void test_native_raise_wake(void)
 {
     uint64_t one = 1;
+    ++doorbells;
     assert(wake_efd >= 0 && write(wake_efd, &one, sizeof(one)) == sizeof(one));
 }
 int dmesh_native_stripe_fd(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return -1; }
-int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return -1; }
-int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; return !sleepable; }
-void dmesh_native_stripe_clear(struct dmesh_native_transport *t, int stripe) { (void)t; (void)stripe; }
+/* With test_native_stripe_map a stream sits on stripe port % stripes, so the
+ * core binds stripe owners as a real carrier does (no doorbell fds here). */
+static int stripe_map;
+void test_native_stripe_map(int value) { stripe_map = value; }
+int dmesh_native_stripe_of(struct dmesh_native_transport *t, uint16_t port)
+{ return stripe_map ? port % t->stripes : -1; }
+/* Flow wake: a test turns it on before opening, counts which stripes were
+ * advanced (by their poll), and posts control news for stripes. */
+static uint32_t news;
+void test_native_flow_wake(int value) { flow_wake = value; }
+uint32_t test_native_progressed(void) { uint32_t p = progressed; progressed = 0; return p; }
+void test_native_news(uint32_t mask) { __atomic_fetch_or(&news, mask, __ATOMIC_RELEASE); }
+int dmesh_native_flow_wake(struct dmesh_native_transport *t) { (void)t; return flow_wake; }
+uint32_t dmesh_native_take_news(struct dmesh_native_transport *t)
+{ (void)t; return __atomic_exchange_n(&news, 0, __ATOMIC_ACQUIRE); }
+/* A channel that cannot sleep models open custody; test_native_retiring
+ * models a closed flow that still retires custody or its FIN. A test can
+ * also declare its receives signaled (the fast path) before opening. */
+static int retiring, custody, rx_signaled;
+void test_native_retiring(int value) { retiring = value; }
+void test_native_custody(int value) { custody = value; }   /* open custody, idle_arm still works */
+void test_native_rx_signaled(int value) { rx_signaled = value; }
+int dmesh_native_rx_signaled(struct dmesh_native_transport *t) { (void)t; return rx_signaled; }
+/* Runs once inside the next arm, a stripe's or the session's: what lands
+ * between a consumer's drain and its arm. */
+static void (*arm_hook)(void);
+void test_native_on_arm(void (*fn)(void)) { arm_hook = fn; }
+static void run_arm_hook(void)
+{
+    void (*fn)(void) = arm_hook;
+    arm_hook = NULL;
+    if (fn) fn();
+}
+static uint32_t armed_stripes;
+uint32_t test_native_armed(void) { uint32_t a = armed_stripes; armed_stripes = 0; return a; }
+int dmesh_native_stripe_arm(struct dmesh_native_transport *t, int stripe, int rang)
+{
+    (void)t; (void)rang;
+    armed_stripes |= UINT32_C(1) << stripe;
+    run_arm_hook();
+    return (sleepable && !custody ? 0 : DMESH_STRIPE_CUSTODY) | (retiring ? DMESH_STRIPE_RETIRING : 0);
+}
 int dmesh_native_wake_fd(struct dmesh_native_transport *t)
 {
     (void)t;
@@ -160,22 +210,18 @@ int dmesh_native_wake_fd(struct dmesh_native_transport *t)
 int dmesh_native_idle_arm(struct dmesh_native_transport *t)
 {
     (void)t;
+    uint64_t v;
+    while (wake_efd >= 0 && read(wake_efd, &v, sizeof(v)) > 0) {}
     if (!sleepable) { errno = EAGAIN; return -1; }
     ++idle_arms;
+    run_arm_hook();
     return 0;
 }
-void dmesh_native_wake_clear(struct dmesh_native_transport *t)
-{
-    (void)t;
-    uint64_t v;
-    ++wake_clears;
-    while (wake_efd >= 0 && read(wake_efd, &v, sizeof(v)) > 0) {}
-}
-void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms, uint64_t *doorbells)
+void dmesh_native_wake_counters(struct dmesh_native_transport *t, uint64_t *arms, uint64_t *rung)
 {
     (void)t;
     *arms = idle_arms;
-    *doorbells = wake_clears;
+    *rung = doorbells;
 }
 int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int service_id) {
     (void)t; (void)port; (void)service_id;
@@ -183,3 +229,38 @@ int dmesh_native_connect(struct dmesh_native_transport *t, uint16_t port, int se
     return 0;
 }
 int dmesh_native_disconnect(struct dmesh_native_transport *t, uint16_t port) { (void)t; (void)port; return 0; }
+/* DPU requests a test raises on a port's flow (test_native_request): the
+ * port's stripe announces them, and its QP takes them in order. Answers are
+ * recorded for the test to read. */
+static struct { uint16_t port; int kind; uint32_t count, token; } requests[4];
+static unsigned n_requests;
+uint32_t test_native_answers[3];   /* port of the last SPARE_READY, token and applied of the last SCALE_ACK */
+void test_native_request(struct dmesh_native_transport *t, uint16_t port, int kind, uint32_t count, uint32_t token)
+{
+    pthread_mutex_lock(&lock);
+    assert(n_requests < 4);
+    requests[n_requests++] = (__typeof__(requests[0])){port, kind, count, token};
+    push(t, (struct dmesh_native_event){.kind = DMESH_NATIVE_REQUEST, .port = port});
+    pthread_mutex_unlock(&lock);
+}
+int dmesh_native_take_request(struct dmesh_native_transport *t, uint16_t port, int *kind,
+                              uint32_t *ip, uint16_t *dst_port, uint32_t *count, uint32_t *token) {
+    (void)t;
+    *ip = htonl(0x0a630101); *dst_port = 80;   /* echo:80 is 10.99.1.1:80 here */
+    pthread_mutex_lock(&lock);
+    int found = 0;
+    for (unsigned i = 0; i < n_requests && !found; ++i) {
+        if (requests[i].port != port) continue;
+        *kind = requests[i].kind; *count = requests[i].count; *token = requests[i].token;
+        memmove(&requests[i], &requests[i + 1], (n_requests - i - 1) * sizeof(requests[0]));
+        --n_requests; found = 1;
+    }
+    pthread_mutex_unlock(&lock);
+    return found;
+}
+int dmesh_native_spare_ready(struct dmesh_native_transport *t, uint16_t port) {
+    (void)t; test_native_answers[0] = port; return 0;
+}
+int dmesh_native_scale_ack(struct dmesh_native_transport *t, uint16_t port, uint32_t token, uint32_t applied) {
+    (void)t; (void)port; test_native_answers[1] = token; test_native_answers[2] = applied; return 0;
+}

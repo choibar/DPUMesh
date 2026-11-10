@@ -9,7 +9,7 @@ BUILD := build
 LIBDIR := $(BUILD)/lib
 TESTDIR := $(BUILD)/test
 BINDIR := $(BUILD)/bin
-ABI_MAJOR := 5
+ABI_MAJOR := 6
 TRANSPORT := src/transport
 DOCA_INC := /opt/mellanox/doca/include
 DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch doca-dma doca-dpa libflexio)
@@ -28,10 +28,11 @@ TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c co
 TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
-HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_loss_test native_core_transport_test \
+HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_signaled_test native_loss_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
     channel_session_test comch_client_test session_server_test backend_dispatch_test dma_cleanup_test dpa_cleanup_test dpa_runtime_test \
-    dispatch_wake_test rx_consumed_pos_test broker_ipc_test broker_peer_test
+    dispatch_wake_test dispatch_request_test placement_instr_test rx_consumed_pos_test native_listen_test channel_flow_wake_test \
+    broker_ipc_test broker_peer_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
 .PHONY: all lib broker test test-native-headers test-abi examples clean
@@ -48,9 +49,14 @@ $(DPA_KERNEL): $(TRANSPORT)/device/dpa_kernel.c $(DPA_BENCH) $(TRANSPORT)/device
 	$(DPACC) $(abspath $(BUILD)/dpa) $(abspath $(TRANSPORT)) $(abspath $<) dpa_kernel nv-dpa-bf3 \
 	    $$(pkg-config --variable=libdir doca-dpa) $(abspath $(DPA_BENCH))
 
+# Calls within the library bind directly and calls into libc and DOCA go
+# through the GOT without a PLT stub; the exported symbols are unchanged.
+LIB_CFLAGS := -fno-plt -fno-semantic-interposition
+LIB_LDFLAGS := -Wl,-Bsymbolic-functions
+
 $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/*.h src/core/*.h $(TRANSPORT_HDRS) | $(LIBDIR)
-	$(CC) $(HOST_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \
-	    $(LIB_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
+	$(CC) $(HOST_CFLAGS) $(LIB_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \
+	    $(LIB_LDFLAGS) $(LIB_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
 	ln -sfn libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh.so
 
 # The host broker: owns the DOCA device for applications (docs/2026-09-29_host-broker-plan.md).
@@ -79,6 +85,9 @@ $(TESTDIR)/session_flow_test: tests/session_flow_test.c $(TRANSPORT)/common/obje
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT)/host/channel_broker.c $(TRANSPORT)/host/broker_ipc.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -DCHANNEL_REV_READY_MS=20 -ffunction-sections -fdata-sections $< $(TRANSPORT)/host/channel_broker.c $(TRANSPORT)/host/broker_ipc.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+
+$(TESTDIR)/channel_flow_wake_test: tests/channel_flow_wake_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT)/host/channel_broker.c $(TRANSPORT)/host/broker_ipc.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/host/channel_broker.c $(TRANSPORT)/host/broker_ipc.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/broker_ipc_test: tests/broker_ipc_test.c $(TRANSPORT)/host/broker_ipc.c $(TRANSPORT)/host/broker_ipc.h | $(TESTDIR)
@@ -97,6 +106,12 @@ $(TESTDIR)/backend_dispatch_test: tests/backend_dispatch_test.c $(TRANSPORT)/dpu
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/dispatch_wake_test: tests/dispatch_wake_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+
+$(TESTDIR)/dispatch_request_test: tests/dispatch_request_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+
+$(TESTDIR)/placement_instr_test: tests/placement_instr_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/dma_cleanup_test: tests/dma_cleanup_test.c $(TRANSPORT)/dpu/dma.c $(TRANSPORT_HDRS) | $(TESTDIR)
@@ -130,11 +145,17 @@ $(TESTDIR)/native_writable_test: tests/native_writable_test.c src/core/dmesh_cor
 $(TESTDIR)/native_polling_test: tests/native_polling_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
 
+$(TESTDIR)/native_signaled_test: tests/native_signaled_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
+
 $(TESTDIR)/native_loss_test: tests/native_loss_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
 
-$(TESTDIR)/native_core_transport_test: tests/native_core_transport_test.c tests/support/native_memory_transport.c src/core/dmesh_core.c src/core/service_resolve.c src/facade/dmesh_api.c src/core/native_transport.h | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) $(filter %.c,$^) -pthread -o $@
+$(TESTDIR)/native_listen_test: tests/native_listen_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
+
+$(TESTDIR)/native_core_transport_test: tests/native_core_transport_test.c src/core/dmesh_core.c src/core/native_transport.h tests/support/native_memory_transport.c src/facade/dmesh_api.c src/core/service_resolve.c | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< src/facade/dmesh_api.c src/core/service_resolve.c -Wl,--gc-sections -pthread -o $@
 
 $(TESTDIR)/service_resolve_test: tests/service_resolve_test.c src/core/service_resolve.c src/core/service_resolve.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -DDMESH_RESOLVE_TEST $(filter %.c,$^) -pthread -o $@
