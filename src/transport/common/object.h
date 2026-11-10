@@ -7,6 +7,7 @@
 #include <doca_ctx.h>
 #include <doca_dma.h>
 
+#include <poll.h>
 #include <sys/queue.h>
 #include "buffer.h"
 #include "comch_server.h"
@@ -450,6 +451,31 @@ static inline void dmesh_pe_read_events(struct doca_pe *pe)
 {
     if (pe != NULL)
         (void)doca_pe_request_notification(pe);
+}
+
+/* Reads the events waiting in a progress engine's notification channel
+ * without arming it again, after waiting up to wait_ms for one to arrive.
+ *
+ * For a context whose SDK object ends when it reaches idle, not at destroy (a
+ * Comch consumer): stopping it flushes its posted receives through its
+ * completion queue, and on an armed PE the flush raises an event. Read the
+ * events before the stop (wait_ms 0: what earlier completions queued) and
+ * again right after doca_ctx_stop(), before the PE is progressed: the context
+ * is still stopping then, and its completion queue, having fired, raises
+ * nothing more. Progressing first would end the context with its event still
+ * queued. */
+static inline void dmesh_pe_take_events(struct doca_pe *pe, int wait_ms)
+{
+    doca_notification_handle_t handle;
+
+    if (pe == NULL || doca_pe_get_notification_handle(pe, &handle) != DOCA_SUCCESS)
+        return;
+    for (int round = 0; round < 2; ++round) {
+        struct pollfd fd = {.fd = (int)handle, .events = POLLIN};
+        if (poll(&fd, 1, wait_ms) <= 0)
+            return;
+        (void)doca_pe_clear_notification(pe, handle);
+    }
 }
 
 #endif // OBJECT_H_
