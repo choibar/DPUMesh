@@ -40,6 +40,7 @@ struct fixture {
     bool hold_contexts, dpa_fatal;
     unsigned deliveries, progress_calls, stop_writes, reads, reposts, task_frees;
     unsigned thread_destroy_calls, arg_free_calls;
+    unsigned event_reads, event_reads_used; /* a PE's events are read before each endpoint destroy */
     bool thread_destroyed, arg_freed;
 };
 static struct fixture *f;
@@ -145,10 +146,20 @@ uint8_t doca_pe_progress(struct doca_pe *pe)
     }
     return 0;
 }
+doca_error_t doca_pe_request_notification(struct doca_pe *pe)
+{
+    assert(pthread_mutex_trylock(&dmesh_dpa_sdk_mutex) == 0);
+    pthread_mutex_unlock(&dmesh_dpa_sdk_mutex);
+    assert(pe == (void *)&f->objs);
+    ++f->event_reads;
+    return DOCA_SUCCESS;
+}
 static doca_error_t destroy_endpoint(void *handle, enum operation op)
 {
     struct fake_resource *r = handle;
     assert(r->state == DOCA_CTX_STATE_IDLE && !r->destroyed);
+    assert(f->event_reads > f->event_reads_used); /* read since the last destroy */
+    f->event_reads_used = f->event_reads;
     ++r->destroy_calls;
     if (fails(op, handle)) return DOCA_ERROR_DRIVER;
     r->destroyed = true;

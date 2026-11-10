@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 #include "session_protocol.h"
 
 struct objects;
@@ -43,10 +44,23 @@ int dmesh_dispatch_worker_fd(struct objects *);
 void dmesh_dispatch_worker_arm(struct objects *);
 void dmesh_dispatch_worker_drain(struct objects *);
 void dmesh_dispatch_worker_flush(struct objects *);
+/* Slots the dispatcher asked to drain for migration (GOAWAY); each is
+ * returned once. Returns the count written to slots (at most max). */
+int dmesh_dispatch_worker_take_migrations(struct objects *, int32_t *slots, int max);
+/* The proxy's statistics of the client connection on slot, DMESH_FLOW_STATS
+ * cumulative counters: requests, CPU ns, residence ns, backend ns,
+ * instructions. Sampled by the dispatcher every DMESH_FLOWSTAT_MS for flow
+ * placement. */
+void dmesh_dispatch_worker_flow_stats(struct objects *, int slot, const uint64_t *counters);
 void dmesh_dispatch_worker_ready(struct objects *);
 void dmesh_dispatch_worker_depart(struct objects *);
 bool dmesh_dispatch_worker_stop_admission(struct objects *);
 doca_error_t dmesh_dispatch_reply(struct dmesh_conn *, uint16_t, const void *, size_t, int32_t);
+/* Held by the dispatcher while it progresses the control PEs and sends; a
+ * worker takes it around the Comch calls that go through a session's
+ * connection (fast-path producer create/start/stop/destroy). NULL without a
+ * dispatcher. */
+pthread_mutex_t *dmesh_dispatch_sdk_lock(struct objects *);
 
 /* Dispatcher-only helpers implemented alongside the Comch callbacks. */
 doca_error_t dmesh_session_send(struct objects *, struct dmesh_session *, uint16_t,

@@ -313,14 +313,14 @@ absl::Status Run(const std::string& service, size_t rounds,
             << " wire_bytes=" << bytes << " protocol=" << protocol
             << " post_max=" << runtime->post_max()
             << " credit_hold_dropped=" << stats.receive_credit_hold_dropped
-            << " eq_budget_exhausted=" << stats.eq_drain_budget_exhausted
+            << " drain_budget_exhausted=" << stats.drain_budget_exhausted
             << '\n';
   runtime.reset();
-  // A dropped credit hold or an exhausted EQ budget means the transport ran
+  // A dropped credit hold or an exhausted drain budget means the transport ran
   // outside the bounds this smoke exercises, so the numbers above describe a
   // different run than the one being reported.
   if (stats.receive_credit_hold_dropped != 0 ||
-      stats.eq_drain_budget_exhausted != 0) {
+      stats.drain_budget_exhausted != 0) {
     return absl::InternalError("runtime stats left their bounds");
   }
   return absl::OkStatus();

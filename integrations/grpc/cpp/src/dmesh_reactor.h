@@ -16,12 +16,14 @@
 
 namespace dpumesh::grpc {
 
-// One EQ shard and its single owner thread. The owner thread is the sole
-// consumer of dmesh_poll_eq() and owns QP lifecycle; no QP is destroyed while
-// a returned event batch can still name it. Transmit operations run on the
-// thread pumping the endpoint write -- the Endpoint::Write() caller or the EQ
-// owner delivering TX_READY -- under a per-connection lock, which the owner
-// also takes before destroying that connection's QP.
+// One shard of QPs and its single owner thread. The owner waits on its QPs'
+// fds, is the sole caller of dmesh_poll_qp() for them and owns their
+// lifecycle; no QP is destroyed while a returned event batch can still name
+// it. One reactor also listens: it waits on the channel's fd and accepts.
+// Transmit operations run on the thread pumping the endpoint write -- the
+// Endpoint::Write() caller or the owner delivering TX_READY -- under a
+// per-connection lock, which the owner also takes before destroying that
+// connection's QP.
 class DmeshReactor final {
  public:
   struct Options {
@@ -33,8 +35,8 @@ class DmeshReactor final {
     // Receives that exceeded the per-connection credit-retention cap. The
     // connection is failed closed so its gRPC receive queue stays bounded.
     uint64_t receive_credit_hold_dropped = 0;
-    // Drains that ended on the per-iteration poll budget with the EQ non-empty.
-    uint64_t eq_drain_budget_exhausted = 0;
+    // Drains that ended on the per-iteration poll budget with the QP non-empty.
+    uint64_t drain_budget_exhausted = 0;
   };
 
   struct ConnectedTransport {
@@ -50,7 +52,6 @@ class DmeshReactor final {
     // Native identity of the two ends. The peer pair stays unset on a client
     // QP: the DPU selects and pins a backend for that stream, so the host
     // learns no peer pod.
-    int local_pod = -1;
     uint16_t local_port = 0;
     int peer_pod = -1;
     uint16_t peer_port = 0;
@@ -59,6 +60,8 @@ class DmeshReactor final {
   using ConnectCallback = absl::AnyInvocable<void(
       absl::StatusOr<ConnectedTransport>)>;
   using AcceptCallback = std::function<void(ConnectedTransport)>;
+  // Places a stream the channel accepted on a reactor.
+  using InboundRouter = std::function<void(dmesh_qp_t*)>;
 
   static absl::StatusOr<std::unique_ptr<DmeshReactor>> Create(
       DmeshApiOps* ops, dmesh_channel_t* channel, int post_max,
@@ -70,18 +73,28 @@ class DmeshReactor final {
   DmeshReactor& operator=(const DmeshReactor&) = delete;
 
   // QP creation and callback delivery are both asynchronous. The callback is
-  // delivered on callback_executor, never on the EQ owner thread.
+  // delivered on callback_executor, never on the owner thread.
   void Connect(std::string service, ConnectCallback callback);
 
+  // Makes this the reactor that waits on the channel's fd: the session's
+  // control work and the inbound streams, each handed to `route` on the owner
+  // thread. Returns once the owner watches the fd.
+  absl::Status Listen(InboundRouter route);
+
+  // Takes an accepted QP: serves it with the accept callback, or destroys it
+  // when none is installed. False when the reactor is shutting down; the QP
+  // stays the caller's.
+  bool Adopt(dmesh_qp_t* qp);
+
   // Installs or replaces the callback for native inbound connections. Returns
-  // only after the EQ owner has applied the change, so callers may advertise
+  // only after the owner has applied the change, so callers may advertise
   // readiness immediately after success. The callback runs on
   // callback_executor and receives the same transport shape as Connect(). An
   // empty callback rejects future connection requests.
   absl::Status SetAcceptCallback(AcceptCallback callback);
 
-  // Idempotent. Existing connections receive a terminal error, QPs are closed
-  // on the owner thread, and the EQ is destroyed after the thread joins.
+  // Idempotent. Existing connections receive a terminal error and their QPs
+  // are closed on the owner thread before it exits.
   void Shutdown();
 
   Stats stats() const;

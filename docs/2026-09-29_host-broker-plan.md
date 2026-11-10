@@ -123,3 +123,15 @@ broker를 거칠 때는 다음과 같이 전달한다(broker IPC v3).
 - main의 `channel_conn_poll`이 forward ring의 DPA error를 보게 바뀐 것에 맞춰, 앱도 공유 ring의 `ctrl->error`를 직접 확인한다.
 
 **검증.** 장비 없는 단위 테스트만 했다(`tests/channel_session_test.c`). broker 경로에서 서버 앱이 backend flow를 받는 동작과 성능은 아직 장비에서 확인하지 않았다.
+
+## 8. comch-wake(ABI 6) 위로 옮기기 — 2026-11-11
+
+`feature/comch-wake`는 host의 wake를 Comch fast path와 flow wake(flow slot마다 consumer와 PE 하나, QP가 직접 poll)로 옮겼고, channel 경계에 flow 단위 함수(열기 시작/완료, 닫기 시작/완료, shutdown, flow별 fd와 poll)를 더했다. broker client에는 PE가 없으므로 다음과 같이 맞춘다(broker IPC v5).
+
+- **broker가 여는 session에는 fast path와 flow wake가 없다.** 소유 모드(`channel_dev_open_owner`)는 wake consumer와 flow별 consumer를 만들지 않고, DPU는 이 session의 push descriptor를 Comch로 보내지 않는다. 앱의 channel은 flow wake가 꺼진 것으로 보고하므로, core는 6절의 ARM/DOORBELL 경로로 잠들고 깬다.
+- **`channel_dev_arm`이 wake eventfd를 비운다.** `channel_dev_clear`는 comch-wake에서 없어졌다. in-process 경로의 arm이 PE의 지난 알림을 지우는 것과 같은 자리에서, client의 arm은 지난 wake를 읽어 없앤 뒤 arm page를 쓰고 kick을 올린다.
+- **flow 단위 함수.** 열기는 요청 하나로 끝나므로 `channel_conn_open_finish`는 바로 0을 돌려준다. 닫기는 `channel_conn_close_finish`가 CONN_CLOSE 요청을 보낸다. half close(`channel_conn_shutdown`)는 앱이 올린 forward ring의 head를 `BROKER_CONN_SHUTDOWN`에 실어 보내고, broker가 그 위치로 SHUTDOWN을 DPU에 보낸다.
+- **DPU의 PREPARE/SCALE 요청**은 broker 경로에서 전달하지 않는다(`channel_conn_take_request`는 요청 없음, `channel_conn_scale_ack`와 `channel_conn_spare_ready`는 0). DPU의 flow scaling을 따르는 client는 direct 경로를 쓴다.
+
+**비용.** flow wake가 없으므로 잠든 QP를 깨우는 첫 메시지는 DOORBELL → broker → wake eventfd → channel의 poller → QP 순서로 온다. direct 경로의 flow wake보다 hop이 둘 많다.
+

@@ -2,9 +2,10 @@
 #define DPUMESH_STREAM_H
 
 /* Byte streams over DPUMesh for language bindings: the C ABI of the C++
- * adapter's EQ reactor. A runtime owns the process's DPUMesh channel, one
- * reactor thread that is the EQ's only consumer, and one callback thread. A
- * stream is one native QP carrying one HTTP/2 connection's bytes.
+ * adapter's reactor. A runtime owns the process's DPUMesh channel, its reactor
+ * threads (DPUMESH_REACTORS, default one), each the only poller of its QPs,
+ * and one callback thread. A stream is one native QP carrying one HTTP/2
+ * connection's bytes.
  *
  * Threads. Stream callbacks run on the reactor thread; connect and accept
  * results run on the callback thread. No callback runs inside a dms_* call,

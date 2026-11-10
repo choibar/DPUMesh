@@ -15,7 +15,7 @@ Worker에는 복사한 OPEN metadata와 flow key/location만 전달한다.
   session/flow directory, READY/export/CLOSE reply 전달. Payload/descriptor/data completion은
   dispatcher를 통과하지 않는다. Control thread는 eventfd와 Comch notification fd를 기다린다.
 - `src/transport/dpu/placement.{c,h}`: DOCA 객체에 접근하지 않는 배정 policy interface.
-  `DMESH_FLOW_PLACEMENT=least-flows`(기본) 또는 `round-robin`. Assigned count는 opening과
+  `DMESH_FLOW_PLACEMENT=least-instr`(기본), `least-flows` 또는 `round-robin`. Assigned count는 opening과
   spare를 포함한다. 정책 변경은 새 flow에만 적용하며 CPU 부하 균등화는 보장하지 않는다.
   DSB launcher에서는 `DSB_FLOW_PLACEMENT`로 설정한다.
 - Flow key `(session_id, session_epoch, flow_id, generation)`와 location

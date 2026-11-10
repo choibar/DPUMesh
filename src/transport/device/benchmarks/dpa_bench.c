@@ -8,7 +8,7 @@
 #include "dsb_blocks.h"
 #include "hpack_term.h"
 
-_Static_assert(sizeof(struct dpa_bench_state) == 128, "benchmark DPA argument layout");
+_Static_assert(sizeof(struct dpa_bench_state) == 144, "benchmark DPA argument layout");
 
 #define DMA_FLUSH_BATCH 32
 

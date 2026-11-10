@@ -1,42 +1,46 @@
 # Go gRPC transport
 
-`dmeshgo` implements `net.Conn` and `net.Listener` over the native API. One
-process owns one channel, one shared host–DPU Comch control connection, one EQ
-and one poller goroutine. Each Go connection owns a native QP; DMA rings,
-buffers and DPA resources remain per flow.
+`dmeshgo` implements `net.Conn` and `net.Listener` over the native socket
+API. One process owns one channel and one shared host–DPU Comch control
+connection; the channel is its listening socket (`dmesh_channel_fd`,
+`dmesh_accept`). Each Go connection owns a native QP with its own fd; DMA
+rings, buffers and DPA resources remain per flow.
 
-- The poller is the EQ's only consumer. It polls the EQ without blocking and,
-  while it is empty, parks on Go's netpoller with a duplicate of the EQ fd
-  (`eq_wait_linux.go`); no OS thread waits in cgo. The library's timers (naps,
-  retained-tail deadlines, the backstop) and doorbells raise that fd, so the
-  wait needs no Go timer. Commands interrupt it through the read deadline. It
-  hands receive leases to their connections and runs every QP destruction;
-  the native API requires destruction to be serialized with polling.
+- A Read or Write that has to wait polls its connection's QP itself and,
+  while it is empty, parks on Go's netpoller with a duplicate of the QP's fd
+  (`fd_wait_linux.go`); no OS thread waits in cgo. The goroutine waiting for
+  the bytes is the one the completion wakes, as with a TCP socket: no poller
+  goroutine hands receives on. The QP has one poller at a time; a Read and a
+  Write that both wait take turns, and the one that polls signals the other
+  when it lets go.
+- Each flow has a Comch consumer of its own (`design/HOST.md`, flow wake),
+  so a completion wakes only its connection.
 - Read, Write and Dial run on the caller's goroutine. Each connection has its
-  own lock, so no connection waits for another's I/O. A Dial waits for the
+  own locks, so no connection waits for another's I/O. A Dial waits for the
   DPU's answer without blocking other traffic; a `DialContext` whose context
   ends first returns at once, and the late stream is aborted. Bytes or a FIN
-  the peer sends before the dial returns (an HTTP/2 server's SETTINGS) are
-  held for the new connection, not dropped.
+  the peer sends before the dial returns (an HTTP/2 server's SETTINGS) wait
+  in the new QP.
 - Reads keep native receive leases until the bytes are consumed. A write that
-  finds no transmit capacity waits for the EQ's TX_READY. A writer blocked on
-  a departed peer fails with `EPIPE`, because that peer returns no credit.
+  finds no transmit capacity waits for TX_READY, polling the QP when nobody
+  else does: custody ACKs free the space and only a poll retires them. A
+  writer blocked on a departed peer fails with `EPIPE`, because that peer
+  returns no credit.
 - Concurrent Read/Write, deadlines and Close follow the Go networking
-  contract. Close wakes blocked calls, returns queued leases and reports the
-  native close result once.
-- A channel that serves `DPUMESH_SERVICE` is polled for the transport's whole
-  life. Streams that arrive before the first `Listen` are held for it. Once a
-  listener has closed, new streams are aborted at once instead of left
-  hanging.
+  contract. Close wakes blocked calls, returns queued leases, destroys the QP
+  with its fd, and reports the native close result once.
+- A channel goroutine polls the channel for the transport's whole life,
+  parked on its fd like a connection's Read. QPs never do the channel's work,
+  so this goroutine takes its control messages, keepalive and loss. On a
+  channel that serves `DPUMESH_SERVICE` it accepts each inbound stream and
+  hands it out; the stream's first bytes wait in its QP. Streams that arrive
+  before the first `Listen` are held for it. Once a listener has closed, new
+  streams are aborted at once instead of left hanging.
 
-Both reverse paths wait the same way. The EQ fd is registered with Go's
-runtime netpoller using an owned duplicate, so waiting parks the goroutine
-without blocking an OS thread in cgo; native code still owns and drains the EQ
-and its doorbells. The library arms that fd for what has no doorbell: its nap
-and linger timers, retained TX deadlines and the backstop, and on DPU-DMA the
-DOORBELL the DPU sends after an ARM (`design/HOST.md`, idle wake). The
-knobs are `DPUMESH_NAP_US`, `DPUMESH_NAP_CAP_US`, `DPUMESH_LINGER_US` and
-`DPUMESH_BACKSTOP_MS`; the poller adds no Go timer of its own.
+Native code owns and drains each QP and its doorbell. The library arms the
+QP's fd for what has no doorbell: re-polls while a sender waits for space,
+and the backstop (`design/HOST.md`, idle wake). A write is submitted at once.
+The adapter adds no Go timer of its own.
 
 Build the native library from the repository root, then compile the module:
 
@@ -112,7 +116,8 @@ Earlier versions of both `dpu-dma` and `host-dpa` passed on the jet1/BF-3 testbe
 [hardware validation report](../../../docs/2026-09-25_channel-comch-grpc-validation.md)
 for topology, exact environment, build commands and results. That report predates
 the netpoller wait, the idle wake and the payload larger than 1 MiB added above.
-The waiter has unit coverage for nested readiness, fd ownership and interrupts.
+The waiter has unit coverage for nested readiness, fd ownership, interrupts,
+a raise that lands after an empty poll, and allocation-free waits.
 `dpu-dma` with this waiter passed the hardware regression
 (`bench-results/2026-09-30_host-idle-wake.md`); `host-dpa` was not available on
 that testbed.

@@ -52,6 +52,7 @@ common_nodpa_srcs = files(
 common_srcs = common_nodpa_srcs + files('common/dpa.c', 'common/dpa_runtime.c', 'common/comch_msgq.c')
 dpu_srcs = files(
   'dpu/comch_server.c',
+  'dpu/comch_wake.c',
   'dpu/dispatcher.c',
   'dpu/placement.c',
   'dpu/dma.c',
