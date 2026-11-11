@@ -1,6 +1,8 @@
 /* Minimal native DPUmesh client. The hello-dpumesh Service replies
  * with the same byte stream, so this shows the complete application contract:
- * channel -> EQ -> service QP -> zero-copy receive -> ordered teardown. */
+ * channel -> connected QP -> zero-copy receive -> ordered teardown. Like every
+ * process, the client also waits on the channel's fd, whose work
+ * dmesh_accept() does. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
@@ -15,37 +17,42 @@
 #define EVENT_BATCH 16
 #define REPLY_MAX   4096
 
-static int wait_eq(int fd)
+static int wait_fds(int channel_fd, int qp_fd)
 {
-    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    struct pollfd pfd[2] = {
+        { .fd = channel_fd, .events = POLLIN },
+        { .fd = qp_fd, .events = POLLIN },
+    };
     int rc;
     do {
-        rc = poll(&pfd, 1, 5000);
+        rc = poll(pfd, 2, 5000);
     } while (rc < 0 && errno == EINTR);
     if (rc <= 0)
         return -1;
     return 0;
 }
 
-static int drain(dmesh_channel_t *channel, dmesh_eq_t *eq, dmesh_qp_t *qp,
+/* The channel's work, then the QP's events. */
+static int drain(dmesh_channel_t *channel, dmesh_qp_t *qp,
                  char *reply, size_t *reply_len)
 {
+    if (dmesh_accept(channel) != NULL || errno != EAGAIN)
+        return -1;                       /* a client is offered no stream */
     dmesh_event_t events[EVENT_BATCH];
     int n;
-    while ((n = dmesh_poll_eq(eq, events, EVENT_BATCH)) > 0) {
+    while ((n = dmesh_poll_qp(qp, events, EVENT_BATCH)) > 0) {
         for (int i = 0; i < n; i++) {
             dmesh_event_t *event = &events[i];
             if (event->type == DMESH_EVENT_RECV) {
-                if (event->qp != qp || event->len > REPLY_MAX - *reply_len) {
+                if (event->len > REPLY_MAX - *reply_len) {
                     dmesh_release_rx_buffer(channel, event);
                     return -1;
                 }
                 memcpy(reply + *reply_len, event->buf, event->len);
                 *reply_len += event->len;
                 dmesh_release_rx_buffer(channel, event);
-            } else if (event->qp == qp &&
-                       (event->type == DMESH_EVENT_RECV_FIN ||
-                        event->type == DMESH_EVENT_TX_ERROR)) {
+            } else if (event->type == DMESH_EVENT_RECV_FIN ||
+                       event->type == DMESH_EVENT_TX_ERROR) {
                 return -1;
             }
         }
@@ -67,18 +74,18 @@ int main(int argc, char **argv)
     }
 
     dmesh_channel_t *channel = dmesh_create_channel();
-    dmesh_eq_t *eq = channel ? dmesh_create_eq(channel) : NULL;
-    dmesh_qp_t *qp = eq ? dmesh_create_qp(eq, service) : NULL;
-    int eq_fd = eq ? dmesh_eq_fd(eq) : -1;
-    if (!channel || !eq || !qp || eq_fd < 0) {
+    dmesh_qp_t *qp = channel ? dmesh_create_qp(channel, service) : NULL;
+    int channel_fd = channel ? dmesh_channel_fd(channel) : -1;
+    int qp_fd = qp ? dmesh_qp_fd(qp) : -1;
+    if (!channel || !qp || channel_fd < 0 || qp_fd < 0) {
         perror("DPUmesh setup");
         goto out;
     }
 
     void *tx;
     while ((tx = dmesh_alloc(qp, (uint32_t)message_len)) == NULL) {
-        if (errno != EAGAIN || wait_eq(eq_fd) != 0 ||
-            drain(channel, eq, qp, reply, &reply_len) < 0) {
+        if (errno != EAGAIN || wait_fds(channel_fd, qp_fd) != 0 ||
+            drain(channel, qp, reply, &reply_len) < 0) {
             perror("dmesh_alloc");
             goto out;
         }
@@ -91,7 +98,7 @@ int main(int argc, char **argv)
     }
 
     while (reply_len < message_len) {
-        if (wait_eq(eq_fd) != 0 || drain(channel, eq, qp, reply, &reply_len) < 0) {
+        if (wait_fds(channel_fd, qp_fd) != 0 || drain(channel, qp, reply, &reply_len) < 0) {
             fprintf(stderr, "DPUmesh reply timed out or failed\n");
             goto out;
         }
@@ -105,7 +112,6 @@ int main(int argc, char **argv)
 
 out:
     dmesh_destroy_qp(qp);
-    dmesh_destroy_eq(eq);
     dmesh_destroy_channel(channel);
     return rc;
 }

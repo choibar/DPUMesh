@@ -58,6 +58,8 @@ bool HasChannelArgument(const ::grpc::ChannelArguments& args,
   return false;
 }
 
+// 127.0.0.<pod>:port; 127.0.0.0 for a pod the host does not learn (its own,
+// or a client's peer).
 EventEngine::ResolvedAddress NativeAddress(int pod, uint16_t port) {
   sockaddr_in address{};
   address.sin_family = AF_INET;
@@ -367,7 +369,7 @@ class DmeshClientEventEngine final : public EventEngine {
         std::move(transport), std::move(callback_executor),
         std::move(memory_allocator),
         NativeAddress(connected->peer_pod, connected->peer_port),
-        NativeAddress(connected->local_pod, connected->local_port)));
+        NativeAddress(DMESH_POD_BLANK, connected->local_port)));
   }
 
   const std::shared_ptr<DmeshRuntime> runtime_;
@@ -449,7 +451,7 @@ struct DmeshGrpcServerAttachment::State {
           std::move(connected.transport), std::move(endpoint_callbacks),
           std::move(allocator),
           NativeAddress(connected.peer_pod, connected.peer_port),
-          NativeAddress(connected.local_pod, connected.local_port));
+          NativeAddress(DMESH_POD_BLANK, connected.local_port));
       status = listener->AcceptConnectedEndpoint(std::move(endpoint));
     }
     if (!status.ok() && on_error) on_error(status);

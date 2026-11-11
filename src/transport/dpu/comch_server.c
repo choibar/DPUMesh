@@ -16,6 +16,7 @@
 #include "comch_msgq.h"
 #include "dma.h"
 #include "ring.h"
+#include "comch_wake.h"
 
 #include <doca_pe.h>
 #include <doca_comch.h>
@@ -309,6 +310,13 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
         }
         return;
     }
+    if (h.type == DMESH_SESSION_SHUTDOWN) {
+        if (conn != NULL) {
+            conn->host_shut_descs = dmesh_session_get_u64(payload);
+            conn->host_shut = true;
+        }
+        return;
+    }
     if (h.type == DMESH_SESSION_CLOSE) {
         if (conn != NULL) {
             conn->close_requested = true;
@@ -574,6 +582,46 @@ destroy_server:
 	return result;
 }
 
+/* A host consumer on a dispatcher session is the host asking for fast-path
+ * wake (dpu/comch_wake.c): flows admitted from now on publish through it, and
+ * dmesh_sessions_advance tells the host with WAKE_READY. */
+static struct objects *server_objs_of(struct doca_comch_connection *connection)
+{
+    union doca_data user_data;
+    struct doca_comch_server *server = doca_comch_server_get_server_ctx(connection);
+    if (server == NULL || doca_ctx_get_user_data(doca_comch_server_as_ctx(server), &user_data) != DOCA_SUCCESS)
+        return NULL;
+    return user_data.ptr;
+}
+static void server_consumer_arrived(struct doca_comch_event_consumer *event,
+                                    struct doca_comch_connection *connection, uint32_t id)
+{
+    server_new_consumer_callback(event, connection, id);
+    struct objects *objs = server_objs_of(connection);
+    if (objs == NULL || !objs->dispatcher || !dmesh_wake_enabled())
+        return;
+    struct dmesh_session *s = session_get(objs, connection, false);
+    if (s == NULL || s->closing)
+        return;
+    /* The first consumer is the session's; later ones are host flow slots'
+     * own (flow wake), named by the OPENs of their flows. */
+    if (s->wake_consumer == 0)
+        s->wake_consumer = id;
+    else
+        dmesh_session_flow_consumer_set(s, id, true);
+}
+static void server_consumer_expired(struct doca_comch_event_consumer *event,
+                                    struct doca_comch_connection *connection, uint32_t id)
+{
+    expired_consumer_callback(event, connection, id);
+    struct objects *objs = server_objs_of(connection);
+    struct dmesh_session *s = objs ? session_get(objs, connection, false) : NULL;
+    if (s != NULL && s->wake_consumer == id)
+        s->wake_consumer = 0;
+    else if (s != NULL)
+        dmesh_session_flow_consumer_set(s, id, false);
+}
+
 doca_error_t
 start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool is_fast_path)
 {
@@ -643,8 +691,8 @@ start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool
     /* Config the data_path related events */
 	if (is_fast_path) {
 		result = doca_comch_server_event_consumer_register(objs->cc_server,
-									server_new_consumer_callback,
-									expired_consumer_callback);
+									server_consumer_arrived,
+									server_consumer_expired);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed adding consumer event cb with error = %s", doca_error_get_name(result));
 			goto destroy_server;
@@ -893,6 +941,7 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
                    doca_ctx_get_state(cctx, &st) == DOCA_SUCCESS && st != DOCA_CTX_STATE_IDLE)
                 doca_pe_progress(objs->consumer_pe);
         }
+        dmesh_pe_read_events(objs->consumer_pe);
         (void)DMESH_DPA_CALL(doca_comch_consumer_destroy(conn->consumer));
         conn->consumer = NULL;
     }
@@ -1039,6 +1088,9 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
         if (result != DOCA_SUCCESS)
             return result;
     }
+    /* The last flow of a session stops its producer before the flow retires:
+     * the dispatcher may disconnect the session right after. */
+    dmesh_wake_detach(conn);
     /* DMESH_DPA_REUSE=1: the pool slot keeps the comch and the started thread
      * (a retried close finds them kept and skips both). */
     if (!dmesh_doca_dpa_comch_keep(conn)) {
@@ -1167,6 +1219,9 @@ void dmesh_sessions_advance(struct objects *objs)
                 (!objs->dispatcher || dmesh_dispatcher_accepting(objs)) &&
                 dmesh_session_send(objs, s, DMESH_SESSION_HELLO_ACK, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)
                 s->hello_pending = false;
+            if (s->wake_consumer && !s->wake_ready_sent && objs->dispatcher && !s->hello_pending &&
+                dmesh_session_send(objs, s, DMESH_SESSION_WAKE_READY, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)
+                s->wake_ready_sent = true;
             if (s->doorbell_pending_epoch != s->doorbell_sent_epoch) {
                 uint8_t epoch[DMESH_SESSION_DOORBELL_SIZE];
                 dmesh_session_put_u64(epoch, s->doorbell_pending_epoch);
@@ -1372,6 +1427,7 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
         if (conn->multiplexed && conn->reverse_exported && !conn->ready_sent &&
             server_send_flow_msg(conn, DMESH_SESSION_READY, NULL, 0, 0) == DOCA_SUCCESS)
             conn->ready_sent = true;
+        dmesh_dma_push_retry_desc(conn);
         if (conn->push_fin_requested && !conn->push_fin_sent)
             (void)dmesh_dma_push_fin(conn);
 		break;
@@ -1416,6 +1472,7 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			 * the DPA thread itself is kept (that destroy is the flexio
 			 * hazard) - the slot leaks its pool thread, as parking always did. */
 			if (conn->consumer != NULL) {
+				dmesh_pe_read_events(objs->consumer_pe);
 				(void)DMESH_DPA_CALL(doca_comch_consumer_destroy(conn->consumer));
 				conn->consumer = NULL;
 			}

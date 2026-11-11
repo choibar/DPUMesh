@@ -8,8 +8,6 @@
 #include <stdatomic.h>
 
 static dmesh_channel_t fake_channel = {
-    .pod_id = 1,
-    .slot_size = 8,
     .block_size = 4,
 };
 static dmesh_qp_t fake_qp = {
@@ -27,8 +25,7 @@ static atomic_int fake_flush_calls;
 static atomic_int fake_fail_fin;
 static atomic_int fake_inflight;
 static atomic_int fake_release_calls;
-static atomic_int fake_suppress_depth;
-static atomic_int fake_suppress_calls;
+static atomic_int fake_kick_calls;
 static atomic_int fake_poll_active;
 static atomic_int fake_poll_max_active;
 static atomic_int fake_poll_delay_us;
@@ -48,8 +45,7 @@ static void fake_reset(void) {
     atomic_store(&fake_fail_fin, 0);
     atomic_store(&fake_inflight, 0);
     atomic_store(&fake_release_calls, 0);
-    atomic_store(&fake_suppress_depth, 0);
-    atomic_store(&fake_suppress_calls, 0);
+    atomic_store(&fake_kick_calls, 0);
     atomic_store(&fake_poll_active, 0);
     atomic_store(&fake_poll_max_active, 0);
     atomic_store(&fake_poll_delay_us, 0);
@@ -79,37 +75,23 @@ void dmesh_resolve_invalidate(uint32_t ip_net, uint16_t port_host) {
 }
 dmesh_channel_t *dmesh_create_channel(void) { return &fake_channel; }
 int dmesh_destroy_channel(dmesh_channel_t *channel) { (void)channel; return 0; }
-int dmesh_pod_id(dmesh_channel_t *channel) { return channel->pod_id; }
-int dmesh_msg_max(dmesh_channel_t *channel) { return channel->slot_size; }
-void dpumesh_get_wait_split(dpumesh_ctx_t *ctx, unsigned long long *window,
-                            unsigned long long *pool) {
-    (void)ctx;
-    if (window) *window = 6;
-    if (pool) *pool = 7;
+int dmesh_channel_fd(dmesh_channel_t *channel) { (void)channel; return -1; }
+dmesh_qp_t *dmesh_accept(dmesh_channel_t *channel) {
+    (void)channel; errno = EAGAIN; return NULL;
 }
-void dmesh_get_tx_stats(dmesh_channel_t *channel, dmesh_tx_stats_t *out) {
-    (void)channel;
-    *out = (dmesh_tx_stats_t){
-        .pool_grabs = 1,
-        .pool_returns = 2,
-        .recycle_hits = 3,
-        .grow_waits = 4,
-        .block_pads = 5,
-    };
+/* A real fd, so a connected socket can be watched. */
+static int fake_qp_efd = -1;
+int dmesh_qp_fd(dmesh_qp_t *qp) {
+    (void)qp;
+    if (fake_qp_efd < 0) fake_qp_efd = eventfd(0, EFD_CLOEXEC);
+    return fake_qp_efd;
 }
-dmesh_eq_t *dmesh_create_eq(dmesh_channel_t *channel) {
-    (void)channel; return (dmesh_eq_t *)(uintptr_t)1;
+void dpumesh_qp_kick_pending(dmesh_qp_t *qp) {
+    (void)qp;
+    atomic_fetch_add(&fake_kick_calls, 1);
 }
-int dmesh_destroy_eq(dmesh_eq_t *eq) { (void)eq; return 0; }
-int dmesh_eq_fd(dmesh_eq_t *eq) { (void)eq; return -1; }
-int64_t dmesh_eq_next_deadline_ns(dmesh_eq_t *eq) { (void)eq; return -1; }
-void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta) {
-    (void)eq;
-    atomic_fetch_add(&fake_suppress_depth, delta);
-    atomic_fetch_add(&fake_suppress_calls, 1);
-}
-dmesh_qp_t *dmesh_qp_open(dmesh_eq_t *eq, int service) {
-    (void)eq; (void)service; return &fake_qp;
+dmesh_qp_t *dmesh_qp_open(dmesh_channel_t *channel, int service) {
+    (void)channel; (void)service; return &fake_qp;
 }
 int dmesh_destroy_qp(dmesh_qp_t *qp) {
     (void)qp;
@@ -127,8 +109,8 @@ int dmesh_send_fin(dmesh_qp_t *qp) {
     }
     return 0;
 }
-int dmesh_poll_eq(dmesh_eq_t *eq, dmesh_event_t *events, int max_events) {
-    (void)eq;
+int dmesh_poll_qp(dmesh_qp_t *qp, dmesh_event_t *events, int max_events) {
+    (void)qp;
     int active = atomic_fetch_add(&fake_poll_active, 1) + 1;
     int maximum = atomic_load(&fake_poll_max_active);
     while (active > maximum &&
@@ -205,6 +187,13 @@ static int fd_ready(pfd_t *e, short events) {
     return n > 0 && (p.revents & events) != 0;
 }
 
+/* The dispatcher's pass over one woken QP. */
+static void drain(pfd_t *e) {
+    int failed;
+    (void)dispatcher_drain_qp(e, NULL, 0, &failed);
+    assert(!failed);
+}
+
 static void fake_emit_event(dmesh_event_type_t type, dmesh_qp_t *qp) {
     assert(fake_event_count < (int)(sizeof(fake_events) /
                                          sizeof(fake_events[0])));
@@ -256,9 +245,8 @@ static void test_writev_eagain_keeps_cursor(void) {
     assert(shim_send_iov(e, iov, 2, MSG_DONTWAIT) == -1);
     assert(errno == EAGAIN);
     assert(fake_posted_len == 0);
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     fake_emit_event(DMESH_EVENT_TX_READY, &fake_qp);
-    dispatcher_drain_eq(NULL, 0);
+    drain(e);
     assert(shim_send_iov(e, iov, 2, MSG_DONTWAIT) == 11);
     assert(fake_posted_len == 11);
     assert(memcmp(fake_posted, "headpayload", 11) == 0);
@@ -274,6 +262,7 @@ static void untrack_fd(int fd) {
     e->active_ops--;
     pthread_mutex_unlock(&g_tbl_mu);
     real_close(fd);
+    pfd_unwatch(e);
     test_pfd_free(e);
 }
 
@@ -283,7 +272,8 @@ static void untrack_fd(int fd) {
 static void test_connect_v4_mapped_ipv6_is_meshed(void) {
     fake_reset();
     g_ch = &fake_channel;
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
+    g_epfd = epoll_create1(EPOLL_CLOEXEC);
+    assert(g_epfd >= 0);
     assert(inet_pton(AF_INET, "10.99.1.1", &fake_mesh_ip) == 1);
     fake_mesh_port = 3550;
     /* Nonblocking, so a connect that escapes to kernel TCP fails the test
@@ -316,6 +306,8 @@ static void test_connect_v4_mapped_ipv6_is_meshed(void) {
     assert(pfd_get(kfd) == NULL);
     real_close(kfd);
     fake_mesh_ip = 0;
+    real_close(g_epfd);
+    g_epfd = -1;
 }
 
 /* A server bound to [::] listens over DPUmesh like an IPv4 one, and what it
@@ -323,7 +315,6 @@ static void test_connect_v4_mapped_ipv6_is_meshed(void) {
 static void test_ipv6_listener_is_converted(void) {
     fake_reset();
     g_ch = &fake_channel;
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     int fd = socket(AF_INET6, SOCK_STREAM, 0);
     assert(fd >= 0);
     struct sockaddr_in6 any = { .sin6_family = AF_INET6, .sin6_addr = IN6ADDR_ANY_INIT };
@@ -373,9 +364,8 @@ static void test_nonblocking_eagain_and_pollout_edge(void) {
     assert(atomic_load(&fake_alloc_calls) == 1);
     assert(!fd_ready(e, POLLOUT));
 
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     fake_emit_event(DMESH_EVENT_TX_READY, &fake_qp);
-    dispatcher_drain_eq(NULL, 0);
+    drain(e);
     assert(fd_ready(e, POLLOUT));
     assert(shim_send(e, "x", 1, MSG_DONTWAIT) == 1);
     assert(atomic_load(&fake_alloc_calls) == 2);
@@ -412,9 +402,8 @@ static void test_blocking_send_waits_for_event(void) {
     assert(atomic_load(&fake_alloc_calls) == 1);  /* no timer/busy retry */
     assert(!atomic_load(&arg.done));
 
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     fake_emit_event(DMESH_EVENT_TX_READY, &fake_qp);
-    dispatcher_drain_eq(NULL, 0);
+    drain(e);
     assert(pthread_join(thread, NULL) == 0);
     assert(arg.result == 8);
     assert(atomic_load(&fake_alloc_calls) == 3);  /* two 4-byte posts after wake */
@@ -678,7 +667,6 @@ static void test_dispatcher_batches_rx_signal(void) {
     fake_reset();
     pfd_t *e = test_pfd();
     static const uint8_t bytes[] = "abcde";
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     for (int i = 0; i < 5; i++) {
         fake_events[fake_event_count++] = (dmesh_event_t){
             .qp = &fake_qp,
@@ -689,7 +677,7 @@ static void test_dispatcher_batches_rx_signal(void) {
         };
     }
 
-    dispatcher_drain_eq(NULL, 0);
+    drain(e);
     uint8_t signals[16];
     assert(real_read(e->efd, signals, sizeof(signals)) == 1);
 
@@ -717,9 +705,8 @@ static void test_tx_batching_is_library_owned(void) {
 static void test_async_tx_error_becomes_socket_error(void) {
     fake_reset();
     pfd_t *e = test_pfd();
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     fake_emit_event(DMESH_EVENT_TX_ERROR, &fake_qp);
-    dispatcher_drain_eq(NULL, 0);
+    drain(e);
     errno = 0;
     assert(shim_send(e, "x", 1, MSG_DONTWAIT) == -1);
     assert(errno == EIO);
@@ -727,11 +714,10 @@ static void test_async_tx_error_becomes_socket_error(void) {
     test_pfd_free(e);
 }
 
-static void test_blocking_recv_drains_eq(void) {
+static void test_blocking_recv_drains_qp(void) {
     fake_reset();
     pfd_t *e = test_pfd();
     static const uint8_t byte = 'x';
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     fake_events[fake_event_count++] = (dmesh_event_t){
         .qp = &fake_qp,
         .type = DMESH_EVENT_RECV,
@@ -743,17 +729,15 @@ static void test_blocking_recv_drains_eq(void) {
     char out = 0;
     assert(shim_recv(e, &out, 1, 0) == 1);
     assert(out == 'x');
-    assert(atomic_load(&fake_suppress_depth) == 0);
-    assert(atomic_load(&fake_suppress_calls) == 2);
+    assert(atomic_load(&fake_kick_calls) == 1);
     assert(atomic_load(&fake_release_calls) == 1);
     test_pfd_free(e);
 }
 
-static void test_nonblocking_recv_drains_eq(void) {
+static void test_nonblocking_recv_drains_qp(void) {
     fake_reset();
     pfd_t *e = test_pfd();
     static const uint8_t byte = 'n';
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     fake_events[fake_event_count++] = (dmesh_event_t){
         .qp = &fake_qp,
         .type = DMESH_EVENT_RECV,
@@ -765,8 +749,7 @@ static void test_nonblocking_recv_drains_eq(void) {
     char out = 0;
     assert(shim_recv(e, &out, 1, MSG_DONTWAIT) == 1);
     assert(out == 'n');
-    assert(atomic_load(&fake_suppress_depth) == 0);
-    assert(atomic_load(&fake_suppress_calls) == 2);
+    assert(atomic_load(&fake_kick_calls) == 1);
     assert(atomic_load(&fake_release_calls) == 1);
     test_pfd_free(e);
 }
@@ -789,11 +772,10 @@ static void wait_for_fake_poll(void) {
     assert(atomic_load(&fake_poll_active) == 1);
 }
 
-static void test_eq_consumers_are_serialized(void) {
+static void test_qp_consumers_are_serialized(void) {
     fake_reset();
     pfd_t *e = test_pfd();
     static const uint8_t byte = 'q';
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     atomic_store(&fake_poll_delay_us, 30000);
     fake_events[fake_event_count++] = (dmesh_event_t){
         .qp = &fake_qp,
@@ -820,10 +802,9 @@ static void test_eq_consumers_are_serialized(void) {
     test_pfd_free(e);
 }
 
-static void test_close_waits_for_eq_consumer(void) {
+static void test_close_waits_for_qp_consumer(void) {
     fake_reset();
     pfd_t *e = test_pfd();
-    g_eq = (dmesh_eq_t *)(uintptr_t)1;
     atomic_store(&fake_poll_delay_us, 30000);
     pthread_mutex_lock(&g_tbl_mu);
     e->active_ops = 1;
@@ -838,20 +819,6 @@ static void test_close_waits_for_eq_consumer(void) {
     assert(atomic_load(&fake_destroy_during_poll) == 0);
     assert(atomic_load(&fake_poll_max_active) == 1);
     pfd_put(e);
-}
-
-static void test_preload_tx_stats(void) {
-    unsigned long long stats[7] = {0};
-    g_ch = NULL;
-    assert(dmesh_preload_tx_stats(stats) == 0);
-    assert(stats[0] == 0 && stats[1] == 0 && stats[2] == 0);
-    assert(stats[3] == 0 && stats[4] == 0 && stats[5] == 0 && stats[6] == 0);
-
-    g_ch = &fake_channel;
-    assert(dmesh_preload_tx_stats(stats) == 0);
-    assert(stats[0] == 1 && stats[1] == 2 && stats[2] == 3);
-    assert(stats[3] == 4 && stats[4] == 5 && stats[5] == 6 && stats[6] == 7);
-    g_ch = NULL;
 }
 
 static void test_fork_child_fails_inherited_socket_closed(void) {
@@ -871,7 +838,7 @@ static void test_fork_child_fails_inherited_socket_closed(void) {
     assert(e->active_ops == 0 && !e->fork_locked);
     preload_atfork_prepare();
     preload_atfork_child();
-    assert(g_ch == NULL && g_eq == NULL && g_wake_fd == -1);
+    assert(g_ch == NULL && g_epfd == -1 && g_wake_fd == -1);
     assert(e->orphaned && e->conn == NULL && e->io_error == ECONNRESET);
     char byte;
     errno = 0;
@@ -883,7 +850,6 @@ static void test_fork_child_fails_inherited_socket_closed(void) {
 
 int main(void) {
     ENSURE_REAL();
-    test_preload_tx_stats();
     test_native_chunking_delegates_batching();
     test_writev_gathers_across_iovecs();
     test_writev_eagain_keeps_cursor();
@@ -900,10 +866,10 @@ int main(void) {
     test_dispatcher_batches_rx_signal();
     test_tx_batching_is_library_owned();
     test_async_tx_error_becomes_socket_error();
-    test_blocking_recv_drains_eq();
-    test_nonblocking_recv_drains_eq();
-    test_eq_consumers_are_serialized();
-    test_close_waits_for_eq_consumer();
+    test_blocking_recv_drains_qp();
+    test_nonblocking_recv_drains_qp();
+    test_qp_consumers_are_serialized();
+    test_close_waits_for_qp_consumer();
     test_fcntl_getfl_without_third_argument();
     test_fcntl_dupfd_cannot_escape_tracking_bound();
     test_install_fd_preserves_cloexec();

@@ -6,10 +6,11 @@ deadlines and RPC semantics stay in gRPC; the endpoint moves bytes.
 
 ## Runtime and ownership
 
-`DmeshRuntime` owns one channel and a configurable set of EQ reactor shards.
-Outbound connections are spread across shards; accepted QPs belong to the
-reactor that received the connection event. Each reactor owns EQ polling and
-receive/TX-ready progress; a shared executor delivers deferred callbacks.
+`DmeshRuntime` owns one channel and a configurable set of reactor shards. The
+first reactor also waits on the channel's fd and accepts; dialed and accepted
+QPs alike are spread across shards round-robin. Each reactor waits on its QPs'
+fds and owns their polling and receive/TX-ready progress; a shared executor
+delivers deferred callbacks.
 Endpoint destruction and transport failure complete pending operations once.
 
 Reads copy native fragments into gRPC slices; a reactor may retain receive

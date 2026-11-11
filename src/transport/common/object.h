@@ -51,6 +51,8 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* Per-flow statistics the proxy exports (struct dmesh_conn.flow_stats). */
 #define DMESH_FLOW_STATS 5
 #define DMESH_MAX_SESSIONS 64
+/* Host flow slots per session that may each bring a flow wake consumer. */
+#define DMESH_SESSION_FLOW_CONSUMERS 32
 
 /* A Comch peer is a channel, independently of its logical data flows. */
 struct dmesh_session {
@@ -79,7 +81,33 @@ struct dmesh_session {
      * and rings as a reply from dmesh_dispatch_worker_flush. */
     bool armed;
     uint64_t armed_epoch, doorbell_pending_epoch, doorbell_sent_epoch;
+    /* Comch fast-path wake, on the dispatcher's session: the host's consumer
+     * (0 = none) and whether WAKE_READY went out. Flows admitted after it
+     * publish through a worker producer (dpu/comch_wake.c). */
+    uint32_t wake_consumer;
+    bool wake_ready_sent;
+    /* Flow wake: the session's further host consumers, one per host flow
+     * slot, any of which an OPEN may name (0 = free entry). */
+    uint32_t flow_consumers[DMESH_SESSION_FLOW_CONSUMERS];
 };
+
+/* Flow wake consumers of a session: record an arrival or an expiry, and
+ * whether an OPEN may name one. */
+static inline void dmesh_session_flow_consumer_set(struct dmesh_session *s, uint32_t id, bool present)
+{
+    for (unsigned i = 0; i < DMESH_SESSION_FLOW_CONSUMERS; ++i)
+        if (s->flow_consumers[i] == (present ? 0 : id)) {
+            s->flow_consumers[i] = present ? id : 0;
+            return;
+        }
+}
+static inline bool dmesh_session_flow_consumer(const struct dmesh_session *s, uint32_t id)
+{
+    for (unsigned i = 0; id != 0 && i < DMESH_SESSION_FLOW_CONSUMERS; ++i)
+        if (s->flow_consumers[i] == id)
+            return true;
+    return false;
+}
 
 /* A push descriptor reached host memory: queue one DOORBELL for an ARMed host. */
 static inline void dmesh_session_push_published(struct dmesh_session *s)
@@ -185,6 +213,11 @@ struct dmesh_conn {
     int recv_seg_head;                        /* consumer (Rust pop) */
     int recv_seg_cnt;
     long recv_seg_dropped;                    /* segments lost to a full ring */
+    /* The host closed its sending half after host_shut_descs forward
+     * descriptors (SHUTDOWN): once all completed and were popped, the pop
+     * reports end of stream. */
+    bool host_shut;
+    uint64_t host_shut_descs;
 
     /* Reverse (response) path, DPU-owned. The DPU exports both to the host,
      * whose DPA thread polls rcv_ring for descriptors and DMAs the referenced
@@ -210,6 +243,13 @@ struct dmesh_conn {
      * batch and the host reads it as end of stream (dmesh_dma_push_fin). */
     bool push_fin_requested, push_fin_sent;
     struct dmesh_push_desc *push_shadow;      /* in tx_staging's reserved tail */
+    /* Comch fast-path wake: the descriptor goes as a producer message to the
+     * host's consumer instead of the desc copy. One the producer could not
+     * take yet is retried from the RUNNING advance. */
+    struct dmesh_wake_producer *wake;
+    uint32_t wake_consumer;                   /* the host consumer the descriptors go to */
+    bool wake_desc_pending;
+    struct dmesh_wake_desc wake_imm;          /* the send task points at it */
 
     /* Push flow control (see struct dmesh_push_cursor). The cursor shadow
      * lives in tx_staging's reserved tail right after push_shadow, so it is
@@ -347,6 +387,8 @@ struct objects {
     /* DPU multi-connection slots (see struct dmesh_conn) */
     struct dmesh_conn conns[DMESH_MAX_CONNECTIONS];
     struct dmesh_session sessions[DMESH_MAX_SESSIONS];
+    /* Worker: one Comch producer per session it serves fast-path flows of */
+    struct dmesh_wake_producer *wake_producers;
 };
 
 doca_error_t
@@ -374,5 +416,21 @@ bool dmesh_objects_have_live_flows(const struct objects *);
 /* Unbind a connection's slot (DOCA resources are NOT torn down yet - TODO) */
 void
 dmesh_conn_close(struct objects *objs, struct doca_comch_connection *connection);
+
+/* Reads the events waiting in a progress engine's notification channel.
+ *
+ * A completion on a context of an armed PE queues an event that refers to
+ * that context's completion queue; the SDK reads the queue on the next
+ * doca_pe_request_notification(). An event still waiting when its context is
+ * destroyed then refers to freed memory, and reading it crashes inside
+ * doca_pe_request_notification() (a host that dies with a DMA in flight
+ * leaves exactly that: the failed task's completion). Call this for a
+ * context that is idle, so it completes nothing more, right before
+ * destroying it. */
+static inline void dmesh_pe_read_events(struct doca_pe *pe)
+{
+    if (pe != NULL)
+        (void)doca_pe_request_notification(pe);
+}
 
 #endif // OBJECT_H_
