@@ -386,6 +386,32 @@ static void test_flow_requests(void)
     free(t);
 }
 
+/* A Pod needs neither DPUMESH_POD_IP nor DPUMESH_SERVICE: its address is the
+ * source of the route toward KUBERNETES_SERVICE_HOST, and DPUMESH_PORT alone
+ * makes it serve that address. */
+static void test_pod_identity_from_environment(void)
+{
+    uint32_t ip = 0;
+    char buf[INET_ADDRSTRLEN + 6];
+    unsetenv("DPUMESH_POD_IP");
+    unsetenv("KUBERNETES_SERVICE_HOST");
+    assert(pod_ip_lookup(&ip) == -1 && errno == EINVAL);
+    setenv("KUBERNETES_SERVICE_HOST", "127.0.0.1", 1);
+    assert(pod_ip_lookup(&ip) == 0 && ip == htonl(INADDR_LOOPBACK));
+    setenv("DPUMESH_POD_IP", "10.244.1.7", 1);        /* the override wins */
+    assert(pod_ip_lookup(&ip) == 0 && ip == htonl(0x0af40107));
+    setenv("DPUMESH_POD_IP", "pod", 1);
+    assert(pod_ip_lookup(&ip) == -1 && errno == EINVAL);
+    unsetenv("DPUMESH_POD_IP");
+    unsetenv("KUBERNETES_SERVICE_HOST");
+
+    assert(served_target(buf, sizeof(buf), NULL, ip, -1) == NULL);
+    assert(served_target(buf, sizeof(buf), "", ip, -1) == NULL);
+    assert(strcmp(served_target(buf, sizeof(buf), "", htonl(0x0af40107), 8080), "10.244.1.7:8080") == 0);
+    assert(strcmp(served_target(buf, sizeof(buf), NULL, htonl(0xffffffff), 65535), "255.255.255.255:65535") == 0);
+    assert(strcmp(served_target(buf, sizeof(buf), "echo:80", htonl(0x0af40107), 8080), "echo:80") == 0);
+}
+
 int main(void)
 {
     test_closed_stripe_stays_pollable_until_retired();
@@ -397,6 +423,7 @@ int main(void)
     test_backend_opens_async();
     test_backend_open_timeout_waits_for_closed();
     test_flow_requests();
+    test_pod_identity_from_environment();
     uint32_t p[2];
     assert(carrier_chunks(0, p) == 0);
     assert(carrier_chunks(1, p) == 1 && p[0] == 1);
@@ -427,6 +454,6 @@ int main(void)
         assert(carrier_window_release(&v, (uint32_t)(k * 64u % 4096u)) == 0);
         assert(carrier_window_advance(&v, &seq, &bytes) && seq == k && bytes == k * 64u);
     }
-    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close, async close and open, held buffers, held flow ids (sync and async opens) and flow requests: PASS");
+    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close, async close and open, held buffers, held flow ids (sync and async opens), flow requests and pod identity: PASS");
     return 0;
 }
