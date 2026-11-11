@@ -8,6 +8,15 @@ static unsigned copies;
 static uint32_t published;
 static doca_error_t copy_error;
 
+/* The flow here has its own DPA thread; a mux flow's slot is not this test's. */
+doca_error_t dmesh_dpa_mux_rx_consumed(struct dmesh_conn *conn, uint32_t pos)
+{
+    (void)conn;
+    (void)pos;
+    assert(!"a per-flow thread's position went to a mux slot");
+    return DOCA_ERROR_UNEXPECTED;
+}
+
 doca_error_t doca_dpa_h2d_memcpy(struct doca_dpa *dpa,
                                doca_dpa_dev_uintptr_t dst, void *src, size_t size)
 {
@@ -67,6 +76,11 @@ int main(void)
     segs[1] = (struct dmesh_recv_seg){64, 32}; conn->recv_seg_cnt = 1;
     assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_SUCCESS && pos == 64);
     assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
+    /* A mux flow has no msgq of its own: its ring's DMA_DONE count gates it. */
+    conn->dpa_comch = NULL; conn->mux = true; conn->mux_received = 1;
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_EMPTY);
+    conn->mux_received = 2;
     assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
     free(objs);
     puts("rx_consumed_pos_test: batching, SDK lock, failure retry, staging wraps and end of stream: PASS");

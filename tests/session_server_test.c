@@ -222,6 +222,10 @@ static void receive_test(void)
     assert(live_flows(objs) == 0 && response_attempts == 0);
     deliver(peer_a, DMESH_SESSION_PING, 0, 0, NULL, 0);   /* keepalive: no reply, no failure */
     assert(!sa->closing && live_flows(objs) == 0 && response_attempts == 0);
+    /* TAILS: kept on the session, copied to each flow it opens (below). */
+    const uint8_t tails_desc[3] = {0x5a, 0x00, 0xa5};
+    deliver(peer_a, DMESH_SESSION_TAILS, 0, 0, tails_desc, sizeof(tails_desc));
+    assert(!sa->closing && sa->tails.desc_len == 3 && memcmp(sa->tails.desc, tails_desc, 3) == 0);
 
     struct dmesh_export_metadata_msg first = {0}, second = {0};
     first.type = second.type = DMESH_MSG_EXPORT_METADATA;
@@ -249,6 +253,8 @@ static void receive_test(void)
     assert(memcmp(a->pending_metadata, &first, sizeof(first)) == 0);
     assert(memcmp(b->pending_metadata, &second, sizeof(second)) == 0);
     assert(sa->generation[0] == 7 && sa->generation[1] == 4);
+    assert(a->pending_tails && b->pending_tails && a->pending_tails != b->pending_tails);
+    assert(a->pending_tails->desc_len == 3 && memcmp(a->pending_tails->desc, tails_desc, 3) == 0);
 
     /* Retransmitting an OPEN while setup is pending keeps the original flow
      * and its owned metadata, even if the duplicate payload differs. */
@@ -293,6 +299,7 @@ static void receive_test(void)
     struct dmesh_conn *other = dmesh_flow_get(objs, peer_b, 1, 7);
     struct dmesh_session *sb = session_get(objs, peer_b, false);
     assert(other && other != a && other->session == sb && sb != sa);
+    assert(!other->pending_tails); /* a session without TAILS hands none on */
     assert(other->state == DMESH_CONN_NEW && live_flows(objs) == 3);
 
     server_disconnection_event_callback(NULL, peer_a, 1);
@@ -304,9 +311,16 @@ static void receive_test(void)
     server_disconnection_event_callback(NULL, peer_a, 1);
     assert(other->state == DMESH_CONN_NEW);
     assert(sa->sends_pending == 0 && sb->sends_pending == 0);
+    /* TAILS comes once per session: a second one fails it. */
+    deliver(peer_b, DMESH_SESSION_TAILS, 0, 0, tails_desc, sizeof(tails_desc));
+    assert(!sb->closing && sb->tails.desc_len == 3);
+    deliver(peer_b, DMESH_SESSION_TAILS, 0, 0, tails_desc, sizeof(tails_desc));
+    assert(sb->closing && other->state == DMESH_CONN_CLOSING);
 
-    for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+    for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
         free(objs->conns[i].pending_metadata);
+        free(objs->conns[i].pending_tails);
+    }
     free(objs);
     callback_objects = NULL;
 }

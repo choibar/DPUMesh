@@ -27,6 +27,17 @@
  *   DMESH_BUSY_POLL      1 = poll the progress engines, 0 = sleep in epoll (0)
  *   DMESH_BENCH_EXIT_OPS exit after this many forward completions (0 = never)
  *
+ * DPA multiplexing probe (docs/2026-10-13_dpa-mux-probe.md), started once
+ * DMESH_MUX_PROBE_CONNS connections are running:
+ *   DMESH_MUX_PROBE             poll | fault (unset = off)
+ *   DMESH_MUX_PROBE_CONNS       connections to use (poll 16, fault 2)
+ *   DMESH_MUX_PROBE_PASSES      poll: passes per configuration (4000)
+ *   DMESH_MUX_PROBE_COPY        fault: bytes per copy (4096)
+ *   DMESH_MUX_PROBE_GAP_US      fault: idle time between copies (20)
+ *   DMESH_MUX_PROBE_TIMEOUT_US  fault: CQE wait before the producer counts as stalled (100000)
+ *   DMESH_MUX_PROBE_EU          pin the probe thread to this EU (unset = scheduler places it)
+ *   DMESH_DPA_PIN_EU_BASE       pin pool thread i to EU base + i (common/dpa.h)
+ *
  * Restart the process per benchmark run: process-wide benchmark shutdown
  * still uses _exit(), while individual connections use checked teardown.
  */
@@ -44,6 +55,8 @@
 #include <doca_error.h>
 
 #include "comch_server.h" /* dmesh_doca_ctrl_*, enum dmesh_doca_init_state */
+#include "dpa_probe.h"    /* MUX_PROBE_POLL, MUX_PROBE_FAULT */
+#include "mux_probe.h"
 
 /* ------------------------------------------------------------------------
  * Shim API (shim.c ships without a header; these mirror its exports)
@@ -342,6 +355,111 @@ static void stats_final(const struct stats *st, const struct counters *cur, doub
 }
 
 /* ------------------------------------------------------------------------
+ * DPA multiplexing probe — one extra DPA thread over live connections
+ *
+ * Starts once enough connections run, using the lowest running slots in
+ * order (start the fault-mode hosts one at a time to know which is which),
+ * then reports once a second. Test only: the probe is never torn down.
+ * ------------------------------------------------------------------------ */
+struct probe {
+    uint32_t mode;              /* 0 = off */
+    int want;
+    struct dmesh_mux_probe_config cfg;
+    int slot_ids[MUX_PROBE_MAX_RINGS];
+    struct dmesh_mux_probe *p;
+    int finished, failed;
+};
+
+static void probe_config(struct probe *pr)
+{
+    const char *mode = getenv("DMESH_MUX_PROBE");
+
+    memset(pr, 0, sizeof(*pr));
+    if (mode == NULL || *mode == '\0')
+        return;
+    if (strcmp(mode, "poll") == 0) {
+        pr->mode = MUX_PROBE_POLL;
+    } else if (strcmp(mode, "fault") == 0) {
+        pr->mode = MUX_PROBE_FAULT;
+    } else {
+        fprintf(stderr, "MUX_PROBE: unknown mode '%s' (poll | fault), probe off\n", mode);
+        return;
+    }
+    pr->want = atoi(env_or("DMESH_MUX_PROBE_CONNS", pr->mode == MUX_PROBE_POLL ? "16" : "2"));
+    if (pr->want < 1 || pr->want > (int)MUX_PROBE_MAX_RINGS || (pr->mode == MUX_PROBE_FAULT && pr->want != 2)) {
+        fprintf(stderr, "MUX_PROBE: DMESH_MUX_PROBE_CONNS=%d out of range, probe off\n", pr->want);
+        pr->mode = 0;
+        return;
+    }
+    pr->cfg.mode = pr->mode;
+    pr->cfg.slots = pr->slot_ids;
+    pr->cfg.nslots = pr->want;
+    pr->cfg.passes = (uint32_t)atoi(env_or("DMESH_MUX_PROBE_PASSES", "4000"));
+    pr->cfg.copy_len = (uint32_t)atoi(env_or("DMESH_MUX_PROBE_COPY", "4096"));
+    pr->cfg.gap_us = (uint32_t)atoi(env_or("DMESH_MUX_PROBE_GAP_US", "20"));
+    pr->cfg.timeout_us = (uint32_t)atoi(env_or("DMESH_MUX_PROBE_TIMEOUT_US", "100000"));
+    if (getenv("DMESH_MUX_PROBE_EU") != NULL && *getenv("DMESH_MUX_PROBE_EU") != '\0')
+        pr->cfg.pin_eu = (uint32_t)atoi(getenv("DMESH_MUX_PROBE_EU")) + 1;
+}
+
+/* Called every tick until the probe starts. */
+static void probe_maybe_start(struct probe *pr, struct objects *objs, const struct slot *slots, int max_conns)
+{
+    int n = 0;
+
+    if (pr->mode == 0 || pr->p != NULL || pr->failed)
+        return;
+    for (int i = 0; i < max_conns && n < pr->want; i++)
+        if (slots[i].state == CONN_RUNNING)
+            pr->slot_ids[n++] = i;
+    if (n < pr->want)
+        return;
+    fprintf(stderr, "MUX_PROBE start: mode=%s slots=", pr->mode == MUX_PROBE_POLL ? "poll" : "fault");
+    for (int i = 0; i < n; i++)
+        fprintf(stderr, "%s%d", i ? "," : "", pr->slot_ids[i]);
+    fprintf(stderr, "\n");
+    pr->p = dmesh_mux_probe_start(objs, &pr->cfg);
+    if (pr->p == NULL) {
+        fprintf(stderr, "MUX_PROBE: start failed\n");
+        pr->failed = 1;
+    }
+}
+
+/* Called once a second. */
+static void probe_report(struct probe *pr)
+{
+    int rc;
+
+    /* A finished fault probe keeps reporting: its counters show whether a
+     * stuck copy completes later. */
+    if (pr->p == NULL || pr->failed || (pr->finished && pr->mode != MUX_PROBE_FAULT))
+        return;
+    rc = dmesh_mux_probe_read(pr->p);
+    if (rc < 0) {
+        fprintf(stderr, "MUX_PROBE: state read failed or DPA context failed\n");
+        pr->failed = 1;
+        return;
+    }
+    if (pr->mode == MUX_PROBE_FAULT || rc == 1)
+        dmesh_mux_probe_print(pr->p, stderr);
+    if (rc == 1 && !pr->finished) {
+        fprintf(stderr, "MUX_PROBE done\n");
+        pr->finished = 1;
+    }
+}
+
+/* At exit: let a fault probe finish its slice and print the last counters. */
+static void probe_finish(struct probe *pr)
+{
+    if (pr->p == NULL || pr->finished || pr->failed)
+        return;
+    dmesh_mux_probe_stop(pr->p);
+    for (int i = 0; i < 100 && dmesh_mux_probe_read(pr->p) == 0; i++)
+        usleep(10000);
+    dmesh_mux_probe_print(pr->p, stderr);
+}
+
+/* ------------------------------------------------------------------------
  * Driver — bring the infrastructure up, then the tick loop
  *
  * The loop mirrors run_dpu_worker_event_driven() and the router's main:
@@ -432,11 +550,13 @@ int main(void)
     struct stats st = { .echo = echo };
     struct counters cur;
     uint64_t closed_pushes = 0, closed_push_bytes = 0;
+    struct probe probe;
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     memset(slots, 0, sizeof(slots));
 
+    probe_config(&probe);
     if (driver_open(&d, dev_pci, rep_pci, server, busy) != 0) return 1;
     fprintf(stderr, "dpumesh_dpu: server=%s dev=%s rep=%s mode=%s poll=%s\n", server, dev_pci, rep_pci,
             echo ? "echo" : "sink", busy ? "busy" : "epoll");
@@ -448,11 +568,13 @@ int main(void)
         double now;
         if (drained < 0) break;
         active = slots_poll(d.objs, slots, d.max_conns, echo, &closed_pushes, &closed_push_bytes);
+        probe_maybe_start(&probe, d.objs, slots, d.max_conns);
 
         now = now_sec();
         if (now - st.last >= 1.0) {
             counters_read(d.objs, slots, d.max_conns, closed_pushes, closed_push_bytes, &cur);
             stats_report(&st, &cur, active, now);
+            probe_report(&probe);
             if (exit_ops > 0 && cur.recv >= exit_ops) {
                 fprintf(stderr, "bench: recv target %ld reached (recv=%lld), exiting\n", exit_ops,
                         (long long)cur.recv);
@@ -462,6 +584,7 @@ int main(void)
         driver_idle(&d, drained);
     }
 
+    probe_finish(&probe);
     counters_read(d.objs, slots, d.max_conns, closed_pushes, closed_push_bytes, &cur);
     stats_final(&st, &cur, now_sec());
     fflush(NULL);

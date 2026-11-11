@@ -52,7 +52,10 @@ static void dmesh_doca_dpa_msgq_recv_cb(struct doca_comch_consumer_task_post_rec
     struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv_task);
     const struct comch_dma_comp_msg *msg = (const void *)doca_comch_consumer_task_post_recv_get_imm_data(recv_task);
     uint32_t len = doca_comch_consumer_task_post_recv_get_imm_data_len(recv_task);
-    if (msg == NULL || len != sizeof(*msg) || msg->type != COMCH_MSG_TYPE_DMA_COMPLETED ||
+    if (comch->raw_received != NULL) {
+        if (msg != NULL)
+            comch->raw_received(comch->owner, msg, len);
+    } else if (msg == NULL || len != sizeof(*msg) || msg->type != COMCH_MSG_TYPE_DMA_COMPLETED ||
         comch->dma_completed == UINT64_MAX) {
         comch->completion_error = true;
     } else {
@@ -190,6 +193,10 @@ static doca_error_t release_dpa_objects(struct objects *objs)
     if (dmesh_objects_have_live_flows(objs)) return DOCA_ERROR_IN_USE;
     for (int i = 0; i < DPA_THREAD_POOL_SIZE; ++i)
         if (pool->owner[i]) return DOCA_ERROR_IN_USE;
+    if (objs->release_mux != NULL) {
+        result = objs->release_mux(objs);
+        if (result != DOCA_SUCCESS) return result;
+    }
     for (int i = 0; i < DPA_THREAD_POOL_SIZE; ++i) {
         if (pool->threads[i].kept_dma != NULL && pool->release_kept_dma != NULL) {
             result = pool->release_kept_dma(objs, pool->threads[i].kept_dma);
@@ -229,10 +236,17 @@ init_dpa_objects(struct objects *objs)
     return DOCA_SUCCESS;
 }
 
-static doca_error_t dpa_pool_thread_create(struct dmesh_doca_dpa_thread *thread)
+static doca_error_t dpa_pool_thread_create(struct objects *objs, int i)
 {
+    struct dmesh_doca_dpa_thread *thread = &objs->dpa_pool->threads[i];
     const char *env = getenv("DMESH_DPA_BENCH_MODE");
+    const char *pin = getenv("DMESH_DPA_PIN_EU_BASE");
     int mode = env ? atoi(env) : 0;
+
+    thread->dpa = objs->dpa_pool->dpa;
+    thread->pin_eu = 0;
+    if (pin != NULL && *pin != '\0')
+        thread->pin_eu = (uint32_t)(atoi(pin) + objs->worker_idx * DPA_THREAD_POOL_SIZE + i + 1);
     return mode > 0 ? dmesh_doca_dpa_bench_thread_create(thread, (uint32_t)mode)
                     : dmesh_doca_dpa_thread_create(thread);
 }
@@ -250,8 +264,7 @@ dmesh_dpa_thread_pool_init(struct objects *objs)
     }
 
     for (i = pool->size; i < DPA_THREAD_POOL_SIZE; i++) {
-        pool->threads[i].dpa = pool->dpa;
-        result = dpa_pool_thread_create(&pool->threads[i]);
+        result = dpa_pool_thread_create(objs, i);
         if (result != DOCA_SUCCESS) {
             DOCA_LOG_ERR("Failed to create DPA pool thread %d: %s", i, doca_error_get_name(result));
             return result;
@@ -287,8 +300,7 @@ dmesh_dpa_thread_pool_alloc(struct objects *objs, struct dmesh_conn *conn)
                 /* Retry cleanup of a previous partial creation before reuse. */
                 if (dmesh_doca_dpa_thread_destroy_checked(&pool->threads[i]) != DOCA_SUCCESS)
                     return NULL;
-                pool->threads[i].dpa = pool->dpa;
-                if (dpa_pool_thread_create(&pool->threads[i]) != DOCA_SUCCESS) {
+                if (dpa_pool_thread_create(objs, i) != DOCA_SUCCESS) {
                     DOCA_LOG_ERR("Failed to recreate DPA pool thread %d", i);
                     return NULL;
                 }
@@ -380,6 +392,21 @@ dpa_thread_create(struct dmesh_doca_dpa_thread *dpa_thread, uint32_t bench_mode)
         DOCA_LOG_ERR("Failed to set DPA thread local storage: %s",
                      doca_error_get_descr(result));
         return result; /* Checked cleanup retains ownership on partial setup. */
+    }
+
+    if (dpa_thread->pin_eu != 0) {
+        /* The affinity object stays allocated for the thread's lifetime. */
+        struct doca_dpa_eu_affinity *affinity = NULL;
+        result = DMESH_DPA_CALL(doca_dpa_eu_affinity_create(dpa_thread->dpa, &affinity));
+        if (result == DOCA_SUCCESS)
+            result = DMESH_DPA_CALL(doca_dpa_eu_affinity_set(affinity, dpa_thread->pin_eu - 1));
+        if (result == DOCA_SUCCESS)
+            result = DMESH_DPA_CALL(doca_dpa_thread_set_affinity(dpa_thread->thread, affinity));
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Failed to pin DPA thread to EU %u: %s", dpa_thread->pin_eu - 1,
+                doca_error_get_descr(result));
+            return result;
+        }
     }
 
     result = DMESH_DPA_CALL(doca_dpa_thread_start(dpa_thread->thread));
@@ -1455,7 +1482,9 @@ setup_dpa_buf_array(struct dmesh_conn *conn, size_t num_elem, struct doca_mmap *
         return result;
     }
 
-    result = DMESH_DPA_CALL(doca_buf_arr_set_target_dpa(conn->buf_arr, conn->dpa_thread->dpa));
+    /* A mux flow has no thread of its own; every thread shares the pool's context. */
+    result = DMESH_DPA_CALL(doca_buf_arr_set_target_dpa(conn->buf_arr,
+        conn->dpa_thread != NULL ? conn->dpa_thread->dpa : conn->objs->dpa_pool->dpa));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array target DPA: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;
@@ -1482,9 +1511,8 @@ destroy_buf_arr:
 }
 
 /* DPU/legacy adapters: the SDK callbacks themselves only see a Comch endpoint. */
-static void conn_received(void *owner, uint32_t pos, uint32_t len, uint32_t count)
+void dmesh_doca_conn_received(struct dmesh_conn *conn, uint32_t pos, uint32_t len, uint32_t count)
 {
-    struct dmesh_conn *conn = owner;
     conn->objs->recv_bytes += len;
     conn->objs->recv_msg_cnt += count > 1 ? count : 1;
     if (!conn->recv_segs) return;
@@ -1492,6 +1520,10 @@ static void conn_received(void *owner, uint32_t pos, uint32_t len, uint32_t coun
     int tail = (conn->recv_seg_head + conn->recv_seg_cnt) % DMESH_RECV_SEG_MAX;
     conn->recv_segs[tail] = (struct dmesh_recv_seg){pos, len};
     ++conn->recv_seg_cnt;
+}
+static void conn_received(void *owner, uint32_t pos, uint32_t len, uint32_t count)
+{
+    dmesh_doca_conn_received(owner, pos, len, count);
 }
 static void conn_sent(void *owner) { ++((struct dmesh_conn *)owner)->objs->sent_msg_cnt; }
 

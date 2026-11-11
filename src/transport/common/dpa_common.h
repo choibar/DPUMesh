@@ -1,6 +1,7 @@
 #ifndef DPA_COMMON_H_
 #define DPA_COMMON_H_
 
+#include <stddef.h>
 #include <stdint.h>
 #include <doca_mmap.h>
 
@@ -103,5 +104,149 @@ struct dma_desc {
 	uint8_t reserved[35];	   // 35B
 	volatile uint8_t valid;		   // 1B
 } __attribute__((__packed__, aligned(8)));
+
+/*
+ * Pod-multiplexed forward DMA (DMESH_DPA_MUX, run_dma_mux). One DPA thread
+ * serves the forward rings of one host session, the process of one pod, and
+ * of no other; ring r is the session's flow r + 1, on whichever worker that
+ * flow landed. A pod's rings therefore only ever wait behind the same pod's
+ * copies, and a copy that never completes stops only that pod's flows.
+ *
+ * Tails: the host keeps one u32 per flow slot, the low 32 bits of the flow's
+ * producer_tail, in a table of DMESH_TAILS_BYTES it exports once per session
+ * (TAILS). Sixteen slots share a cache line: one read of a line tells the
+ * thread which of sixteen rings have new descriptors, and only those rings
+ * are visited. The ring's own ctrl still carries producer_tail (per-flow
+ * threads read it there) and consumer_head, completed_bytes and error.
+ *
+ * Messages: the thread's one producer has a consumer on every worker that
+ * owns one of its rings; a copy's DMA_DONE goes to its ring's worker
+ * (cfg.consumer). Completions stay in submission order, one FIFO per thread.
+ *
+ * Slots: the ARM writes a ring's cfg while its cmd is NONE, then cmd = OPEN,
+ * then bumps ctl_seq; the DPA reads the commands again only when ctl_seq
+ * moved. CLOSE the same way; the DPA stops copying and sets state = CLOSED
+ * once the ring's last copy has completed. Every line has one writer, the
+ * ARM through h2d_memcpy or the DPA, and every field is 64-bit so both
+ * toolchains agree on the layout. The ARM learns the DPA's side from the
+ * thread's published status (struct dpa_mux_status), never from a
+ * d2h_memcpy of local storage.
+ */
+#define DMESH_MUX_RINGS      32u  /* = DMESH_SESSION_MAX_FLOWS: ring r is flow r + 1 */
+#define DMESH_TAILS_PER_LINE 16u
+#define DMESH_TAILS_LINES    (DMESH_MUX_RINGS / DMESH_TAILS_PER_LINE)
+#define DMESH_TAILS_BYTES    (DMESH_MUX_RINGS * 4u)
+#define DMESH_MUX_FIFO       DMESH_DPA_MAX_INFLIGHT
+#define DMESH_MUX_QUANTUM    32u  /* descriptors per ring per pass */
+
+enum dmesh_mux_cmd {           /* ARM -> DPA */
+	DMESH_MUX_CMD_NONE = 0,       /* the slot is the ARM's: the DPA leaves it alone */
+	DMESH_MUX_CMD_OPEN = 1,
+	DMESH_MUX_CMD_CLOSE = 2,
+};
+
+enum dmesh_mux_state {         /* DPA -> ARM */
+	DMESH_MUX_IDLE = 0,
+	DMESH_MUX_ACTIVE = 1,
+	DMESH_MUX_ERROR = 2,          /* bad descriptor or failed copy: no new copies */
+	DMESH_MUX_CLOSED = 3,         /* CLOSE seen and no copy left in flight */
+};
+
+enum dmesh_mux_ring_error {
+	DMESH_MUX_ERR_TAIL = 1,   /* the published tail moved backwards or past the ring */
+	DMESH_MUX_ERR_DESC = 2,   /* size or address outside the registered TX pool */
+	DMESH_MUX_ERR_COPY = 3,   /* the copy completed with an error */
+};
+
+struct dpa_mux_ring_cfg {      /* ARM */
+	/* Line 0, written while cmd is NONE */
+	uint64_t buf_arr;         /* host ring: [0] = dma_ring_ctrl, [1..ring_size] = dma_desc */
+	uint64_t host_mmap;       /* TX pool: copy source */
+	uint64_t dpu_mmap;        /* this connection's staging: copy destination */
+	uint64_t staging_addr;
+	uint64_t buf_size;        /* staging bytes */
+	uint64_t ring_size;       /* descriptors, a power of two */
+	uint64_t host_base;       /* TX pool range every descriptor must fall in */
+	uint64_t host_len;
+	/* Line 1 */
+	uint64_t slot;            /* connection slot on its worker, echoed in every message */
+	uint64_t generation;      /* echoed in every message */
+	uint64_t consumer;        /* consumer id of the ring's worker */
+	volatile uint64_t cmd;    /* enum dmesh_mux_cmd */
+	volatile uint64_t rx_consumed_pos; /* staging the reader released */
+	uint64_t reserved[3];
+};
+
+struct dpa_mux_ring_state {    /* DPA, one line */
+	uint64_t pos;             /* next staging offset */
+	uint64_t submit;          /* next ticket to copy */
+	uint64_t complete;        /* contiguous completed tickets (custody ACK) */
+	uint64_t completed_bytes;
+	uint64_t inflight;        /* copies of this ring in the FIFO */
+	uint64_t failed;          /* copies that completed with an error (no message) */
+	volatile uint64_t state;  /* enum dmesh_mux_state */
+	uint64_t error;           /* enum dmesh_mux_ring_error */
+};
+
+/* What the DPA writes. The thread works on its copy in local storage and
+ * publishes it to ARM memory (dpa_mux_ctx.status): lines 0-1 at the end of
+ * every activation and before it stops, a ring's line when the ring stops
+ * (ERROR) or closes (CLOSED). The ARM reads only that memory. */
+struct dpa_mux_status {
+	/* Line 0: counters the watch reads (DMESH_DPA_MUX_STATS) */
+	uint64_t heartbeat;                /* passes, for the ARM's liveness check */
+	uint64_t tail_reads;               /* tail lines read from host memory */
+	uint64_t visits;                   /* rings visited because their tail moved */
+	uint64_t copies;
+	uint64_t credit_waits;             /* visits cut short by the worker's empty consumer */
+	uint64_t fifo_full;                /* visits cut short by a full FIFO */
+	uint64_t err_cqes;                 /* failed completions */
+	uint64_t bad_cqes;                 /* completions with an empty FIFO */
+	/* Line 1 */
+	uint64_t fifo_head, fifo_tail;     /* copies in submission order */
+	uint64_t rr;                       /* first ring of the next pass */
+	uint64_t open_mask;                /* rings ACTIVE */
+	uint64_t closing_mask;             /* rings CLOSE seen, copies still in flight */
+	uint64_t ctl_seen;                 /* ctl_seq the commands were last read at */
+	uint64_t oldest_age_us;            /* age of the oldest copy in flight */
+	uint64_t stopped;
+	struct dpa_mux_ring_state st[DMESH_MUX_RINGS];
+};
+
+struct dpa_mux_ctx {
+	/* Line 0, ARM: set before run, then only ctl_seq and stop */
+	uint64_t producer, producer_comp; /* DPA -> ARM msgq: copies and their messages */
+	uint64_t dpa_dev;
+	uint64_t tails;                   /* buf array over the host table, one line per buf */
+	volatile uint64_t ctl_seq;        /* bumped after every cmd write */
+	volatile uint64_t stop;
+	uint64_t status, status_addr;     /* mmap handle and address of the ARM's dpa_mux_status */
+	struct dpa_mux_status s;          /* DPA */
+	uint64_t fifo[DMESH_MUX_FIFO];     /* ring << 32 | length */
+	uint64_t fifo_us[DMESH_MUX_FIFO];  /* __dpa_thread_time() at submission */
+	struct dpa_mux_ring_cfg cfg[DMESH_MUX_RINGS];
+};
+
+_Static_assert(sizeof(struct dpa_mux_ring_cfg) == 128 && offsetof(struct dpa_mux_ring_cfg, slot) == 64,
+	       "dpa_mux_ring_cfg: two ARM lines");
+_Static_assert(sizeof(struct dpa_mux_ring_state) == 64, "dpa_mux_ring_state: one DPA line");
+_Static_assert(offsetof(struct dpa_mux_status, fifo_head) == 64 && offsetof(struct dpa_mux_status, st) == 128,
+	       "dpa_mux_status: whole lines");
+_Static_assert(offsetof(struct dpa_mux_ctx, s) == 64 && offsetof(struct dpa_mux_ctx, cfg) % 64 == 0,
+	       "dpa_mux_ctx: one writer per cache line");
+_Static_assert(DMESH_MUX_RINGS <= 64 && DMESH_MUX_RINGS % DMESH_TAILS_PER_LINE == 0,
+	       "ring masks are 64-bit; tails fill whole lines");
+
+/* DPA -> ARM: the immediate of every copy. */
+#define DMESH_MUX_MSG_DMA_DONE 1u
+struct dmesh_mux_msg {
+	uint8_t type;
+	uint8_t ring;
+	uint16_t slot;
+	uint32_t generation;
+	uint32_t pos;
+	uint32_t length;
+};
+_Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a copy's immediate");
 
 #endif

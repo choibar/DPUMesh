@@ -35,6 +35,8 @@ void dmesh_dispatcher_request(struct objects *, struct dmesh_session *,
 void dmesh_dispatcher_session_lost(struct objects *, struct dmesh_session *);
 bool dmesh_dispatcher_session_busy(struct objects *, struct dmesh_session *);
 bool dmesh_dispatcher_accepting(struct objects *);
+/* Workers of the worker's dispatcher; 1 without a dispatcher. */
+unsigned dmesh_dispatch_worker_count(struct objects *);
 /* Worker control request; no SDK access, copied into the dispatcher's mailbox. */
 int dmesh_dispatch_backend_request(struct objects *, uint32_t ip, uint16_t port);
 /* Thread-safe membership only; no SDK or live session pointers escape. */
