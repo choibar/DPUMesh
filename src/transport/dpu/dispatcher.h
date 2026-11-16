@@ -12,6 +12,15 @@ struct dmesh_conn;
 struct dmesh_session;
 struct dmesh_dispatcher;
 struct dmesh_worker_mailbox;
+struct peer_session_control;
+/* Optional inter-node runtime. Installed before group initialization. Tests
+ * and single-node apps do not need to link the RDMA SDK. */
+struct dmesh_dispatch_peer_ops {
+    int (*start)(struct peer_session_control *, struct objects **, size_t, void **);
+    void (*progress)(void *);
+    int (*free)(void **);
+};
+int dmesh_dispatcher_set_peer_ops(const struct dmesh_dispatch_peer_ops *);
 
 /* Stable identity and execution location are deliberately separate. Ownership
  * epoch is currently 1: changing owners/migrating live flows is NOT supported. */
@@ -34,10 +43,15 @@ void dmesh_dispatcher_request(struct objects *, struct dmesh_session *,
 void dmesh_dispatcher_session_lost(struct objects *, struct dmesh_session *);
 bool dmesh_dispatcher_session_busy(struct objects *, struct dmesh_session *);
 bool dmesh_dispatcher_accepting(struct objects *);
+int dmesh_dispatcher_registration_required(struct objects *);
+int dmesh_dispatcher_register(struct objects *, struct dmesh_session *, const void *, size_t);
+struct peer_authority;
+struct peer_authority *dmesh_dispatch_worker_authority(struct objects *);
 /* Worker control request; no SDK access, copied into the dispatcher's mailbox. */
 int dmesh_dispatch_backend_request(struct objects *, uint32_t ip, uint16_t port);
 /* Thread-safe membership only; no SDK or live session pointers escape. */
 int dmesh_dispatch_listener_known(uint32_t ip, uint16_t port);
+int dmesh_dispatch_listener_live(uint32_t ip, uint16_t port);
 
 int dmesh_dispatch_worker_fd(struct objects *);
 void dmesh_dispatch_worker_arm(struct objects *);

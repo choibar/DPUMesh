@@ -20,6 +20,7 @@ struct dmesh_doca_dpa_comch;
 struct dmesh_dpa_thread_pool;
 struct dma_ring;
 struct objects;
+struct peer_node_worker;
 struct dmesh_conn;
 /* What a DMA task carries; drives the completion callback's behavior. */
 #define DMESH_TASK_NORMAL    0   /* legacy staging->rcvbuf copy */
@@ -57,6 +58,13 @@ struct dmesh_session {
     uint64_t epoch;
     struct doca_comch_connection *connection;
     bool occupied, negotiated, hello_pending, closing;
+    bool registration_challenged, challenge_pending;
+    uint8_t registration_nonce[32];
+    /* A verified assertion can precede the signed Pod topology update.
+     * Keep the connection unnegotiated until both agree, within HELLO's bound. */
+    bool registration_pending;
+    uint64_t registration_retry_ms;
+    uint8_t registration_assertion[DMESH_SESSION_REG_ASSERTION_SIZE];
     unsigned sends_pending;
     uint64_t hello_deadline_ms;
     uint32_t generation[DMESH_MAX_CONNECTIONS];
@@ -288,6 +296,7 @@ struct objects {
 
     doca_error_t (*release_dpa)(struct objects *); /* optional checked worker cleanup */
     struct dmesh_dpa_thread_pool *dpa_pool;   /* pre-created DPA threads */
+    struct peer_node_worker *peer_worker;    /* inter-node RDMA; same ARM owner */
     struct dmesh_doca_dpa_thread *dpa_thread; /* thread assigned to the active connection */
 	struct dmesh_doca_dpa_comch *dpa_comch;
     doca_dpa_dev_comch_producer_t remote_dpa_producer;

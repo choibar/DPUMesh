@@ -62,7 +62,21 @@ doca_error_t doca_comch_server_disconnect(struct doca_comch_server *server,
     return disconnect_result;
 }
 
+static bool inject_registration;
+static int registration_result;
+static int register_for_test(struct objects *o, struct dmesh_session *s,
+                              const void *payload, size_t length)
+{
+    if (!inject_registration)
+        return dmesh_dispatcher_register(o, s, payload, length);
+    assert(length == DMESH_SESSION_REG_ASSERTION_SIZE);
+    assert(((const uint8_t *)payload)[0] == 0x42);
+    return registration_result;
+}
+
+#define dmesh_dispatcher_register register_for_test
 #include "../src/transport/dpu/comch_server.c"
+#undef dmesh_dispatcher_register
 
 
 static char cleanup_order[64];
@@ -639,6 +653,58 @@ static void idle_wake_test(void)
     callback_objects = NULL;
 }
 
+static void pending_registration_test(void)
+{
+    unsigned char peer_storage;
+    struct doca_comch_connection *peer = (void *)&peer_storage;
+    struct objects *objs = calloc(1, sizeof(*objs));
+    assert(objs);
+    callback_objects = objs;
+    objs->cc_server = (void *)&server_storage;
+    inject_registration = true;
+    registration_result = EAGAIN; /* Valid seal, signed Pod update not here yet. */
+    struct dmesh_session *s = session_get(objs, peer, true);
+    s->registration_challenged = true;
+    s->hello_deadline_ms = session_now_ms() + 15000;
+    uint8_t assertion[DMESH_SESSION_REG_ASSERTION_SIZE] = {0x42};
+    unsigned before = response_attempts;
+    deliver(peer, DMESH_SESSION_REG_ASSERTION, 0, 0, assertion, sizeof(assertion));
+    assert(s->registration_pending && !s->negotiated && !s->closing);
+    s->registration_retry_ms = 0;
+    dmesh_sessions_advance(objs);
+    assert(!s->negotiated && !live_flows(objs) && response_attempts == before);
+
+    registration_result = 0;
+    s->registration_retry_ms = 0;
+    dmesh_sessions_advance(objs);
+    assert(s->negotiated && !s->registration_pending);
+    assert(response_attempts == before + 1);
+    assert(attempted_response.type == DMESH_SESSION_HELLO_ACK);
+
+    /* Waiting for topology never permits an expired/invalid assertion. */
+    s->negotiated = s->hello_pending = false;
+    registration_result = EAGAIN;
+    deliver(peer, DMESH_SESSION_REG_ASSERTION, 0, 0, assertion, sizeof(assertion));
+    registration_result = EACCES;
+    s->registration_retry_ms = 0;
+    dmesh_sessions_advance(objs);
+    assert(!s->negotiated && !live_flows(objs));
+
+    /* The original HELLO deadline also bounds the pending state. */
+    memset(objs->sessions, 0, sizeof(objs->sessions));
+    s = session_get(objs, peer, true);
+    s->registration_challenged = true;
+    registration_result = EAGAIN;
+    deliver(peer, DMESH_SESSION_REG_ASSERTION, 0, 0, assertion, sizeof(assertion));
+    s->hello_deadline_ms = 0;
+    before = response_attempts;
+    dmesh_sessions_advance(objs);
+    assert(!s->negotiated && response_attempts == before && !live_flows(objs));
+    inject_registration = false;
+    callback_objects = NULL;
+    free(objs);
+}
+
 int main(void)
 {
     receive_test();
@@ -646,6 +712,7 @@ int main(void)
     checked_close_test();
     reader_fence_test();
     physical_disconnect_test();
+    pending_registration_test();
     puts("session_server_test: PASS");
     return 0;
 }

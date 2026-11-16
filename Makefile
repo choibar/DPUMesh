@@ -12,22 +12,23 @@ BINDIR := $(BUILD)/bin
 ABI_MAJOR := 5
 TRANSPORT := src/transport
 DOCA_INC := /opt/mellanox/doca/include
-DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch doca-dma doca-dpa libflexio)
+DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch doca-dma doca-dpa libflexio libcrypto libssl)
 DPACC := $(TRANSPORT)/build_dpacc.sh
 DPA_KERNEL := $(BUILD)/dpa/device/dpa_kernel.a
 DPA_BENCH := $(TRANSPORT)/device/benchmarks/dpa_bench.c
 HOST_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -DDOCA_ALLOW_EXPERIMENTAL_API \
-    -Iinclude -I. -I$(TRANSPORT)/common -I$(TRANSPORT)/dpu -I$(TRANSPORT)/host -I$(DOCA_INC)
+    -Iinclude -I. -I$(TRANSPORT)/common -I$(TRANSPORT)/dpu -I$(TRANSPORT)/host -I$(TRANSPORT)/peer -I$(DOCA_INC)
 # Transport sources the host library needs: the common set, the DPA
 # management the host-dpa reverse path's host DPA thread uses, the Comch client and the
 # channel layer. Keep in step with src/transport/meson.build.
 TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c comch_common.c \
     comch_consumer.c comch_producer.c comch_msgq.c dpa.c dpa_runtime.c ring.c) \
-    $(addprefix $(TRANSPORT)/host/,comch_client.c comch_client_legacy.c channel.c host_stubs.c)
-TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h)
+    $(addprefix $(TRANSPORT)/host/,comch_client.c comch_client_legacy.c channel.c registration_client.c host_stubs.c)
+TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h $(TRANSPORT)/peer/*.h)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
-HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_loss_test native_core_transport_test \
+PEER_AUTH_SRCS := $(addprefix $(TRANSPORT)/peer/,peer_authority.c peer_topology.c peer_workload_identity.c peer_local_control.c peer_session_control.c)
+HOST_TESTS := peer_write_bootstrap_test peer_dmesh4_test peer_write_completion_test peer_stream_test peer_channel_retire_test peer_authority_test carrier_logic_test service_resolve_test native_writable_test native_polling_test native_loss_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
     channel_session_test comch_client_test session_server_test backend_dispatch_test dma_cleanup_test dpa_cleanup_test dpa_runtime_test \
     dispatch_wake_test placement_instr_test rx_consumed_pos_test
@@ -57,7 +58,11 @@ $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh
 
 test: test-native-headers $(addprefix $(TESTDIR)/,$(HOST_TESTS)) test-abi
 	@set -e; for test in $(HOST_TESTS); do $(TESTDIR)/$$test; done
+	CC="$(CC)" $(PYTHON) tests/peer_rdma_layout_test.py
 	CC="$(CC)" $(PYTHON) tests/dpa_poll_test.py
+	CC="$(CC)" $(PYTHON) tests/peer_write_completion_dpa_test.py
+	$(PYTHON) tests/peer_fence_stats_test.py
+	PYTHONPATH=. $(PYTHON) tests/native_registration_test.py
 
 test-native-headers:
 	CC="$(CC)" CXX="$(CXX)" $(PYTHON) tests/native_header_contract_test.py
@@ -65,29 +70,32 @@ test-native-headers:
 test-abi: lib
 	sh tests/abi_contract_test.sh $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so $(ABI_MAJOR)
 
+$(TESTDIR)/peer_write_completion_test: tests/peer_write_completion_test.c $(TRANSPORT)/peer/peer_write_completion.h $(TRANSPORT)/peer/peer_write_tx_ring.h $(TRANSPORT)/peer/peer_write_sync_dpa_shared.h $(TRANSPORT)/peer/peer_write_fence_stats.h | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) $< -o $@
+
 $(TESTDIR)/session_protocol_test: tests/session_protocol_test.c $(TRANSPORT)/common/session_protocol.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) $< -o $@
 
 $(TESTDIR)/session_flow_test: tests/session_flow_test.c $(TRANSPORT)/common/object.c $(TRANSPORT)/common/dpa.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
-$(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+$(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) $(TRANSPORT)/host/registration_client.c | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/host/registration_client.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/comch_client_test: tests/comch_client_test.c $(TRANSPORT)/host/comch_client.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
 
-$(TESTDIR)/session_server_test: tests/session_server_test.c $(TRANSPORT)/common/object.c $(TRANSPORT)/dpu/comch_server.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT)/common/object.c -Wl,--gc-sections $(DOCA_LIBS) -pthread -o $@
+$(TESTDIR)/session_server_test: tests/session_server_test.c $(TRANSPORT)/common/object.c $(TRANSPORT)/dpu/comch_server.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT_HDRS) $(PEER_AUTH_SRCS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT)/common/object.c $(PEER_AUTH_SRCS) -Wl,--gc-sections $(DOCA_LIBS) -pthread -o $@
 
-$(TESTDIR)/backend_dispatch_test: tests/backend_dispatch_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+$(TESTDIR)/backend_dispatch_test: tests/backend_dispatch_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) $(PEER_AUTH_SRCS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c $(PEER_AUTH_SRCS) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
-$(TESTDIR)/dispatch_wake_test: tests/dispatch_wake_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+$(TESTDIR)/dispatch_wake_test: tests/dispatch_wake_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) $(PEER_AUTH_SRCS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c $(PEER_AUTH_SRCS) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
-$(TESTDIR)/placement_instr_test: tests/placement_instr_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+$(TESTDIR)/placement_instr_test: tests/placement_instr_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) $(PEER_AUTH_SRCS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c $(PEER_AUTH_SRCS) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/dma_cleanup_test: tests/dma_cleanup_test.c $(TRANSPORT)/dpu/dma.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections $(DOCA_LIBS) -o $@
@@ -142,3 +150,18 @@ $(BINDIR)/tcp_echo $(BINDIR)/tcp_client: $(BINDIR)/%: examples/preload/%.c | $(B
 
 clean:
 	rm -rf $(BUILD)
+
+$(TESTDIR)/peer_stream_test: tests/peer_stream_test.c $(TRANSPORT)/peer/peer_stream.c $(TRANSPORT)/peer/peer_pair_wire.c $(TRANSPORT)/peer/peer_security_wire.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/peer/peer_pair_wire.c $(TRANSPORT)/peer/peer_security_wire.c -Wl,--gc-sections -lcrypto -o $@
+
+$(TESTDIR)/peer_write_bootstrap_test: tests/peer_write_bootstrap_test.c $(TRANSPORT)/peer/peer_wire_write_sync.c $(TRANSPORT)/peer/peer_wire_write_imm.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -libverbs -o $@
+
+$(TESTDIR)/peer_dmesh4_test: tests/peer_dmesh4_test.c $(TRANSPORT)/peer/peer_channel.c $(TRANSPORT)/peer/peer_pair_wire.c $(TRANSPORT)/peer/peer_security_wire.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/peer/peer_pair_wire.c $(TRANSPORT)/peer/peer_security_wire.c -Wl,--gc-sections -lcrypto -o $@
+
+$(TESTDIR)/peer_authority_test: tests/peer_authority_test.c $(PEER_AUTH_SRCS) $(wildcard $(TRANSPORT)/peer/*.h) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) $(filter %.c,$^) -pthread -lssl -lcrypto -o $@
+
+$(TESTDIR)/peer_channel_retire_test: tests/peer_channel_retire_test.c $(TRANSPORT)/peer/peer_channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -o $@

@@ -42,7 +42,7 @@ foreach a : ['libdmesh_dpu.a', 'libdmesh_common.a', 'libdmesh_host.a', 'device/d
   endif
 endforeach
 transport_link_args = ['-Wl,--whole-archive', transport_build / 'libdmesh_dpu.a',
-                       transport_build / 'libdmesh_common.a', '-Wl,--no-whole-archive',
+                       transport_build / 'libdmesh_common.a', transport_build / 'peer/libdmesh_peer.a', '-Wl,--no-whole-archive',
                        transport_build / 'libdmesh_host.a']
 dpa_program_lib = cc.find_library('dpa_kernel', dirs : transport_build / 'device', static : true)
 
@@ -57,6 +57,13 @@ deps = [
   dependency('doca-dma'),
   dependency('doca-dpa'),
   dependency('libflexio'),
+  dependency('doca-rdma'),
+  dependency('doca-verbs'),
+  dependency('libibverbs'),
+  dependency('librdmacm'),
+  dependency('libcrypto'),
+  dependency('libssl'),
+  cc.find_library('dl'),
 ]
 
 side = get_option('side')

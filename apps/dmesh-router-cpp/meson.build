@@ -45,6 +45,13 @@ deps = [
   dependency('doca-sha'),
   dependency('doca-dpa'),
   dependency('libflexio'),
+  dependency('doca-rdma'),
+  dependency('doca-verbs'),
+  dependency('libibverbs'),
+  dependency('librdmacm'),
+  dependency('libcrypto'),
+  dependency('libssl'),
+  cc.find_library('dl'),
 ]
 
 # The transport archives and the DPA kernel come from the transport's meson
@@ -60,7 +67,7 @@ endforeach
 # instead of relying on GNU ld's single pass; host (the Comch client the
 # shared framing dispatches to) resolves normally after them.
 transport_link_args = ['-Wl,--whole-archive', transport_build / 'libdmesh_dpu.a',
-                       transport_build / 'libdmesh_common.a', '-Wl,--no-whole-archive',
+                       transport_build / 'libdmesh_common.a', transport_build / 'peer/libdmesh_peer.a', '-Wl,--no-whole-archive',
                        transport_build / 'libdmesh_host.a']
 deps += cc.find_library('dpa_kernel', dirs: dpa_kernel_dir, static: true)
 
