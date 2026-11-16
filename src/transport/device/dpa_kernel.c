@@ -242,6 +242,16 @@ static void mux_publish(struct dpa_mux_ctx *m, uint64_t off, uint32_t len)
     __dpa_thread_window_writeback();
 }
 
+/* The end of the staging ring r's reader released, from ARM memory. */
+static uint64_t mux_released(const struct dpa_mux_ctx *m, uint32_t r)
+{
+    const volatile uint64_t *pos = (void *)doca_dpa_dev_mmap_get_external_ptr(
+        (doca_dpa_dev_mmap_t)m->status,
+        m->status_addr + offsetof(struct dpa_mux_arm, release) + r * sizeof(uint64_t));
+
+    return *pos;
+}
+
 /* A ring's line once it stopped or closed: what the ARM waits for. */
 static void mux_publish_ring(struct dpa_mux_ctx *m, uint32_t r)
 {
@@ -310,6 +320,7 @@ static void mux_commands(struct dpa_mux_ctx *m)
 
         if (cmd == DMESH_MUX_CMD_OPEN && s->state == DMESH_MUX_IDLE) {
             s->state = DMESH_MUX_ACTIVE;
+            m->released[r] = 0;
             m->s.open_mask |= bit;
         } else if (cmd == DMESH_MUX_CMD_CLOSE && s->state != DMESH_MUX_CLOSED) {
             m->s.open_mask &= ~bit;
@@ -349,13 +360,19 @@ static int mux_service(struct dpa_mux_ctx *m, uint32_t r, uint64_t tail, uint64_
         }
         len = (uint32_t)size;
         /* Staging stays owned until the reader releases it; keep one byte
-         * free so equal positions only ever mean empty. */
-        unread = (uint32_t)((s->pos + c->buf_size - c->rx_consumed_pos) % c->buf_size);
-        free_space = (uint32_t)c->buf_size - unread;
+         * free so equal positions only ever mean empty. The reader's release
+         * is read again only when the last one read leaves too little. */
         remaining = (uint32_t)(c->buf_size - s->pos);
         wrap_padding = len > remaining ? remaining : 0;
-        if (free_space <= wrap_padding + len)
-            return 0; /* this ring waits for its reader; the others go on */
+        unread = (uint32_t)((s->pos + c->buf_size - m->released[r]) % c->buf_size);
+        free_space = (uint32_t)c->buf_size - unread;
+        if (free_space <= wrap_padding + len) {
+            m->released[r] = mux_released(m, r) % c->buf_size;
+            unread = (uint32_t)((s->pos + c->buf_size - m->released[r]) % c->buf_size);
+            free_space = (uint32_t)c->buf_size - unread;
+            if (free_space <= wrap_padding + len)
+                return 0; /* this ring waits for its reader; the others go on */
+        }
         if (doca_dpa_dev_comch_producer_is_consumer_empty(m->producer, (uint32_t)c->consumer)) {
             m->s.credit_waits++;
             return 0; /* its worker has no receive posted; other workers' rings go on */

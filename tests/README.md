@@ -13,7 +13,7 @@
 | `native_writable_test` | Writable-buffer accounting of the core; a drain quiets only its own thread's notifies of its EQ |
 | `native_polling_test` | A QP's idle wake (the periodic backstop from the fd's hand-out, sleep on its own stripe, re-polls while a flow retires, the backstop's missed-wake count, which counts only when it hands the poller events); the channel arms the session and re-polls after a DOORBELL |
 | `native_loss_test` | A lost session ends the process with status 75 by default; with `DPUMESH_EXIT_ON_LOSS=0` accepts, polls and dials report the sticky errno and the channel's and QPs' fds stay readable |
-| `rx_consumed_pos_test` | Production proxy shim: DPU RX consumed-position batching under the DPA SDK lock, failed-copy retry and multiple staging wraps |
+| `rx_consumed_pos_test` | Production proxy shim: a pool thread's DPU RX consumed-position batching under the DPA SDK lock, failed-copy retry and multiple staging wraps; a mux flow's release store on every change |
 | `carrier_logic_test` | Forward chunking to the DPUMesh copy rule, the in-order release window, async open and close, held flow ids, and a flow's DPU requests announced once and answered on the open client flow only |
 | `service_resolve_test` | Service target grammar, DNS answer caching and invalidation, address ids, fail-closed `DPUMESH_TARGETS` membership |
 | `topology_test` | Topology header |
@@ -26,7 +26,7 @@
 | `dispatch_request_test` | DPU requests on their flow: PREPARE on the flow a migration moves, SCALE on the flow it was asked on, then another client flow to the destination, or waiting for one, and sent again until acknowledged; SCALE_ACK matched by token |
 | `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression; against a fake reverse DPA thread, batches posted back to back, the thread's full ring and the host's free slots holding the next one, the cursor pull, the end of stream after the last batch and TX completion from the thread's completion line |
 | `dpa_cleanup_test` | DPA issued/completed close fence, kernel error retention, MsgQ/context/thread cleanup failures and retryable ownership |
-| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, descriptor-sized RX space checks including wrap padding and the full/empty boundary, CQ draining while RX is full, consume/resume, shutdown, errors and TLS across retriggers; the pod mux thread: one read per tail line, only rings whose tail moved visited, each ring's copies and messages to its worker's consumer, a worker without credit holding back only its rings, tail errors, close, refill and stop |
+| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, descriptor-sized RX space checks including wrap padding and the full/empty boundary, CQ draining while RX is full, consume/resume, shutdown, errors and TLS across retriggers; the pod mux thread: one read per tail line, only rings whose tail moved visited, each ring's copies and messages to its worker's consumer, a worker without credit holding back only its rings, tail errors, close, refill, the staging gate reading the reader's release from ARM memory only when it holds a copy back, and stop |
 
 The session tests do not open a device. They exercise production control and cleanup code with mock SDK objects.
 The private Comch protocol (session protocol v10, `src/transport/common/session_protocol.h`)

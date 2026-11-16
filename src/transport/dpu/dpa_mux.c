@@ -67,8 +67,9 @@ struct dmesh_pod_thread {
     struct doca_comch_producer *producer;
     struct doca_mmap *tails_mmap;       /* the host's table, imported */
     struct doca_buf_arr *tails_arr;     /* one buf per line, read by the DPA */
-    struct doca_mmap *status_mmap;
+    struct doca_mmap *status_mmap;      /* over struct dpa_mux_arm */
     struct dpa_mux_status *status;      /* the DPA publishes its state here */
+    struct dpa_mux_release *release;    /* the rings' readers return staging here */
     struct pod_consumer *cons;          /* one per worker */
     struct dmesh_conn *ring_conn[DMESH_MUX_RINGS]; /* NULL = free */
     uint32_t ring_error[DMESH_MUX_RINGS];          /* the watch's finding, taken by the ring's worker */
@@ -362,6 +363,7 @@ static doca_error_t pod_retire(struct dmesh_pod_thread *p)
             return result;
         p->status_mmap = NULL;
         p->status = NULL;
+        p->release = NULL;
     }
     DOCA_LOG_INFO("DPA mux thread %d of session %llx/%llu released", p->idx,
                   (unsigned long long)p->key, (unsigned long long)p->epoch);
@@ -412,9 +414,12 @@ static doca_error_t pod_start(struct dmesh_pod_thread *p, struct objects *objs,
         return result;
     }
 
-    /* The ARM's copy of the thread's state, which the DPA writes. */
+    /* The ARM's copy of the thread's state, which the DPA writes, and the
+     * rings' releases, which the DPA reads. */
     result = alloc_buffer_and_set_mmap(&p->status_mmap, objs->dev, (void **)&p->status,
-                                       sizeof(struct dpa_mux_status), DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+                                       sizeof(struct dpa_mux_arm), DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+    if (result == DOCA_SUCCESS)
+        p->release = &((struct dpa_mux_arm *)p->status)->release;
     if (result == DOCA_SUCCESS)
         result = DMESH_DPA_CALL(doca_mmap_dev_get_dpa_handle(p->status_mmap, objs->dev, &status));
     if (result != DOCA_SUCCESS) {
@@ -686,6 +691,7 @@ doca_error_t dmesh_dpa_mux_add(struct dmesh_conn *conn)
     /* The previous flow's CLOSED record goes before this flow's ring opens;
      * the DPA writes the line again only when this ring stops or closes. */
     memset(&p->status->st[r], 0, sizeof(p->status->st[r]));
+    __atomic_store_n(&p->release->rx_consumed_pos[r], 0, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
     if (result == DOCA_SUCCESS)
         result = tls_set(p, cfg_off(r, offsetof(struct dpa_mux_ring_cfg, cmd)), DMESH_MUX_CMD_OPEN);
@@ -788,13 +794,14 @@ void dmesh_dpa_mux_release(struct dmesh_conn *conn)
     conn->mux_error = 0;
 }
 
+/* A store the DPA reads when the ring's staging gate needs it. */
 doca_error_t dmesh_dpa_mux_rx_consumed(struct dmesh_conn *conn, uint32_t pos)
 {
     /* After CLOSE the ring no longer takes releases. */
     if (!conn->mux || conn->mux_close_sent)
         return DOCA_SUCCESS;
-    return tls_set(conn->mux_pod, cfg_off(conn->mux_ring, offsetof(struct dpa_mux_ring_cfg, rx_consumed_pos)),
-                   pos);
+    __atomic_store_n(&conn->mux_pod->release->rx_consumed_pos[conn->mux_ring], pos, __ATOMIC_RELEASE);
+    return DOCA_SUCCESS;
 }
 
 uint32_t dmesh_dpa_mux_error(struct dmesh_conn *conn)

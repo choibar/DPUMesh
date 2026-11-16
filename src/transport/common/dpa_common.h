@@ -131,6 +131,11 @@ struct dma_desc {
  * toolchains agree on the layout. The ARM learns the DPA's side from the
  * thread's published status (struct dpa_mux_status), never from a
  * d2h_memcpy of local storage.
+ *
+ * Releases: a ring's reader returns staging with a plain store into ARM
+ * memory (struct dpa_mux_release), not through local storage. The DPA reads
+ * a ring's word only when its staging gate holds a copy back, and keeps the
+ * last value it read (dpa_mux_ctx.released).
  */
 #define DMESH_MUX_RINGS      32u  /* = DMESH_SESSION_MAX_FLOWS: ring r is flow r + 1 */
 #define DMESH_TAILS_PER_LINE 16u
@@ -173,8 +178,7 @@ struct dpa_mux_ring_cfg {      /* ARM */
 	uint64_t generation;      /* echoed in every message */
 	uint64_t consumer;        /* consumer id of the ring's worker */
 	volatile uint64_t cmd;    /* enum dmesh_mux_cmd */
-	volatile uint64_t rx_consumed_pos; /* staging the reader released */
-	uint64_t reserved[3];
+	uint64_t reserved[4];
 };
 
 struct dpa_mux_ring_state {    /* DPA, one line */
@@ -213,6 +217,19 @@ struct dpa_mux_status {
 	struct dpa_mux_ring_state st[DMESH_MUX_RINGS];
 };
 
+/* What the ARM writes for the DPA: the end of the staging each ring's reader
+ * released. It follows the status in the same ARM memory, on lines of its own. */
+struct dpa_mux_release {
+	volatile uint64_t rx_consumed_pos[DMESH_MUX_RINGS];
+};
+
+/* A mux thread's ARM memory: the status the DPA writes, then the releases the
+ * ARM writes. */
+struct dpa_mux_arm {
+	struct dpa_mux_status status;
+	struct dpa_mux_release release;
+};
+
 struct dpa_mux_ctx {
 	/* Line 0, ARM: set before run, then only ctl_seq and stop */
 	uint64_t producer, producer_comp; /* DPA -> ARM msgq: copies and their messages */
@@ -220,16 +237,19 @@ struct dpa_mux_ctx {
 	uint64_t tails;                   /* buf array over the host table, one line per buf */
 	volatile uint64_t ctl_seq;        /* bumped after every cmd write */
 	volatile uint64_t stop;
-	uint64_t status, status_addr;     /* mmap handle and address of the ARM's dpa_mux_status */
+	uint64_t status, status_addr;     /* mmap handle and address of the ARM's dpa_mux_arm */
 	struct dpa_mux_status s;          /* DPA */
 	uint64_t fifo[DMESH_MUX_FIFO];     /* ring << 32 | length */
 	uint64_t fifo_us[DMESH_MUX_FIFO];  /* __dpa_thread_time() at submission */
 	struct dpa_mux_ring_cfg cfg[DMESH_MUX_RINGS];
+	uint64_t released[DMESH_MUX_RINGS]; /* DPA: each ring's last release read */
 };
 
 _Static_assert(sizeof(struct dpa_mux_ring_cfg) == 128 && offsetof(struct dpa_mux_ring_cfg, slot) == 64,
 	       "dpa_mux_ring_cfg: two ARM lines");
 _Static_assert(sizeof(struct dpa_mux_ring_state) == 64, "dpa_mux_ring_state: one DPA line");
+_Static_assert(sizeof(struct dpa_mux_status) % 64 == 0 && offsetof(struct dpa_mux_arm, release) % 64 == 0,
+	       "dpa_mux_arm: the ARM's lines follow the DPA's");
 _Static_assert(offsetof(struct dpa_mux_status, fifo_head) == 64 && offsetof(struct dpa_mux_status, st) == 128,
 	       "dpa_mux_status: whole lines");
 _Static_assert(offsetof(struct dpa_mux_ctx, s) == 64 && offsetof(struct dpa_mux_ctx, cfg) % 64 == 0,

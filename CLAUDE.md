@@ -198,6 +198,9 @@ messages reach the ARM workers over DPA MsgQs (`comch_msgq.c`).
   and the DPA answers in the ring's `state`; Linkerd is unchanged. Known limit:
   a copy from a host process that died blocks its thread's producer for good,
   which stops only that process's flows. Design: `docs/2026-10-13_dpa-mux-design.md`.
+- **Mux staging release:** a mux flow's reader returns staging with a store
+  into ARM memory beside the thread's status (`struct dpa_mux_release`); the
+  DPA reads a ring's word only when its staging gate holds a copy back.
 - **Reverse (proxy→host):** one reverse DPA thread per worker (`dpu/ec_rev.c`,
   `device/ec_rev_kernel.c`). The proxy writes a flow's bytes into its
   `tx_staging`; the worker appends a ≤64 KiB batch to the thread's ring in ARM
