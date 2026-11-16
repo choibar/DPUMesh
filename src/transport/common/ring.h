@@ -24,8 +24,6 @@ struct dma_ring {
 
 struct doca_dev;
 
-int setup_dma_ring(struct objects *objs, size_t size);
-
 /* Standalone ring helpers: allocate/free a ring on an explicit device (a host
  * flow's forward ring). */
 doca_error_t alloc_dma_ring(struct dma_ring **ring_out, struct doca_dev *dev, size_t size);

@@ -18,9 +18,8 @@ project('dpumesh', 'c', 'cpp',
 #   device/  the DPA kernel (compiled by dpacc, see build_dpacc.sh)
 #
 # The programs live elsewhere and link these archives: apps/dma_bench
-# (`dpumesh`, the original worker pair, and `dpumesh-echo`),
-# apps/dmesh-router-cpp, apps/dmeshgo (the old Go host library) and the Rust
-# proxy (linkerd/doca/build.rs).
+# (`dpumesh_dpu`), apps/dmesh-router-cpp and the Rust proxy
+# (linkerd/doca/build.rs).
 
 # Comment this line to restore warnings of experimental DOCA features
 add_project_arguments('-D DOCA_ALLOW_EXPERIMENTAL_API', language: ['c', 'cpp'])
@@ -38,8 +37,8 @@ deps += dependency('doca-dpa')
 deps += dependency('libflexio')
 
 # DPA management (common/dpa.c, and comch_msgq.c on top of it) references the
-# dpacc host stub; the host library's Makefile and apps/dmeshgo's shared
-# library compile parts of the DPA-free set on their own.
+# dpacc host stub; the host library's Makefile compiles part of the DPA-free
+# set on its own.
 common_nodpa_srcs = files(
   'common/buffer.c',
   'common/ring.c',
@@ -61,7 +60,6 @@ dpu_srcs = files(
 )
 host_srcs = files(
   'host/comch_client.c',
-  'host/comch_client_legacy.c',
 )
 # The host library's channel layer. host_stubs.c stubs the server-side symbol
 # the shared sources reference, so this archive must never be linked together

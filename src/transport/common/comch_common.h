@@ -122,9 +122,5 @@ doca_error_t dmesh_build_dma_metadata(struct doca_dev *dev, const struct dma_rin
     const struct dmesh_flow_id *flow, struct dmesh_export_metadata_msg *msg);
 
 doca_error_t
-build_dma_metadata(struct objects *objs, struct dmesh_export_metadata_msg *msg);
-doca_error_t
-export_dma_metadata(struct objects *objs);
-doca_error_t
 process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadata_msg *metadata_msg);
 #endif // COMCH_COMMON_H

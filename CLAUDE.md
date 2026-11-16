@@ -22,9 +22,7 @@ Three trees at the repo root:
 - `apps/` — the programs over the transport, each its own meson project
   linking the archives: `dma_bench/` (the DMA benchmark pair `dpumesh_host`
   — `host/dpumesh_host.c` over the host library — and `dpumesh_dpu` —
-  `dpu/dpumesh_dpu.c` over the shim),
-  `dmesh-router-cpp/`, `dmeshgo/` (old Go host lib, `libdmesh_hostlib.so`),
-  `hpack-h2-bench/`.
+  `dpu/dpumesh_dpu.c` over the shim), `dmesh-router-cpp/`, `hpack-h2-bench/`.
 - `src/core/`, `src/facade/`, `include/dpumesh/` — the DOCA-free host library
   (`libdpumesh.so.6`, root `Makefile`): core, carrier, native/preload façades.
   `src/core` sees the transport only through `src/transport/host/channel.h`.
@@ -49,8 +47,8 @@ meson setup build && ninja -C build    # DPU: build/dpumesh_dpu; host: dpumesh_h
 The transport build produces only archives: `libdmesh_common.a`,
 `libdmesh_dpu.a`, `libdmesh_host.a`, `libdmesh_channel.a` (+ `device/dpa_kernel.a`
 from dpacc). `src/transport/meson.build` is the one list of transport
-sources; the root `Makefile` (host library) and `apps/dmeshgo/hostlib/meson.build`
-(old Go lib) repeat only the DPA-free host subset they need. Every program in
+sources; the root `Makefile` (host library) repeats only the DPA-free host
+subset it needs. Every program in
 `apps/` must be rebuilt after a transport change (it links the archives).
 
 There is no test suite and no linter; correctness is validated by running the

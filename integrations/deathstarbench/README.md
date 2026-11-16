@@ -3,8 +3,8 @@
 This integration targets DeathStarBench `hotelres-bench-patches` commit
 `312855ac450bcd35550a482517fd47e093a26ac4`. It patches the shared gRPC dialer,
 nine service listeners, and ten command lifecycles. It uses
-`integrations/grpc/go` / `libdpumesh.so.5`; **do not link `apps/dmeshgo` or
-`libdmesh_hostlib`**. Host and DPU must run matching session-protocol builds.
+`integrations/grpc/go` / `libdpumesh.so.5`. Host and DPU must run matching
+session-protocol builds.
 
 The host runs native Go processes. Frontend HTTP, databases, cache, Consul and
 Jaeger retain their original transports. DPU gRPC is plaintext with the proxy

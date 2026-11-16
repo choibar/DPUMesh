@@ -21,7 +21,7 @@ HOST_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -DDOCA_ALLOW_EXPERI
 # Transport sources the host library needs: the common set, the Comch client
 # and the channel layer. Keep in step with src/transport/meson.build.
 TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c comch_common.c ring.c) \
-    $(addprefix $(TRANSPORT)/host/,comch_client.c comch_client_legacy.c channel.c host_stubs.c)
+    $(addprefix $(TRANSPORT)/host/,comch_client.c channel.c host_stubs.c)
 TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)

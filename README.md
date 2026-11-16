@@ -11,5 +11,5 @@
 | `tests/` | host | Host library unit and contract tests, run by `make test`. |
 | `design/` | host | Host library documents: `HOST.md` (layout, wire mapping, limits, configuration), `API.md`, `GRPC.md`. |
 | `Makefile`, `.env.example` | host | Host library build and the environment variables it reads. |
-| `apps/` | — | Programs over the transport: `dma_bench` (the DMA benchmark pair `dpumesh_host` over the host library and `dpumesh_dpu` over the shim), `dmesh-router-cpp`, `dmeshgo` (old Go host library), `hpack-h2-bench`. |
+| `apps/` | — | Programs over the transport: `dma_bench` (the DMA benchmark pair `dpumesh_host` over the host library and `dpumesh_dpu` over the shim), `dmesh-router-cpp`, `hpack-h2-bench`. |
 | `docs/` | — | Working notes. |

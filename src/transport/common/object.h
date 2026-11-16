@@ -245,7 +245,6 @@ struct objects {
     /* Exactly one is non-NULL: control endpoint or data worker. */
     struct dmesh_dispatcher *dispatcher;
     struct dmesh_worker_mailbox *mailbox;
-    struct dmesh_comch_client legacy_client; /* compatibility adapter, not used by native channels */
     int worker_idx;                 /* index of the owning worker thread */
     bool migrate_pending;           /* some conn has migrate_requested set */
     struct doca_dev *dev;
@@ -279,16 +278,12 @@ struct objects {
     struct dmesh_buffer sndbuf;
     struct dmesh_buffer rcvbuf;
 
-    /* (host side) identity of the flow this worker carries; copied into the
-     * metadata message by export_dma_metadata */
-    struct dmesh_flow_id flow;
 
     struct doca_mmap *local_mmap;
     struct doca_mmap *remote_mmap;
     void *dma_buffer;
     void *remote_addr;
     size_t remote_buf_size;
-    struct dma_ring *dma_ring;
     struct doca_mmap *ring_mmap;    /* used for DMA ring mmap in DPU */
 
     struct doca_buf_arr *buf_arr;

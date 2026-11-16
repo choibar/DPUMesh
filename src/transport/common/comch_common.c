@@ -19,11 +19,7 @@ DOCA_LOG_REGISTER(COMCH_COMMON);
 _Static_assert(sizeof(struct dmesh_export_metadata_msg) <= DMESH_SESSION_MAX_PAYLOAD,
                "OPEN metadata must fit a session frame");
 
-/*
- * Export all host-side DMA metadata (ring + send buffer + receive buffer) to
- * the DPU in a single control-path message. Must be called after
- * setup_dma_ring() and both init_dmesh_buffer() calls.
- */
+/* One region's PCI export descriptor, copied into the metadata message. */
 static doca_error_t
 copy_export(struct doca_mmap *mmap, struct doca_dev *dev,
             uint8_t *destination, size_t capacity, size_t *length)
@@ -65,23 +61,6 @@ dmesh_build_dma_metadata(struct doca_dev *dev, const struct dma_ring *ring,
         result = copy_export(rcvbuf->mmap, dev,
                              msg->rcv_desc, sizeof(msg->rcv_desc), &msg->rcv_desc_len);
     return result;
-}
-
-doca_error_t
-build_dma_metadata(struct objects *objs, struct dmesh_export_metadata_msg *msg)
-{
-    if (!objs) return DOCA_ERROR_INVALID_VALUE;
-    return dmesh_build_dma_metadata(objs->dev, objs->dma_ring, &objs->sndbuf, &objs->rcvbuf, &objs->flow, msg);
-}
-
-doca_error_t
-export_dma_metadata(struct objects *objs)
-{
-    struct dmesh_export_metadata_msg msg;
-    doca_error_t result = build_dma_metadata(objs, &msg);
-    if (result != DOCA_SUCCESS)
-        return result;
-    return client_send_msg(objs, (const char *)&msg, sizeof(msg));
 }
 
 /*
