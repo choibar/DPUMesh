@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "dispatcher.h"
+#include "ec_rev.h"
 #include "placement.h"
 #include "object.h"
 #include "comch_wake.h"
@@ -1231,7 +1232,8 @@ void dmesh_dispatch_worker_drain(struct objects *o)
             /* The host of a fast-path session no longer ARMs: a flow that
              * cannot publish through a producer must fail rather than fall
              * back to descriptors nobody is woken for. */
-            if (c->state == DMESH_CONN_NEW && m.wake_connection &&
+            /* DMESH_D2H_EC: the reverse DPA thread wakes the host itself. */
+            if (c->state == DMESH_CONN_NEW && m.wake_connection && !dmesh_ec_enabled() &&
                 dmesh_wake_attach(c, m.wake_connection, m.wake_consumer) != DOCA_SUCCESS) {
                 c->error_status = EIO;
                 c->state = DMESH_CONN_ERROR;

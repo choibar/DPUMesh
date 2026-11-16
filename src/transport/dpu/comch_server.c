@@ -16,6 +16,7 @@
 #include "comch_msgq.h"
 #include "dma.h"
 #include "dpa_mux.h"
+#include "ec_rev.h"
 #include "ring.h"
 #include "comch_wake.h"
 
@@ -1016,6 +1017,7 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     conn->push_len = 0;
     conn->push_state = 0;
     conn->push_shadow = NULL;
+    dmesh_ec_conn_reset(conn);
 
     /* Per-connection DMA engine (ctx, inventory, task pool, recv/pending rings). */
     cleanup_dma_tasks(conn);
@@ -1093,6 +1095,10 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     if (getenv("DMESH_NO_TEARDOWN") != NULL && flow_has_resources(conn))
         return DOCA_ERROR_NOT_SUPPORTED;
     conn->dma_closing = true;
+    /* A reverse-DPA flow waits until the thread finished its batches. */
+    result = dmesh_ec_quiesce_step(conn);
+    if (result != DOCA_SUCCESS)
+        return result;
     /* A mux flow leaves its thread with DEL; DEL_ACK follows its last copy. */
     result = conn->mux ? dmesh_dpa_mux_del_step(conn) : dmesh_doca_dpa_quiesce_step(conn);
     if (result != DOCA_SUCCESS)
@@ -1389,6 +1395,13 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			goto error;
 		}
 
+		/* DMESH_D2H_EC: before a mux thread takes the session's TAILS. */
+		result = dmesh_ec_conn_setup(conn);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to set up the reverse DPA push: %s", doca_error_get_name(result));
+			goto error;
+		}
+
 		if (conn->dpa_thread == NULL) {
 			/* A mux thread takes the ring on its next pass. */
 			result = dmesh_dpa_mux_add(conn);
@@ -1627,6 +1640,12 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 		result = dmesh_dpa_mux_init(objs);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to start DPA mux threads: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		result = dmesh_ec_init(objs);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to start the reverse DPA thread: %s", doca_error_get_name(result));
 			goto error;
 		}
 

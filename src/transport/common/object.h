@@ -20,6 +20,7 @@ struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
 struct dmesh_dpa_thread_pool;
 struct dmesh_mux;
+struct dmesh_ec_worker;
 struct dma_ring;
 struct objects;
 struct dmesh_conn;
@@ -281,6 +282,17 @@ struct dmesh_conn {
     uint64_t host_consumed_bytes;
     uint64_t pushed_bytes;
     struct dmesh_push_cursor *cursor_shadow;  /* in tx_staging's reserved tail */
+
+    /* DMESH_D2H_EC=1 (dpu/ec_rev.h): the worker's reverse DPA thread copies
+     * this flow's batches and publishes them; push_seq and pushed_bytes follow
+     * its completions, several batches may be in flight. */
+    bool ec;                                  /* the flow pushes through the reverse DPA thread */
+    bool ec_ready;                            /* the DPA handles below are valid */
+    uint32_t ec_src_h, ec_win_h, ec_se_h;     /* tx_staging, rcvbuf window, tail table page */
+    uint64_t ec_se_addr;                      /* host address of the flow slot's sync event word */
+    struct doca_mmap *ec_se_mmap;             /* the session's tail table page, imported */
+    uint64_t ec_issued_seq, ec_issued_bytes;  /* batches handed to the thread */
+    uint64_t ec_quiesce_ns;                   /* teardown has waited for the thread since */
 };
 
 /* DOCA objects for DPUMesh thread */
@@ -348,6 +360,7 @@ struct objects {
     doca_error_t (*release_mux)(struct objects *); /* stops and frees the mux threads */
     struct dmesh_dpa_thread_pool *dpa_pool;   /* pre-created DPA threads */
     struct dmesh_mux *mux;                    /* DMESH_DPA_MUX threads, NULL when off */
+    struct dmesh_ec_worker *ec;               /* DMESH_D2H_EC reverse DPA thread, NULL when off */
     struct dmesh_doca_dpa_thread *dpa_thread; /* thread assigned to the active connection */
 	struct dmesh_doca_dpa_comch *dpa_comch;
     doca_dpa_dev_comch_producer_t remote_dpa_producer;

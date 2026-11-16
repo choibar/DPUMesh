@@ -57,6 +57,7 @@ dpu_srcs = files(
   'dpu/placement.c',
   'dpu/dma.c',
   'dpu/dpa_mux.c',
+  'dpu/ec_rev.c',
   'dpu/mux_probe.c',
 )
 host_srcs = files(

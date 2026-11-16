@@ -16,6 +16,7 @@
 #include <doca_error.h>
 #include <doca_log.h>
 #include <doca_pe.h>
+#include <doca_sync_event.h>
 
 #include "buffer.h"
 #include "comch_client.h"
@@ -130,6 +131,14 @@ struct channel_flow_wake {
 	int running;
 	struct channel_conn *conn;          /* the slot's open push flow, or NULL */
 	uint64_t descs, drops;
+	/* DPUMESH_D2H_EC=1: the DPU's reverse DPA thread stores each published
+	 * batch's sequence into this slot's word of the tail table page; a wait
+	 * task on the word wakes the slot's PE. */
+	uint32_t slot;                      /* flow slot id, 1..32 */
+	struct doca_sync_event *se;
+	volatile uint64_t *se_word;
+	int se_pending;
+	uint64_t se_waits, se_wakes;
 };
 
 struct channel_mem {
@@ -654,11 +663,110 @@ static void flow_wake_state_changed(const union doca_data user_data, struct doca
 	fw->running = next == DOCA_CTX_STATE_RUNNING;
 }
 
+static int ec_on(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *v = getenv("DPUMESH_D2H_EC");
+		on = v != NULL && *v != '\0' && strcmp(v, "0") != 0;
+	}
+	return on;
+}
+
+static void flow_se_done(struct doca_sync_event_task_wait_neq *task, union doca_data task_data,
+			 union doca_data ctx_data)
+{
+	struct channel_flow_wake *fw = task_data.ptr;
+	(void)ctx_data;
+	fw->se_pending = 0;
+	fw->se_wakes++;
+	doca_task_free(doca_sync_event_task_wait_neq_as_doca_task(task));
+}
+
+/* Starts the slot's sync event on its PE, over the slot's word of the tail
+ * table page (dev->tails, exported to the DPU with the session). */
+static doca_error_t flow_se_start_locked(struct channel_dev *dev, struct channel_flow_wake *fw)
+{
+	doca_error_t result;
+	if (dev->tails == NULL)
+		return DOCA_ERROR_BAD_STATE;
+	fw->se_word = (volatile uint64_t *)((uint8_t *)dev->tails + DMESH_EC_SE_OFF(fw->slot));
+	*fw->se_word = 0;
+	if ((result = doca_sync_event_create(&fw->se)) != DOCA_SUCCESS ||
+	    (result = doca_sync_event_add_publisher_location_remote_pci(fw->se)) != DOCA_SUCCESS ||
+	    (result = doca_sync_event_add_subscriber_location_cpu(fw->se, dev->dev)) != DOCA_SUCCESS ||
+	    (result = doca_sync_event_set_addr(fw->se, (uint64_t *)fw->se_word)) != DOCA_SUCCESS ||
+	    (result = doca_pe_connect_ctx(fw->pe, doca_sync_event_as_ctx(fw->se))) != DOCA_SUCCESS ||
+	    (result = doca_sync_event_task_wait_neq_set_conf(fw->se, flow_se_done, flow_se_done, 2)) != DOCA_SUCCESS)
+		return result;
+	result = doca_ctx_start(doca_sync_event_as_ctx(fw->se));
+	return result == DOCA_ERROR_IN_PROGRESS ? DOCA_SUCCESS : result;
+}
+
+/* Before the slot's PE is armed: a wait task on the word's current value. */
+static void flow_se_wait(struct channel_flow_wake *fw)
+{
+	struct doca_sync_event_task_wait_neq *task;
+	if (fw->se == NULL || fw->se_pending)
+		return;
+	uint64_t v = __atomic_load_n(fw->se_word, __ATOMIC_ACQUIRE);
+	if (doca_sync_event_task_wait_neq_alloc_init(fw->se, v, ~0ull, (union doca_data){.ptr = fw}, &task) != DOCA_SUCCESS)
+		return;
+	if (doca_task_submit(doca_sync_event_task_wait_neq_as_doca_task(task)) != DOCA_SUCCESS) {
+		doca_task_free(doca_sync_event_task_wait_neq_as_doca_task(task));
+		return;
+	}
+	fw->se_pending = 1;
+	fw->se_waits++;
+}
+
+/* The PE event reads of common/object.h (dmesh_pe_take_events,
+ * dmesh_pe_read_events), which this layer does not include: events a context
+ * queued are read before it is destroyed. */
+static void se_pe_take_events(struct doca_pe *pe)
+{
+	doca_notification_handle_t handle;
+	if (doca_pe_get_notification_handle(pe, &handle) != DOCA_SUCCESS)
+		return;
+	for (int round = 0; round < 2; ++round) {
+		struct pollfd fd = {.fd = (int)handle, .events = POLLIN};
+		if (poll(&fd, 1, 0) <= 0)
+			return;
+		(void)doca_pe_clear_notification(pe, handle);
+	}
+}
+
+static void flow_se_free(struct channel_flow_wake *fw)
+{
+	if (fw->se == NULL)
+		return;
+	if (fw->se_waits)
+		DOCA_LOG_INFO("flow wake: slot %u sync event: %lu waits, %lu wakes", fw->slot,
+			      (unsigned long)fw->se_waits, (unsigned long)fw->se_wakes);
+	struct doca_ctx *ctx = doca_sync_event_as_ctx(fw->se);
+	enum doca_ctx_states state = DOCA_CTX_STATE_STOPPING;
+	se_pe_take_events(fw->pe);
+	(void)doca_ctx_stop(ctx);
+	se_pe_take_events(fw->pe);
+	for (int spins = 0; spins < CHANNEL_CTX_STOP_SPINS && state != DOCA_CTX_STATE_IDLE; ++spins) {
+		(void)doca_pe_progress(fw->pe);
+		if (doca_ctx_get_state(ctx, &state) != DOCA_SUCCESS)
+			break;
+	}
+	(void)doca_pe_request_notification(fw->pe);
+	if (state == DOCA_CTX_STATE_IDLE)
+		(void)doca_sync_event_destroy(fw->se);
+	else
+		DOCA_LOG_ERR("flow wake: sync event of slot %u did not stop; retained", fw->slot);
+	fw->se = NULL;
+}
+
 /* Stop and release one flow wake; one whose consumer does not stop is kept.
  * The stop's message to the DPU completes on the control PE, so the wait
  * progresses it with the consumer's own. */
 static int flow_wake_free(struct channel_dev *dev, struct channel_flow_wake *fw)
 {
+	flow_se_free(fw);
 	if (fw->consumer != NULL) {
 		struct doca_ctx *ctx = doca_comch_consumer_as_ctx(fw->consumer);
 		enum doca_ctx_states state = DOCA_CTX_STATE_STOPPING;
@@ -763,7 +871,13 @@ static int flow_wakes_open_locked(struct channel_dev *dev)
 	for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS && result == DOCA_SUCCESS; ++id) {
 		struct channel_flow_wake *fw = dev->flow_wake[id] = calloc(1, sizeof(*fw));
 		step = "start";
+		if (fw != NULL)
+			fw->slot = id;
 		result = fw == NULL ? DOCA_ERROR_NO_MEMORY : flow_wake_start_locked(dev, fw);
+		if (result == DOCA_SUCCESS && ec_on()) {
+			step = "sync event";
+			result = flow_se_start_locked(dev, fw);
+		}
 		if (result != DOCA_SUCCESS)
 			break;
 		step = "running";
@@ -781,8 +895,8 @@ static int flow_wakes_open_locked(struct channel_dev *dev)
 		return -1;
 	}
 	dev->flow_wake_on = 1;
-	DOCA_LOG_INFO("flow wake on: each flow slot has its own consumer (%lu ms)",
-		      (unsigned long)(channel_now_ms() - start_ms));
+	DOCA_LOG_INFO("flow wake on: each flow slot has its own consumer%s (%lu ms)",
+		      ec_on() ? " and sync event (DPUMESH_D2H_EC)" : "", (unsigned long)(channel_now_ms() - start_ms));
 	return 0;
 }
 
@@ -810,6 +924,7 @@ void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id)
 
 int channel_flow_arm(struct channel_dev *dev, uint32_t flow_id)
 {
+	flow_se_wait(dev->flow_wake[flow_id]);
 	doca_error_t result = doca_pe_request_notification(dev->flow_wake[flow_id]->pe);
 	if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
 	return 0;
@@ -829,12 +944,13 @@ static int tails_send_locked(struct channel_dev *dev)
 	doca_error_t result;
 	if (!dev->tails) {
 		void *buf = NULL;
-		result = alloc_buffer_and_set_mmap(&dev->tails_mmap, dev->dev, &buf, DMESH_TAILS_BYTES,
+		/* The whole page: the flow slots' sync event words follow the tails. */
+		result = alloc_buffer_and_set_mmap(&dev->tails_mmap, dev->dev, &buf, DMESH_TAILS_ALLOC,
 						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
 		if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
 		dev->tails = buf;
 	}
-	memset((void *)dev->tails, 0, DMESH_TAILS_BYTES);
+	memset((void *)dev->tails, 0, DMESH_TAILS_ALLOC);
 	result = doca_mmap_export_pci(dev->tails_mmap, dev->dev, &desc, &len);
 	if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
 	if (len == 0 || len > DMESH_SESSION_TAILS_MAX) { errno = EMSGSIZE; return -1; }

@@ -249,4 +249,70 @@ struct dmesh_mux_msg {
 };
 _Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a copy's immediate");
 
+/*
+ * DPU -> host push through a DPU-owned DPA thread (DMESH_D2H_EC=1, "E-c").
+ *
+ * Each worker owns one reverse DPA thread, run_ec_rev. The worker appends one
+ * entry per batch to the thread's ring in ARM memory and advances the tail;
+ * the thread copies the batch from tx_staging into the host's data ring with
+ * its async ops queue and, after the copy's completion, stores the batch's
+ * descriptor into the host's slot ring (pos and len, then seq), a value no
+ * earlier store to it had (wid << 48 | the thread's publish count) into the
+ * flow slot's sync event word on the host, and the flow's
+ * completed sequence and bytes into the worker's ARM memory. The host sleeps
+ * on a sync event wait task; neither side's CPU takes part in the copy or the
+ * wake. A zero-length entry is the end of stream: it publishes a descriptor
+ * of length 0 after every earlier batch of the flow.
+ *
+ * The sync event words live in the session's tail table page, one line per
+ * flow slot at DMESH_EC_SE_OFF(slot).
+ */
+#define DMESH_TAILS_ALLOC    4096u                     /* the tail table page the host exports */
+#define DMESH_EC_SE_OFF(slot) (1024u + (uint32_t)(slot) * 64u)
+#define DMESH_EC_RING        1024u                     /* entries per worker thread */
+#define DMESH_EC_FIFO        128u                      /* copies in flight per thread */
+#define DMESH_EC_CONNS       64u                       /* = DMESH_MAX_CONNECTIONS */
+#define DMESH_EC_DESC_N      128u                      /* = DMESH_PUSH_DESC_N */
+#define DMESH_EC_DESC_SZ     16u                       /* = sizeof(struct dmesh_push_desc): seq, pos, len */
+#define DMESH_EC_DATA_OFF    4096u                     /* = DMESH_PUSH_DATA_OFF */
+
+struct dmesh_ec_ent {               /* ARM -> DPA, one line */
+	uint32_t conn;                  /* worker's connection slot */
+	uint32_t src_mmap;              /* tx_staging, DPA handle */
+	uint32_t win_mmap;              /* host rcvbuf window, DPA handle */
+	uint32_t se_mmap;               /* host tail table page, DPA handle */
+	uint64_t seq;                   /* batch sequence of the flow, 1-based */
+	uint64_t pos_len;               /* data ring offset << 32 | length (0 = end of stream) */
+	uint64_t src_addr;              /* tx_staging address of the batch */
+	uint64_t win_addr;              /* host address of the rcvbuf window */
+	uint64_t se_addr;               /* host address of the flow slot's sync event word */
+	uint64_t cum_bytes;             /* the flow's bytes up to and including this batch */
+};
+
+struct dmesh_ec_done {              /* DPA -> ARM, one line per connection slot */
+	volatile uint64_t seq, bytes, l[6];
+};
+
+struct dmesh_ec_ctl {               /* ARM memory, one per worker */
+	volatile uint64_t tail, l0[7];                  /* ARM -> DPA */
+	volatile uint64_t stop, l1[7];                  /* ARM -> DPA */
+	volatile uint64_t head, copies, publishes, passes, activations, stopped, l2[2]; /* DPA -> ARM */
+	struct dmesh_ec_done done[DMESH_EC_CONNS];
+	struct dmesh_ec_ent ring[DMESH_EC_RING];
+};
+
+struct dmesh_ec_tls {               /* the thread's local storage */
+	uint64_t ops, acomp, ctl_mmap, ctl_addr;        /* set by the ARM */
+	uint64_t head, ff_head, ff_tail, copies, publishes, passes, activations;
+	uint64_t wid;                                   /* worker index + 1: the high bits of every wake value */
+	struct dmesh_ec_ent ff[DMESH_EC_FIFO];          /* entries in copy order */
+};
+
+_Static_assert(sizeof(struct dmesh_ec_ent) == 64, "dmesh_ec_ent: one line");
+_Static_assert(sizeof(struct dmesh_ec_done) == 64, "dmesh_ec_done: one line");
+_Static_assert(offsetof(struct dmesh_ec_ctl, done) == 192 && offsetof(struct dmesh_ec_ctl, ring) % 64 == 0,
+	       "dmesh_ec_ctl: one writer per line");
+_Static_assert(DMESH_EC_SE_OFF(33) + 64 <= DMESH_TAILS_ALLOC && DMESH_EC_SE_OFF(0) >= DMESH_TAILS_BYTES,
+	       "sync event words fit the tail table page");
+
 #endif

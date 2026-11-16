@@ -23,7 +23,7 @@ static unsigned arms_seen, pings_seen, notify_requests, notify_clears;
 /* The session's tail table: allocated once, exported once per session. */
 static unsigned tails_allocs, tails_seen;
 static char fake_tails_mmap, fake_tails_desc[40];
-static uint32_t fake_tails[DMESH_TAILS_BYTES / 4] __attribute__((aligned(64)));
+static uint32_t fake_tails[DMESH_TAILS_ALLOC / 4] __attribute__((aligned(64))); /* the page: tails, then sync event words */
 static uint64_t arm_epoch_seen;
 static uint32_t arm_count_seen;
 static struct dmesh_session_arm_flow arm_flows_seen[DMESH_SESSION_MAX_FLOWS];
