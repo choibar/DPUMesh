@@ -250,7 +250,7 @@ struct dmesh_mux_msg {
 _Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a copy's immediate");
 
 /*
- * DPU -> host push through a DPU-owned DPA thread (DMESH_D2H_EC=1, "E-c").
+ * DPU -> host through a DPU-owned DPA thread (the reverse DPA thread).
  *
  * Each worker owns one reverse DPA thread, run_ec_rev. The worker appends one
  * entry per batch to the thread's ring in ARM memory and advances the tail;

@@ -1,12 +1,10 @@
-/* DPU -> host push through the worker's reverse DPA thread (DMESH_D2H_EC=1):
- * the DPU side's device code (the host library's DPA program does not carry it). */
+/* DPU -> host through the worker's reverse DPA thread: DPU-side device code. */
 #include "doca_dpa_dev.h"
 #include "doca_dpa_dev_buf.h"
 #include "dpaintrin.h"
 #include "dpa_common.h"
 
 /*
- * DPU -> host push through the worker's reverse DPA thread (DMESH_D2H_EC=1).
  * Layout and protocol in common/dpa_common.h (struct dmesh_ec_*).
  *
  * Every access to ARM or host memory takes a fresh external pointer: a pointer

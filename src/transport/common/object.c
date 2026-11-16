@@ -183,8 +183,6 @@ stop_comch_ctx(struct doca_ctx *ctx, struct objects *objs)
                  "device objects will leak until the driver reclaims them", state);
 }
 
-/* dpu/comch_wake.c, linked only into DPU programs. */
-void dmesh_wake_cleanup(struct objects *) __attribute__((weak));
 
 doca_error_t
 cleanup_objects(struct objects *objs)
@@ -236,8 +234,6 @@ cleanup_objects(struct objects *objs)
     }
 
     /* Fast-path producers live on consumer_pe (DPU workers only). */
-    if (dmesh_wake_cleanup != NULL)
-        dmesh_wake_cleanup(objs);
 
     if (objs->is_server && objs->consumer_pe != NULL) {
         result = doca_pe_destroy(objs->consumer_pe);

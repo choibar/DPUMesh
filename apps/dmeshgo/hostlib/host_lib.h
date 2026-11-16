@@ -8,7 +8,7 @@
  *
  * A channel wraps one comch connection + one push-transport DMA channel
  * (안 2: no host DPA, freely replicable per process/thread). Modes:
- *   2 (INGRESS_PUSH): client semantics — the DPU proxy serves this flow
+ *   2 (CLIENT): client semantics — the DPU proxy serves this flow
  *     through its outbound L7 stack (dial side).
  *   1 (BACKEND): this process is a backend provider for (dst_ip, dst_port);
  *     the proxy connects through the channel instead of dialing TCP.
@@ -33,7 +33,7 @@ struct dmesh_chan;
  * server_name: DPU comch server (e.g. "DPUMesh0").
  * src/dst: flow identity (dotted-quad strings, host-order ports).
  * workload: source workload identity string (attested over PCIe).
- * mode: 1 = BACKEND provider, 2 = INGRESS_PUSH client. */
+ * mode: 1 = BACKEND provider, 2 = CLIENT client. */
 struct dmesh_chan *dmesh_chan_connect(const char *pci_addr,
 				      const char *server_name,
 				      const char *src_ip, uint16_t src_port,

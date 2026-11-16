@@ -26,8 +26,6 @@ struct objects;
 struct dmesh_conn;
 /* What a DMA task carries; drives the completion callback's behavior. */
 #define DMESH_TASK_NORMAL    0   /* legacy staging->rcvbuf copy */
-#define DMESH_TASK_PUSH_DATA 1   /* backend push: batch data -> host data ring */
-#define DMESH_TASK_PUSH_DESC 2   /* backend push: 16B descriptor -> host slot */
 #define DMESH_TASK_PULL_CURSOR 3 /* flow control: host cursor -> DPU shadow */
 
 struct dma_task_entry {
@@ -54,8 +52,6 @@ typedef uint64_t doca_dpa_dev_buf_arr_t;
 /* Per-flow statistics the proxy exports (struct dmesh_conn.flow_stats). */
 #define DMESH_FLOW_STATS 5
 #define DMESH_MAX_SESSIONS 64
-/* Host flow slots per session that may each bring a flow wake consumer. */
-#define DMESH_SESSION_FLOW_CONSUMERS 32
 
 /* A Comch peer is a channel, independently of its logical data flows. */
 struct dmesh_session {
@@ -77,53 +73,11 @@ struct dmesh_session {
         uint32_t token;
         bool sent;
     } backend[DMESH_SESSION_MAX_WORKERS];
-    /* Idle wake: the host ARMed before sleeping; the next push descriptor
-     * completion (or one the ARM had not seen) queues a DOORBELL, sent from
-     * dmesh_sessions_advance and retried until the send is accepted. A
-     * dispatcher worker keeps this state on the flow's worker-local session
-     * and rings as a reply from dmesh_dispatch_worker_flush. */
-    bool armed;
-    uint64_t armed_epoch, doorbell_pending_epoch, doorbell_sent_epoch;
-    /* Comch fast-path wake, on the dispatcher's session: the host's consumer
-     * (0 = none) and whether WAKE_READY went out. Flows admitted after it
-     * publish through a worker producer (dpu/comch_wake.c). */
-    uint32_t wake_consumer;
-    bool wake_ready_sent;
-    /* Flow wake: the session's further host consumers, one per host flow
-     * slot, any of which an OPEN may name (0 = free entry). */
-    uint32_t flow_consumers[DMESH_SESSION_FLOW_CONSUMERS];
     /* TAILS: the export descriptor of the host's tail table (0 = none yet).
      * Every flow of the session carries a copy to its worker, whose pod mux
      * thread maps the table once. */
     struct dmesh_tails_export tails;
 };
-
-/* Flow wake consumers of a session: record an arrival or an expiry, and
- * whether an OPEN may name one. */
-static inline void dmesh_session_flow_consumer_set(struct dmesh_session *s, uint32_t id, bool present)
-{
-    for (unsigned i = 0; i < DMESH_SESSION_FLOW_CONSUMERS; ++i)
-        if (s->flow_consumers[i] == (present ? 0 : id)) {
-            s->flow_consumers[i] = present ? id : 0;
-            return;
-        }
-}
-static inline bool dmesh_session_flow_consumer(const struct dmesh_session *s, uint32_t id)
-{
-    for (unsigned i = 0; id != 0 && i < DMESH_SESSION_FLOW_CONSUMERS; ++i)
-        if (s->flow_consumers[i] == id)
-            return true;
-    return false;
-}
-
-/* A push descriptor reached host memory: queue one DOORBELL for an ARMed host. */
-static inline void dmesh_session_push_published(struct dmesh_session *s)
-{
-    if (s != NULL && s->armed) {
-        s->armed = false;
-        s->doorbell_pending_epoch = s->armed_epoch;
-    }
-}
 
 /* Per-connection init state, advanced by dmesh_doca_ctrl_advance() */
 enum dmesh_conn_state {
@@ -238,44 +192,27 @@ struct dmesh_conn {
     bool host_shut;
     uint64_t host_shut_descs;
 
-    /* Reverse (response) path, DPU-owned. The DPU exports both to the host,
-     * whose DPA thread polls rcv_ring for descriptors and DMAs the referenced
-     * tx_staging bytes into the host's rcvbuf. The proxy writes response bytes
-     * into tx_staging[tx_pos..] and appends a descriptor to rcv_ring. */
-    struct dma_ring *rcv_ring;                /* descriptor ring (DPU memory) */
-    struct doca_mmap *tx_staging_mmap;        /* mmap over tx_staging (PCI export) */
+    /* Reverse (DPU -> host) path. The proxy writes a flow's bytes into
+     * tx_staging; the worker's reverse DPA thread copies each batch into the
+     * host's data ring and publishes its descriptor (struct dmesh_push_desc),
+     * then wakes the host through the flow slot's sync event (dpu/ec_rev.h).
+     * A batch stays untouched in tx_staging until its descriptor landed. */
+    struct doca_mmap *tx_staging_mmap;        /* mmap over tx_staging */
     void *tx_staging;                         /* DMA source for DPU->host copies */
     size_t tx_staging_len;
-    uint32_t tx_pos;                          /* write cursor into tx_staging */
-    bool reverse_exported;                    /* rcv_ring+tx_staging sent to host */
-
-    /* Backend (안 2) push state: DPU -> host via this connection's doca_dma,
-     * one batch outstanding at a time (data copy, then - from its completion
-     * callback - the 16B descriptor copy; see struct dmesh_push_desc). The
-     * batch staged in tx_staging stays untouched until the desc completes.
-     * push_shadow is the DPU-local (mmap'd) source of the descriptor copy. */
+    bool reverse_ready;                       /* tx_staging allocated: READY may go out */
     uint64_t push_seq;                        /* completed batches (next = +1) */
     uint32_t push_pos;                        /* data-ring write offset (host side) */
-    uint32_t push_len;                        /* in-flight batch length */
-    int push_state;                           /* 0 idle, 1 data in flight, 2 desc in flight */
     /* The proxy finished sending: a zero-length descriptor follows the last
      * batch and the host reads it as end of stream (dmesh_dma_push_fin). */
     bool push_fin_requested, push_fin_sent;
-    struct dmesh_push_desc *push_shadow;      /* in tx_staging's reserved tail */
-    /* Comch fast-path wake: the descriptor goes as a producer message to the
-     * host's consumer instead of the desc copy. One the producer could not
-     * take yet is retried from the RUNNING advance. */
-    struct dmesh_wake_producer *wake;
-    uint32_t wake_consumer;                   /* the host consumer the descriptors go to */
-    bool wake_desc_pending;
-    struct dmesh_wake_desc wake_imm;          /* the send task points at it */
 
     /* Push flow control (see struct dmesh_push_cursor). The cursor shadow
-     * lives in tx_staging's reserved tail right after push_shadow, so it is
-     * mmap'd as a read-DMA destination. host_fc: 0 = probing (legacy host
-     * until the magic shows up), 1 = enforced. pushed_bytes counts published
-     * batch bytes for the data-ring occupancy check. */
+     * lives in tx_staging's reserved tail, so it is mmap'd as a read-DMA
+     * destination. host_fc: the host's cursor was seen. pushed_bytes counts
+     * the bytes of completed batches. */
     int cursor_state;                         /* 0 idle, 1 pull in flight */
+    uint64_t cursor_pull_seq;                 /* push_seq at the last pull */
     uint64_t gated_calls;                     /* consecutive gated push attempts */
     int host_fc;
     uint64_t host_consumed_seq;
@@ -283,10 +220,10 @@ struct dmesh_conn {
     uint64_t pushed_bytes;
     struct dmesh_push_cursor *cursor_shadow;  /* in tx_staging's reserved tail */
 
-    /* DMESH_D2H_EC=1 (dpu/ec_rev.h): the worker's reverse DPA thread copies
-     * this flow's batches and publishes them; push_seq and pushed_bytes follow
-     * its completions, several batches may be in flight. */
-    bool ec;                                  /* the flow pushes through the reverse DPA thread */
+    /* The flow's share of the reverse DPA thread: DPA handles of its
+     * tx_staging, rcvbuf window and the session's tail table page, taken on
+     * its first batch; the batches handed to the thread so far. */
+    bool ec;                                  /* the flow is known to the reverse DPA thread */
     bool ec_ready;                            /* the DPA handles below are valid */
     uint32_t ec_src_h, ec_win_h, ec_se_h;     /* tx_staging, rcvbuf window, tail table page */
     uint64_t ec_se_addr;                      /* host address of the flow slot's sync event word */
@@ -360,11 +297,9 @@ struct objects {
     doca_error_t (*release_mux)(struct objects *); /* stops and frees the mux threads */
     struct dmesh_dpa_thread_pool *dpa_pool;   /* pre-created DPA threads */
     struct dmesh_mux *mux;                    /* DMESH_DPA_MUX threads, NULL when off */
-    struct dmesh_ec_worker *ec;               /* DMESH_D2H_EC reverse DPA thread, NULL when off */
+    struct dmesh_ec_worker *ec;               /* the worker's reverse DPA thread */
     struct dmesh_doca_dpa_thread *dpa_thread; /* thread assigned to the active connection */
 	struct dmesh_doca_dpa_comch *dpa_comch;
-    doca_dpa_dev_comch_producer_t remote_dpa_producer;
-    doca_dpa_dev_completion_t remote_dpa_producer_comp;
 
     /* comch control path related */
     bool server_finish;             /* Controls whether server progress loop should be run */
@@ -394,34 +329,9 @@ struct objects {
     long unsigned int start_time_ns;
     long unsigned int end_time_ns;
 
-    /* Reverse (response) path, host side. Handles imported from the DPU's
-     * rcv_ring + tx_staging (DPU_TO_HOST metadata), and the host-launched DPA
-     * thread that polls the ring and DMAs tx_staging -> local rcvbuf (mirror of
-     * the DPU forward datapath). rev_conn carries the DPA thread + comch msgqs. */
-    struct doca_mmap *rev_ring_mmap;   /* imported DPU rcv_ring */
-    void *rev_ring_buf;
-    size_t rev_ring_buf_len;
-    struct doca_mmap *rev_tx_mmap;     /* imported DPU tx_staging */
-    void *rev_tx_buf;
-    size_t rev_tx_len;
-    struct dmesh_conn *rev_conn;       /* host DPA thread + comch for reverse path */
-    bool reverse_ready;
-
-    /* The reverse DPA must run on a DIFFERENT host PCI function than the
-     * forward path: a flexio process is one-per-function, and the DPU proxy
-     * already holds this host's 94:00.1. rev_objs owns the reverse device
-     * (94:00.0), its DPA instance, the local reverse rcvbuf and the imported
-     * DPU handles. rev_msg stashes the export descriptors until rev_objs's
-     * device exists to import them on. */
-    struct dmesh_export_rcv_ring_msg rev_msg;  /* stashed DPU export descriptors */
-    struct objects *rev_objs;                  /* reverse device (94:00.0) state */
-    struct dmesh_buffer rev_rcvbuf;            /* reverse DMA destination (on rev dev) */
-
     /* DPU multi-connection slots (see struct dmesh_conn) */
     struct dmesh_conn conns[DMESH_MAX_CONNECTIONS];
     struct dmesh_session sessions[DMESH_MAX_SESSIONS];
-    /* Worker: one Comch producer per session it serves fast-path flows of */
-    struct dmesh_wake_producer *wake_producers;
 };
 
 doca_error_t

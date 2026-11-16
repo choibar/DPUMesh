@@ -6,16 +6,8 @@
 static void legacy_message(void *owner, const uint8_t *data, size_t len)
 {
     struct objects *objs = owner;
-    if (objs->control_message_cb) {
+    if (objs->control_message_cb)
         objs->control_message_cb(objs, data, len);
-        return;
-    }
-    if (len < sizeof(enum dmesh_msg_type)) return;
-    struct dmesh_comch_msg *msg = (struct dmesh_comch_msg *)data;
-    if (msg->type == DMESH_MSG_EXPORT_DPA_COMP && len == sizeof(struct dmesh_dpa_comp_msg))
-        (void)process_dpa_comp_msg(objs, (struct dmesh_dpa_comp_msg *)data);
-    else if (msg->type == DMESH_MSG_EXPORT_RCV_RING && len == sizeof(struct dmesh_export_rcv_ring_msg))
-        (void)process_export_rcv_ring_msg(objs, (struct dmesh_export_rcv_ring_msg *)data);
 }
 
 static void legacy_disconnected(void *owner) { ((struct objects *)owner)->peer_gone = 1; }

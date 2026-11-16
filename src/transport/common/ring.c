@@ -12,10 +12,9 @@ DOCA_LOG_REGISTER(RING);
 #define DMA_RING_LOG_INTERVAL 1024
 
 /* Allocate a standalone descriptor ring on `dev` (mmap'd for PCI export) and
- * return it. Used for the reverse (response) path's per-connection rcv_ring,
- * which the DPU owns and the host's DPA thread polls. Mirrors setup_dma_ring
- * but takes an explicit device and returns the ring instead of storing it in
- * objs. */
+ * return it: a host flow's forward ring, which the DPU's DPA polls. Mirrors
+ * setup_dma_ring but takes an explicit device and returns the ring instead of
+ * storing it in objs. */
 doca_error_t
 alloc_dma_ring(struct dma_ring **ring_out, struct doca_dev *dev, size_t size)
 {

@@ -1162,7 +1162,7 @@ dmesh_doca_dpa_thread_stop_only(struct dmesh_doca_dpa_thread *dpa_thread)
         return;
     /* Opt-in (DMESH_THREAD_STOP): fixes the flexio thread-destroy wedge in the
      * standalone C-worker sibling-teardown reproducer (errors 2->0), but
-     * REGRESSES the proxy INGRESS_PUSH path (N=1 DSB 7.6k->17 req/s, flexio
+     * REGRESSES the proxy's client flows (N=1 DSB 7.6k->17 req/s, flexio
      * still fires) - the proxy client-channel teardown differs. Default off
      * until that path is understood. */
     if (getenv("DMESH_THREAD_STOP") == NULL)

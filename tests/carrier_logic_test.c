@@ -1,20 +1,16 @@
 #include "../src/core/carrier.c"
 #include <assert.h>
 #include <stdio.h>
-static unsigned arm_calls;
-static int arm_result;
 static unsigned progress_calls;
 int channel_dev_progress(struct channel_dev *dev)
 { (void)dev; ++progress_calls; return 0; }
-/* Off unless a test turns it on: the stripes keep their slot epoll doorbells. */
-static int flow_wake;
 static unsigned flow_arm_calls, flow_progress_calls;
-int channel_dev_flow_wake(const struct channel_dev *dev) { (void)dev; return flow_wake; }
+static int flow_arm_result;
 int channel_flow_fd(struct channel_dev *dev, uint32_t flow_id) { (void)dev; (void)flow_id; return -1; }
 void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id)
 { (void)dev; assert(flow_id == 1); ++flow_progress_calls; }
 int channel_flow_arm(struct channel_dev *dev, uint32_t flow_id)
-{ (void)dev; assert(flow_id == 1); ++flow_arm_calls; return 0; }
+{ (void)dev; assert(flow_id == 1); ++flow_arm_calls; return flow_arm_result; }
 uint32_t channel_dev_take_news(struct channel_dev *dev) { (void)dev; return 0; }
 
 /* No DPU request unless a test queues one; its answer is recorded. */
@@ -36,12 +32,8 @@ int channel_conn_open_start(struct channel_dev *dev, const struct channel_conn_c
 { (void)dev; assert(expect_open); opened_id = cfg->flow_id; *out = (struct channel_conn *)cfg; return 0; }
 int channel_conn_open_finish(struct channel_conn *conn)
 { (void)conn; if (open_error) { errno = open_error; return -1; } return open_outstanding; }
-int channel_dev_host_dpa(const struct channel_dev *dev) { (void)dev; return 0; }
 int channel_flow_free(struct channel_dev *dev, uint32_t flow_id)
 { (void)dev; return !(held_ids & (UINT32_C(1) << (flow_id - 1))); }
-int channel_conn_fds(struct channel_conn *conn, int *fds, int max)
-{ (void)conn; (void)fds; (void)max; return 0; }
-void channel_conn_clear(struct channel_conn *conn, int fd) { (void)conn; (void)fd; }
 
 static void test_closed_stripe_stays_pollable_until_retired(void)
 {
@@ -62,40 +54,36 @@ static void test_closed_stripe_stays_pollable_until_retired(void)
     free(t);
 }
 
-int channel_conn_arm(struct channel_conn *conn)
-{
-    (void)conn;
-    ++arm_calls;
-    return arm_result;
-}
 
 
-/* Only outstanding custody keeps a stripe polling: the shared control session
- * now wakes a sleeping EQ through the channel wake fd, and push receives
- * through the DPU's DOORBELL. The reverse doorbell stays one-shot. */
+/* Only outstanding custody keeps a stripe polling: control messages wake a
+ * sleeping EQ through the channel wake fd and receives through the slot's own
+ * wake fd. The doorbell stays one-shot. */
 static void test_custody_polling(void)
 {
     struct dmesh_native_transport *t = calloc(1, sizeof(*t));
     assert(t);
     struct slot *s = &t->slots[0];
     assert(pthread_mutex_init(&s->lock, NULL) == 0);
+    unsigned base = flow_arm_calls;
     assert(dmesh_native_stripe_arm(t, -1, 0) == 0);
     assert(dmesh_native_stripe_arm(t, SLOTS, 0) == 0);
-    assert(dmesh_native_stripe_arm(t, 0, 0) == 0); /* no live flow */
+    assert(flow_arm_calls == base);
     s->state = SLOT_OPEN;
     assert(dmesh_native_stripe_arm(t, 0, 0) == 0);
-    assert(s->armed && arm_calls == 1);
+    assert(s->armed && flow_arm_calls == base + 1);
     for (int i = 0; i < 4; ++i)
         assert(dmesh_native_stripe_arm(t, 0, 0) == 0);
-    assert(arm_calls == 1); /* preserve one-shot doorbell arming */
+    assert(flow_arm_calls == base + 1); /* preserve one-shot doorbell arming */
     s->tickets[0] = (struct ticket){1, 1};
     s->t_tail = 1;               /* custody outstanding: no doorbell covers its ACK */
     assert(dmesh_native_stripe_arm(t, 0, 0) == DMESH_STRIPE_CUSTODY);
     s->t_head = 1;
     assert(dmesh_native_stripe_arm(t, 0, 0) == 0);
     s->armed = 0;
-    arm_result = -1;
+    flow_arm_result = -1;
     assert(dmesh_native_stripe_arm(t, 0, 0) == 0 && !s->armed);
+    flow_arm_result = 0;
     s->state = SLOT_CLOSED;
     assert(dmesh_native_stripe_arm(t, 0, 0) == 0);
     s->fin_pending = 1;
@@ -107,27 +95,27 @@ static void test_custody_polling(void)
     free(t);
 }
 
-/* A flow wake's consumer outlives its flows: one raised as its flow closed is
- * cleared by the next request, which a closed or free slot still gets, after
- * its clear progresses away the descriptors its last flow left. */
-static void test_flow_consumer_rearmed_after_close(void)
+/* A slot's wake outlives its flows: one raised as its flow closed is cleared
+ * by the next request, which a closed or free slot still gets, after its
+ * clear completes the raised wait. */
+static void test_slot_wake_rearmed_after_close(void)
 {
     struct dmesh_native_transport *t = calloc(1, sizeof(*t));
     assert(t);
     struct slot *s = &t->slots[0];
     assert(pthread_mutex_init(&s->lock, NULL) == 0);
-    t->flow_wake = 1;
+    unsigned arms = flow_arm_calls, progresses = flow_progress_calls;
     s->state = SLOT_OPEN;
-    assert(dmesh_native_stripe_arm(t, 0, 0) == 0 && s->armed && flow_arm_calls == 1);
-    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == 2);
-    assert(flow_progress_calls == 0);   /* an open slot's receives are its poll's */
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0 && s->armed && flow_arm_calls == arms + 1);
+    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == arms + 2);
+    assert(flow_progress_calls == progresses);   /* an open slot's receives are its poll's */
     s->state = SLOT_CLOSED;
-    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == 3);
-    assert(flow_progress_calls == 1);
+    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == arms + 3);
+    assert(flow_progress_calls == progresses + 1);
     s->state = SLOT_FREE;
-    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == 4);
-    assert(flow_progress_calls == 2);
-    assert(dmesh_native_stripe_arm(t, 0, 0) == 0 && flow_arm_calls == 4); /* still one-shot */
+    assert(dmesh_native_stripe_arm(t, 0, 1) == 0 && s->armed && flow_arm_calls == arms + 4);
+    assert(flow_progress_calls == progresses + 2);
+    assert(dmesh_native_stripe_arm(t, 0, 0) == 0 && flow_arm_calls == arms + 4); /* still one-shot */
     pthread_mutex_destroy(&s->lock);
     free(t);
 }
@@ -165,7 +153,6 @@ static void test_batched_poll(void)
     struct slot *s = &t->slots[0];
     assert(pthread_mutex_init(&s->lock, NULL) == 0 && pthread_mutex_init(&t->lock, NULL) == 0);
     struct dmesh_native_event ev[8];
-    t->flow_wake = 1;
     s->state = SLOT_OPEN; s->port = 7;
     carrier_window_init(&s->window);
     unsigned progressed = flow_progress_calls;
@@ -203,7 +190,6 @@ static void test_batched_poll(void)
     assert(s->state == SLOT_CLOSED);
     dmesh_native_release(t, CHANNEL_DATA_OFF + 256);
     assert(s->state == SLOT_FREE);
-    t->flow_wake = 0;
     pthread_mutex_destroy(&s->lock);
     free(t);
 }
@@ -251,7 +237,6 @@ static void test_half_close_and_held_buffers(void)
     assert(t);
     struct slot *s = &t->slots[0];
     assert(pthread_mutex_init(&s->lock, NULL) == 0 && pthread_mutex_init(&t->lock, NULL) == 0);
-    for (int i = 0; i < SLOTS; ++i) t->slots[i].epfd = -1;
     struct dmesh_native_event ev[8];
     s->state = SLOT_OPEN; s->port = 9; s->conn = (struct channel_conn *)t;
     t->port_slot[9] = 1; t->active_stripes = 1;
@@ -390,7 +375,7 @@ int main(void)
 {
     test_closed_stripe_stays_pollable_until_retired();
     test_custody_polling();
-    test_flow_consumer_rearmed_after_close();
+    test_slot_wake_rearmed_after_close();
     test_batched_poll();
     test_half_close_and_held_buffers();
     test_held_id_skipped();
@@ -427,6 +412,6 @@ int main(void)
         assert(carrier_window_release(&v, (uint32_t)(k * 64u % 4096u)) == 0);
         assert(carrier_window_advance(&v, &seq, &bytes) && seq == k && bytes == k * 64u);
     }
-    puts("carrier logic: chunking, release window, custody polling, flow consumer rearm, batched poll, half close, async close and open, held buffers, held flow ids (sync and async opens) and flow requests: PASS");
+    puts("carrier logic: chunking, release window, custody polling, slot wake rearm, batched poll, half close, async close and open, held buffers, held flow ids (sync and async opens) and flow requests: PASS");
     return 0;
 }

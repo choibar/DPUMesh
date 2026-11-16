@@ -13,7 +13,7 @@ project('dpumesh', 'c', 'cpp',
 #
 #   common/  buffers, rings, per-worker objects, Comch control-path framing,
 #            DPA thread/msgq management (both sides)
-#   dpu/     Comch server, forward DPA pool + DMA push engine
+#   dpu/     Comch server, forward DPA threads, the reverse DPA thread
 #   host/    Comch client, and the channel layer the host library builds on
 #   device/  the DPA kernel (compiled by dpacc, see build_dpacc.sh)
 #
@@ -38,8 +38,8 @@ deps += dependency('doca-dpa')
 deps += dependency('libflexio')
 
 # DPA management (common/dpa.c, and comch_msgq.c on top of it) references the
-# dpacc host stub; the DPA-free set is what the host library's Makefile and
-# apps/dmeshgo's shared library compile on their own.
+# dpacc host stub; the host library's Makefile and apps/dmeshgo's shared
+# library compile parts of the DPA-free set on their own.
 common_nodpa_srcs = files(
   'common/buffer.c',
   'common/ring.c',
@@ -52,7 +52,6 @@ common_nodpa_srcs = files(
 common_srcs = common_nodpa_srcs + files('common/dpa.c', 'common/dpa_runtime.c', 'common/comch_msgq.c')
 dpu_srcs = files(
   'dpu/comch_server.c',
-  'dpu/comch_wake.c',
   'dpu/dispatcher.c',
   'dpu/placement.c',
   'dpu/dma.c',
@@ -64,9 +63,9 @@ host_srcs = files(
   'host/comch_client.c',
   'host/comch_client_legacy.c',
 )
-# The host library's channel layer. host_stubs.c stubs the two server-side
-# symbols the shared sources reference, so this archive must never be linked
-# together with dmesh_dpu.
+# The host library's channel layer. host_stubs.c stubs the server-side symbol
+# the shared sources reference, so this archive must never be linked together
+# with dmesh_dpu.
 channel_srcs = files(
   'host/channel.c',
   'host/host_stubs.c',

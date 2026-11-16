@@ -9,9 +9,8 @@
  *
  * Modes (DMESH_MODE):
  *   sink   count every forward DMA completion (host -> DPU) and drop the bytes
- *   echo   ...and send the same bytes back (DPU -> host). How they go back is
- *          the channel layer's business: a push batch (dpu-dma reverse path) or a descriptor the
- *          host's DPA pulls (host-dpa reverse path, CLIENT / BACKEND_PULL flows).
+ *   echo   ...and send the same bytes back (DPU -> host), through the worker's
+ *          reverse DPA thread.
  *
  * Output, once a second:
  *   TOTAL(N conns): recv: <DMA/s> (<Gbps>), sent: <push/s> (<Gbps>), ...

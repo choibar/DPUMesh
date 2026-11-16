@@ -12,17 +12,15 @@ BINDIR := $(BUILD)/bin
 ABI_MAJOR := 6
 TRANSPORT := src/transport
 DOCA_INC := /opt/mellanox/doca/include
+# The library runs no DPA: Comch and registered memory only. Tests that
+# compile DPU sources link the DPA libraries too.
+LIB_DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch)
 DOCA_LIBS := $(shell pkg-config --libs doca-common doca-comch doca-dma doca-dpa libflexio)
-DPACC := $(TRANSPORT)/build_dpacc.sh
-DPA_KERNEL := $(BUILD)/dpa/device/dpa_kernel.a
-DPA_BENCH := $(TRANSPORT)/device/benchmarks/dpa_bench.c
 HOST_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -D_GNU_SOURCE -DDOCA_ALLOW_EXPERIMENTAL_API \
     -Iinclude -I. -I$(TRANSPORT)/common -I$(TRANSPORT)/dpu -I$(TRANSPORT)/host -I$(DOCA_INC)
-# Transport sources the host library needs: the common set, the DPA
-# management the host-dpa reverse path's host DPA thread uses, the Comch client and the
-# channel layer. Keep in step with src/transport/meson.build.
-TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c comch_common.c \
-    comch_consumer.c comch_producer.c comch_msgq.c dpa.c dpa_runtime.c ring.c) \
+# Transport sources the host library needs: the common set, the Comch client
+# and the channel layer. Keep in step with src/transport/meson.build.
+TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c comch_common.c ring.c) \
     $(addprefix $(TRANSPORT)/host/,comch_client.c comch_client_legacy.c channel.c host_stubs.c)
 TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
@@ -30,7 +28,7 @@ LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c 
 HOST_TESTS := carrier_logic_test service_resolve_test native_writable_test native_polling_test native_signaled_test native_loss_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
     channel_session_test comch_client_test session_server_test backend_dispatch_test dma_cleanup_test dpa_cleanup_test dpa_runtime_test \
-    dispatch_wake_test dispatch_request_test placement_instr_test rx_consumed_pos_test native_listen_test channel_flow_wake_test
+    dispatch_request_test placement_instr_test rx_consumed_pos_test native_listen_test channel_flow_wake_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
 .PHONY: all lib test test-native-headers test-abi examples clean
@@ -41,20 +39,14 @@ lib: $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so
 $(LIBDIR) $(TESTDIR) $(BINDIR):
 	mkdir -p $@
 
-# The DPA kernel + its (PIC) host stub, compiled by dpacc: the host-dpa reverse path runs
-# the same poll_desc_ring kernel on a host-owned DPA thread.
-$(DPA_KERNEL): $(TRANSPORT)/device/dpa_kernel.c $(DPA_BENCH) $(TRANSPORT)/device/*.h $(TRANSPORT)/device/benchmarks/*.h $(TRANSPORT)/common/dpa_common.h $(TRANSPORT)/common/dpa_bench.h $(DPACC)
-	$(DPACC) $(abspath $(BUILD)/dpa) $(abspath $(TRANSPORT)) $(abspath $<) dpa_kernel nv-dpa-bf3 \
-	    $$(pkg-config --variable=libdir doca-dpa) $(abspath $(DPA_BENCH))
-
 # Calls within the library bind directly and calls into libc and DOCA go
 # through the GOT without a PLT stub; the exported symbols are unchanged.
 LIB_CFLAGS := -fno-plt -fno-semantic-interposition
 LIB_LDFLAGS := -Wl,-Bsymbolic-functions
 
-$(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/*.h src/core/*.h $(TRANSPORT_HDRS) | $(LIBDIR)
+$(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) include/dpumesh/*.h src/core/*.h $(TRANSPORT_HDRS) | $(LIBDIR)
 	$(CC) $(HOST_CFLAGS) $(LIB_CFLAGS) -fPIC -shared -Wl,-soname,libdpumesh.so.$(ABI_MAJOR) -Wl,--no-undefined \
-	    $(LIB_LDFLAGS) $(LIB_SRCS) $(DPA_KERNEL) -pthread $(DOCA_LIBS) -o $@
+	    $(LIB_LDFLAGS) $(LIB_SRCS) -pthread $(LIB_DOCA_LIBS) -o $@
 	ln -sfn libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh.so
 
 $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR)
@@ -77,7 +69,7 @@ $(TESTDIR)/session_flow_test: tests/session_flow_test.c $(TRANSPORT)/common/obje
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $(filter %.c,$^) -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/channel_session_test: tests/channel_session_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -DCHANNEL_REV_READY_MS=20 -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
+	$(CC) $(HOST_CFLAGS) -DCHANNEL_REPLY_MS=20 -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/channel_flow_wake_test: tests/channel_flow_wake_test.c $(TRANSPORT)/host/channel.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
@@ -89,9 +81,6 @@ $(TESTDIR)/session_server_test: tests/session_server_test.c $(TRANSPORT)/common/
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT)/dpu/dpa_mux.c $(TRANSPORT)/common/dpa_runtime.c $(TRANSPORT)/common/object.c $(TRANSPORT)/common/buffer.c -Wl,--gc-sections $(DOCA_LIBS) -pthread -o $@
 
 $(TESTDIR)/backend_dispatch_test: tests/backend_dispatch_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
-
-$(TESTDIR)/dispatch_wake_test: tests/dispatch_wake_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/dpu/placement.c -Wl,--gc-sections -pthread $(DOCA_LIBS) -o $@
 
 $(TESTDIR)/dispatch_request_test: tests/dispatch_request_test.c $(TRANSPORT)/dpu/dispatcher.c $(TRANSPORT)/dpu/placement.c $(TRANSPORT_HDRS) | $(TESTDIR)

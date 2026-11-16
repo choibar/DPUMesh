@@ -1,5 +1,5 @@
-/* DPU -> host push through the worker's reverse DPA thread (DMESH_D2H_EC=1).
- * See ec_rev.h and common/dpa_common.h. */
+/* DPU -> host through the worker's reverse DPA thread. See ec_rev.h and
+ * common/dpa_common.h. */
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -51,16 +51,6 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-int dmesh_ec_enabled(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *v = getenv("DMESH_D2H_EC");
-        on = v != NULL && *v != '\0' && strcmp(v, "0") != 0;
-    }
-    return on;
-}
-
 doca_error_t dmesh_ec_init(struct objects *objs)
 {
     struct dmesh_ec_worker *w;
@@ -71,7 +61,7 @@ doca_error_t dmesh_ec_init(struct objects *objs)
     const char *step = "";
     doca_error_t r;
 
-    if (!dmesh_ec_enabled() || objs->ec != NULL)
+    if (objs->ec != NULL)
         return DOCA_SUCCESS;
     if (objs->dpa_pool == NULL || objs->dpa_pool->dpa == NULL)
         return DOCA_ERROR_BAD_STATE;
@@ -110,8 +100,7 @@ doca_error_t dmesh_ec_init(struct objects *objs)
     EC_TRY(DMESH_DPA_CALL(doca_dpa_rpc(w->dpa, mux_kick_rpc, &rpc_ret, notify_h)), "first activation");
 #undef EC_TRY
     objs->ec = w;
-    DOCA_LOG_INFO("worker %d: reverse DPA thread running (D2H through the DPA, host wake by sync event)",
-                  objs->worker_idx);
+    DOCA_LOG_INFO("worker %d: reverse DPA thread running", objs->worker_idx);
     return DOCA_SUCCESS;
 fail:
     DOCA_LOG_ERR("worker %d: reverse DPA thread: %s failed: %s", objs->worker_idx, step, doca_error_get_name(r));
@@ -126,8 +115,6 @@ doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn)
     size_t len = 0;
     doca_error_t r;
 
-    if (!dmesh_ec_enabled() || !DMESH_FLOW_USES_PUSH(conn->flow.mode))
-        return DOCA_SUCCESS;
     if (objs->ec == NULL || conn->pending_tails == NULL || conn->flow_id == 0 || conn->flow_id > 32)
         return DOCA_ERROR_BAD_STATE;
     r = doca_mmap_create_from_export(NULL, conn->pending_tails->desc, conn->pending_tails->desc_len, objs->dev,
@@ -137,7 +124,7 @@ doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn)
     if (r == DOCA_SUCCESS)
         r = doca_mmap_get_memrange(conn->ec_se_mmap, &base, &len);
     if (r == DOCA_SUCCESS && len < DMESH_TAILS_ALLOC)
-        r = DOCA_ERROR_INVALID_VALUE;   /* a host library without the sync event words */
+        r = DOCA_ERROR_INVALID_VALUE;   /* the page holds the slots' sync event words */
     if (r == DOCA_SUCCESS)
         r = DMESH_DPA_CALL(doca_mmap_dev_get_dpa_handle(conn->ec_se_mmap, objs->dev, &conn->ec_se_h));
     if (r != DOCA_SUCCESS) {

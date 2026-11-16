@@ -7,13 +7,38 @@
  * replaced. A submitted fake task cannot be freed, and an IDLE transition
  * requires every allocated task to have been returned, like the SDK contract. */
 #define DMESH_DMA_STOP_MAX_POLLS 4u
+#define DMESH_EC_EXTERN
 #include "../src/transport/dpu/dma.c"
 
-/* The fast-path producer is exercised on hardware, not here. */
-doca_error_t dmesh_wake_send_desc(struct dmesh_conn *c, uint64_t seq, uint32_t pos, uint32_t len)
+/* The reverse DPA thread as dma.c sees it: the entries posted to its ring and
+ * the flow's completion line. The thread itself is exercised on hardware. */
+struct ec_entry { uint64_t seq; uint32_t pos, len; uint64_t cum; };
+static struct ec_entry ec_posted[8];
+static unsigned ec_posts;
+static int ec_ring_full;
+static uint64_t ec_done_seq, ec_done_bytes;
+doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn)
 {
-    (void)c; (void)seq; (void)pos; (void)len;
-    return DOCA_ERROR_BAD_STATE;
+    conn->ec_ready = true;
+    return DOCA_SUCCESS;
+}
+doca_error_t dmesh_ec_post(struct dmesh_conn *conn, uint64_t seq, uint32_t pos, uint32_t len,
+                           uint64_t src_addr, uint64_t cum_bytes)
+{
+    (void)conn; (void)src_addr;
+    if (ec_ring_full)
+        return DOCA_ERROR_AGAIN;
+    assert(ec_posts < sizeof(ec_posted) / sizeof(ec_posted[0]));
+    ec_posted[ec_posts++] = (struct ec_entry){seq, pos, len, cum_bytes};
+    return DOCA_SUCCESS;
+}
+int dmesh_ec_reap(struct dmesh_conn *conn)
+{
+    if (ec_done_seq <= conn->push_seq || ec_done_seq > conn->ec_issued_seq)
+        return 0;
+    conn->push_seq = ec_done_seq;
+    conn->pushed_bytes = ec_done_bytes;
+    return 1;
 }
 
 struct test_buffer { int refs, releases; };
@@ -214,14 +239,15 @@ static void finish_fixture(struct dmesh_conn *conn)
 static void test_flush_and_dependency_order(void)
 {
     struct dmesh_conn *conn = create_fixture(3);
-    fixture->tasks[0].entry->kind = DMESH_TASK_PUSH_DATA;
+    fixture->tasks[0].entry->kind = DMESH_TASK_PULL_CURSOR;
     fixture->tasks[1].fail_completion = true;
     fixture->tasks[2].entry->in_flight = false;
     fixture->tasks[2].submitted = false;
     assert(put_submission_dma_task(conn, (void *)&fixture->tasks[2]) == DOCA_SUCCESS);
-    conn->push_state = 1;
+    conn->cursor_state = 1;
     conn->dma_pending_cnt = 1;
     assert(cleanup_dma_tasks(conn) == DOCA_SUCCESS);
+    assert(conn->cursor_state == 0);
     assert(fixture->free_count == 3 && fixture->submit_count == 0);
     assert(fixture->progress_count > 0 && fixture->inventory_count == 1);
     for (unsigned i = 0; i < 6; ++i)
@@ -339,94 +365,110 @@ static void test_submission_failure_does_not_release_caller_buffers(void)
     finish_fixture(conn);
 }
 
-static void test_push_fin_follows_the_last_batch(void)
+/* A flow over a 1 KiB data ring: batches of at most a quarter of it. */
+static void push_flow(struct dmesh_conn *conn, uint8_t *staging, size_t staging_len, uint8_t *window)
+{
+    conn->tx_staging = staging;
+    conn->tx_staging_len = staging_len;
+    conn->tx_staging_mmap = (void *)fixture;
+    conn->rcvbuf.mmap = (void *)fixture;
+    conn->rcvbuf.buf = window;
+    conn->rcvbuf.size = DMESH_PUSH_DATA_OFF + 1024;
+    ec_posts = 0;
+    ec_ring_full = 0;
+    ec_done_seq = ec_done_bytes = 0;
+}
+
+/* Batches go to the reverse thread back to back, each at its own place in
+ * the host's data ring; a full thread ring or the host's free slots hold the
+ * next one, and a held flow pulls the host's cursor. */
+static void test_push_batches_and_gate(void)
 {
     struct dmesh_conn *conn = create_fixture(2);
-    uint8_t staging[256], ring[64];
-    struct test_task *last = &fixture->tasks[0], *spare = &fixture->tasks[1];
-    last->entry->kind = DMESH_TASK_PUSH_DESC;
+    static uint8_t staging[4096], window[DMESH_PUSH_DATA_OFF + 1024];
+    struct test_task *spare = &fixture->tasks[1];
     spare->submitted = spare->entry->in_flight = false;
     assert(put_free_dma_task(conn, (void *)spare) == DOCA_SUCCESS);
-    conn->tx_staging = staging;
-    conn->tx_staging_len = sizeof(staging);
-    conn->rcvbuf.mmap = (void *)fixture;
-    conn->rcvbuf.buf = ring;
-    conn->push_seq = 16;
+    push_flow(conn, staging, sizeof(staging), window);
+
+    assert(dmesh_dma_push_staged(conn, 0, 1000) == 256);
+    assert(dmesh_dma_push_staged(conn, 256, 744) == 256);
+    assert(ec_posts == 2 && conn->ec_ready);
+    assert(ec_posted[0].seq == 1 && ec_posted[0].pos == 0 && ec_posted[0].len == 256 && ec_posted[0].cum == 256);
+    assert(ec_posted[1].seq == 2 && ec_posted[1].pos == 256 && ec_posted[1].cum == 512);
+    assert(conn->ec_issued_seq == 2 && conn->push_seq == 0 && conn->pushed_bytes == 0);
+
+    ec_ring_full = 1;
+    assert(dmesh_dma_push_staged(conn, 512, 100) == 0 && conn->ec_issued_seq == 2);
+    ec_ring_full = 0;
+
+    /* The thread completed batch 1: its bytes may be reused. */
+    ec_done_seq = 1;
+    ec_done_bytes = 256;
+    uint64_t bytes = 0;
+    fixture->lend_buffers = 2;           /* an early completion pulls the cursor */
+    assert(dmesh_dma_tx_completed(conn, &bytes) == DOCA_SUCCESS && bytes == 256 && conn->push_seq == 1);
+    assert(conn->cursor_state == 1 && fixture->submit_count == 1 && fixture->lend_buffers == 0);
+    (void)doca_pe_progress(fixture->objs.consumer_pe);   /* the fixture's first task */
+    conn->cursor_shadow->magic = DMESH_PUSH_FC_MAGIC;
+    conn->cursor_shadow->consumed_seq = 1;
+    conn->cursor_shadow->consumed_bytes = 256;
+    (void)doca_pe_progress(fixture->objs.consumer_pe);   /* the pull */
+    assert(conn->cursor_state == 0 && conn->host_fc && conn->host_consumed_seq == 1);
+
+    /* All but two of the host's slots in flight: held, with a fresh pull. */
+    conn->ec_issued_seq = conn->host_consumed_seq + DMESH_PUSH_DESC_N - 2;
+    fixture->lend_buffers = 2;
+    unsigned posts = ec_posts, submits = fixture->submit_count;
+    assert(dmesh_dma_push_staged(conn, 512, 100) == 0);
+    assert(ec_posts == posts && fixture->submit_count == submits + 1 && conn->cursor_state == 1);
+    (void)doca_pe_progress(fixture->objs.consumer_pe);
+    assert(cleanup_dma_tasks(conn) == DOCA_SUCCESS);
+    finish_fixture(conn);
+}
+
+/* The end of stream is a zero-length entry after the flow's last batch; the
+ * flow takes no bytes after it and posts it once. */
+static void test_push_fin_follows_the_last_batch(void)
+{
+    struct dmesh_conn *conn = create_fixture(0);
+    static uint8_t staging[4096], window[DMESH_PUSH_DATA_OFF + 1024];
+    push_flow(conn, staging, sizeof(staging), window);
+    conn->ec_ready = true;
+    conn->ec_issued_seq = 16;
+    conn->ec_issued_bytes = 4000;
+    conn->push_seq = 16 - (DMESH_PUSH_DESC_N - 1);   /* one slot short */
     conn->push_pos = 40;
-    conn->push_len = 8;
-    conn->push_state = 2;
 
     conn->push_fin_requested = true;
     assert(dmesh_dma_push_staged(conn, 0, 1) == -(int)DOCA_ERROR_BAD_STATE);
-    assert(dmesh_dma_push_fin(conn) == 0);
-    assert(!conn->push_fin_sent && fixture->submit_count == 0);
-
-    /* The last descriptor lands, then the FIN is published after it. */
-    fixture->lend_buffers = 2;
-    (void)doca_pe_progress(fixture->objs.consumer_pe);
-    assert(conn->push_fin_sent && conn->push_state == 2 && fixture->submit_count == 1);
-    assert(conn->push_seq == 17 && conn->push_shadow->seq == 18 && conn->push_shadow->pos == 48);
-    assert(conn->push_shadow->len == 0 && fixture->lend_buffers == 0);
-    assert(dmesh_dma_push_fin(conn) == 0 && fixture->submit_count == 1);
-    assert(cleanup_dma_tasks(conn) == DOCA_SUCCESS);
-    assert(fixture->buffers[4].refs == 0 && fixture->buffers[5].refs == 0);
+    assert(dmesh_dma_push_fin(conn) == 0 && !conn->push_fin_sent && ec_posts == 0);
+    conn->push_seq = 15;
+    assert(dmesh_dma_push_fin(conn) == 0 && conn->push_fin_sent && ec_posts == 1);
+    assert(ec_posted[0].seq == 17 && ec_posted[0].pos == 40 && ec_posted[0].len == 0);
+    assert(ec_posted[0].cum == 4000 && conn->ec_issued_seq == 17);
+    assert(dmesh_dma_push_fin(conn) == 0 && ec_posts == 1);
     finish_fixture(conn);
 }
 
-static void test_push_descriptor_failure_does_not_release_source(void)
-{
-    struct dmesh_conn *conn = create_fixture(1);
-    uint8_t staging[128] = {0}, ring[128] = {0};
-    struct test_task *t = &fixture->tasks[0];
-    t->entry->kind = DMESH_TASK_PUSH_DATA;
-    conn->flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
-    conn->tx_staging = staging;
-    conn->tx_staging_len = sizeof(staging);
-    conn->rcvbuf.buf = ring;
-    conn->push_state = 1;
-    conn->push_len = 8;
-    conn->pushed_bytes = 32;
-    fixture->lend_buffers = 2;
-    fixture->submit_error = DOCA_ERROR_UNEXPECTED;
-    (void)doca_pe_progress(fixture->objs.consumer_pe);
-    assert(conn->state == DMESH_CONN_ERROR && conn->dma_closing);
-    assert(conn->pushed_bytes == 32 && conn->push_seq == 0);
-    uint64_t bytes = 999;
-    assert(dmesh_dma_tx_completed(conn, &bytes) == DOCA_ERROR_BAD_STATE);
-    assert(bytes == 999);
-    assert(fixture->buffers[4].refs == 0 && fixture->buffers[5].refs == 0);
-    finish_fixture(conn);
-}
-
+/* What the proxy may reuse is what the reverse thread completed. */
 static void test_tx_completion_sources(void)
 {
-    struct dma_ring_ctrl ctrl = {0};
-    struct dma_ring ring = {.ctrl = &ctrl};
-    struct dmesh_conn conn = {.state = DMESH_CONN_RUNNING, .rcv_ring = &ring};
+    struct dmesh_conn conn = {.state = DMESH_CONN_RUNNING};
     uint64_t bytes = 999;
-    conn.flow.mode = DMESH_FLOW_MODE_CLIENT;
-    ctrl.producer_tail = 3;
+    ec_done_seq = ec_done_bytes = 0;
     assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_SUCCESS && bytes == 0);
-    ctrl.consumer_head = 1;
-    ctrl.completed_bytes = 64;
-    assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_SUCCESS && bytes == 64);
-    ctrl.error = 1;
-    assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_ERROR_IO_FAILED);
-    assert(conn.state == DMESH_CONN_ERROR && bytes == 64);
-
-    conn.state = DMESH_CONN_RUNNING;
-    conn.flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
-    conn.pushed_bytes = 64;
-    conn.push_len = 128;
-    conn.push_state = 1;
-    assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_SUCCESS && bytes == 64);
-    conn.push_state = 2; /* payload DMA alone does not publish the batch */
-    assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_SUCCESS && bytes == 64);
-    conn.push_seq = 7; /* finalizer will not schedule a cursor pull */
-    dmesh_dma_push_desc_done(&conn);
-    assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_SUCCESS && bytes == 192);
+    conn.ec_issued_seq = 3;
+    ec_done_seq = 2;
+    ec_done_bytes = 192;
+    assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_SUCCESS && bytes == 192 && conn.push_seq == 2);
+    ec_done_seq = 4;                      /* past what was issued: not this flow's */
+    assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_SUCCESS && bytes == 192 && conn.push_seq == 2);
     conn.state = DMESH_CONN_ERROR;
     assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_ERROR_BAD_STATE);
+    conn.state = DMESH_CONN_RUNNING;
+    conn.dma_closing = true;
+    assert(dmesh_dma_tx_completed(&conn, &bytes) == DOCA_ERROR_BAD_STATE && bytes == 192);
 }
 
 int main(void)
@@ -439,9 +481,9 @@ int main(void)
     test_destroy_failures_are_retryable();
     test_error_callback_keeps_sibling_tasks();
     test_submission_failure_does_not_release_caller_buffers();
+    test_push_batches_and_gate();
     test_push_fin_follows_the_last_batch();
     test_tx_completion_sources();
-    test_push_descriptor_failure_does_not_release_source();
     puts("dma_cleanup_test: PASS");
     return 0;
 }

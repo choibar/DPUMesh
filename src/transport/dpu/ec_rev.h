@@ -5,29 +5,26 @@
 #include <doca_error.h>
 
 /*
- * DPU -> host push through a DPU-owned DPA thread (DMESH_D2H_EC=1). Each
- * worker owns one reverse DPA thread (device: run_ec_rev; layout and protocol
- * in common/dpa_common.h). A push flow's batches go into the thread's ring
- * instead of the flow's doca_dma engine: the DPA copies them, publishes their
- * descriptors and wakes the host through the flow slot's sync event; the ARM
- * takes no completion and sends no message. Several batches of a flow may be
- * in flight; push_seq and pushed_bytes follow the thread's completions, read
- * whenever the worker asks (dmesh_ec_reap). The host must create the slot
- * sync events (DPUMESH_D2H_EC=1 in the host library).
+ * DPU -> host through a DPU-owned DPA thread. Each worker owns one reverse
+ * DPA thread (device: run_ec_rev; layout and protocol in common/dpa_common.h).
+ * A flow's batches go into the thread's ring: the DPA copies them, publishes
+ * their descriptors and wakes the host through the flow slot's sync event;
+ * the ARM takes no completion and sends no message. Several batches of a flow
+ * may be in flight; push_seq and pushed_bytes follow the thread's
+ * completions, read whenever the worker asks (dmesh_ec_reap).
  */
 
 struct objects;
 struct dmesh_conn;
 struct dmesh_ec_ctl;
 
-#ifdef DOCA_ARCH_DPU
+/* DMESH_EC_EXTERN: a host unit test supplies these instead of the stubs. */
+#if defined(DOCA_ARCH_DPU) || defined(DMESH_EC_EXTERN)
 
-/* DMESH_D2H_EC, read once. */
-int dmesh_ec_enabled(void);
 /* Starts the worker's reverse DPA thread once its DPA context exists. */
 doca_error_t dmesh_ec_init(struct objects *objs);
-/* A push flow's metadata arrived (its session's TAILS still pending): imports
- * the tail table page and marks the flow for the reverse thread. */
+/* A flow's metadata arrived (its session's TAILS still pending): imports the
+ * tail table page and marks the flow for the reverse thread. */
 doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn);
 /* DPA handles of the flow's tx_staging and rcvbuf window, taken on its first batch. */
 doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn);
@@ -45,9 +42,8 @@ doca_error_t dmesh_ec_quiesce_step(struct dmesh_conn *conn);
 /* Releases the flow's import and clears its E-c state. */
 void dmesh_ec_conn_reset(struct dmesh_conn *conn);
 
-#else /* !DOCA_ARCH_DPU: host builds and unit tests, never on */
+#else /* !DOCA_ARCH_DPU: host builds and unit tests, no DPA */
 
-static inline int dmesh_ec_enabled(void) { return 0; }
 static inline doca_error_t dmesh_ec_init(struct objects *objs) { (void)objs; return DOCA_SUCCESS; }
 static inline doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn) { (void)conn; return DOCA_SUCCESS; }
 static inline doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn) { (void)conn; return DOCA_ERROR_NOT_SUPPORTED; }

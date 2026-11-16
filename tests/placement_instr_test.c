@@ -45,7 +45,7 @@ int main(void)
      * rule leaves every worker eligible. The first two fit on w0 (100M, then
      * 100M + 150M assumed); the third would make w0 400M, so it goes to w1. */
     struct dmesh_export_metadata_msg metadata = {0};
-    metadata.flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
+    metadata.flow.mode = DMESH_FLOW_MODE_CLIENT;
     struct dmesh_session_header open = {.type = DMESH_SESSION_OPEN, .generation = 1,
                                         .payload_len = sizeof(metadata)};
     int owners[3];
@@ -79,7 +79,7 @@ int main(void)
         struct assignment *a = &d.flows[10 + i];
         *a = (struct assignment){.used = true, .ready = true, .control = d.controls[0], .session = s,
             .key = {1, s->epoch, 10 + i, 1}, .location = {.worker = 0, .slot = 10 + i, .ownership_epoch = 1},
-            .mode = DMESH_FLOW_MODE_INGRESS_PUSH, .pair = 0x10 + i,
+            .mode = DMESH_FLOW_MODE_CLIENT, .pair = 0x10 + i,
             .stat_valid = true, .rps = 1000, .instr_per_req = 250000};
     }
     migrate_due(&d);

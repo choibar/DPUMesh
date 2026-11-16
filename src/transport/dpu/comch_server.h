@@ -101,9 +101,6 @@ struct dmesh_conn;
 doca_error_t server_send_flow_msg(struct dmesh_conn *, uint16_t, const void *, size_t, int32_t);
 
 doca_error_t
-export_dpa_comp_to_host(struct objects *objs);
-
-doca_error_t
 dmesh_doca_init_comch_server(struct dmesh_doca_objects *objs, const char *server_name, 
 							 bool enable_fast_path);
 #endif // COMCH_SERVER_H

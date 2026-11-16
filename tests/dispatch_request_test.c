@@ -6,11 +6,6 @@
 #include <assert.h>
 #include "src/transport/dpu/dispatcher.c"
 
-doca_error_t dmesh_wake_attach(struct dmesh_conn *c, struct doca_comch_connection *connection, uint32_t consumer)
-{
-    (void)c; (void)connection; (void)consumer;
-    return DOCA_SUCCESS;
-}
 
 /* The PREPARE and SCALE messages the dispatcher sent. */
 static struct { uint16_t type; uint32_t flow, generation, count, token; size_t len; } sent[8];
@@ -37,7 +32,7 @@ static struct assignment *open_client(struct dmesh_dispatcher *d, struct dmesh_s
                                       uint32_t generation, uint32_t ip, uint16_t port)
 {
     struct dmesh_export_metadata_msg metadata = {0};
-    metadata.flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
+    metadata.flow.mode = DMESH_FLOW_MODE_CLIENT;
     metadata.flow.dst_ip = ip;
     metadata.flow.dst_port = port;
     struct dmesh_session_header open = {.type = DMESH_SESSION_OPEN, .flow_id = flow,

@@ -2,7 +2,7 @@
 // as net.Conn / net.Listener, so a Go service can dial and serve gRPC (or any
 // byte-stream protocol) THROUGH the DPU proxy with no TCP bridge processes.
 //
-//   - Dial:   an INGRESS_PUSH channel — the DPU proxy terminates h2 and routes
+//   - Dial:   an CLIENT channel — the DPU proxy terminates h2 and routes
 //     the flow through its outbound L7 stack toward the flow's dst key.
 //   - Listen: BACKEND channels — this process registers itself as the backend
 //     provider for (ip, port); the proxy connects through the channel instead

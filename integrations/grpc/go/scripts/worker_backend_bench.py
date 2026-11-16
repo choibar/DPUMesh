@@ -88,7 +88,7 @@ class Sampler:
 def host_env(root):
     env = os.environ.copy()
     env.update(LD_LIBRARY_PATH=str(root/'build/lib')+':/opt/mellanox/doca/lib/x86_64-linux-gnu:/opt/mellanox/flexio/lib',
-               DPUMESH_PCI_ADDR='0b:00.1', DPUMESH_SERVER='DPUMesh0', DPUMESH_REVERSE='dpu-dma')
+               DPUMESH_PCI_ADDR='0b:00.1', DPUMESH_SERVER='DPUMesh0')
     return env
 
 

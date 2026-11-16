@@ -17,16 +17,8 @@
 #include "dpa.h"
 #include "buffer.h"
 #include "ring.h"
-#include "comch_wake.h"
-
-static void dmesh_ec_after_reap(struct dmesh_conn *conn);
-static int dmesh_ec_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len);
 
 DOCA_LOG_REGISTER(DMA);
-
-/* backend push chaining stages (defined below, called from the completion cb) */
-static void dmesh_dma_push_submit_desc(struct dmesh_conn *conn);
-static void dmesh_dma_push_desc_done(struct dmesh_conn *conn);
 
 #ifndef DMESH_DMA_STOP_MAX_POLLS
 #define DMESH_DMA_STOP_MAX_POLLS 100000u
@@ -119,8 +111,8 @@ send_dma_request_to_dpa(struct dmesh_conn *conn)
     }
 
     dma_req_msg.type = COMCH_MSG_TYPE_DMA_REQ;
-    dma_req_msg.dpa_producer = objs->remote_dpa_producer;
-    dma_req_msg.dpa_producer_comp = objs->remote_dpa_producer_comp;
+    dma_req_msg.dpa_producer = 0;      /* the request only starts the thread */
+    dma_req_msg.dpa_producer_comp = 0;
     dma_req_msg.src_mmap = src_mmap;
     dma_req_msg.dst_mmap = dst_mmap;
     dma_req_msg.src_addr = (uint64_t)conn->sndbuf.buf;
@@ -271,23 +263,11 @@ static void dmesh_doca_dpa_dma_task_completed_cb(struct doca_dma_task_memcpy *dm
         }
     }
     if (dma_admission_closed(conn)) {
-        conn->push_state = 0;
         conn->cursor_state = 0;
         conn->dma_pending_cnt = 0;
         return;
     }
 
-    /* Backend push chaining (task submission is allowed inside a completion
-     * callback): data landed -> publish its descriptor; descriptor landed ->
-     * the batch is visible, accept the next one. */
-    if (kind == DMESH_TASK_PUSH_DATA) {
-        dmesh_dma_push_submit_desc(conn);
-        return;
-    }
-    if (kind == DMESH_TASK_PUSH_DESC) {
-        dmesh_dma_push_desc_done(conn);
-        return;
-    }
     if (kind == DMESH_TASK_PULL_CURSOR) {
         static int probed;
 
@@ -348,8 +328,6 @@ static void dmesh_doca_dpa_dma_task_error_cb(struct doca_dma_task_memcpy *dma_ta
     }
     conn->dma_closing = true;
     conn->dma_pending_cnt = 0;
-    if (kind == DMESH_TASK_PUSH_DATA || kind == DMESH_TASK_PUSH_DESC)
-        conn->push_state = 0;
     if (kind == DMESH_TASK_PULL_CURSOR)
         conn->cursor_state = 0;
 
@@ -422,7 +400,6 @@ static void dma_engine_reset_queues(struct dmesh_conn *conn)
     conn->dma_pending_cnt = 0;
     conn->recv_seg_head = 0;
     conn->recv_seg_cnt = 0;
-    conn->push_state = 0;
     conn->cursor_state = 0;
 }
 
@@ -799,17 +776,10 @@ submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca
     return submit_dma_task_kind(conn, src, dst, DMESH_TASK_NORMAL);
 }
 
-/* Backend (안 2) push: DPU -> host with this connection's doca_dma engine, no
- * host DPA. The batch is ALREADY staged at tx_staging+src_pos (the Rust writer
- * put it there); this DMAs up to DMESH_PUSH_MAX_BATCH of it into the host's data ring
- * (rcvbuf + DMESH_PUSH_DATA_OFF) and - from that copy's completion callback -
- * DMAs a 16B dmesh_push_desc into slot seq % N. The host busy-polls the slots
- * in order. One batch outstanding at a time. Returns bytes accepted (0 while a
- * batch is in flight - caller retries), or a negative doca_error_t. */
 /* Kick a read-DMA pulling the host's consumption cursor into the DPU-local
  * shadow (tx_staging reserved tail). Fire-and-forget; the completion callback
- * copies it into conn->host_consumed_*. Safe to call any time - no-ops while
- * a pull is already in flight or before the reverse path is exported. */
+ * copies it into conn->host_consumed_*. No-op while a pull is in flight or
+ * before the reverse path exists. */
 static void
 dmesh_dma_pull_cursor(struct dmesh_conn *conn)
 {
@@ -847,76 +817,76 @@ dmesh_dma_pull_cursor(struct dmesh_conn *conn)
     }
 }
 
+/* The reverse thread completed batches: keep the host cursor fresh. */
+static void
+dmesh_dma_reap(struct dmesh_conn *conn)
+{
+    if (!dmesh_ec_reap(conn))
+        return;
+    if (conn->push_seq < conn->cursor_pull_seq)
+        conn->cursor_pull_seq = 0;
+    if (conn->push_seq < 4 || conn->push_seq - conn->cursor_pull_seq >= 16) {
+        conn->cursor_pull_seq = conn->push_seq;
+        dmesh_dma_pull_cursor(conn);
+    }
+}
+
 doca_error_t dmesh_dma_tx_completed(struct dmesh_conn *conn, uint64_t *bytes)
 {
     if (!conn || !bytes) return DOCA_ERROR_INVALID_VALUE;
     if (conn->state != DMESH_CONN_RUNNING || dma_admission_closed(conn))
         return DOCA_ERROR_BAD_STATE;
-    if (DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
-        /* This prefix advances only after both data and descriptor DMA. */
-        if (conn->ec && dmesh_ec_reap(conn))
-            dmesh_ec_after_reap(conn);
-        *bytes = conn->pushed_bytes;
-        return DOCA_SUCCESS;
-    }
-    if (!conn->rcv_ring) return DOCA_ERROR_BAD_STATE;
-    if (__atomic_load_n(&conn->rcv_ring->ctrl->error, __ATOMIC_ACQUIRE)) {
-        conn->state = DMESH_CONN_ERROR;
-        conn->error_status = EIO;
-        return DOCA_ERROR_IO_FAILED;
-    }
-    *bytes = __atomic_load_n(&conn->rcv_ring->ctrl->completed_bytes, __ATOMIC_ACQUIRE);
+    /* This prefix advances only after a batch's copy and descriptor. */
+    dmesh_dma_reap(conn);
+    *bytes = conn->pushed_bytes;
     return DOCA_SUCCESS;
 }
 
-/* E-c: the reverse thread completed batches; keep the host cursor fresh as
- * the completion path of the doca_dma push does. */
-static void
-dmesh_ec_after_reap(struct dmesh_conn *conn)
+/* Batches in flight are bounded by the host's free descriptor slots and its
+ * unread data-ring bytes; before the host's cursor is known, the slots alone
+ * bound them against the completed ones. */
+static bool
+dmesh_dma_push_gated(const struct dmesh_conn *conn, uint64_t slots, size_t bytes)
 {
-    static uint64_t last_pull_seq[DMESH_MAX_CONNECTIONS];
-    uint64_t *last = &last_pull_seq[conn - conn->objs->conns];
-    if (conn->push_seq < *last)
-        *last = 0;                      /* the slot carries a new flow */
-    if (conn->push_seq < 4 || conn->push_seq - *last >= 16) {
-        *last = conn->push_seq;
-        dmesh_dma_pull_cursor(conn);
-    }
+    size_t ring = conn->rcvbuf.size - DMESH_PUSH_DATA_OFF;
+    uint64_t consumed = conn->host_fc ? conn->host_consumed_seq : conn->push_seq;
+
+    return conn->ec_issued_seq - consumed >= DMESH_PUSH_DESC_N - slots ||
+           (conn->host_fc && conn->ec_issued_bytes - conn->host_consumed_bytes + bytes > ring);
 }
 
-/* E-c: hand up to one batch to the worker's reverse DPA thread. Several
- * batches may be in flight; the host's cursor bounds them as it bounds the
- * doca_dma push. */
-static int
-dmesh_ec_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
+int
+dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
 {
-    static uint32_t max_batch;
-    size_t data_size, chunk, ring;
+    size_t data_size, chunk;
 
-    if (max_batch == 0) {
-        const char *v = getenv("DMESH_EC_MAX_BATCH");
-        max_batch = v != NULL && atoi(v) > 0 ? (uint32_t)atoi(v) : 65536u;
-    }
+    if (conn == NULL)
+        return -(int)DOCA_ERROR_INVALID_VALUE;
+    if (dma_admission_closed(conn))
+        return -(int)DOCA_ERROR_BAD_STATE;
+    if (conn->tx_staging == NULL || conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL)
+        return -(int)DOCA_ERROR_BAD_STATE;
+    if (conn->push_fin_requested)
+        return -(int)DOCA_ERROR_BAD_STATE; /* no bytes after end of stream */
     if (len == 0)
         return 0;
     if (dmesh_ec_conn_handles(conn) != DOCA_SUCCESS)
         return -(int)DOCA_ERROR_BAD_STATE;
-    if (dmesh_ec_reap(conn))
-        dmesh_ec_after_reap(conn);
+    dmesh_dma_reap(conn);
 
+    /* push_pos is this flow's cursor into the host data ring (destination),
+     * independent of the source position in tx_staging. */
     data_size = conn->rcvbuf.size - DMESH_PUSH_DATA_OFF;
     if (data_size > conn->tx_staging_len - 64)
         data_size = conn->tx_staging_len - 64;
-    ring = conn->rcvbuf.size - DMESH_PUSH_DATA_OFF;
-    chunk = len > max_batch ? max_batch : len;
+    chunk = len > DMESH_PUSH_MAX_BATCH ? DMESH_PUSH_MAX_BATCH : len;
     if (chunk > data_size / 4)
         chunk = data_size / 4;
-    /* Unconsumed slots and data-ring bytes, counting the batches in flight.
-     * Before the host's cursor is known, the slots alone bound them. */
-    if (conn->ec_issued_seq - (conn->host_fc ? conn->host_consumed_seq : conn->push_seq) >= DMESH_PUSH_DESC_N - 2 ||
-        (conn->host_fc && conn->ec_issued_bytes - conn->host_consumed_bytes + 2 * chunk > ring)) {
+    if (dmesh_dma_push_gated(conn, 2, 2 * chunk)) {
+        /* Stale-pull recovery: a pull whose completion never arrived would
+         * pin cursor_state and freeze the cursor. */
         if (++conn->gated_calls % 4096 == 0 && conn->cursor_state != 0) {
-            DOCA_LOG_WARN("push gate (E-c): pull stuck, resetting cursor_state");
+            DOCA_LOG_WARN("push gate: cursor pull stuck, resetting it");
             conn->cursor_state = 0;
         }
         dmesh_dma_pull_cursor(conn);
@@ -935,201 +905,6 @@ dmesh_ec_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
 }
 
 int
-dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
-{
-    struct doca_buf *sbuf = NULL, *dbuf = NULL;
-    size_t data_size, chunk;
-    doca_error_t result;
-
-    if (conn == NULL)
-        return -(int)DOCA_ERROR_INVALID_VALUE;
-    if (dma_admission_closed(conn))
-        return -(int)DOCA_ERROR_BAD_STATE;
-    if (conn->tx_staging == NULL || conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL)
-        return -(int)DOCA_ERROR_BAD_STATE;
-    if (conn->push_fin_requested)
-        return -(int)DOCA_ERROR_BAD_STATE; /* no bytes after end of stream */
-    if (conn->ec)
-        return dmesh_ec_push_staged(conn, src_pos, len);
-    if (conn->push_state != 0)
-        return 0;                       /* previous batch still in flight */
-    if (len == 0)
-        return 0;
-
-    /* Flow control: once the host has published its cursor (magic seen),
-     * refuse to publish past unconsumed slots or unread data-ring bytes -
-     * the caller retries, so tx_staging soaks the backlog (upstream
-     * backpressure). While gated, keep the cursor fresh. */
-    if (conn->host_fc) {
-        size_t ring = conn->rcvbuf.size - DMESH_PUSH_DATA_OFF;
-
-        if (conn->push_seq - conn->host_consumed_seq >= DMESH_PUSH_DESC_N - 2 ||
-            conn->pushed_bytes - conn->host_consumed_bytes + 2 * DMESH_PUSH_MAX_BATCH > ring) {
-            /* Stale-pull recovery: a pull whose completion never arrived
-             * would pin cursor_state=1 and freeze the cursor forever. After
-             * enough consecutive gated calls (driver ticks ~1ms), assume it
-             * was lost and allow a fresh pull. */
-            if (++conn->gated_calls % 4096 == 0) {
-                if (conn->cursor_state != 0) {
-                    DOCA_LOG_WARN("push gate: pull stuck, resetting cursor_state");
-                    conn->cursor_state = 0;
-                }
-                DOCA_LOG_WARN("push gate held %lu calls: push_seq=%lu consumed_seq=%lu "
-                              "pushed_bytes=%lu consumed_bytes=%lu ring=%zu cursor_state=%d",
-                              conn->gated_calls, conn->push_seq, conn->host_consumed_seq,
-                              conn->pushed_bytes, conn->host_consumed_bytes, ring,
-                              conn->cursor_state);
-            }
-            dmesh_dma_pull_cursor(conn);
-            return 0;
-        }
-        conn->gated_calls = 0;
-    }
-
-    /* The bytes are already staged at tx_staging+src_pos (written once by the
-     * Rust side). We only build the DMA and publish a descriptor - no memcpy.
-     * push_pos is our own cursor into the HOST data ring (destination), tracked
-     * independently of the source and advanced in dmesh_dma_push_desc_done. */
-    data_size = conn->rcvbuf.size - DMESH_PUSH_DATA_OFF;
-    if (data_size > conn->tx_staging_len - 64)
-        data_size = conn->tx_staging_len - 64;
-
-    chunk = len > DMESH_PUSH_MAX_BATCH ? DMESH_PUSH_MAX_BATCH : len;
-    if ((size_t)conn->push_pos + chunk > data_size)
-        conn->push_pos = 0;             /* wrap the destination before the end */
-
-    result = doca_buf_inventory_buf_get_by_data(conn->buf_inv, conn->tx_staging_mmap,
-                                                (uint8_t *)conn->tx_staging + src_pos,
-                                                chunk, &sbuf);
-    if (result != DOCA_SUCCESS)
-        return -(int)result;
-    result = doca_buf_inventory_buf_get_by_addr(conn->buf_inv, conn->rcvbuf.mmap,
-                                                (uint8_t *)conn->rcvbuf.buf + DMESH_PUSH_DATA_OFF +
-                                                    conn->push_pos,
-                                                chunk, &dbuf);
-    if (result != DOCA_SUCCESS) {
-        (void)doca_buf_dec_refcount(sbuf, NULL);
-        return -(int)result;
-    }
-
-    result = submit_dma_task_kind(conn, sbuf, dbuf, DMESH_TASK_PUSH_DATA);
-    if (result != DOCA_SUCCESS) {
-        (void)doca_buf_dec_refcount(dbuf, NULL);
-        (void)doca_buf_dec_refcount(sbuf, NULL);
-        return result == DOCA_ERROR_AGAIN ? 0 : -(int)result;
-    }
-
-    conn->push_len = (uint32_t)chunk;
-    conn->push_state = 1;
-    return (int)chunk;
-}
-
-/* Second stage of a backend push, run from the data copy's completion
- * callback: publish the batch by DMAing its 16B descriptor into the host's
- * slot ring. The shadow (descriptor source) lives in tx_staging's reserved
- * tail so it is mmap'd for DMA. */
-static void
-dmesh_dma_push_submit_desc(struct dmesh_conn *conn)
-{
-    struct doca_buf *sbuf = NULL, *dbuf = NULL;
-    uint64_t next_seq = conn->push_seq + 1;
-    doca_error_t result;
-
-    if (dma_admission_closed(conn))
-        return;
-    if (conn->wake != NULL) {
-        /* Fast-path wake: the descriptor travels as the immediate data of a
-         * producer message; its completion lands in the host's control PE
-         * (and wakes it), where it is written into the slot ring. */
-        result = dmesh_wake_send_desc(conn, next_seq, conn->push_pos, conn->push_len);
-        conn->wake_desc_pending = result == DOCA_ERROR_AGAIN;
-        if (result == DOCA_SUCCESS) {
-            conn->push_state = 2;
-            return;
-        }
-        if (result == DOCA_ERROR_AGAIN)
-            return;                     /* retried from the flow's advance */
-        goto failed;
-    }
-    conn->push_shadow = (struct dmesh_push_desc *)((uint8_t *)conn->tx_staging +
-                                                   conn->tx_staging_len - 64);
-    conn->push_shadow->seq = next_seq;
-    conn->push_shadow->pos = conn->push_pos;
-    conn->push_shadow->len = conn->push_len;
-
-    result = doca_buf_inventory_buf_get_by_data(conn->buf_inv, conn->tx_staging_mmap,
-                                                conn->push_shadow,
-                                                sizeof(struct dmesh_push_desc), &sbuf);
-    if (result == DOCA_SUCCESS)
-        result = doca_buf_inventory_buf_get_by_addr(conn->buf_inv, conn->rcvbuf.mmap,
-                                                    (uint8_t *)conn->rcvbuf.buf +
-                                                        (next_seq % DMESH_PUSH_DESC_N) *
-                                                            sizeof(struct dmesh_push_desc),
-                                                    sizeof(struct dmesh_push_desc), &dbuf);
-    if (result == DOCA_SUCCESS)
-        result = submit_dma_task_kind(conn, sbuf, dbuf, DMESH_TASK_PUSH_DESC);
-
-    if (result == DOCA_SUCCESS) {
-        conn->push_state = 2;
-        return;
-    }
-
-failed:
-    /* Batch is lost to the stream if we cannot publish it - log loudly. */
-    DOCA_LOG_ERR("backend push: failed to submit desc %s (seq=%lu): %s",
-                 conn->wake != NULL ? "message" : "DMA", next_seq, doca_error_get_descr(result));
-    if (dbuf != NULL)
-        (void)doca_buf_dec_refcount(dbuf, NULL);
-    if (sbuf != NULL)
-        (void)doca_buf_dec_refcount(sbuf, NULL);
-    conn->push_state = 0;
-    conn->dma_closing = true;
-    conn->state = DMESH_CONN_ERROR;
-    conn->error_status = EIO;
-}
-
-/* Final stage: descriptor landed; the batch is visible to the host. */
-static void
-dmesh_dma_push_desc_done(struct dmesh_conn *conn)
-{
-    conn->push_seq++;
-    dmesh_session_push_published(conn->session);
-    conn->push_pos += conn->push_len;
-    conn->pushed_bytes += conn->push_len;
-    conn->push_len = 0;
-    conn->push_state = 0;
-    /* Keep the host cursor reasonably fresh (also probes legacy hosts). */
-    if ((conn->push_seq & 0xf) == 0 || conn->push_seq < 4)
-        dmesh_dma_pull_cursor(conn);
-    (void)dmesh_dma_push_fin(conn);
-}
-
-void dmesh_dma_push_desc_sent(struct dmesh_conn *conn)
-{
-    dmesh_dma_push_desc_done(conn);
-}
-
-/* The same terminal fault as a failed desc DMA: the batch cannot be
- * published, so the stream is broken. */
-void dmesh_dma_push_desc_failed(struct dmesh_conn *conn)
-{
-    conn->push_state = 0;
-    conn->dma_closing = true;
-    conn->state = DMESH_CONN_ERROR;
-    conn->error_status = EIO;
-}
-
-void dmesh_dma_push_retry_desc(struct dmesh_conn *conn)
-{
-    if (!conn->wake_desc_pending)
-        return;
-    if (conn->push_state == 1)
-        dmesh_dma_push_submit_desc(conn);   /* a data batch waits for its descriptor */
-    else
-        conn->wake_desc_pending = false;    /* a FIN: dmesh_dma_push_fin repeats it */
-}
-
-int
 dmesh_dma_push_fin(struct dmesh_conn *conn)
 {
     if (conn == NULL)
@@ -1138,27 +913,15 @@ dmesh_dma_push_fin(struct dmesh_conn *conn)
         return 0;
     if (dma_admission_closed(conn))
         return -(int)DOCA_ERROR_BAD_STATE;
-    if (conn->ec) {
-        /* Ordered behind the flow's batches by the reverse thread. */
-        if (!conn->ec_ready ||
-            conn->ec_issued_seq - (conn->host_fc ? conn->host_consumed_seq : conn->push_seq) >= DMESH_PUSH_DESC_N - 1)
-            return 0;
-        if (dmesh_ec_post(conn, conn->ec_issued_seq + 1, conn->push_pos, 0, 0, conn->ec_issued_bytes) != DOCA_SUCCESS)
-            return 0;
-        conn->ec_issued_seq++;
-        conn->push_fin_sent = true;
+    /* The reverse thread publishes it behind the flow's batches. The data gate
+     * leaves two descriptor slots free, so it never overwrites one the host
+     * has not read. */
+    if (!conn->ec_ready || dmesh_dma_push_gated(conn, 1, 0))
         return 0;
-    }
-    /* Due once the push channel exists and no batch is in flight. The data
-     * gate leaves two descriptor slots free, so the FIN never overwrites a
-     * descriptor the host has not read. */
-    if (conn->tx_staging == NULL || conn->rcvbuf.mmap == NULL || conn->rcvbuf.buf == NULL ||
-        conn->push_state != 0)
+    if (dmesh_ec_post(conn, conn->ec_issued_seq + 1, conn->push_pos, 0, 0, conn->ec_issued_bytes) != DOCA_SUCCESS)
         return 0;
-    conn->push_len = 0;
-    dmesh_dma_push_submit_desc(conn);
-    if (conn->push_state == 2)
-        conn->push_fin_sent = true;
+    conn->ec_issued_seq++;
+    conn->push_fin_sent = true;
     return 0;
 }
 
@@ -1450,7 +1213,6 @@ cleanup_dma_tasks(struct dmesh_conn *conn)
     conn->recv_segs = NULL;
     conn->recv_seg_head = 0;
     conn->recv_seg_cnt = 0;
-    conn->push_state = 0;
     conn->cursor_state = 0;
     return DOCA_SUCCESS;
 }
