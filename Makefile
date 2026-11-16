@@ -55,6 +55,7 @@ $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh
 test: test-native-headers $(addprefix $(TESTDIR)/,$(HOST_TESTS)) test-abi
 	@set -e; for test in $(HOST_TESTS); do $(TESTDIR)/$$test; done
 	CC="$(CC)" $(PYTHON) tests/dpa_poll_test.py
+	CC="$(CC)" $(PYTHON) tests/ec_rev_poll_test.py
 
 test-native-headers:
 	CC="$(CC)" CXX="$(CXX)" $(PYTHON) tests/native_header_contract_test.py

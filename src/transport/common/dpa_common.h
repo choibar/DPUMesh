@@ -272,17 +272,32 @@ _Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a cop
 /*
  * DPU -> host through a DPU-owned DPA thread (the reverse DPA thread).
  *
- * Each worker owns one reverse DPA thread, run_ec_rev. The worker appends one
- * entry per batch to the thread's ring in ARM memory and advances the tail;
- * the thread copies the batch from tx_staging into the host's data ring with
- * its async ops queue and, after the copy's completion, stores the batch's
- * descriptor into the host's slot ring (pos and len, then seq), a value no
- * earlier store to it had (wid << 48 | the thread's publish count) into the
- * flow slot's sync event word on the host, and the flow's
- * completed sequence and bytes into the worker's ARM memory. The host sleeps
- * on a sync event wait task; neither side's CPU takes part in the copy or the
- * wake. A zero-length entry is the end of stream: it publishes a descriptor
- * of length 0 after every earlier batch of the flow.
+ * Each worker owns one reverse DPA thread, run_ec_rev, and each flow slot one
+ * async ops queue of it. Before a flow's first batch the worker writes the
+ * flow's line (its queue, DPA handles and host addresses); then it appends one
+ * entry per batch to the thread's ring in ARM memory and advances the tail.
+ * The thread copies the batch from tx_staging into the host's data ring on
+ * the flow's queue. Once the copy completed and the flow's earlier batches
+ * were published, it stores the batch's descriptor into the host's slot ring
+ * (pos and len, then seq), a value no earlier store to it had
+ * (wid << 48 | the thread's publish count) into the flow slot's sync event
+ * word on the host, and the flow's completed sequence and bytes into the
+ * worker's ARM memory. The host sleeps on a sync event wait task; neither
+ * side's CPU takes part in the copy or the wake. A zero-length entry is the
+ * end of stream: it publishes a descriptor of length 0 after every earlier
+ * batch of the flow.
+ *
+ * Flows have queues of their own because a copy into the memory of a host
+ * process that died never completes, and neither does any copy behind it on
+ * its queue: one flow's dead host must not stop the others. The queues share
+ * the thread's completion queue, and a completion names its queue by user
+ * data. The thread publishes each flow in order and the flows independently.
+ * The worker keeps a flow's batches in flight below DMESH_EC_FLOW_Q, so the
+ * thread always takes the ring's next entry. A flow whose copy failed gets its
+ * generation in `failed` and nothing more published. Completion lines carry
+ * the flow's generation, so a slot's next flow never reads its last one's.
+ * An entry with seq 0 retires the slot's queue: once the thread took it, no
+ * completion of that queue matches the slot, and the worker may destroy it.
  *
  * The sync event words live in the session's tail table page, one line per
  * flow slot at DMESH_EC_SE_OFF(slot).
@@ -290,47 +305,73 @@ _Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a cop
 #define DMESH_TAILS_ALLOC    4096u                     /* the tail table page the host exports */
 #define DMESH_EC_SE_OFF(slot) (1024u + (uint32_t)(slot) * 64u)
 #define DMESH_EC_RING        1024u                     /* entries per worker thread */
-#define DMESH_EC_FIFO        128u                      /* copies in flight per thread */
 #define DMESH_EC_CONNS       64u                       /* = DMESH_MAX_CONNECTIONS */
 #define DMESH_EC_DESC_N      128u                      /* = DMESH_PUSH_DESC_N */
+#define DMESH_EC_FLOW_Q      DMESH_EC_DESC_N           /* a flow's batches in flight, and its queue's depth */
+/* Every queue full, and the flush of queues replaced meanwhile. */
+#define DMESH_EC_CQ          (2u * DMESH_EC_CONNS * DMESH_EC_FLOW_Q)
 #define DMESH_EC_DESC_SZ     16u                       /* = sizeof(struct dmesh_push_desc): seq, pos, len */
 #define DMESH_EC_DATA_OFF    4096u                     /* = DMESH_PUSH_DATA_OFF */
+#define DMESH_EC_GEN_SHIFT   40                        /* completion line: generation << 40 | sequence */
+#define DMESH_EC_GEN_MASK    0xffffffu
 
-struct dmesh_ec_ent {               /* ARM -> DPA, one line */
+struct dmesh_ec_ent {               /* ARM -> DPA, one line per batch */
 	uint32_t conn;                  /* worker's connection slot */
-	uint32_t src_mmap;              /* tx_staging, DPA handle */
-	uint32_t win_mmap;              /* host rcvbuf window, DPA handle */
-	uint32_t se_mmap;               /* host tail table page, DPA handle */
-	uint64_t seq;                   /* batch sequence of the flow, 1-based */
+	uint32_t gen;                   /* the slot's flow (dmesh_ec_flow.gen) */
+	uint64_t seq;                   /* batch sequence of the flow, 1-based; 0 retires the slot's queue */
 	uint64_t pos_len;               /* data ring offset << 32 | length (0 = end of stream) */
 	uint64_t src_addr;              /* tx_staging address of the batch */
+	uint64_t cum_bytes;             /* the flow's bytes up to and including this batch */
+	uint64_t l[3];
+};
+
+struct dmesh_ec_flow {              /* ARM -> DPA, one line per connection slot */
+	uint64_t ops;                   /* the flow's queue, DPA handle */
+	uint32_t gen;                   /* the flow, as its entries name it (masked by DMESH_EC_GEN_MASK) */
+	uint32_t id;                    /* the queue's user data, which its completions carry */
+	uint32_t src_mmap, win_mmap, se_mmap, pad; /* DPA handles: tx_staging, host rcvbuf window, tail table page */
 	uint64_t win_addr;              /* host address of the rcvbuf window */
 	uint64_t se_addr;               /* host address of the flow slot's sync event word */
-	uint64_t cum_bytes;             /* the flow's bytes up to and including this batch */
+	uint64_t l[2];
 };
 
 struct dmesh_ec_done {              /* DPA -> ARM, one line per connection slot */
-	volatile uint64_t seq, bytes, l[6];
+	volatile uint64_t seq;          /* generation << DMESH_EC_GEN_SHIFT | last batch published */
+	volatile uint64_t bytes;        /* the flow's bytes up to that batch */
+	volatile uint64_t failed;       /* generation of a flow whose copy failed */
+	volatile uint64_t l[5];
 };
 
 struct dmesh_ec_ctl {               /* ARM memory, one per worker */
 	volatile uint64_t tail, l0[7];                  /* ARM -> DPA */
-	volatile uint64_t stop, l1[7];                  /* ARM -> DPA */
-	volatile uint64_t head, copies, publishes, passes, activations, stopped, l2[2]; /* DPA -> ARM */
+	volatile uint64_t head, copies, publishes, passes, activations, stale_cqes, err_cqes, l1; /* DPA -> ARM */
 	struct dmesh_ec_done done[DMESH_EC_CONNS];
+	struct dmesh_ec_flow flow[DMESH_EC_CONNS];
 	struct dmesh_ec_ent ring[DMESH_EC_RING];
 };
 
+struct dmesh_ec_batch {             /* a batch the thread holds */
+	uint64_t pos_len, cum_bytes;
+};
+
+struct dmesh_ec_fq {                /* the thread's state of a slot's flow */
+	uint64_t ops, win_addr, se_addr;
+	uint32_t gen, id, src_mmap, win_mmap, se_mmap, failed;
+	uint64_t head, tail, done;      /* batches published, batches taken, copies completed and not published */
+	struct dmesh_ec_batch b[DMESH_EC_FLOW_Q];
+};
+
 struct dmesh_ec_tls {               /* the thread's local storage */
-	uint64_t ops, acomp, ctl_mmap, ctl_addr;        /* set by the ARM */
-	uint64_t head, ff_head, ff_tail, copies, publishes, passes, activations;
+	uint64_t acomp, ctl_mmap, ctl_addr;             /* set by the ARM */
+	uint64_t head, copies, publishes, passes, activations, stale_cqes, err_cqes;
 	uint64_t wid;                                   /* worker index + 1: the high bits of every wake value */
-	struct dmesh_ec_ent ff[DMESH_EC_FIFO];          /* entries in copy order */
+	struct dmesh_ec_fq f[DMESH_EC_CONNS];
 };
 
 _Static_assert(sizeof(struct dmesh_ec_ent) == 64, "dmesh_ec_ent: one line");
+_Static_assert(sizeof(struct dmesh_ec_flow) == 64, "dmesh_ec_flow: one line");
 _Static_assert(sizeof(struct dmesh_ec_done) == 64, "dmesh_ec_done: one line");
-_Static_assert(offsetof(struct dmesh_ec_ctl, done) == 192 && offsetof(struct dmesh_ec_ctl, ring) % 64 == 0,
+_Static_assert(offsetof(struct dmesh_ec_ctl, done) == 128 && offsetof(struct dmesh_ec_ctl, ring) % 64 == 0,
 	       "dmesh_ec_ctl: one writer per line");
 _Static_assert(DMESH_EC_SE_OFF(33) + 64 <= DMESH_TAILS_ALLOC && DMESH_EC_SE_OFF(0) >= DMESH_TAILS_BYTES,
 	       "sync event words fit the tail table page");

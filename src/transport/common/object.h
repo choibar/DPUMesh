@@ -220,12 +220,13 @@ struct dmesh_conn {
     uint64_t pushed_bytes;
     struct dmesh_push_cursor *cursor_shadow;  /* in tx_staging's reserved tail */
 
-    /* The flow's share of the reverse DPA thread: DPA handles of its
-     * tx_staging, rcvbuf window and the session's tail table page, taken on
-     * its first batch; the batches handed to the thread so far. */
+    /* The flow's share of the reverse DPA thread: the session's tail table
+     * page, the flow's line (written on its first batch) and the batches
+     * handed to the thread so far. */
     bool ec;                                  /* the flow is known to the reverse DPA thread */
-    bool ec_ready;                            /* the DPA handles below are valid */
-    uint32_t ec_src_h, ec_win_h, ec_se_h;     /* tx_staging, rcvbuf window, tail table page */
+    bool ec_ready;                            /* the flow's line is written */
+    uint32_t ec_gen;                          /* the flow, as its entries and completion line name it */
+    uint32_t ec_se_h;                         /* tail table page, DPA handle */
     uint64_t ec_se_addr;                      /* host address of the flow slot's sync event word */
     struct doca_mmap *ec_se_mmap;             /* the session's tail table page, imported */
     uint64_t ec_issued_seq, ec_issued_bytes;  /* batches handed to the thread */

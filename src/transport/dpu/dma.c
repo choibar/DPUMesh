@@ -283,8 +283,13 @@ static void dmesh_doca_dpa_dma_task_completed_cb(struct doca_dma_task_memcpy *dm
                 conn->host_fc = 1;
                 DOCA_LOG_INFO("push flow control enabled (host cursor live)");
             }
-            conn->host_consumed_seq = conn->cursor_shadow->consumed_seq;
-            conn->host_consumed_bytes = conn->cursor_shadow->consumed_bytes;
+            /* The host cannot have read what was not published. A larger
+             * value (a host that died, a broken cursor) must not open the
+             * push gate past the batches the reverse thread can hold. */
+            conn->host_consumed_seq = conn->cursor_shadow->consumed_seq < conn->push_seq
+                                          ? conn->cursor_shadow->consumed_seq : conn->push_seq;
+            conn->host_consumed_bytes = conn->cursor_shadow->consumed_bytes < conn->pushed_bytes
+                                            ? conn->cursor_shadow->consumed_bytes : conn->pushed_bytes;
         }
         return;
     }
@@ -817,11 +822,20 @@ dmesh_dma_pull_cursor(struct dmesh_conn *conn)
     }
 }
 
-/* The reverse thread completed batches: keep the host cursor fresh. */
+/* The reverse thread completed batches: keep the host cursor fresh. A failed
+ * copy fails the flow, as a failed DMA task does. */
 static void
 dmesh_dma_reap(struct dmesh_conn *conn)
 {
-    if (!dmesh_ec_reap(conn))
+    int reaped = dmesh_ec_reap(conn);
+
+    if (reaped < 0 && !dma_admission_closed(conn)) {
+        DOCA_LOG_ERR("flow %u: a reverse DPA copy failed", conn->flow_id);
+        conn->state = DMESH_CONN_ERROR;
+        conn->error_status = EIO;
+        conn->dma_closing = true;
+    }
+    if (reaped <= 0)
         return;
     if (conn->push_seq < conn->cursor_pull_seq)
         conn->cursor_pull_seq = 0;
@@ -873,6 +887,8 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
     if (dmesh_ec_conn_handles(conn) != DOCA_SUCCESS)
         return -(int)DOCA_ERROR_BAD_STATE;
     dmesh_dma_reap(conn);
+    if (dma_admission_closed(conn))
+        return -(int)DOCA_ERROR_BAD_STATE;  /* a copy of the flow failed */
 
     /* push_pos is this flow's cursor into the host data ring (destination),
      * independent of the source position in tx_staging. */

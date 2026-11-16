@@ -5,8 +5,10 @@ DPU runs the DPUMesh transport and its embedded Linkerd proxy. The two
 meet at DPUMesh's host wire: one Comch control session per channel, a forward
 descriptor ring per connection that the DPU's DPA copies from, and, back to
 the host, the DPU's reverse DPA thread: one per DPU worker, it copies a
-flow's batches into the connection's window, publishes their descriptors and
-wakes the flow through its slot's sync event. The host runs no DPA.
+flow's batches into the connection's window on the flow's own queue,
+publishes their descriptors and wakes the flow through its slot's sync event.
+A host process that dies with copies to it in flight holds back only its own
+flows. The host runs no DPA.
 
 ## Layout
 

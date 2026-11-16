@@ -15,7 +15,7 @@
 struct ec_entry { uint64_t seq; uint32_t pos, len; uint64_t cum; };
 static struct ec_entry ec_posted[8];
 static unsigned ec_posts;
-static int ec_ring_full;
+static int ec_ring_full, ec_failed;
 static uint64_t ec_done_seq, ec_done_bytes;
 doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn)
 {
@@ -34,6 +34,8 @@ doca_error_t dmesh_ec_post(struct dmesh_conn *conn, uint64_t seq, uint32_t pos, 
 }
 int dmesh_ec_reap(struct dmesh_conn *conn)
 {
+    if (ec_failed)
+        return -1;
     if (ec_done_seq <= conn->push_seq || ec_done_seq > conn->ec_issued_seq)
         return 0;
     conn->push_seq = ec_done_seq;
@@ -375,7 +377,7 @@ static void push_flow(struct dmesh_conn *conn, uint8_t *staging, size_t staging_
     conn->rcvbuf.buf = window;
     conn->rcvbuf.size = DMESH_PUSH_DATA_OFF + 1024;
     ec_posts = 0;
-    ec_ring_full = 0;
+    ec_ring_full = ec_failed = 0;
     ec_done_seq = ec_done_bytes = 0;
 }
 
@@ -410,11 +412,14 @@ static void test_push_batches_and_gate(void)
     assert(dmesh_dma_tx_completed(conn, &bytes) == DOCA_SUCCESS && bytes == 256 && conn->push_seq == 1);
     assert(conn->cursor_state == 1 && fixture->submit_count == 1 && fixture->lend_buffers == 0);
     (void)doca_pe_progress(fixture->objs.consumer_pe);   /* the fixture's first task */
+    /* A cursor past what was published (a host that died) counts as the
+     * published batches: the gate stays within what the thread can hold. */
     conn->cursor_shadow->magic = DMESH_PUSH_FC_MAGIC;
-    conn->cursor_shadow->consumed_seq = 1;
-    conn->cursor_shadow->consumed_bytes = 256;
+    conn->cursor_shadow->consumed_seq = 9;
+    conn->cursor_shadow->consumed_bytes = 9999;
     (void)doca_pe_progress(fixture->objs.consumer_pe);   /* the pull */
     assert(conn->cursor_state == 0 && conn->host_fc && conn->host_consumed_seq == 1);
+    assert(conn->host_consumed_bytes == 256);
 
     /* All but two of the host's slots in flight: held, with a fresh pull. */
     conn->ec_issued_seq = conn->host_consumed_seq + DMESH_PUSH_DESC_N - 2;
@@ -451,6 +456,21 @@ static void test_push_fin_follows_the_last_batch(void)
     finish_fixture(conn);
 }
 
+/* A failed copy of the flow fails it and takes no more batches. */
+static void test_failed_copy_fails_the_flow(void)
+{
+    struct dmesh_conn *conn = create_fixture(0);
+    static uint8_t staging[4096], window[DMESH_PUSH_DATA_OFF + 1024];
+    push_flow(conn, staging, sizeof(staging), window);
+    conn->state = DMESH_CONN_RUNNING;
+    assert(dmesh_dma_push_staged(conn, 0, 100) == 100 && ec_posts == 1);
+    ec_failed = 1;
+    assert(dmesh_dma_push_staged(conn, 100, 100) == -(int)DOCA_ERROR_BAD_STATE && ec_posts == 1);
+    assert(conn->state == DMESH_CONN_ERROR && conn->error_status == EIO && conn->dma_closing);
+    ec_failed = 0;
+    finish_fixture(conn);
+}
+
 /* What the proxy may reuse is what the reverse thread completed. */
 static void test_tx_completion_sources(void)
 {
@@ -483,6 +503,7 @@ int main(void)
     test_submission_failure_does_not_release_caller_buffers();
     test_push_batches_and_gate();
     test_push_fin_follows_the_last_batch();
+    test_failed_copy_fails_the_flow();
     test_tx_completion_sources();
     puts("dma_cleanup_test: PASS");
     return 0;

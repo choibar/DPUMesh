@@ -859,6 +859,9 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
         conn->buf_arr = NULL;
     }
 
+    /* The reverse DPA thread's state of the flow, before the mmaps its copies use. */
+    dmesh_ec_conn_reset(conn);
+
     /* Remote mmaps imported from the host's metadata message. */
     if (conn->ring_mmap != NULL) {
         (void)doca_mmap_destroy(conn->ring_mmap);
@@ -892,7 +895,6 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     conn->reverse_ready = false;
     conn->push_seq = 0;
     conn->push_pos = 0;
-    dmesh_ec_conn_reset(conn);
 
     /* Per-connection DMA engine (ctx, inventory, task pool, recv/pending rings). */
     cleanup_dma_tasks(conn);
@@ -970,10 +972,12 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     if (getenv("DMESH_NO_TEARDOWN") != NULL && flow_has_resources(conn))
         return DOCA_ERROR_NOT_SUPPORTED;
     conn->dma_closing = true;
-    /* The reverse DPA thread finishes the flow's batches first. */
+    /* The reverse DPA thread finishes the flow's batches first; then the flow
+     * leaves it, before the mmaps its copies use go. */
     result = dmesh_ec_quiesce_step(conn);
     if (result != DOCA_SUCCESS)
         return result;
+    dmesh_ec_conn_reset(conn);
     /* A mux flow leaves its thread with DEL; DEL_ACK follows its last copy. */
     result = conn->mux ? dmesh_dpa_mux_del_step(conn) : dmesh_doca_dpa_quiesce_step(conn);
     if (result != DOCA_SUCCESS)

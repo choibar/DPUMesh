@@ -208,7 +208,12 @@ messages reach the ARM workers over DPA MsgQs (`comch_msgq.c`).
   page), which wakes the host. Several batches of a flow are in flight,
   bounded by the host's consumption cursor, which the worker pulls with its
   connection's `doca_dma` engine. The ARM takes no completion and sends no
-  message per batch.
+  message per batch. Each connection slot has its own async ops queue on the
+  thread (one shared completion queue): a copy into a host process that died
+  never completes and holds back its queue, so it holds only its own flow. A
+  flow that ends with such copies leaves its queue behind and the slot's next
+  flow gets a new one. `DMESH_ECHO_DELAY_US` on `dpumesh_dpu` reproduces it
+  (kill a host process while echoes to it are held back).
 - **`ring.c` / `buffer.c` / `object.c`:** the descriptor rings, exportable DMA
   buffers, and the central `struct objects` (per-worker state) + `struct
   dmesh_conn` (per-connection state) that everything hangs off of.
