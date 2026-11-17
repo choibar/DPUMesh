@@ -17,12 +17,11 @@ static struct ec_entry ec_posted[8];
 static unsigned ec_posts;
 static int ec_ring_full, ec_failed;
 static uint64_t ec_done_seq, ec_done_bytes;
-static uint32_t ec_ring, ec_max_batch;      /* the flow's line */
-doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring, uint32_t max_batch)
+static uint32_t ec_ring;                    /* the flow's line */
+doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring)
 {
     conn->ec_ready = true;
     ec_ring = ring;
-    ec_max_batch = max_batch;
     return DOCA_SUCCESS;
 }
 doca_error_t dmesh_ec_post(struct dmesh_conn *conn, uint64_t seq, uint32_t pos, uint32_t len,
@@ -393,7 +392,7 @@ static void test_push_batches_and_gate(void)
 
     assert(dmesh_dma_push_staged(conn, 0, 1000) == 256);
     assert(dmesh_dma_push_staged(conn, 256, 744) == 256);
-    assert(ec_posts == 2 && conn->ec_ready && ec_ring == 1024 && ec_max_batch == 256);
+    assert(ec_posts == 2 && conn->ec_ready && ec_ring == 1024);
     assert(ec_posted[0].seq == 1 && ec_posted[0].pos == 0 && ec_posted[0].len == 256 && ec_posted[0].cum == 256);
     assert(ec_posted[1].seq == 2 && ec_posted[1].pos == 256 && ec_posted[1].cum == 512);
     assert(conn->ec_issued_seq == 2 && conn->push_seq == 0 && conn->pushed_bytes == 0);

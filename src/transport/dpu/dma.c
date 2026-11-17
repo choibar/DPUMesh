@@ -764,8 +764,8 @@ doca_error_t dmesh_dma_tx_completed(struct dmesh_conn *conn, uint64_t *bytes)
     return DOCA_SUCCESS;
 }
 
-/* The host's data ring as the flow places batches in it, and the largest
- * batch: positions wrap before a batch that would cross the end. */
+/* The host's data ring as the flow places batches in it (a batch that would
+ * cross the end goes to its start), and the largest batch. */
 static size_t
 push_data_size(const struct dmesh_conn *conn)
 {
@@ -807,7 +807,7 @@ dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len)
     if (len == 0)
         return 0;
     data_size = push_data_size(conn);
-    if (dmesh_ec_conn_handles(conn, (uint32_t)data_size, (uint32_t)push_max_batch(data_size)) != DOCA_SUCCESS)
+    if (dmesh_ec_conn_handles(conn, (uint32_t)data_size) != DOCA_SUCCESS)
         return -(int)DOCA_ERROR_BAD_STATE;
     dmesh_dma_reap(conn);
     if (dma_admission_closed(conn))

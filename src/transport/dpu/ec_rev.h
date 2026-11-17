@@ -32,9 +32,9 @@ doca_error_t dmesh_ec_init(struct objects *objs);
  * reverse thread. */
 doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn);
 /* The flow's line for the thread (its queue, the DPA handles of its tx_staging
- * and rcvbuf window, the data ring bytes it places batches in and its largest
- * batch), written on its first batch. */
-doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring, uint32_t max_batch);
+ * and rcvbuf window, the data ring bytes it places batches in), written on its
+ * first batch. */
+doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring);
 /* The worker's ring and completion lines; NULL when off. */
 struct dmesh_ec_ctl *dmesh_ec_ctl_of(struct objects *objs);
 /* Appends one entry; DOCA_ERROR_AGAIN when the ring is full. */
@@ -55,9 +55,9 @@ void dmesh_ec_conn_reset(struct dmesh_conn *conn);
 
 static inline doca_error_t dmesh_ec_init(struct objects *objs) { (void)objs; return DOCA_SUCCESS; }
 static inline doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn) { (void)conn; return DOCA_SUCCESS; }
-static inline doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring, uint32_t max_batch)
+static inline doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring)
 {
-    (void)conn; (void)ring; (void)max_batch;
+    (void)conn; (void)ring;
     return DOCA_ERROR_NOT_SUPPORTED;
 }
 static inline struct dmesh_ec_ctl *dmesh_ec_ctl_of(struct objects *objs) { (void)objs; return NULL; }

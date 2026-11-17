@@ -291,9 +291,10 @@ _Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a cop
  * Room is the host's consumption cursor (struct dmesh_push_cursor in the
  * window), which only the thread reads. A batch's copy starts when its
  * descriptor slot is free (seq - consumed_seq <= DMESH_EC_DESC_N - 2, one slot
- * more for the end of stream) and its bytes fit the data ring with one largest
- * batch to spare for the gap a wrap leaves
- * (cum_bytes - consumed_bytes + slack <= ring). The thread keeps the cursor it
+ * more for the end of stream) and the data ring holds it: the bytes the host
+ * has not read, this batch included, plus the end of the ring that a wrap left
+ * unused while the host has not read past it, fit the ring
+ * (cum_bytes - consumed_bytes + gap <= ring). The thread keeps the cursor it
  * read last and reads it again only when that leaves too little room; a flow
  * still waiting reads it at doubling intervals (EC_CURSOR_*_US in the kernel).
  * A cursor past what the thread published counts as what it published. The
@@ -345,11 +346,10 @@ struct dmesh_ec_flow {              /* ARM -> DPA, one line per connection slot 
 	uint32_t gen;                   /* the flow, as its entries name it (masked by DMESH_EC_GEN_MASK) */
 	uint32_t id;                    /* the queue's user data, which its completions carry */
 	uint32_t src_mmap, win_mmap, se_mmap; /* DPA handles: tx_staging, host rcvbuf window, tail table page */
-	uint32_t ring;                  /* data ring bytes the worker places batches in */
+	uint32_t ring;                  /* data ring bytes the worker places batches in (wrapping before the end) */
 	uint64_t win_addr;              /* host address of the rcvbuf window */
 	uint64_t se_addr;               /* host address of the flow slot's sync event word */
-	uint32_t slack, pad;            /* the flow's largest batch: the most a wrap leaves unused */
-	uint64_t l[1];
+	uint64_t l[2];
 };
 
 struct dmesh_ec_done {              /* DPA -> ARM, one line per connection slot */
@@ -368,26 +368,29 @@ struct dmesh_ec_ctl {               /* ARM memory, one per worker */
 };
 
 struct dmesh_ec_batch {             /* a batch the thread holds */
-	uint64_t pos_len, cum_bytes, src_addr;
+	uint64_t pos_len, cum_bytes;
 };
 
 struct dmesh_ec_fq {                /* the thread's state of a slot's flow */
 	uint64_t ops, win_addr, se_addr;
-	uint32_t gen, id, src_mmap, win_mmap, se_mmap, failed, ring, slack;
+	uint32_t gen, id, src_mmap, win_mmap, se_mmap, failed, ring;
+	uint32_t end, gap;              /* end of the last batch started; the ring's end the last wrap left */
+	uint64_t gap_seq;               /* the batch that wrapped: the gap is unread until the host read the one before */
 	/* Batches published <= started <= taken; copies completed and not published. */
 	uint64_t head, issued, tail, done;
 	uint64_t pub_bytes;             /* the flow's bytes up to the last batch published */
 	uint64_t cseq, cbytes;          /* the host's cursor as last read, at most what was published */
 	uint64_t cur_us, cur_gap;       /* when it was last read; how long a waiting flow waits to read it again */
-	struct dmesh_ec_batch b[DMESH_EC_FLOW_Q];
-};
+	struct dmesh_ec_batch b[DMESH_EC_FLOW_Q] __attribute__((aligned(64)));
+	uint64_t src[DMESH_EC_FLOW_Q];  /* tx_staging address of a batch that waits for the host's room */
+} __attribute__((aligned(64)));
 
 struct dmesh_ec_tls {               /* the thread's local storage */
 	uint64_t acomp, ctl_mmap, ctl_addr;             /* set by the ARM */
 	uint64_t head, copies, publishes, passes, activations, stale_cqes, err_cqes, cursor_reads;
 	uint64_t wid;                                   /* worker index + 1: the high bits of every wake value */
 	uint64_t waiting;                               /* slots with batches taken but not started */
-	struct dmesh_ec_fq f[DMESH_EC_CONNS];
+	struct dmesh_ec_fq f[DMESH_EC_CONNS] __attribute__((aligned(64)));
 };
 
 _Static_assert(sizeof(struct dmesh_ec_ent) == 64, "dmesh_ec_ent: one line");

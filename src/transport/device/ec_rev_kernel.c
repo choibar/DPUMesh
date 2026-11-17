@@ -92,14 +92,15 @@ static void ec_load(struct dmesh_ec_tls *t, struct dmesh_ec_fq *q, uint32_t conn
     q->win_addr = l->win_addr;
     q->se_addr = l->se_addr;
     q->ring = l->ring;
-    q->slack = l->slack;
+    q->end = q->gap = 0;
+    q->gap_seq = 0;
     q->head = q->issued = q->tail = q->done = 0;
     q->pub_bytes = q->cseq = q->cbytes = 0;
     q->cur_us = 0;
     q->cur_gap = EC_CURSOR_MIN_US;
     q->failed = 0;
     t->waiting &= ~(1ull << conn);
-    if (q->gen != gen || q->slack >= q->ring) {
+    if (q->gen != gen || q->ring == 0) {
         q->gen = gen;
         ec_fail(t, q, conn);
     }
@@ -127,50 +128,69 @@ static void ec_cursor(struct dmesh_ec_tls *t, struct dmesh_ec_fq *q, uint64_t no
         q->cbytes = bytes;
 }
 
-/* The host has a free descriptor slot for batch seq and room for its bytes. */
-static int ec_room(const struct dmesh_ec_fq *q, const struct dmesh_ec_batch *b, uint64_t seq)
+/* The host has a free descriptor slot for batch seq and room for its bytes:
+ * what it has not read, this batch included, and the unused end of the ring
+ * before a wrap it has not read past (this batch's own, if it wraps). */
+static int ec_room(const struct dmesh_ec_fq *q, uint64_t seq, uint64_t pos_len, uint64_t cum)
 {
-    if ((uint32_t)b->pos_len == 0)
+    uint32_t gap = 0;
+
+    if ((uint32_t)pos_len == 0)
         return seq - q->cseq <= DMESH_EC_DESC_N - 1;
-    return seq - q->cseq <= DMESH_EC_DESC_N - 2 && b->cum_bytes - q->cbytes + q->slack <= q->ring;
+    if ((uint32_t)(pos_len >> 32) < q->end)
+        gap = q->ring - q->end;
+    else if (q->gap_seq != 0 && q->cseq + 1 < q->gap_seq)
+        gap = q->gap;
+    return seq - q->cseq <= DMESH_EC_DESC_N - 2 && cum - q->cbytes + gap <= q->ring;
 }
 
-/* Starts, in order, the flow's batches the host has room for: a copy on the
- * flow's queue, or the end of stream's publish. */
+/* Batch seq has room: a copy on the flow's queue, or the end of stream's
+ * publish. */
+static void ec_start(struct dmesh_ec_tls *t, struct dmesh_ec_fq *q, uint32_t conn, uint64_t seq, uint64_t pos_len,
+                     uint64_t src)
+{
+    uint32_t pos = (uint32_t)(pos_len >> 32), len = (uint32_t)pos_len;
+
+    q->issued = seq;
+    if (len == 0) {
+        ec_flush(t, q, conn);
+        return;
+    }
+    if (pos < q->end) {
+        q->gap = q->ring - q->end;
+        q->gap_seq = seq;
+    }
+    q->end = pos + len;
+    doca_dpa_dev_post_memcpy((doca_dpa_dev_async_ops_t)q->ops, (doca_dpa_dev_mmap_t)q->win_mmap,
+                             q->win_addr + DMESH_EC_DATA_OFF + pos, (doca_dpa_dev_mmap_t)q->src_mmap, src, len,
+                             DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
+    t->copies++;
+}
+
+/* Starts, in order, the batches of a waiting flow the host has room for. */
 static void ec_issue(struct dmesh_ec_tls *t, struct dmesh_ec_fq *q, uint32_t conn, uint64_t now)
 {
     while (q->issued != q->tail) {
         const struct dmesh_ec_batch *b = &q->b[q->issued % DMESH_EC_FLOW_Q];
         uint64_t seq = q->issued + 1;
 
-        if (!ec_room(q, b, seq)) {
+        if (!ec_room(q, seq, b->pos_len, b->cum_bytes)) {
             if (now - q->cur_us < q->cur_gap)
-                break;
+                return;
             ec_cursor(t, q, now);
-            if (!ec_room(q, b, seq)) {
+            if (!ec_room(q, seq, b->pos_len, b->cum_bytes)) {
                 q->cur_gap = q->cur_gap >= EC_CURSOR_MAX_US / 2 ? EC_CURSOR_MAX_US : q->cur_gap * 2;
-                break;
+                return;
             }
             q->cur_gap = EC_CURSOR_MIN_US;
         }
-        q->issued++;
-        if ((uint32_t)b->pos_len == 0) {
-            ec_flush(t, q, conn);
-            continue;
-        }
-        doca_dpa_dev_post_memcpy((doca_dpa_dev_async_ops_t)q->ops, (doca_dpa_dev_mmap_t)q->win_mmap,
-                                 q->win_addr + DMESH_EC_DATA_OFF + (b->pos_len >> 32),
-                                 (doca_dpa_dev_mmap_t)q->src_mmap, b->src_addr, (uint32_t)b->pos_len,
-                                 DOCA_DPA_DEV_SUBMIT_FLAG_FLUSH);
-        t->copies++;
+        ec_start(t, q, conn, seq, b->pos_len, q->src[q->issued % DMESH_EC_FLOW_Q]);
     }
-    if (q->issued != q->tail)
-        t->waiting |= 1ull << conn;
-    else
-        t->waiting &= ~(1ull << conn);
+    t->waiting &= ~(1ull << conn);
 }
 
-/* New entries: each goes to its flow, which starts it once the host has room. */
+/* New entries: each goes to its flow. A flow with nothing waiting starts the
+ * batch at once when the host has room; otherwise the batch waits. */
 static void ec_take(struct dmesh_ec_tls *t, uint64_t tail, uint64_t now)
 {
     while (t->head != tail) {
@@ -192,15 +212,24 @@ static void ec_take(struct dmesh_ec_tls *t, uint64_t tail, uint64_t now)
             ec_load(t, q, conn, gen);
         if (q->failed)
             continue;
-        /* The worker numbers a flow's batches from 1 and keeps fewer than
-         * DMESH_EC_FLOW_Q unpublished. */
-        if (seq != q->tail + 1 || q->tail - q->head >= DMESH_EC_FLOW_Q) {
+        /* The worker numbers a flow's batches from 1, keeps fewer than
+         * DMESH_EC_FLOW_Q unpublished and places them inside the ring. */
+        if (seq != q->tail + 1 || q->tail - q->head >= DMESH_EC_FLOW_Q ||
+            (pos_len >> 32) + (uint32_t)pos_len > q->ring) {
             ec_fail(t, q, conn);
             continue;
         }
-        q->b[q->tail % DMESH_EC_FLOW_Q] = (struct dmesh_ec_batch){pos_len, cum, src};
-        q->tail++;
-        ec_issue(t, q, conn, now);
+        q->b[q->tail % DMESH_EC_FLOW_Q] = (struct dmesh_ec_batch){pos_len, cum};
+        q->tail = seq;
+        if (q->issued + 1 == seq && ec_room(q, seq, pos_len, cum)) {
+            ec_start(t, q, conn, seq, pos_len, src);
+            continue;
+        }
+        q->src[(seq - 1) % DMESH_EC_FLOW_Q] = src;
+        if (!(t->waiting & 1ull << conn)) {
+            t->waiting |= 1ull << conn;
+            ec_issue(t, q, conn, now);
+        }
     }
 }
 

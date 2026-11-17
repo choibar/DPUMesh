@@ -86,7 +86,9 @@ doca_error_t dmesh_ec_init(struct objects *objs)
     if (objs->dpa_pool == NULL || objs->dpa_pool->dpa == NULL)
         return DOCA_ERROR_BAD_STATE;
     w = calloc(1, sizeof(*w));
-    tl = calloc(1, sizeof(*tl));
+    tl = aligned_alloc(64, sizeof(*tl));    /* the flows' state is laid out by cache line */
+    if (tl != NULL)
+        memset(tl, 0, sizeof(*tl));
     if (w == NULL || tl == NULL) {
         free(w);
         free(tl);
@@ -255,7 +257,7 @@ doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn)
     return DOCA_SUCCESS;
 }
 
-doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring, uint32_t max_batch)
+doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring)
 {
     struct objects *objs = conn->objs;
     struct dmesh_ec_worker *w = objs->ec;
@@ -285,7 +287,6 @@ doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring, uint3
     l->ring = ring;
     l->win_addr = (uint64_t)(uintptr_t)conn->rcvbuf.buf;
     l->se_addr = conn->ec_se_addr;
-    l->slack = max_batch;
     conn->ec_ready = true;
     return DOCA_SUCCESS;
 }
@@ -354,9 +355,10 @@ void dmesh_ec_conn_reset(struct dmesh_conn *conn)
 
     if (conn->ec && w != NULL) {
         if (conn->ec_issued_seq != 0)
-            DOCA_LOG_INFO("flow %u: %lu batches (%lu bytes) through the reverse DPA thread, %lu completed",
+            DOCA_LOG_INFO("flow %u: %lu batches (%lu bytes) through the reverse DPA thread, %lu completed; "
+                          "the thread read host cursors %lu times so far",
                           conn->flow_id, (unsigned long)conn->ec_issued_seq, (unsigned long)conn->ec_issued_bytes,
-                          (unsigned long)conn->push_seq);
+                          (unsigned long)conn->push_seq, (unsigned long)w->ctl->cursor_reads);
         if (dmesh_ec_reap(conn) < 0 || conn->push_seq != conn->ec_issued_seq)
             ec_queue_replace(w, slot_of(conn));
     }
