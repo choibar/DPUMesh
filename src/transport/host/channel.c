@@ -42,6 +42,9 @@ DOCA_LOG_REGISTER(CHANNEL);
 _Static_assert(CHANNEL_DESC_N == DMESH_PUSH_DESC_N, "push slot count");
 _Static_assert(CHANNEL_DATA_OFF == DMESH_PUSH_DATA_OFF, "push data offset");
 _Static_assert(CHANNEL_WINDOW == DMESH_PUSH_WINDOW, "push window");
+_Static_assert(CHANNEL_RING_SIZE == DMA_RING_SIZE &&
+               sizeof(struct dma_ring_ctrl) + CHANNEL_RING_SIZE * sizeof(struct dma_desc) <= CHANNEL_RING_STRIDE &&
+               CHANNEL_RING_STRIDE % 4096 == 0, "a forward ring fits its stride");
 _Static_assert(CHANNEL_MODE_CLIENT == DMESH_FLOW_MODE_CLIENT, "client mode");
 _Static_assert(CHANNEL_MODE_BACKEND == DMESH_FLOW_MODE_BACKEND, "backend mode");
 
@@ -843,15 +846,10 @@ void channel_mem_free(struct channel_mem *mem)
  */
 static int conn_teardown(struct channel_conn *conn)
 {
-	/* Only reached before OPEN or after a confirmed CLOSED. */
-	if (conn->forward_ring != NULL) {
-		if (conn->forward_ring->mmap != NULL) {
-			doca_error_t result = destroy_mmap_and_free_buffer(conn->forward_ring->mmap, conn->forward_ring->buffer);
-			if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
-		}
-		free(conn->forward_ring);
-	}
-	/* All other memory and the control PE belong to the channel. */
+	/* Only reached before OPEN or after a confirmed CLOSED. The ring stays in
+	 * the channel's ring region; all memory and the control PE belong to the
+	 * channel. */
+	free(conn->forward_ring);
 	free(conn);
 	return 0;
 }
@@ -862,8 +860,10 @@ static int conn_open(struct channel_dev *dev, const struct channel_conn_config *
 {
 	struct channel_conn *conn;
 	doca_error_t result;
-	if (!dev || !cfg || !out || !cfg->flow_id || cfg->flow_id > 32 || !cfg->tx || !cfg->rx ||
-	    cfg->rx_offset > cfg->rx->bytes || CHANNEL_WINDOW > cfg->rx->bytes - cfg->rx_offset) { errno = EINVAL; return -1; }
+	if (!dev || !cfg || !out || !cfg->flow_id || cfg->flow_id > 32 || !cfg->tx || !cfg->rx || !cfg->rings ||
+	    cfg->rx_offset > cfg->rx->bytes || CHANNEL_WINDOW > cfg->rx->bytes - cfg->rx_offset ||
+	    cfg->ring_offset % CHANNEL_RING_STRIDE != 0 || cfg->ring_offset > cfg->rings->bytes ||
+	    CHANNEL_RING_STRIDE > cfg->rings->bytes - cfg->ring_offset) { errno = EINVAL; return -1; }
 	*out = NULL;
 
 	conn = calloc(1, sizeof(*conn));
@@ -900,9 +900,18 @@ static int conn_open(struct channel_dev *dev, const struct channel_conn_config *
 	snprintf(flow.src_workload, sizeof(flow.src_workload), "%s",
 		 cfg->workload != NULL ? cfg->workload : "");
 
-	/* forward ring and the shared regions as this connection's sndbuf/rcvbuf */
-	result = alloc_dma_ring(&conn->forward_ring, dev->dev, CHANNEL_RING_SIZE);
-	if (result != DOCA_SUCCESS) goto fail;
+	/* The slot's forward ring in the channel's ring region, empty: the slot's
+	 * last flow was closed (CLOSED), so no DPA reads it. The DPU imports the
+	 * region and reads the ring at its offset. */
+	conn->forward_ring = calloc(1, sizeof(*conn->forward_ring));
+	if (conn->forward_ring == NULL) { result = DOCA_ERROR_NO_MEMORY; goto fail; }
+	conn->forward_ring->mmap = cfg->rings->mmap;
+	conn->forward_ring->size = CHANNEL_RING_SIZE;
+	conn->forward_ring->buffer = (char *)cfg->rings->buf + cfg->ring_offset;
+	memset(conn->forward_ring->buffer, 0, sizeof(struct dma_ring_ctrl) + CHANNEL_RING_SIZE * sizeof(struct dma_desc));
+	conn->forward_ring->ctrl = (struct dma_ring_ctrl *)conn->forward_ring->buffer;
+	conn->forward_ring->descs = (struct dma_desc *)((char *)conn->forward_ring->buffer + sizeof(struct dma_ring_ctrl));
+	/* the shared regions as this connection's sndbuf/rcvbuf */
 	sndbuf.mmap = cfg->tx->mmap;
 	sndbuf.buf = cfg->tx->buf;
 	sndbuf.size = cfg->tx->bytes;

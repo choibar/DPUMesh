@@ -67,7 +67,7 @@ struct slot {
 };
 struct dmesh_native_transport {
     struct channel_dev *dev;
-    struct channel_mem *tx, *rx;
+    struct channel_mem *tx, *rx, *rings;
     char server[64], workload[64];
     uint32_t pod_ip;
     int pod_id, service_id, backend_max;
@@ -107,6 +107,8 @@ static int slot_open_mode(struct dmesh_native_transport *t, struct slot *s, uint
         .mode = mode, .backend_worker = worker, .backend_token = token,
         .tx = t->tx, .rx = t->rx,
         .rx_offset = (size_t)slot_index(t, s) * CHANNEL_WINDOW,
+        .rings = t->rings,
+        .ring_offset = (size_t)slot_index(t, s) * CHANNEL_RING_STRIDE,
     };
     struct channel_conn *c = NULL;
     if ((wait ? channel_conn_open(t->dev, &cfg, &c) : channel_conn_open_start(t->dev, &cfg, &c)) != 0)
@@ -330,6 +332,7 @@ int dmesh_native_open(struct dmesh_native_transport **out, struct dmesh_native_c
     if (channel_session_open(t->dev, t->server) != 0) goto fail;
     if (channel_mem_alloc(t->dev, cfg->bytes, &t->tx) != 0) goto fail;
     if (channel_mem_alloc(t->dev, (size_t)SLOTS * CHANNEL_WINDOW, &t->rx) != 0) goto fail;
+    if (channel_mem_alloc(t->dev, (size_t)SLOTS * CHANNEL_RING_STRIDE, &t->rings) != 0) goto fail;
     if (t->service_id != DMESH_SVC_NONE) {
         uint32_t ip; uint16_t port;
         if (dmesh_target_addr(t->service_id, &ip, &port) != 0 ||
@@ -358,7 +361,7 @@ int dmesh_native_close(struct dmesh_native_transport *t)
     if (!saved && channel_session_close(t->dev) != 0) saved = errno;
     /* A missing CLOSED/quiescence fence leaves exported regions registered. */
     if (saved) { errno = saved; return -1; }
-    channel_mem_free(t->rx); channel_mem_free(t->tx);
+    channel_mem_free(t->rings); channel_mem_free(t->rx); channel_mem_free(t->tx);
     channel_dev_close(t->dev);
     free(t);
     return 0;

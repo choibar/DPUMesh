@@ -25,6 +25,7 @@ struct channel_conn; /* Forward declaration: one logical flow with its own rings
 #define CHANNEL_WINDOW   (4u * 1024u * 1024u)  /* One connection's receive window (DMESH_PUSH_WINDOW) */
 #define CHANNEL_DESC_MAX      8064u            /* Forward descriptor bytes */
 #define CHANNEL_RING_SIZE     1024u            /* Forward ring depth of a flow */
+#define CHANNEL_RING_STRIDE   (17u * 4096u)    /* A flow's forward ring in the ring region: control line + descriptors */
 #define CHANNEL_DESC_ALIGN    128u             /* Forward descriptor alignment */
 
 #define CHANNEL_MODE_BACKEND 1u    /* DPUMesh BACKEND: a server flow the proxy connects through */
@@ -42,6 +43,8 @@ struct channel_conn_config {
 	struct channel_mem *tx;    /* Shared registered TX pool */
 	struct channel_mem *rx;    /* Registered RX region */
 	size_t rx_offset;       /* This connection's window inside rx */
+	struct channel_mem *rings; /* Registered forward ring region */
+	size_t ring_offset;     /* This connection's forward ring inside rings */
 };
 
 /* Device: opens the Comch device */

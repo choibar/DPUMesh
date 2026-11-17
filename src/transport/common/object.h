@@ -148,6 +148,7 @@ struct dmesh_conn {
 
     /* remote metadata from this connection's host */
     struct doca_mmap *ring_mmap;
+    uint64_t ring_off;                        /* the flow's forward ring inside ring_mmap (host region) */
     struct dmesh_buffer sndbuf;
     struct dmesh_buffer rcvbuf;
 

@@ -1490,7 +1490,7 @@ setup_dpa_buf_array(struct dmesh_conn *conn, size_t num_elem, struct doca_mmap *
         goto destroy_buf_arr;
     }
 
-    result = DMESH_DPA_CALL(doca_buf_arr_set_params(conn->buf_arr, mmap, sizeof(struct dma_desc), 0));
+    result = DMESH_DPA_CALL(doca_buf_arr_set_params(conn->buf_arr, mmap, sizeof(struct dma_desc), conn->ring_off));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array params: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;

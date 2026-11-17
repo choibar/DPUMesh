@@ -10,7 +10,7 @@
 #endif
 
 static struct dmesh_comch_client *mock_control;
-static unsigned client_creates, client_destroys, ring_allocs, ring_frees;
+static unsigned client_creates, client_destroys;
 static unsigned opens, closes;
 static unsigned shared_progress_calls;
 static int next_close_status;
@@ -28,8 +28,6 @@ static doca_error_t send_result = DOCA_SUCCESS;
 static int control_notify_fd = -1;
 
 /* The forward ring's release after CLOSED can fail once. */
-static int fail_ring_free;
-static unsigned ring_free_attempts;
 
 /* Flow wakes: every slot's PE and sync event, running at once (the flow wake
  * test models their states). */
@@ -199,20 +197,6 @@ doca_error_t doca_pe_destroy(struct doca_pe *pe)
     assert(pe == (struct doca_pe *)mock_control); return DOCA_SUCCESS;
 }
 
-static int fail_ring_alloc;
-doca_error_t alloc_dma_ring(struct dma_ring **out, struct doca_dev *dev, size_t size)
-{
-    (void)dev;
-    if (fail_ring_alloc) { fail_ring_alloc = 0; return DOCA_ERROR_NO_MEMORY; }
-    struct dma_ring *ring = calloc(1, sizeof(*ring) + sizeof(struct dma_ring_ctrl));
-    assert(ring);
-    ring->size = (uint32_t)size;
-    ring->ctrl = (void *)(ring + 1);
-    ring->mmap = (struct doca_mmap *)ring;
-    *out = ring;
-    ++ring_allocs;
-    return DOCA_SUCCESS;
-}
 doca_error_t alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
                                        void **buffer, size_t size, uint32_t access)
 {
@@ -234,11 +218,8 @@ doca_error_t doca_mmap_export_pci(struct doca_mmap *mmap, const struct doca_dev 
 }
 doca_error_t destroy_mmap_and_free_buffer(struct doca_mmap *mmap, void *buffer)
 {
-    if (mmap == (struct doca_mmap *)&fake_tails_mmap) { assert(buffer == fake_tails); return DOCA_SUCCESS; }
-    assert(mmap && !buffer);
-    ++ring_free_attempts;
-    if (fail_ring_free) { fail_ring_free = 0; return DOCA_ERROR_TIME_OUT; }
-    ++ring_frees;
+    /* A flow's ring lives in the channel's region: only the tail table is freed here. */
+    assert(mmap == (struct doca_mmap *)&fake_tails_mmap && buffer == fake_tails);
     return DOCA_SUCCESS;
 }
 doca_error_t dmesh_build_dma_metadata(struct doca_dev *dev, const struct dma_ring *ring,
@@ -282,39 +263,41 @@ static void test_checked_close(void)
     assert(channel_session_open(&dev, "unit-session") == 0);
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
     struct channel_mem rx = {.buf = calloc(1, 2 * CHANNEL_WINDOW), .bytes = 2 * CHANNEL_WINDOW};
-    assert(tx.buf && rx.buf);
-    struct channel_conn_config cfg = {.tx = &tx, .rx = &rx, .mode = CHANNEL_MODE_CLIENT};
+    struct channel_mem rings = {.buf = calloc(1, 2 * CHANNEL_RING_STRIDE), .bytes = 2 * CHANNEL_RING_STRIDE};
+    assert(tx.buf && rx.buf && rings.buf);
+    struct channel_conn_config cfg = {.tx = &tx, .rx = &rx, .rings = &rings, .mode = CHANNEL_MODE_CLIENT};
 
-    /* Failed ring allocation never publishes OPEN and leaves no stale map. */
-    cfg.flow_id = 1;
+    /* A ring outside the ring region never publishes OPEN and leaves no stale map. */
+    cfg.flow_id = 1; cfg.ring_offset = 2 * CHANNEL_RING_STRIDE;
     struct channel_conn *unopened = NULL;
     unsigned before_open = opens;
-    fail_ring_alloc = 1;
-    assert(channel_conn_open(&dev, &cfg, &unopened) == -1 && errno == ENOMEM);
+    assert(channel_conn_open(&dev, &cfg, &unopened) == -1 && errno == EINVAL);
     assert(!unopened && !dev.flows[1] && opens == before_open);
 
-    /* A ring the release after CLOSED fails keeps the flow without closing a
-     * sibling; the retry sends no second CLOSE and frees the ring once. */
-    cfg.flow_id = 1; cfg.rx_offset = 0;
-    struct channel_conn *a, *b;
+    /* Each flow's ring is its slot's part of the region. A closed flow leaves
+     * it there without closing a sibling; the slot's next flow finds it empty. */
+    cfg.flow_id = 1; cfg.rx_offset = 0; cfg.ring_offset = 0;
+    struct channel_conn *a, *b, *again;
     assert(channel_conn_open(&dev, &cfg, &a) == 0);
-    cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW;
+    cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW; cfg.ring_offset = CHANNEL_RING_STRIDE;
     assert(channel_conn_open(&dev, &cfg, &b) == 0);
-    unsigned before_close = closes, before_free = ring_frees, attempts = ring_free_attempts;
+    assert(a->forward_ring->buffer == rings.buf && a->forward_ring->mmap == rings.mmap);
+    assert(b->forward_ring->buffer == (char *)rings.buf + CHANNEL_RING_STRIDE);
+    a->forward_ring->ctrl->producer_tail = 7;
+    a->forward_ring->ctrl->consumer_head = 5;
+    unsigned before_close = closes;
     struct dmesh_comch_client *control = dev.control;
-    fail_ring_free = 1;
-    assert(channel_conn_close(a) == -1 && errno == ETIMEDOUT);
-    assert(dev.flows[1] == a && dev.flows[2] == b && dev.control == control);
-    assert(closes == before_close + 1 && ring_frees == before_free && ring_free_attempts == attempts + 1);
-    assert(channel_conn_poll(a) == 1);              /* CLOSED arrived */
     assert(channel_conn_close(a) == 0);
-    assert(!dev.flows[1] && dev.flows[2] == b && dev.control == control);
-    assert(closes == before_close + 1 && ring_frees == before_free + 1);
+    assert(!dev.flows[1] && dev.flows[2] == b && dev.control == control && closes == before_close + 1);
+    cfg.flow_id = 1; cfg.rx_offset = 0; cfg.ring_offset = 0;
+    assert(channel_conn_open(&dev, &cfg, &again) == 0);
+    assert(again->forward_ring->buffer == rings.buf && again->forward_ring->ctrl->producer_tail == 0 &&
+           again->forward_ring->ctrl->consumer_head == 0 && again->forward_ring->head == 0);
+    assert(channel_conn_close(again) == 0);
     assert(channel_conn_close(b) == 0);
     assert(channel_session_close(&dev) == 0);
     pthread_mutex_destroy(&dev.session_lock);
-    free(tx.buf); free(rx.buf);
-    assert(ring_allocs == ring_frees);
+    free(tx.buf); free(rx.buf); free(rings.buf);
 }
 
 /* An OPEN the DPU answers only after the host stopped waiting: the
@@ -327,23 +310,23 @@ static void test_late_open(void)
     assert(channel_session_open(&dev, "unit-session") == 0);
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
     struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW), .bytes = CHANNEL_WINDOW};
-    assert(tx.buf && rx.buf);
-    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx,
+    struct channel_mem rings = {.buf = calloc(1, CHANNEL_RING_STRIDE), .bytes = CHANNEL_RING_STRIDE};
+    assert(tx.buf && rx.buf && rings.buf);
+    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx, .rings = &rings,
                                       .mode = CHANNEL_MODE_CLIENT};
     struct channel_conn *flow = NULL;
-    unsigned freed = ring_frees;
 
     silent_open = silent_close = 1;
     assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == ETIMEDOUT && !flow);
     struct channel_conn *held = dev.flows[1];
-    assert(held && held->abandoned && held->close_sent && ring_frees == freed);
+    assert(held && held->abandoned && held->close_sent);
     assert(!channel_flow_free(&dev, 1));
     assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == EBUSY);
     silent_open = silent_close = 0;
     dispatch(&dev, DMESH_SESSION_READY, 1, held->generation, 0);
     assert(!channel_flow_free(&dev, 1) && dev.flows[1] == held);
     dispatch(&dev, DMESH_SESSION_CLOSED, 1, held->generation, 0);
-    assert(channel_flow_free(&dev, 1) && !dev.flows[1] && ring_frees == freed + 1);
+    assert(channel_flow_free(&dev, 1) && !dev.flows[1]);
     assert(channel_conn_open(&dev, &cfg, &flow) == 0 && flow->ready);
     assert(channel_conn_close(flow) == 0);
 
@@ -360,8 +343,7 @@ static void test_late_open(void)
 
     assert(channel_session_close(&dev) == 0);
     pthread_mutex_destroy(&dev.session_lock);
-    free(tx.buf); free(rx.buf);
-    assert(ring_allocs == ring_frees);
+    free(tx.buf); free(rx.buf); free(rings.buf);
 }
 
 static void test_backend_requests(struct channel_dev *dev)
@@ -404,12 +386,13 @@ int main(void)
     struct dmesh_comch_client *control = dev.control;
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
     struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW * 3), .bytes = CHANNEL_WINDOW * 3};
-    assert(tx.buf && rx.buf);
-    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx,
+    struct channel_mem rings = {.buf = calloc(1, CHANNEL_RING_STRIDE * 3), .bytes = CHANNEL_RING_STRIDE * 3};
+    assert(tx.buf && rx.buf && rings.buf);
+    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx, .rings = &rings,
                                       .mode = CHANNEL_MODE_CLIENT};
     struct channel_conn *a, *b, *again;
     assert(channel_conn_open(&dev, &cfg, &a) == 0);
-    cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW;
+    cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW; cfg.ring_offset = CHANNEL_RING_STRIDE;
     assert(channel_conn_open(&dev, &cfg, &b) == 0);
     assert(client_creates == 1 && opens == 2 && a->ready && b->ready);
     /* Each flow publishes its tail in its own slot of the session's table. */
@@ -441,8 +424,8 @@ int main(void)
 
     assert(channel_conn_close(a) == 0);
     assert(dev.flows[1] == NULL && dev.flows[2] == b);
-    assert(dev.control == control && client_destroys == 0 && ring_frees == 1);
-    cfg.flow_id = 1; cfg.rx_offset = 0;
+    assert(dev.control == control && client_destroys == 0);
+    cfg.flow_id = 1; cfg.rx_offset = 0; cfg.ring_offset = 0;
     assert(channel_conn_open(&dev, &cfg, &again) == 0);
     assert(again->generation == 2 && client_creates == 1);
     dispatch(&dev, DMESH_SESSION_CLOSED, 1, 1, 0);
@@ -458,15 +441,14 @@ int main(void)
     control->peer_gone = 0; dev.session_error = 0; /* Test-only reset. */
 
     /* A failed close retains the flow and its ring, without closing siblings. */
-    unsigned freed = ring_frees;
     next_close_status = EBUSY;
     assert(channel_conn_close(b) == -1 && errno == EBUSY);
-    assert(dev.flows[2] == b && ring_frees == freed && dev.control == control);
+    assert(dev.flows[2] == b && dev.control == control);
     assert(channel_conn_close(b) == 0);
 
     /* No wraparound to an old generation, and no RX-window overwrite on reject. */
     dev.generations[3] = UINT32_MAX;
-    cfg.flow_id = 3; cfg.rx_offset = CHANNEL_WINDOW * 2;
+    cfg.flow_id = 3; cfg.rx_offset = CHANNEL_WINDOW * 2; cfg.ring_offset = CHANNEL_RING_STRIDE * 2;
     memset((char *)rx.buf + cfg.rx_offset, 0xa5, 64);
     struct channel_conn *unused = NULL;
     assert(channel_conn_open(&dev, &cfg, &unused) == -1 && errno == EOVERFLOW);
@@ -484,9 +466,9 @@ int main(void)
     assert(channel_session_close(&dev) == 0);
     assert(!dev.control && !dev.flows[1] && client_destroys == 1);
     assert(flow_pes_live == 0 && events_live == 0);
-    assert(ring_allocs == ring_frees && closes == 4);
+    assert(closes == 4);
     pthread_mutex_destroy(&dev.session_lock);
-    free(tx.buf); free(rx.buf);
+    free(tx.buf); free(rx.buf); free(rings.buf);
     test_checked_close();
     test_late_open();
     puts("channel session: isolated flows, checked cleanup failures and retry verified");

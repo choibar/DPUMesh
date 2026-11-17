@@ -108,6 +108,24 @@ process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadat
                      doca_error_get_name(result));
         return result;
     }
+    /* The export is the host's ring region; this flow's ring is at ring_buf. */
+    {
+        void *base = NULL;
+        size_t len = 0;
+        result = doca_mmap_start(conn->ring_mmap);
+        if (result == DOCA_SUCCESS)
+            result = doca_mmap_get_memrange(conn->ring_mmap, &base, &len);
+        if (result == DOCA_SUCCESS &&
+            ((uintptr_t)metadata_msg->ring_buf < (uintptr_t)base ||
+             (uintptr_t)metadata_msg->ring_buf - (uintptr_t)base > len ||
+             metadata_msg->ring_buf_len > len - ((uintptr_t)metadata_msg->ring_buf - (uintptr_t)base)))
+            result = DOCA_ERROR_INVALID_VALUE;
+        if (result != DOCA_SUCCESS) {
+            DOCA_LOG_ERR("Forward ring outside its exported region: %s", doca_error_get_name(result));
+            goto destroy_ring_mmap;
+        }
+        conn->ring_off = (uintptr_t)metadata_msg->ring_buf - (uintptr_t)base;
+    }
 
     /* send buffer */
     result = doca_mmap_create_from_export(NULL, metadata_msg->snd_desc,
