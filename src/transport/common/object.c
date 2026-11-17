@@ -7,6 +7,7 @@
 #include <doca_pe.h>
 #include <doca_comch.h>
 
+#include "buffer.h"
 #include "dma.h"
 
 DOCA_LOG_REGISTER(OBJECT);
@@ -234,6 +235,21 @@ cleanup_objects(struct objects *objs)
     }
 
     /* Fast-path producers live on consumer_pe (DPU workers only). */
+
+    /* The connection slots' stagings (DPU workers only), once no flow and no
+     * DPA thread uses them. */
+    if (objs->fwd_pool_mmap != NULL) {
+        result = destroy_mmap_and_free_buffer(objs->fwd_pool_mmap, objs->fwd_pool);
+        if (result != DOCA_SUCCESS) return result;
+        objs->fwd_pool_mmap = NULL;
+        objs->fwd_pool = NULL;
+    }
+    if (objs->rev_pool_mmap != NULL) {
+        result = destroy_mmap_and_free_buffer(objs->rev_pool_mmap, objs->rev_pool);
+        if (result != DOCA_SUCCESS) return result;
+        objs->rev_pool_mmap = NULL;
+        objs->rev_pool = NULL;
+    }
 
     if (objs->is_server && objs->consumer_pe != NULL) {
         result = doca_pe_destroy(objs->consumer_pe);

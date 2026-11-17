@@ -878,19 +878,11 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     conn->sndbuf.buf = NULL;
     conn->rcvbuf.buf = NULL;
 
-    /* Local staging buffer + its mmap. */
-    if (conn->local_mmap != NULL) {
-        destroy_mmap_and_free_buffer(conn->local_mmap, conn->dma_buffer);
-        conn->local_mmap = NULL;
-        conn->dma_buffer = NULL;
-    }
-
-    /* Reverse (DPU -> host) staging. */
-    if (conn->tx_staging_mmap != NULL) {
-        destroy_mmap_and_free_buffer(conn->tx_staging_mmap, conn->tx_staging);
-        conn->tx_staging_mmap = NULL;
-        conn->tx_staging = NULL;
-    }
+    /* The slot's stagings stay in the worker's pools. */
+    conn->local_mmap = NULL;
+    conn->dma_buffer = NULL;
+    conn->tx_staging_mmap = NULL;
+    conn->tx_staging = NULL;
     conn->tx_staging_len = 0;
     conn->reverse_ready = false;
     conn->push_seq = 0;
@@ -947,18 +939,6 @@ static doca_error_t flow_mmap_destroy(struct doca_mmap **mmap)
     return result;
 }
 
-static doca_error_t flow_local_buffer_destroy(struct doca_mmap **mmap, void **buffer)
-{
-    if (*mmap == NULL)
-        return DOCA_SUCCESS;
-    doca_error_t result = flow_mmap_destroy(mmap);
-    if (result == DOCA_SUCCESS) {
-        free(*buffer);
-        *buffer = NULL;
-    }
-    return result;
-}
-
 static bool flow_has_resources(const struct dmesh_conn *conn)
 {
     return conn->dpa_thread || conn->dpa_comch || conn->mux || conn->dma_ctx || conn->buf_arr ||
@@ -1007,12 +987,13 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     }
     if ((result = flow_mmap_destroy(&conn->ring_mmap)) != DOCA_SUCCESS ||
         (result = flow_mmap_destroy(&conn->sndbuf.mmap)) != DOCA_SUCCESS ||
-        (result = flow_mmap_destroy(&conn->rcvbuf.mmap)) != DOCA_SUCCESS ||
-        (result = flow_local_buffer_destroy(&conn->local_mmap, &conn->dma_buffer)) != DOCA_SUCCESS)
+        (result = flow_mmap_destroy(&conn->rcvbuf.mmap)) != DOCA_SUCCESS)
         return result;
-    result = flow_local_buffer_destroy(&conn->tx_staging_mmap, &conn->tx_staging);
-    if (result != DOCA_SUCCESS)
-        return result;
+    /* The slot's stagings stay in the worker's pools. */
+    conn->local_mmap = NULL;
+    conn->dma_buffer = NULL;
+    conn->tx_staging_mmap = NULL;
+    conn->tx_staging = NULL;
     dmesh_dpa_mux_release(conn);
     dmesh_dpa_thread_pool_release(conn->objs, conn);
     conn->dpa_thread = NULL;
@@ -1232,13 +1213,9 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			goto error;
 		}
 
-		result = alloc_buffer_and_set_mmap(&conn->local_mmap, objs->dev,
-						   &conn->dma_buffer, BUFFER_SIZE,
-						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to allocate DMA buffer: %s", doca_error_get_name(result));
-			goto error;
-		}
+		/* The slot's forward staging, in the worker's pool. */
+		conn->local_mmap = objs->fwd_pool_mmap;
+		conn->dma_buffer = (uint8_t *)objs->fwd_pool + (size_t)(conn - objs->conns) * BUFFER_SIZE;
 
 		/* The reverse path imports the session's TAILS page before a mux
 		 * thread takes it. */
@@ -1281,18 +1258,13 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			conn->error_status = EIO;
 			goto error;
 		}
-		/* The reverse path's staging, once per connection: the proxy writes
-		 * a flow's bytes there and the reverse DPA thread copies them to the
-		 * host (dmesh_dma_push_staged). */
+		/* The reverse path's staging, the slot's part of the worker's pool:
+		 * the proxy writes a flow's bytes there and the reverse DPA thread
+		 * copies them to the host (dmesh_dma_push_staged). */
 		if (!conn->reverse_ready) {
 			if (conn->tx_staging == NULL) {
-				result = alloc_buffer_and_set_mmap(&conn->tx_staging_mmap, objs->dev, &conn->tx_staging,
-								   DMESH_PUSH_WINDOW, DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
-				if (result != DOCA_SUCCESS) {
-					DOCA_LOG_ERR("Failed to alloc reverse staging (will retry): %s",
-						     doca_error_get_name(result));
-					break;
-				}
+				conn->tx_staging_mmap = objs->rev_pool_mmap;
+				conn->tx_staging = (uint8_t *)objs->rev_pool + (size_t)(conn - objs->conns) * DMESH_PUSH_WINDOW;
 				conn->tx_staging_len = DMESH_PUSH_WINDOW;
 				conn->push_seq = 0;
 				conn->push_pos = 0;
@@ -1458,6 +1430,20 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 			clock_gettime(CLOCK_MONOTONIC, &t1);
 			DOCA_LOG_INFO("Prewarmed %d/%d DPA pool slots in %ld ms", ready, prewarm,
 				      (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+		}
+
+		/* Every slot's stagings, registered once: a connection's setup
+		 * registers no memory of its own. */
+		result = alloc_buffer_and_set_mmap(&objs->fwd_pool_mmap, objs->dev, &objs->fwd_pool,
+						   (size_t)DMESH_MAX_CONNECTIONS * BUFFER_SIZE,
+						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+		if (result == DOCA_SUCCESS)
+			result = alloc_buffer_and_set_mmap(&objs->rev_pool_mmap, objs->dev, &objs->rev_pool,
+							   (size_t)DMESH_MAX_CONNECTIONS * DMESH_PUSH_WINDOW,
+							   DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to register the stagings: %s", doca_error_get_name(result));
+			goto error;
 		}
 
 		result = dmesh_dpa_mux_init(objs);

@@ -267,6 +267,11 @@ struct objects {
     struct doca_mmap *local_mmap;
     struct doca_mmap *remote_mmap;
     void *dma_buffer;
+    /* DPU: every connection slot's forward staging (BUFFER_SIZE) and reverse
+     * staging (DMESH_PUSH_WINDOW), registered once when the worker starts; a
+     * connection takes its slot's part. */
+    struct doca_mmap *fwd_pool_mmap, *rev_pool_mmap;
+    void *fwd_pool, *rev_pool;
     void *remote_addr;
     size_t remote_buf_size;
     struct doca_mmap *ring_mmap;    /* used for DMA ring mmap in DPU */
