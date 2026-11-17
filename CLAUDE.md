@@ -206,9 +206,9 @@ messages reach the ARM workers over DPA MsgQs (`comch_msgq.c`).
   16B `struct dmesh_push_desc{seq,pos,len}` into the window's slot ring and a
   new value into the flow slot's sync event word (in the session's tail table
   page), which wakes the host. Several batches of a flow are in flight,
-  bounded by the host's consumption cursor, which the worker pulls with its
-  connection's `doca_dma` engine. The ARM takes no completion and sends no
-  message per batch. Each connection slot has its own async ops queue on the
+  bounded by the host's consumption cursor in the window, which the DPA reads
+  itself when the last value it read leaves too little room. The ARM takes no
+  completion, sends no message per batch and does not read the host. Each connection slot has its own async ops queue on the
   thread (one shared completion queue): a copy into a host process that died
   never completes and holds back its queue, so it holds only its own flow. A
   flow that ends with such copies leaves its queue behind and the slot's next

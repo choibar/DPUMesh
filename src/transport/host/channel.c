@@ -32,8 +32,9 @@
  * Reverse path: the DPU's reverse DPA thread lands each batch in the window's
  * data ring and its descriptor in the slot ring, then stores a new value into
  * the flow slot's sync event word in the session's tail table page. The host
- * reads the slots in order, publishes a consumption cursor the DPU pulls, and
- * sleeps on a wait task of the slot's sync event (channel_flow_arm).
+ * reads the slots in order, publishes a consumption cursor the DPA thread
+ * reads, and sleeps on a wait task of the slot's sync event
+ * (channel_flow_arm).
  */
 
 DOCA_LOG_REGISTER(CHANNEL);
@@ -1224,7 +1225,7 @@ int channel_conn_rx_next(struct channel_conn *conn, uint64_t *seq, uint32_t *pos
 
 void channel_conn_rx_consumed(struct channel_conn *conn, uint64_t seq, uint64_t bytes)
 {
-	/* the DPU pulls this cursor for its flow control */
+	/* the DPU's reverse DPA thread reads this cursor for its flow control */
 	conn->cursor->consumed_seq = seq;
 	conn->cursor->consumed_bytes = bytes;
 }

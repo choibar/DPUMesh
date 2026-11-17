@@ -63,9 +63,9 @@ struct dmesh_push_desc {
 
 /* Push flow control: the host publishes its consumption cursor at a fixed
  * offset in its rcvbuf (the reserved gap between the desc slots and the data
- * ring). The DPU pulls it with a small read-DMA and issues no batch that would
- * overrun unconsumed slots or bytes. MAGIC marks a published cursor; before
- * the first one the free slots alone bound the batches in flight. */
+ * ring). The worker's reverse DPA thread reads it and starts no copy that
+ * would overrun unconsumed slots or bytes. MAGIC marks a published cursor;
+ * until the thread sees it, it takes the host to have consumed nothing. */
 #define DMESH_PUSH_CURSOR_OFF   2048u
 #define DMESH_PUSH_FC_MAGIC     0xD3E5FC01D3E5FC01ull
 struct dmesh_push_cursor {

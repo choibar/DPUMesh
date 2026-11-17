@@ -28,8 +28,10 @@ _Static_assert(DMESH_EC_DESC_N == DMESH_PUSH_DESC_N && DMESH_EC_DATA_OFF == DMES
                DMESH_EC_DESC_SZ == sizeof(struct dmesh_push_desc) &&
                offsetof(struct dmesh_push_desc, pos) == 8 && offsetof(struct dmesh_push_desc, len) == 12,
                "the DPA writes the host's push layout");
-/* dmesh_dma_push_gated keeps a flow below DMESH_PUSH_DESC_N - 1 batches past push_seq. */
-_Static_assert(DMESH_EC_FLOW_Q >= DMESH_PUSH_DESC_N, "the thread holds every batch of a flow in flight");
+_Static_assert(DMESH_EC_CURSOR_OFF == DMESH_PUSH_CURSOR_OFF && DMESH_EC_FC_MAGIC == DMESH_PUSH_FC_MAGIC &&
+               offsetof(struct dmesh_push_cursor, consumed_seq) == 8 &&
+               offsetof(struct dmesh_push_cursor, consumed_bytes) == 16,
+               "the DPA reads the host's cursor");
 
 #define EC_QUIESCE_NS 1000000000ull
 #define EC_RETIRE_NS  100000000ull      /* the thread takes an entry within a pass */
@@ -253,7 +255,7 @@ doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn)
     return DOCA_SUCCESS;
 }
 
-doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn)
+doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring, uint32_t max_batch)
 {
     struct objects *objs = conn->objs;
     struct dmesh_ec_worker *w = objs->ec;
@@ -280,8 +282,10 @@ doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn)
     l->src_mmap = src_h;
     l->win_mmap = win_h;
     l->se_mmap = conn->ec_se_h;
+    l->ring = ring;
     l->win_addr = (uint64_t)(uintptr_t)conn->rcvbuf.buf;
     l->se_addr = conn->ec_se_addr;
+    l->slack = max_batch;
     conn->ec_ready = true;
     return DOCA_SUCCESS;
 }

@@ -3,7 +3,8 @@
 
 A copy writes the host window only when the test completes it, and a copy
 the test never completes stands for one into a host process that died. The
-kernel must keep publishing every other flow. Hardware behavior is verified
+kernel must keep publishing every other flow, and start a flow's copies only
+when the host's cursor leaves room for them. Hardware behavior is verified
 separately on devices.
 """
 from pathlib import Path
@@ -31,11 +32,11 @@ typedef unsigned doca_dpa_dev_completion_element_t;
 static struct dmesh_ec_tls tls;
 static struct dmesh_ec_ctl ctl;
 static unsigned retriggers;
-static uint64_t clock_ns;
+static uint64_t clock_ns, clock_step = 1000;
 static uint64_t doca_dpa_dev_thread_get_local_storage(void) { return (uintptr_t)&tls; }
 static void doca_dpa_dev_thread_retrigger(void) { ++retriggers; }
-/* An activation ends after EC_ACTIVATION_US: each read advances 1 us. */
-static uint64_t __dpa_thread_time(void) { return clock_ns += 1000; }
+/* Each read advances clock_step us; an activation ends after EC_ACTIVATION_US. */
+static uint64_t __dpa_thread_time(void) { return clock_ns += clock_step; }
 static void __dpa_thread_window_writeback(void) {}
 static void __dpa_thread_window_read_inv(void) {}
 /* Handles are 1 + an index into these; addresses are the test's pointers. */
@@ -74,11 +75,21 @@ static unsigned char win[4][DMESH_EC_DATA_OFF + 65536] __attribute__((aligned(64
 static unsigned char src[4][65536];
 static uint64_t se_words[4][8];
 
+/* The host's consumption cursor in the flow's window. */
+static uint64_t *cursor(uint32_t slot) { return (uint64_t *)&win[slot][DMESH_EC_CURSOR_OFF]; }
+static void consumed(uint32_t slot, uint64_t seq, uint64_t bytes)
+{
+    cursor(slot)[1] = seq;
+    cursor(slot)[2] = bytes;
+}
+/* A 64 KiB data ring and batches of at most 16 KiB. */
 static void flow(uint32_t slot, uint32_t gen, uint32_t id)
 {
     ctl.flow[slot] = (struct dmesh_ec_flow){.ops = 100 + id, .gen = gen, .id = id,
-        .src_mmap = 1, .win_mmap = 2, .se_mmap = 3,
-        .win_addr = (uintptr_t)win[slot], .se_addr = (uintptr_t)se_words[slot]};
+        .src_mmap = 1, .win_mmap = 2, .se_mmap = 3, .ring = 65536,
+        .win_addr = (uintptr_t)win[slot], .se_addr = (uintptr_t)se_words[slot], .slack = 16384};
+    cursor(slot)[0] = DMESH_EC_FC_MAGIC;
+    consumed(slot, 0, 0);
 }
 static void post(uint32_t slot, uint32_t gen, uint64_t seq, uint32_t pos, uint32_t len, uint64_t cum)
 {
@@ -192,6 +203,11 @@ int main(void)
     post(3, 4, 1, 0, 10, 10);
     run_ec_rev();
     assert(ctl.done[3].failed == 4 && nposted == 0);
+    flow(1, 3, 65);
+    ctl.flow[1].slack = ctl.flow[1].ring;    /* no batch could ever fit */
+    post(1, 3, 1, 0, 10, 10);
+    run_ec_rev();
+    assert(ctl.done[1].failed == 3 && nposted == 0);
 
     /* A flow's full window in flight: DMESH_EC_FLOW_Q - 2 batches, then each
      * completion publishes one, in order. */
@@ -206,9 +222,83 @@ int main(void)
         assert(done_seq(2, 2) == i && ctl.done[2].bytes == i * 4);
     }
     assert(!memcmp(win[2] + DMESH_EC_DATA_OFF, src[2], (DMESH_EC_FLOW_Q - 2) * 4));
+
+    /* The host's descriptor slots: with nothing consumed, a flow's batch
+     * DMESH_EC_DESC_N - 1 waits; the end of stream may take one slot more. A
+     * cursor without its magic is no cursor. */
+    flow(3, 6, 131);
+    for (uint64_t i = 1; i <= DMESH_EC_DESC_N - 2; i++)
+        post(3, 6, i, 0, 4, i * 4);
+    while (ctl.head != ctl.tail) run_ec_rev();
+    assert(nposted == DMESH_EC_DESC_N - 2);
+    for (uint64_t i = 1; i <= DMESH_EC_DESC_N - 2; i++)
+        complete(231, DOCA_DPA_DEV_COMP_SEND);
+    run_ec_rev();
+    assert(done_seq(3, 6) == DMESH_EC_DESC_N - 2);
+    post(3, 6, DMESH_EC_DESC_N - 1, 0, 4, (DMESH_EC_DESC_N - 1) * 4);
+    post(3, 6, DMESH_EC_DESC_N, 0, 0, (DMESH_EC_DESC_N - 1) * 4);
+    run_ec_rev();
+    assert(nposted == 0 && (tls.waiting & 1ull << 3) && done_seq(3, 6) == DMESH_EC_DESC_N - 2);
+    uint64_t reads = tls.cursor_reads;
+    cursor(3)[0] = 0;
+    consumed(3, 2, 8);
+    run_ec_rev();
+    assert(nposted == 0 && tls.cursor_reads > reads && tls.f[3].cseq == 0);
+    cursor(3)[0] = DMESH_EC_FC_MAGIC;
+    run_ec_rev();
+    assert(nposted == 1 && !(tls.waiting & 1ull << 3) && tls.f[3].cseq == 2);
+    complete(231, DOCA_DPA_DEV_COMP_SEND);
+    run_ec_rev();
+    assert(done_seq(3, 6) == DMESH_EC_DESC_N && desc(3, DMESH_EC_DESC_N)->len == 0);
+
+    /* The host's data ring: a batch fits with one largest batch to spare. A
+     * cursor past what was published counts as what was published. */
+    flow(0, 3, 192);
+    for (uint32_t i = 0; i < 4; i++)
+        post(0, 3, i + 1, i * 16384, 16384, (i + 1) * 16384ull);
+    run_ec_rev();
+    assert(nposted == 3 && (tls.waiting & 1));
+    consumed(0, 9, 1ull << 30);
+    complete(292, DOCA_DPA_DEV_COMP_SEND);
+    run_ec_rev();
+    assert(tls.f[0].cseq == 1 && tls.f[0].cbytes == 16384 && !(tls.waiting & 1));
+    assert(nposted == 3 && posted[2].dst == (uintptr_t)win[0] + DMESH_EC_DATA_OFF + 49152);
+    for (int i = 0; i < 3; i++)
+        complete(292, DOCA_DPA_DEV_COMP_SEND);
+    run_ec_rev();
+    assert(done_seq(0, 3) == 4 && !memcmp(win[0] + DMESH_EC_DATA_OFF, src[0], 65536));
+
+    /* A flow that keeps waiting reads the cursor at doubling intervals: about
+     * 35 reads in 2 ms (4, 8, 16, 32 us, then every 64 us), and one more read
+     * after the host makes room. */
+    consumed(0, 1, 16384);
+    clock_step = 1;
+    reads = tls.cursor_reads;
+    post(0, 3, 5, 0, 16384, 5 * 16384);
+    run_ec_rev();
+    assert(nposted == 0 && tls.cursor_reads - reads >= 25 && tls.cursor_reads - reads <= 40);
+    consumed(0, 2, 32768);
+    reads = tls.cursor_reads;
+    run_ec_rev();
+    assert(nposted == 1 && tls.cursor_reads - reads == 1 && !(tls.waiting & 1));
+
+    /* A waiting flow whose queue is retired starts nothing more. */
+    post(0, 3, 6, 16384, 16384, 6 * 16384);
+    run_ec_rev();
+    assert(nposted == 1 && (tls.waiting & 1));
+    post(0, 0, 0, 0, 0, 0);
+    consumed(0, 5, 5 * 16384);
+    run_ec_rev();
+    complete(292, DOCA_DPA_DEV_COMP_SEND);
+    run_ec_rev();
+    assert(nposted == 0 && !(tls.waiting & 1) && tls.stale_cqes == 4);
+    clock_step = 1000;
+
     assert(ctl.publishes == tls.publishes && ctl.activations == tls.activations);
+    assert(ctl.cursor_reads == tls.cursor_reads);
     puts("reverse DPA thread: per-flow queues, a stuck flow holds back no other, order, end of stream, "
-         "retired queue, failed copy, bad entries, full window PASS");
+         "retired queue, failed copy, bad entries, full window, host room (slots, bytes, cursor clamp, "
+         "read backoff) PASS");
 }
 '''
 flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'doca-common'], text=True))

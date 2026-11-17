@@ -10,7 +10,8 @@
  * and each of its connection slots one queue of it. A flow's batches go into
  * the thread's ring: the DPA copies them on the flow's queue, publishes their
  * descriptors and wakes the host through the flow slot's sync event; the ARM
- * takes no completion and sends no message. Several batches of a flow may be
+ * takes no completion, sends no message and does not read the host: the
+ * thread waits for the host's room itself. Several batches of a flow may be
  * in flight; push_seq and pushed_bytes follow the thread's completions, read
  * whenever the worker asks (dmesh_ec_reap). A flow that ends with batches the
  * thread still holds leaves its queue behind: the slot's next flow gets a new
@@ -31,8 +32,9 @@ doca_error_t dmesh_ec_init(struct objects *objs);
  * reverse thread. */
 doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn);
 /* The flow's line for the thread (its queue, the DPA handles of its tx_staging
- * and rcvbuf window), written on its first batch. */
-doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn);
+ * and rcvbuf window, the data ring bytes it places batches in and its largest
+ * batch), written on its first batch. */
+doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring, uint32_t max_batch);
 /* The worker's ring and completion lines; NULL when off. */
 struct dmesh_ec_ctl *dmesh_ec_ctl_of(struct objects *objs);
 /* Appends one entry; DOCA_ERROR_AGAIN when the ring is full. */
@@ -53,7 +55,11 @@ void dmesh_ec_conn_reset(struct dmesh_conn *conn);
 
 static inline doca_error_t dmesh_ec_init(struct objects *objs) { (void)objs; return DOCA_SUCCESS; }
 static inline doca_error_t dmesh_ec_conn_setup(struct dmesh_conn *conn) { (void)conn; return DOCA_SUCCESS; }
-static inline doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn) { (void)conn; return DOCA_ERROR_NOT_SUPPORTED; }
+static inline doca_error_t dmesh_ec_conn_handles(struct dmesh_conn *conn, uint32_t ring, uint32_t max_batch)
+{
+    (void)conn; (void)ring; (void)max_batch;
+    return DOCA_ERROR_NOT_SUPPORTED;
+}
 static inline struct dmesh_ec_ctl *dmesh_ec_ctl_of(struct objects *objs) { (void)objs; return NULL; }
 static inline doca_error_t dmesh_ec_post(struct dmesh_conn *conn, uint64_t seq, uint32_t pos, uint32_t len,
                                          uint64_t src_addr, uint64_t cum_bytes)

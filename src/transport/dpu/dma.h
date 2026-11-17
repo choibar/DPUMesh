@@ -54,18 +54,15 @@ doca_error_t dmesh_dma_engine_prewarm(struct objects *objs, struct dmesh_doca_dp
 doca_error_t
 submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 
-doca_error_t
-submit_dma_task_kind(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst,
-                     int kind);
-
 /* Largest batch the reverse DPA thread copies at once. */
 #define DMESH_PUSH_MAX_BATCH 65536u
 
 /* DPU -> host: hand up to one batch already staged at tx_staging+src_pos to
  * the worker's reverse DPA thread, which copies it into the host's data ring
  * and publishes its descriptor (struct dmesh_push_desc). Several batches of
- * a flow may be in flight. Returns bytes accepted (0 = the host's window or
- * the thread's ring is full, retry) or a negative doca_error_t. */
+ * a flow may be in flight; the thread starts each once the host has room for
+ * it. Returns bytes accepted (0 = the thread holds as many of the flow's
+ * batches as it can, or its ring is full: retry) or a negative doca_error_t. */
 int
 dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len);
 

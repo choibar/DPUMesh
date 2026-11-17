@@ -276,9 +276,10 @@ _Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a cop
  * async ops queue of it. Before a flow's first batch the worker writes the
  * flow's line (its queue, DPA handles and host addresses); then it appends one
  * entry per batch to the thread's ring in ARM memory and advances the tail.
- * The thread copies the batch from tx_staging into the host's data ring on
- * the flow's queue. Once the copy completed and the flow's earlier batches
- * were published, it stores the batch's descriptor into the host's slot ring
+ * Once the host has room for the batch, the thread copies it from tx_staging
+ * into the host's data ring on the flow's queue. Once the copy completed and
+ * the flow's earlier batches were published, it stores the batch's descriptor
+ * into the host's slot ring
  * (pos and len, then seq), a value no earlier store to it had
  * (wid << 48 | the thread's publish count) into the flow slot's sync event
  * word on the host, and the flow's completed sequence and bytes into the
@@ -286,6 +287,18 @@ _Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a cop
  * side's CPU takes part in the copy or the wake. A zero-length entry is the
  * end of stream: it publishes a descriptor of length 0 after every earlier
  * batch of the flow.
+ *
+ * Room is the host's consumption cursor (struct dmesh_push_cursor in the
+ * window), which only the thread reads. A batch's copy starts when its
+ * descriptor slot is free (seq - consumed_seq <= DMESH_EC_DESC_N - 2, one slot
+ * more for the end of stream) and its bytes fit the data ring with one largest
+ * batch to spare for the gap a wrap leaves
+ * (cum_bytes - consumed_bytes + slack <= ring). The thread keeps the cursor it
+ * read last and reads it again only when that leaves too little room; a flow
+ * still waiting reads it at doubling intervals (EC_CURSOR_*_US in the kernel).
+ * A cursor past what the thread published counts as what it published. The
+ * worker does not look at the host: staging it cannot reuse yet holds its
+ * flow back.
  *
  * Flows have queues of their own because a copy into the memory of a host
  * process that died never completes, and neither does any copy behind it on
@@ -312,6 +325,8 @@ _Static_assert(sizeof(struct dmesh_mux_msg) == 16, "dmesh_mux_msg must fit a cop
 #define DMESH_EC_CQ          (2u * DMESH_EC_CONNS * DMESH_EC_FLOW_Q)
 #define DMESH_EC_DESC_SZ     16u                       /* = sizeof(struct dmesh_push_desc): seq, pos, len */
 #define DMESH_EC_DATA_OFF    4096u                     /* = DMESH_PUSH_DATA_OFF */
+#define DMESH_EC_CURSOR_OFF  2048u                     /* = DMESH_PUSH_CURSOR_OFF */
+#define DMESH_EC_FC_MAGIC    0xD3E5FC01D3E5FC01ull     /* = DMESH_PUSH_FC_MAGIC */
 #define DMESH_EC_GEN_SHIFT   40                        /* completion line: generation << 40 | sequence */
 #define DMESH_EC_GEN_MASK    0xffffffu
 
@@ -329,10 +344,12 @@ struct dmesh_ec_flow {              /* ARM -> DPA, one line per connection slot 
 	uint64_t ops;                   /* the flow's queue, DPA handle */
 	uint32_t gen;                   /* the flow, as its entries name it (masked by DMESH_EC_GEN_MASK) */
 	uint32_t id;                    /* the queue's user data, which its completions carry */
-	uint32_t src_mmap, win_mmap, se_mmap, pad; /* DPA handles: tx_staging, host rcvbuf window, tail table page */
+	uint32_t src_mmap, win_mmap, se_mmap; /* DPA handles: tx_staging, host rcvbuf window, tail table page */
+	uint32_t ring;                  /* data ring bytes the worker places batches in */
 	uint64_t win_addr;              /* host address of the rcvbuf window */
 	uint64_t se_addr;               /* host address of the flow slot's sync event word */
-	uint64_t l[2];
+	uint32_t slack, pad;            /* the flow's largest batch: the most a wrap leaves unused */
+	uint64_t l[1];
 };
 
 struct dmesh_ec_done {              /* DPA -> ARM, one line per connection slot */
@@ -344,27 +361,32 @@ struct dmesh_ec_done {              /* DPA -> ARM, one line per connection slot 
 
 struct dmesh_ec_ctl {               /* ARM memory, one per worker */
 	volatile uint64_t tail, l0[7];                  /* ARM -> DPA */
-	volatile uint64_t head, copies, publishes, passes, activations, stale_cqes, err_cqes, l1; /* DPA -> ARM */
+	volatile uint64_t head, copies, publishes, passes, activations, stale_cqes, err_cqes, cursor_reads; /* DPA -> ARM */
 	struct dmesh_ec_done done[DMESH_EC_CONNS];
 	struct dmesh_ec_flow flow[DMESH_EC_CONNS];
 	struct dmesh_ec_ent ring[DMESH_EC_RING];
 };
 
 struct dmesh_ec_batch {             /* a batch the thread holds */
-	uint64_t pos_len, cum_bytes;
+	uint64_t pos_len, cum_bytes, src_addr;
 };
 
 struct dmesh_ec_fq {                /* the thread's state of a slot's flow */
 	uint64_t ops, win_addr, se_addr;
-	uint32_t gen, id, src_mmap, win_mmap, se_mmap, failed;
-	uint64_t head, tail, done;      /* batches published, batches taken, copies completed and not published */
+	uint32_t gen, id, src_mmap, win_mmap, se_mmap, failed, ring, slack;
+	/* Batches published <= started <= taken; copies completed and not published. */
+	uint64_t head, issued, tail, done;
+	uint64_t pub_bytes;             /* the flow's bytes up to the last batch published */
+	uint64_t cseq, cbytes;          /* the host's cursor as last read, at most what was published */
+	uint64_t cur_us, cur_gap;       /* when it was last read; how long a waiting flow waits to read it again */
 	struct dmesh_ec_batch b[DMESH_EC_FLOW_Q];
 };
 
 struct dmesh_ec_tls {               /* the thread's local storage */
 	uint64_t acomp, ctl_mmap, ctl_addr;             /* set by the ARM */
-	uint64_t head, copies, publishes, passes, activations, stale_cqes, err_cqes;
+	uint64_t head, copies, publishes, passes, activations, stale_cqes, err_cqes, cursor_reads;
 	uint64_t wid;                                   /* worker index + 1: the high bits of every wake value */
+	uint64_t waiting;                               /* slots with batches taken but not started */
 	struct dmesh_ec_fq f[DMESH_EC_CONNS];
 };
 

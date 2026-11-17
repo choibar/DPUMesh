@@ -24,15 +24,10 @@ struct dmesh_ec_worker;
 struct dma_ring;
 struct objects;
 struct dmesh_conn;
-/* What a DMA task carries; drives the completion callback's behavior. */
-#define DMESH_TASK_NORMAL    0   /* legacy staging->rcvbuf copy */
-#define DMESH_TASK_PULL_CURSOR 3 /* flow control: host cursor -> DPU shadow */
-
 struct dma_task_entry {
     struct dmesh_conn *owner;
     struct doca_dma_task_memcpy *task;
     doca_error_t result;
-    int kind;                    /* DMESH_TASK_* */
     bool in_free_queue;
     bool in_submission_queue;
     bool in_flight;
@@ -207,18 +202,7 @@ struct dmesh_conn {
      * batch and the host reads it as end of stream (dmesh_dma_push_fin). */
     bool push_fin_requested, push_fin_sent;
 
-    /* Push flow control (see struct dmesh_push_cursor). The cursor shadow
-     * lives in tx_staging's reserved tail, so it is mmap'd as a read-DMA
-     * destination. host_fc: the host's cursor was seen. pushed_bytes counts
-     * the bytes of completed batches. */
-    int cursor_state;                         /* 0 idle, 1 pull in flight */
-    uint64_t cursor_pull_seq;                 /* push_seq at the last pull */
-    uint64_t gated_calls;                     /* consecutive gated push attempts */
-    int host_fc;
-    uint64_t host_consumed_seq;
-    uint64_t host_consumed_bytes;
-    uint64_t pushed_bytes;
-    struct dmesh_push_cursor *cursor_shadow;  /* in tx_staging's reserved tail */
+    uint64_t pushed_bytes;                    /* the bytes of completed batches */
 
     /* The flow's share of the reverse DPA thread: the session's tail table
      * page, the flow's line (written on its first batch) and the batches
