@@ -1287,13 +1287,13 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 		if (!conn->reverse_ready) {
 			if (conn->tx_staging == NULL) {
 				result = alloc_buffer_and_set_mmap(&conn->tx_staging_mmap, objs->dev, &conn->tx_staging,
-								   BUFFER_SIZE, DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
+								   DMESH_PUSH_WINDOW, DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
 				if (result != DOCA_SUCCESS) {
 					DOCA_LOG_ERR("Failed to alloc reverse staging (will retry): %s",
 						     doca_error_get_name(result));
 					break;
 				}
-				conn->tx_staging_len = BUFFER_SIZE;
+				conn->tx_staging_len = DMESH_PUSH_WINDOW;
 				conn->push_seq = 0;
 				conn->push_pos = 0;
 			}

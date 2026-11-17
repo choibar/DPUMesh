@@ -13,7 +13,6 @@
 #include "dpa.h"
 #include "ring.h"
 #include "buffer.h"
-#include "dma.h"          /* BUFFER_SIZE */
 DOCA_LOG_REGISTER(COMCH_COMMON);
 
 _Static_assert(sizeof(struct dmesh_export_metadata_msg) <= DMESH_SESSION_MAX_PAYLOAD,
@@ -79,7 +78,7 @@ process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadat
         metadata_msg->rcv_desc_len == 0 || metadata_msg->rcv_desc_len > sizeof(metadata_msg->rcv_desc) ||
         !metadata_msg->ring_buf || !metadata_msg->sndbuf || !metadata_msg->rcvbuf ||
         metadata_msg->ring_buf_len != sizeof(struct dma_ring_ctrl) + DMA_RING_SIZE * sizeof(struct dma_desc) ||
-        metadata_msg->sndbuf_len == 0 || metadata_msg->rcvbuf_len != BUFFER_SIZE ||
+        metadata_msg->sndbuf_len == 0 || metadata_msg->rcvbuf_len != DMESH_PUSH_WINDOW ||
         !DMESH_FLOW_MODE_VALID(metadata_msg->flow.mode))
         return DOCA_ERROR_INVALID_VALUE;
     if (conn->ring_mmap || conn->sndbuf.mmap || conn->rcvbuf.mmap)

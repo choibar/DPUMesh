@@ -60,6 +60,10 @@ struct dmesh_push_desc {
 };
 #define DMESH_PUSH_DESC_N    128u
 #define DMESH_PUSH_DATA_OFF  4096u
+/* The rcvbuf (the host's receive window) and the DPU's tx_staging of every
+ * connection: room for many batches in flight, so a full window, and the
+ * reverse thread's wait for it, stays rare. */
+#define DMESH_PUSH_WINDOW    (4u * 1024u * 1024u)
 
 /* Push flow control: the host publishes its consumption cursor at a fixed
  * offset in its rcvbuf (the reserved gap between the desc slots and the data

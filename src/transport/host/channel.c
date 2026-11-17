@@ -41,7 +41,7 @@ DOCA_LOG_REGISTER(CHANNEL);
 
 _Static_assert(CHANNEL_DESC_N == DMESH_PUSH_DESC_N, "push slot count");
 _Static_assert(CHANNEL_DATA_OFF == DMESH_PUSH_DATA_OFF, "push data offset");
-_Static_assert(CHANNEL_WINDOW == BUFFER_SIZE, "push window");
+_Static_assert(CHANNEL_WINDOW == DMESH_PUSH_WINDOW, "push window");
 _Static_assert(CHANNEL_MODE_CLIENT == DMESH_FLOW_MODE_CLIENT, "client mode");
 _Static_assert(CHANNEL_MODE_BACKEND == DMESH_FLOW_MODE_BACKEND, "backend mode");
 
