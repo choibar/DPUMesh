@@ -27,14 +27,15 @@ TRANSPORT_SRCS := $(addprefix $(TRANSPORT)/common/,object.c buffer.c common.c co
 TRANSPORT_HDRS := $(wildcard $(TRANSPORT)/common/*.h $(TRANSPORT)/host/*.h $(TRANSPORT)/dpu/*.h $(TRANSPORT)/peer/*.h)
 LIB_SRCS := src/core/dmesh_core.c src/core/carrier.c src/core/service_resolve.c \
     src/facade/dmesh_api.c $(TRANSPORT_SRCS)
-PEER_AUTH_SRCS := $(addprefix $(TRANSPORT)/peer/,peer_authority.c peer_topology.c peer_workload_identity.c peer_local_control.c peer_session_control.c)
-HOST_TESTS := peer_write_bootstrap_test peer_dmesh4_test peer_write_completion_test peer_stream_test peer_channel_retire_test peer_authority_test carrier_logic_test service_resolve_test native_writable_test native_polling_test native_loss_test native_core_transport_test \
+PEER_AUTH_SRCS := $(addprefix $(TRANSPORT)/peer/,peer_authority.c peer_topology.c peer_identity.c local_control_session.c)
+PEER_LAYOUT_TESTS := peer_rdma_layout_test peer_rdma_layout_2_1_test peer_rdma_layout_8_8_test peer_rdma_layout_129_16_test
+HOST_TESTS := peer_imm_bootstrap_test peer_dpa_runtime_test $(PEER_LAYOUT_TESTS) peer_write_completion_dpa_test peer_dmesh4_test peer_write_completion_test peer_connection_test peer_channel_retire_test peer_authority_test carrier_logic_test service_resolve_test native_writable_test native_polling_test native_loss_test native_core_transport_test \
     topology_test native_api_contract_test preload_api_contract_test session_protocol_test session_flow_test \
     channel_session_test comch_client_test session_server_test backend_dispatch_test dma_cleanup_test dpa_cleanup_test dpa_runtime_test \
     dispatch_wake_test placement_instr_test rx_consumed_pos_test
 EXAMPLES := hello_dpumesh hello_dpumesh_server tcp_echo tcp_client
 
-.PHONY: all lib test test-native-headers test-abi examples clean
+.PHONY: all lib test test-native-headers test-abi test-peer-config examples clean
 all: lib
 
 lib: $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so
@@ -56,11 +57,9 @@ $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR): $(LIB_SRCS) $(DPA_KERNEL) include/dpumesh/
 $(LIBDIR)/libdpumesh_preload.so: src/facade/dmesh_preload.c $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR)
 	$(CC) $(HOST_CFLAGS) -U_FILE_OFFSET_BITS -fPIC -shared $< -L$(LIBDIR) -ldpumesh -ldl -pthread -o $@
 
-test: test-native-headers $(addprefix $(TESTDIR)/,$(HOST_TESTS)) test-abi
+test: test-native-headers $(addprefix $(TESTDIR)/,$(HOST_TESTS)) test-peer-config test-abi
 	@set -e; for test in $(HOST_TESTS); do $(TESTDIR)/$$test; done
-	CC="$(CC)" $(PYTHON) tests/peer_rdma_layout_test.py
 	CC="$(CC)" $(PYTHON) tests/dpa_poll_test.py
-	CC="$(CC)" $(PYTHON) tests/peer_write_completion_dpa_test.py
 	$(PYTHON) tests/peer_fence_stats_test.py
 	PYTHONPATH=. $(PYTHON) tests/native_registration_test.py
 
@@ -70,8 +69,31 @@ test-native-headers:
 test-abi: lib
 	sh tests/abi_contract_test.sh $(LIBDIR)/libdpumesh.so.$(ABI_MAJOR) $(LIBDIR)/libdpumesh_preload.so $(ABI_MAJOR)
 
-$(TESTDIR)/peer_write_completion_test: tests/peer_write_completion_test.c $(TRANSPORT)/peer/peer_write_completion.h $(TRANSPORT)/peer/peer_write_tx_ring.h $(TRANSPORT)/peer/peer_write_sync_dpa_shared.h $(TRANSPORT)/peer/peer_write_fence_stats.h | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) $< -o $@
+$(TESTDIR)/peer_rdma_layout_2_1_test: PEER_LAYOUT_FLAGS := -DPEER_RDMA_CLUSTER_NODES=2u -DPEER_RDMA_MAX_WORKERS=1u
+$(TESTDIR)/peer_rdma_layout_8_8_test: PEER_LAYOUT_FLAGS := -DPEER_RDMA_CLUSTER_NODES=8u -DPEER_RDMA_MAX_WORKERS=8u
+$(TESTDIR)/peer_rdma_layout_129_16_test: PEER_LAYOUT_FLAGS := -DPEER_RDMA_CLUSTER_NODES=129u -DPEER_RDMA_MAX_WORKERS=16u
+$(addprefix $(TESTDIR)/,$(PEER_LAYOUT_TESTS)): tests/peer_rdma_layout_test.c $(TRANSPORT)/peer/peer_pair_transport.c $(TRANSPORT_HDRS) $(TRANSPORT)/peer/device/peer_write_imm_dpa_internal.h | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -U_GNU_SOURCE $(PEER_LAYOUT_FLAGS) -Werror -ffunction-sections -fdata-sections $< -Wl,--gc-sections -o $@
+
+test-peer-config: $(TRANSPORT)/peer/peer_config.h | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -x c -fsyntax-only $<
+	@set -e; for setting in PEER_RDMA_CLUSTER_NODES=1u PEER_RDMA_CLUSTER_NODES=130u PEER_RDMA_MAX_WORKERS=0u PEER_RDMA_MAX_WORKERS=17u; do \
+	    if $(CC) $(HOST_CFLAGS) -D$$setting -x c -fsyntax-only $< >$(TESTDIR)/peer_config_invalid.log 2>&1; then \
+	        echo "invalid peer configuration accepted: $$setting" >&2; exit 1; \
+	    fi; \
+	done
+
+$(TESTDIR)/peer_imm_bootstrap_test: tests/peer_imm_bootstrap_test.c $(TRANSPORT)/peer/peer_carrier_write_imm.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -U_GNU_SOURCE -Werror -ffunction-sections -fdata-sections $< -Wl,--gc-sections -libverbs -o $@
+
+$(TESTDIR)/peer_dpa_runtime_test: tests/peer_dpa_runtime_test.c $(TRANSPORT)/peer/device/peer_runtime.c $(TRANSPORT_HDRS) $(wildcard tests/support/dpa_sdk/*.h) | $(TESTDIR)
+	$(CC) -Itests/support/dpa_sdk $(HOST_CFLAGS) -Werror $< -o $@
+
+$(TESTDIR)/peer_write_completion_dpa_test: tests/peer_write_completion_dpa_test.c $(TRANSPORT)/peer/device/peer_write_imm_dpa.c $(TRANSPORT)/peer/peer_write_imm_dpa.c $(TRANSPORT_HDRS) $(wildcard tests/support/dpa_sdk/*.h) $(TRANSPORT)/peer/device/peer_write_imm_dpa_internal.h | $(TESTDIR)
+	$(CC) -Itests/support/dpa_sdk $(HOST_CFLAGS) $(WRITE_COMPLETION_TEST_CFLAGS) -Werror -ffunction-sections -fdata-sections $< -Wl,--gc-sections -o $@
+
+$(TESTDIR)/peer_write_completion_test: tests/peer_write_completion_test.c $(TRANSPORT)/peer/peer_carrier_write_imm.c $(TRANSPORT)/peer/peer_write_imm_dpa.c $(TRANSPORT_HDRS) $(TRANSPORT)/peer/device/peer_write_imm_dpa_internal.h | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -o $@
 
 $(TESTDIR)/session_protocol_test: tests/session_protocol_test.c $(TRANSPORT)/common/session_protocol.h | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) $< -o $@
@@ -151,14 +173,11 @@ $(BINDIR)/tcp_echo $(BINDIR)/tcp_client: $(BINDIR)/%: examples/preload/%.c | $(B
 clean:
 	rm -rf $(BUILD)
 
-$(TESTDIR)/peer_stream_test: tests/peer_stream_test.c $(TRANSPORT)/peer/peer_stream.c $(TRANSPORT)/peer/peer_pair_wire.c $(TRANSPORT)/peer/peer_security_wire.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/peer/peer_pair_wire.c $(TRANSPORT)/peer/peer_security_wire.c -Wl,--gc-sections -lcrypto -o $@
+$(TESTDIR)/peer_connection_test: tests/peer_connection_test.c $(TRANSPORT)/peer/peer_connection_io.c $(TRANSPORT)/peer/peer_carrier_write_imm.c $(TRANSPORT)/peer/peer_pair_protocol.c $(TRANSPORT)/peer/peer_control_protocol.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/peer/peer_pair_protocol.c $(TRANSPORT)/peer/peer_control_protocol.c -Wl,--gc-sections -lcrypto -o $@
 
-$(TESTDIR)/peer_write_bootstrap_test: tests/peer_write_bootstrap_test.c $(TRANSPORT)/peer/peer_wire_write_sync.c $(TRANSPORT)/peer/peer_wire_write_imm.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< -Wl,--gc-sections -libverbs -o $@
-
-$(TESTDIR)/peer_dmesh4_test: tests/peer_dmesh4_test.c $(TRANSPORT)/peer/peer_channel.c $(TRANSPORT)/peer/peer_pair_wire.c $(TRANSPORT)/peer/peer_security_wire.c $(TRANSPORT_HDRS) | $(TESTDIR)
-	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/peer/peer_pair_wire.c $(TRANSPORT)/peer/peer_security_wire.c -Wl,--gc-sections -lcrypto -o $@
+$(TESTDIR)/peer_dmesh4_test: tests/peer_dmesh4_test.c $(TRANSPORT)/peer/peer_channel.c $(TRANSPORT)/peer/peer_pair_protocol.c $(TRANSPORT)/peer/peer_control_protocol.c $(TRANSPORT_HDRS) | $(TESTDIR)
+	$(CC) $(HOST_CFLAGS) -ffunction-sections -fdata-sections $< $(TRANSPORT)/peer/peer_pair_protocol.c $(TRANSPORT)/peer/peer_control_protocol.c -Wl,--gc-sections -lcrypto -o $@
 
 $(TESTDIR)/peer_authority_test: tests/peer_authority_test.c $(PEER_AUTH_SRCS) $(wildcard $(TRANSPORT)/peer/*.h) | $(TESTDIR)
 	$(CC) $(HOST_CFLAGS) $(filter %.c,$^) -pthread -lssl -lcrypto -o $@

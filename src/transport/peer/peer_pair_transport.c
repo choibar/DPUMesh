@@ -1,8 +1,6 @@
 #define _GNU_SOURCE
 #include "peer_pair_transport.h"
-#include "live_slots.h"
-#include "arm_path_profile.h"
-#include "transfer_size_profile.h"
+#include "peer_profile.h"
 #include "peer_dpa_abi.h"
 #include <errno.h>
 #include <stdatomic.h>
@@ -39,7 +37,7 @@ struct pair_conn {
     struct peer_assoc_grant grant;
     struct dmesh_peer_channel *channel;
     uint32_t channel_incarnation;
-    void *wire;
+    void *carrier;
     uint64_t created, operation, epoch;
     uint64_t deadline[3];
     unsigned local;
@@ -239,8 +237,8 @@ static int live_impl(struct pair_conn *c)
                 expired |= 1u << i;
 
     int setup_expired = !c->active && now - c->created >= rt->cfg.setup_timeout_ns;
-    int wire_bad = c->wire && rt->driver.wire->faulted(c->wire);
-    if (clock_bad || identity_bad || expired || setup_expired || wire_bad) {
+    int carrier_bad = c->carrier && rt->driver.carrier->faulted(c->carrier);
+    if (clock_bad || identity_bad || expired || setup_expired || carrier_bad) {
         /* Once per fault transition; no payload, credentials or key material.
          * Lease mask bits: authority=1, policy=2, control heartbeat=4. */
         fprintf(stderr,
@@ -250,7 +248,7 @@ static int live_impl(struct pair_conn *c)
                 identity_bad,
                 expired,
                 setup_expired,
-                wire_bad);
+                carrier_bad);
         fault(c);
         return 0;
     }
@@ -345,7 +343,7 @@ static int drained(struct pair_conn *c)
         (ch->staging_bytes || ch->inflight_bytes || ch->ack_staged || ch->tx_len || ch->rx_len))
         return 0;
 
-    return dma_fenced(c) && c->wire && c->rt->driver.send_drained(c->wire) == 1;
+    return dma_fenced(c) && c->carrier && c->rt->driver.send_drained(c->carrier) == 1;
 }
 
 static void reset_channel(struct pair_conn *c)
@@ -354,7 +352,7 @@ static void reset_channel(struct pair_conn *c)
     if (c->channel && c->channel->conn == c)
         dmesh_peer_reset(c->rt->table, c->channel, "Pod pair transport revoked");
     else
-        c->released = 1; /* no channel owns it: inbound, or prepared ahead of a stream */
+        c->released = 1; /* no channel owns it: inbound, or prepared ahead of a connection */
 }
 
 static void completed(struct peer_pair_transport *rt,
@@ -380,7 +378,7 @@ static void completed(struct peer_pair_transport *rt,
 static int prepared_pair(const struct peer_pair_offer *o, int incoming)
 {
     const struct dmesh_peer_pair *p = &o->pair;
-    const struct dmesh_peer_stream_open *in = &o->intent;
+    const struct dmesh_peer_connection_open *in = &o->intent;
     return dmesh_peer_registration_valid(&p->remote) && peer_sec_nonzero(p->association, 16) &&
            p->lane_id && p->lane_generation && in->dst_port && !in->reserved &&
            text_valid(in->src_service_key, sizeof(in->src_service_key)) &&
@@ -397,8 +395,8 @@ static int authorized(struct peer_pair_transport *rt, const struct peer_pair_off
            rt->table->ops->pair_authorize(rt->table->ops_ctx, &o->pair, &o->intent) == 1;
 }
 
-static int intent_equal(const struct dmesh_peer_stream_open *a,
-                        const struct dmesh_peer_stream_open *b)
+static int intent_equal(const struct dmesh_peer_connection_open *a,
+                        const struct dmesh_peer_connection_open *b)
 {
     return !strncmp(a->src_pod_uid, b->src_pod_uid, sizeof(a->src_pod_uid)) &&
            !strncmp(a->dst_pod_uid, b->dst_pod_uid, sizeof(a->dst_pod_uid)) &&
@@ -433,7 +431,7 @@ static int enable(struct pair_conn *c, const struct peer_pair_command *cmd, uint
 
     remote.native = lane->native[1 - i];
 
-    if (c->rt->driver.activate(c->wire, &remote, 1))
+    if (c->rt->driver.activate(c->carrier, &remote, 1))
         return -1;
 
     c->association = cmd->association;
@@ -589,11 +587,11 @@ execute(struct peer_pair_transport *rt, const struct peer_pair_command *cmd, uin
 
         int prepared =
             rt->driver.prepare_pair
-                ? rt->driver.prepare_pair(rt->driver.ctx, &c->offer.pair, &c->wire, &c->endpoint)
-                : rt->driver.prepare(rt->driver.ctx, &c->wire, &c->endpoint);
+                ? rt->driver.prepare_pair(rt->driver.ctx, &c->offer.pair, &c->carrier, &c->endpoint)
+                : rt->driver.prepare(rt->driver.ctx, &c->carrier, &c->endpoint);
         if (prepared) {
-            status = c->wire ? -2 : -1;
-            c->quarantine = !!c->wire;
+            status = c->carrier ? -2 : -1;
+            c->quarantine = !!c->carrier;
             break;
         }
 
@@ -644,13 +642,13 @@ execute(struct peer_pair_transport *rt, const struct peer_pair_command *cmd, uin
     case PEER_PAIR_DESTROY:
         if (!c->blocked || cmd->hardware_ready != 1)
             break;
-        if (c->wire && rt->driver.close(c->wire)) {
+        if (c->carrier && rt->driver.close(c->carrier)) {
             c->quarantine = 1;
             status = -2;
             break;
         }
 
-        c->wire = NULL;
+        c->carrier = NULL;
         c->quarantine = 0;
 
         if (!dma_fenced(c)) {
@@ -663,7 +661,7 @@ execute(struct peer_pair_transport *rt, const struct peer_pair_command *cmd, uin
         break;
 
     case PEER_PAIR_FORGET:
-        if (!c->released || !c->destroyed || c->wire || c->quarantine || !dma_fenced(c))
+        if (!c->released || !c->destroyed || c->carrier || c->quarantine || !dma_fenced(c))
             break;
 
         if (c->channel)
@@ -693,7 +691,7 @@ static int connect_pair(void *ctx,
                         uint16_t port,
                         uint32_t incarnation,
                         const struct dmesh_peer_pair *pair,
-                        const struct dmesh_peer_stream_open *intent,
+                        const struct dmesh_peer_connection_open *intent,
                         void **out)
 {
     struct peer_pair_transport *rt = ctx;
@@ -711,7 +709,7 @@ static int connect_pair(void *ctx,
     memcpy(o.node, node, strlen(node) + 1);
     memcpy(o.key, key, 32);
 
-    /* A lane the node owner prepared ahead of this worker's first stream is
+    /* A lane the node owner prepared ahead of this worker's first connection is
      * adopted rather than duplicated. The new intent is authorized afresh: the
      * lane certifies the Pod pair, not every Service claim made over it. */
     for (unsigned k = 0; k < rt->live.count; k++) {
@@ -775,13 +773,13 @@ static int peer_key(void *conn, uint8_t key[32])
 static long send_frame(void *conn, const void *buf, size_t len)
 {
     struct pair_conn *c = conn;
-    if (!c || !live(c) || !c->active || !buf || !len || len > PEER_WIRE_MSG_MAX)
+    if (!c || !live(c) || !c->active || !buf || !len || len > PEER_CARRIER_MSG_MAX)
         return -1;
 
-    int n = c->rt->driver.wire->send_msg(c->wire, buf, len);
+    int n = c->rt->driver.carrier->send_msg(c->carrier, buf, len);
     if (n == 1 && c->rt->rdma_data.hist) {
         const uint8_t *h = buf;
-        int data = len >= PEER_WIRE_HEADER_BYTES && peer_data_tag(h) >> 13 == PEER_SEC_DATA;
+        int data = len >= PEER_CARRIER_HEADER_BYTES && peer_data_tag(h) >> 13 == PEER_SEC_DATA;
         transfer_size_record(data ? &c->rt->rdma_data : &c->rt->rdma_control, (uint32_t)len);
     }
 
@@ -797,14 +795,14 @@ static long recv_frame(void *conn, void *buf, size_t cap)
     if (!c || !live(c) || !c->active)
         return -1;
 
-    long n = c->rt->driver.wire->recv_msg(c->wire, buf, cap);
+    long n = c->rt->driver.carrier->recv_msg(c->carrier, buf, cap);
     if (n < 0)
         fault(c);
 
     return n;
 }
 
-static int frame_reserve(void *conn, struct peer_wire_frame_lease *out)
+static int frame_reserve(void *conn, struct peer_carrier_frame_lease *out)
 {
     if (!out)
         return -1;
@@ -814,11 +812,11 @@ static int frame_reserve(void *conn, struct peer_wire_frame_lease *out)
     struct pair_conn *c = conn;
     if (!c || !live(c) || !c->active)
         return -1;
-    if (!c->rt->driver.wire->frame_reserve)
+    if (!c->rt->driver.carrier->frame_reserve)
         return -2;
 
     struct arm_profile_stamp stamp = arm_profile_begin(&c->rt->profile, ARM_PROF_WIRE_RESERVE);
-    int n = c->rt->driver.wire->frame_reserve(c->wire, out);
+    int n = c->rt->driver.carrier->frame_reserve(c->carrier, out);
     arm_profile_end(&c->rt->profile, ARM_PROF_WIRE_RESERVE, stamp, n);
 
     if (n < 0)
@@ -827,44 +825,44 @@ static int frame_reserve(void *conn, struct peer_wire_frame_lease *out)
     return n;
 }
 
-static int frame_cancel(void *conn, struct peer_wire_frame_lease *l)
+static int frame_cancel(void *conn, struct peer_carrier_frame_lease *l)
 {
     struct pair_conn *c = conn;
-    return c && c->wire && c->rt->driver.wire->frame_cancel
-               ? c->rt->driver.wire->frame_cancel(c->wire, l)
+    return c && c->carrier && c->rt->driver.carrier->frame_cancel
+               ? c->rt->driver.carrier->frame_cancel(c->carrier, l)
                : -1;
 }
 
-static int frame_acquire(void *conn, struct peer_wire_rx_frame *f)
+static int frame_acquire(void *conn, struct peer_carrier_rx_frame *f)
 {
     struct pair_conn *c = conn;
     if (!c || !live(c) || !c->active)
         return -1;
-    if (!c->rt->driver.wire->frame_acquire)
+    if (!c->rt->driver.carrier->frame_acquire)
         return -2;
 
     struct arm_profile_stamp stamp = arm_profile_begin(&c->rt->profile, ARM_PROF_WIRE_ACQUIRE);
-    int n = c->rt->driver.wire->frame_acquire(c->wire, f);
+    int n = c->rt->driver.carrier->frame_acquire(c->carrier, f);
     arm_profile_end(&c->rt->profile, ARM_PROF_WIRE_ACQUIRE, stamp, n);
 
     return n;
 }
 
-static int frame_release(void *conn, struct peer_wire_rx_frame *f)
+static int frame_release(void *conn, struct peer_carrier_rx_frame *f)
 {
     struct pair_conn *c = conn;
-    return c && c->wire && c->rt->driver.wire->frame_release
-               ? c->rt->driver.wire->frame_release(c->wire, f)
+    return c && c->carrier && c->rt->driver.carrier->frame_release
+               ? c->rt->driver.carrier->frame_release(c->carrier, f)
                : -1;
 }
 
 static int frame_commit(void *conn,
-                        struct peer_wire_frame_lease *l,
+                        struct peer_carrier_frame_lease *l,
                         size_t len,
-                        const struct peer_wire_payload *payload)
+                        const struct peer_carrier_payload *payload)
 {
     struct pair_conn *c = conn;
-    if (!c || !c->wire || !c->rt->driver.wire->frame_commit)
+    if (!c || !c->carrier || !c->rt->driver.carrier->frame_commit)
         return -1;
     if (!live(c) || !c->active) {
         (void)frame_cancel(conn, l);
@@ -878,10 +876,10 @@ static int frame_commit(void *conn,
         data = h && peer_data_tag(h) >> 13 == PEER_SEC_DATA;
     }
 
-    int n = c->rt->driver.wire->frame_commit(c->wire, l, len, payload);
+    int n = c->rt->driver.carrier->frame_commit(c->carrier, l, len, payload);
     if (n == 1)
         transfer_size_record(data ? &c->rt->rdma_data : &c->rt->rdma_control,
-                             (uint32_t)len + PEER_WIRE_HEADER_BYTES);
+                             (uint32_t)len + PEER_CARRIER_HEADER_BYTES);
     arm_profile_end(&c->rt->profile, ARM_PROF_WIRE_COMMIT, stamp, n);
 
     if (n != 1)
@@ -913,7 +911,7 @@ static int progress(void *ctx)
 
     if (!rt->driver.has_live || rt->driver.has_live(rt->driver.ctx)) {
         struct arm_profile_stamp stamp = arm_profile_begin(&rt->profile, ARM_PROF_WIRE_PROGRESS);
-        n = rt->driver.wire->progress(rt->driver.ctx, &unexpected, 1, &accepted);
+        n = rt->driver.carrier->progress(rt->driver.ctx, &unexpected, 1, &accepted);
         arm_profile_end(&rt->profile, ARM_PROF_WIRE_PROGRESS, stamp, n);
     } else
         arm_profile_count(&rt->profile, ARM_CNT_WIRE_SKIPPED);
@@ -922,7 +920,7 @@ static int progress(void *ctx)
         moved = 1;
 
     if (accepted && unexpected)
-        rt->driver.wire->close(unexpected);
+        rt->driver.carrier->close(unexpected);
 
     for (unsigned k = 0; k < rt->live.count; k++) {
         struct pair_conn *c = &rt->conns[rt->live.ids[k]];
@@ -999,7 +997,7 @@ static int pending(void *ctx)
 static int send_drained(void *opaque)
 {
     struct pair_conn *c = opaque;
-    return c && live(c) && c->wire && c->rt->driver.send_drained(c->wire) == 1;
+    return c && live(c) && c->carrier && c->rt->driver.send_drained(c->carrier) == 1;
 }
 static const struct dmesh_peer_transport OPS = {.peer_key = peer_key,
                                                 .send = send_frame,
@@ -1023,19 +1021,19 @@ const struct dmesh_peer_transport *peer_pair_transport_ops(void)
 }
 
 struct driver_group {
-    struct peer_wire_ops wire;
+    struct peer_carrier_ops carrier;
     unsigned count;
     int (*select)(void *, const struct dmesh_peer_pair *);
     void *select_ctx;
     struct peer_pair_driver children[];
 };
 
-static int group_rx_pool_set(void *ctx, const struct peer_wire_rx_pool *pool)
+static int group_rx_pool_set(void *ctx, const struct peer_carrier_rx_pool *pool)
 {
     struct driver_group *g = ctx;
     for (unsigned i = 0; i < g->count; i++)
-        if (!g->children[i].wire->rx_pool_set ||
-            g->children[i].wire->rx_pool_set(g->children[i].ctx, pool))
+        if (!g->children[i].carrier->rx_pool_set ||
+            g->children[i].carrier->rx_pool_set(g->children[i].ctx, pool))
             return -1;
     return 0;
 }
@@ -1075,11 +1073,11 @@ static int group_progress(void *ctx, void **accepted, int max, int *count)
 
         void *unexpected = NULL;
         int n = 0;
-        int rc = d->wire->progress(d->ctx, &unexpected, 1, &n);
+        int rc = d->carrier->progress(d->ctx, &unexpected, 1, &n);
 
         /* These are manually created QPs, not listening carriers. */
         if (n && unexpected)
-            d->wire->close(unexpected);
+            d->carrier->close(unexpected);
         if (rc < 0 || n)
             return -1;
 
@@ -1106,16 +1104,6 @@ static int group_epfd(void *ctx)
     return -1;
 }
 
-static void group_profile_report(void *ctx, int force)
-{
-    struct driver_group *g = ctx;
-    for (unsigned i = 0; i < g->count; i++) {
-        struct peer_pair_driver *d = &g->children[i];
-        if (d->profile_report)
-            d->profile_report(d->ctx, force);
-    }
-}
-
 static void group_free(void *ctx)
 {
     struct driver_group *g = ctx;
@@ -1123,7 +1111,7 @@ static void group_free(void *ctx)
     /* Transport teardown has already fenced every native connection. Each
      * child STOP must detach its ring before its state/mappings are freed. */
     for (unsigned i = 0; i < g->count; i++)
-        g->children[i].wire->ctx_free(g->children[i].ctx);
+        g->children[i].carrier->ctx_free(g->children[i].ctx);
 
     free(g);
 }
@@ -1143,10 +1131,10 @@ int peer_pair_driver_group_new(const struct peer_pair_driver *children,
         return -1;
 
     const struct peer_pair_driver *first = &children[0];
-    if (!peer_wire_ops_valid(first->wire) || (!first->prepare && !first->prepare_pair) ||
-        !first->activate || !first->send_drained || !first->close || !first->wire->progress ||
-        !first->wire->ctx_free || !first->wire->epfd || !first->wire->close ||
-        !first->wire->send_msg || !first->wire->recv_msg || !first->wire->faulted)
+    if (!peer_carrier_ops_valid(first->carrier) || (!first->prepare && !first->prepare_pair) ||
+        !first->activate || !first->send_drained || !first->close || !first->carrier->progress ||
+        !first->carrier->ctx_free || !first->carrier->epfd || !first->carrier->close ||
+        !first->carrier->send_msg || !first->carrier->recv_msg || !first->carrier->faulted)
         return -1;
 
     for (unsigned i = 0; i < count; i++) {
@@ -1154,11 +1142,11 @@ int peer_pair_driver_group_new(const struct peer_pair_driver *children,
 
         /* Connection operations are forwarded directly to native handles;
          * homogeneous callbacks and single ARM ownership are mandatory. */
-        if (!d->ctx || d->wire != first->wire || d->prepare != first->prepare ||
+        if (!d->ctx || d->carrier != first->carrier || d->prepare != first->prepare ||
             d->prepare_pair != first->prepare_pair || d->activate != first->activate ||
             d->send_drained != first->send_drained || d->close != first->close ||
-            d->poll_required != first->poll_required || d->has_live != first->has_live ||
-            d->wire->epfd(d->ctx) >= 0)
+            d->has_live != first->has_live ||
+            d->carrier->epfd(d->ctx) >= 0)
             return -1;
 
         for (unsigned j = 0; j < i; j++)
@@ -1174,35 +1162,21 @@ int peer_pair_driver_group_new(const struct peer_pair_driver *children,
     g->select = select;
     g->select_ctx = select_ctx;
     memcpy(g->children, children, count * sizeof(*children));
-    g->wire = *first->wire;
-    g->wire.progress = group_progress;
-    g->wire.epfd = group_epfd;
-    g->wire.ctx_free = group_free;
+    g->carrier = *first->carrier;
+    g->carrier.progress = group_progress;
+    g->carrier.epfd = group_epfd;
+    g->carrier.ctx_free = group_free;
 
-    if (first->wire->rx_pool_set)
-        g->wire.rx_pool_set = group_rx_pool_set;
+    if (first->carrier->rx_pool_set)
+        g->carrier.rx_pool_set = group_rx_pool_set;
     *out = *first;
     out->ctx = g;
-    out->wire = &g->wire;
+    out->carrier = &g->carrier;
     out->prepare = NULL;
     out->prepare_pair = group_prepare;
-    out->profile_report = group_profile_report;
     out->has_live = first->has_live ? group_has_live : NULL;
 
     return 0;
-}
-
-void peer_pair_transport_profile_report(struct peer_pair_transport *rt, int force)
-{
-    if (!rt)
-        return;
-
-    transfer_size_report(&rt->rdma_data, force);
-    transfer_size_report(&rt->rdma_control, force);
-    arm_profile_report(&rt->profile, "pair", force);
-
-    if (rt->driver.profile_report)
-        rt->driver.profile_report(rt->driver.ctx, force);
 }
 
 int peer_pair_transport_epfd(struct peer_pair_transport *rt)
@@ -1220,22 +1194,6 @@ int peer_pair_transport_registration_busy(struct peer_pair_transport *rt, const 
         const struct pair_conn *conn = &rt->conns[i];
         if (conn->used && conn->offer.pair.local.generation == generation &&
             !strcmp(conn->offer.pair.local_uid, uid))
-            return 1;
-    }
-    return 0;
-}
-
-int peer_pair_transport_poll_required(struct peer_pair_transport *rt)
-{
-    if (!rt || !rt->driver.poll_required)
-        return 0;
-
-    /* Connection lifetime and native callbacks belong to this ARM worker.
-     * Do not gate on grant/paused: ENABLE and rekey can still need CQ service.
-     * Shared completion visibility remains the native driver's responsibility. */
-    for (unsigned k = 0; k < rt->live.count; k++) {
-        struct pair_conn *c = &rt->conns[rt->live.ids[k]];
-        if (c->used && !c->fault && c->wire && rt->driver.poll_required(c->wire))
             return 1;
     }
     return 0;
@@ -1277,10 +1235,10 @@ int peer_pair_transport_new_driver(const struct peer_pair_transport_config *cfg,
 
     if (!cfg || cfg->worker >= PEER_ASSOC_LANES_MAX || !cfg->connections ||
         cfg->connections > DMESH_CHANNEL_MAX || !cfg->setup_timeout_ns || !cfg->dma_fenced || !d ||
-        !d->ctx || !peer_wire_ops_valid(d->wire) || (!d->prepare && !d->prepare_pair) ||
-        !d->activate || !d->send_drained || !d->close || !d->wire->progress || !d->wire->send_msg ||
-        !d->wire->recv_msg || !d->wire->faulted || !d->wire->ctx_free || !d->wire->close ||
-        !d->wire->epfd)
+        !d->ctx || !peer_carrier_ops_valid(d->carrier) || (!d->prepare && !d->prepare_pair) ||
+        !d->activate || !d->send_drained || !d->close || !d->carrier->progress || !d->carrier->send_msg ||
+        !d->carrier->recv_msg || !d->carrier->faulted || !d->carrier->ctx_free || !d->carrier->close ||
+        !d->carrier->epfd)
         return -1;
 
     struct peer_pair_transport *rt = calloc(1, sizeof(*rt));
@@ -1292,8 +1250,8 @@ int peer_pair_transport_new_driver(const struct peer_pair_transport_config *cfg,
     rt->driver = *d;
 
     arm_profile_init(&rt->profile, cfg->worker, -1);
-    transfer_size_init(&rt->rdma_data, "rdma_data", cfg->worker, PEER_WIRE_FRAME_BYTES);
-    transfer_size_init(&rt->rdma_control, "rdma_control", cfg->worker, PEER_WIRE_FRAME_BYTES);
+    transfer_size_init(&rt->rdma_data, "rdma_data", cfg->worker, PEER_CARRIER_FRAME_BYTES);
+    transfer_size_init(&rt->rdma_control, "rdma_control", cfg->worker, PEER_CARRIER_FRAME_BYTES);
 
     if (!rt->cfg.now_ns)
         rt->cfg.now_ns = clock_ns;
@@ -1320,7 +1278,7 @@ int peer_pair_transport_new_driver(const struct peer_pair_transport_config *cfg,
     if (epoll_ctl(rt->epfd, EPOLL_CTL_ADD, rt->commands.fd, &e))
         goto fail;
 
-    int carrier = d->wire->epfd(d->ctx);
+    int carrier = d->carrier->epfd(d->ctx);
     if (carrier >= 0 && epoll_ctl(rt->epfd, EPOLL_CTL_ADD, carrier, &e))
         goto fail;
 
@@ -1333,7 +1291,7 @@ int peer_pair_transport_new_driver(const struct peer_pair_transport_config *cfg,
     rt->last_now = rt->cfg.now_ns(rt->cfg.now_ctx);
 
     if (cfg->rx_pool &&
-        (!d->prepare_pair || !d->wire->rx_pool_set || d->wire->rx_pool_set(d->ctx, cfg->rx_pool)))
+        (!d->prepare_pair || !d->carrier->rx_pool_set || d->carrier->rx_pool_set(d->ctx, cfg->rx_pool)))
         goto fail;
 
     rt->cfg.rx_pool = NULL; /* drivers copied the pool; caller may use stack storage */
@@ -1376,7 +1334,7 @@ int peer_pair_transport_free(struct peer_pair_transport *rt)
     transfer_size_destroy(&rt->rdma_data);
     transfer_size_destroy(&rt->rdma_control);
 
-    rt->driver.wire->ctx_free(rt->driver.ctx);
+    rt->driver.carrier->ctx_free(rt->driver.ctx);
     free(rt->conns);
     free(rt);
 

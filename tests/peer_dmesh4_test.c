@@ -1,6 +1,6 @@
 /* Run the production codec and handle-return gate without any device. */
 #include "src/transport/peer/peer_channel.c"
-#include "src/transport/peer/peer_security_wire.h"
+#include "src/transport/peer/peer_control_protocol.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -9,17 +9,17 @@ static struct dmesh_peer_msg_header message;
 static int blocked;
 static unsigned commits;
 
-static int reserve(void *conn, struct peer_wire_frame_lease *lease)
+static int reserve(void *conn, struct peer_carrier_frame_lease *lease)
 {
     (void)conn;
     if (blocked)
         return 0;
-    *lease = (struct peer_wire_frame_lease){
+    *lease = (struct peer_carrier_frame_lease){
         .header = wire, .body = wire + 4, .body_cap = sizeof(wire) - 4};
     return 1;
 }
-static int commit(void *conn, struct peer_wire_frame_lease *lease, size_t body,
-                  const struct peer_wire_payload *payload)
+static int commit(void *conn, struct peer_carrier_frame_lease *lease, size_t body,
+                  const struct peer_carrier_payload *payload)
 {
     (void)conn;
     (void)lease;
@@ -28,37 +28,37 @@ static int commit(void *conn, struct peer_wire_frame_lease *lease, size_t body,
     commits++;
     return 1;
 }
-static int cancel(void *conn, struct peer_wire_frame_lease *lease)
+static int cancel(void *conn, struct peer_carrier_frame_lease *lease)
 {
     (void)conn;
     (void)lease;
     return 0;
 }
 
-static size_t encode(struct peer_pair_wire *from, unsigned type, uint32_t handle, const void *body,
+static size_t encode(struct peer_pair_protocol *from, unsigned type, uint32_t handle, const void *body,
                      uint32_t bytes)
 {
-    long n = peer_pair_wire_encode_parts(from, type, handle, body, bytes, wire,
+    long n = peer_pair_protocol_encode_parts(from, type, handle, body, bytes, wire,
                                          wire + PEER_DATA_HEADER_BYTES,
                                          sizeof(wire) - PEER_DATA_HEADER_BYTES);
     assert(n >= PEER_DATA_HEADER_BYTES);
     assert(peer_data_frame_size(wire) == (size_t)n);
     return (size_t)n;
 }
-static void receive(struct peer_pair_wire *to, size_t n)
+static void receive(struct peer_pair_protocol *to, size_t n)
 {
-    assert(peer_pair_wire_decode(to, wire, n, 1, &message, decoded, sizeof(decoded)) == (long)n);
+    assert(peer_pair_protocol_decode(to, wire, n, 1, &message, decoded, sizeof(decoded)) == (long)n);
 }
-static void transfer(struct peer_pair_wire *from, struct peer_pair_wire *to, unsigned type,
+static void transfer(struct peer_pair_protocol *from, struct peer_pair_protocol *to, unsigned type,
                      uint32_t handle, const void *body, uint32_t bytes)
 {
     receive(to, encode(from, type, handle, body, bytes));
 }
 
-static void open_stream(struct peer_pair_wire *a, struct peer_pair_wire *b, uint32_t token,
+static void open_stream(struct peer_pair_protocol *a, struct peer_pair_protocol *b, uint32_t token,
                         uint32_t handle)
 {
-    struct dmesh_peer_stream_open o = {.source_token = token,
+    struct dmesh_peer_connection_open o = {.source_token = token,
                                        .dst_port = 8080,
                                        .src_generation = 1,
                                        .src_pod_uid = "src",
@@ -66,57 +66,57 @@ static void open_stream(struct peer_pair_wire *a, struct peer_pair_wire *b, uint
                                        .src_service_key = "ns/service"};
     transfer(a, b, DMESH_PEER_MSG_STREAM_OPEN, 0, &o, sizeof(o));
     assert(message.type == DMESH_PEER_MSG_STREAM_OPEN);
-    assert(((struct dmesh_peer_stream_open *)decoded)->source_token == token);
-    struct dmesh_peer_stream_open_ack ack = {.source_token = token, .handle = handle};
+    assert(((struct dmesh_peer_connection_open *)decoded)->source_token == token);
+    struct dmesh_peer_connection_open_ack ack = {.source_token = token, .handle = handle};
     transfer(b, a, DMESH_PEER_MSG_STREAM_OPEN_ACK, 0, &ack, sizeof(ack));
-    assert(((struct dmesh_peer_stream_open_ack *)decoded)->handle == handle);
+    assert(((struct dmesh_peer_connection_open_ack *)decoded)->handle == handle);
 }
 
-static void close_stream(struct peer_pair_wire *a, struct peer_pair_wire *b, uint32_t h,
+static void close_stream(struct peer_pair_protocol *a, struct peer_pair_protocol *b, uint32_t h,
                          struct dmesh_peer_channel *channel)
 {
     uint32_t candidate = 0;
     uint8_t type = 0;
     transfer(a, b, DMESH_PEER_MSG_STREAM_FIN, h, NULL, 0);
-    assert(peer_pair_wire_next_retire(b, 1, &candidate, &type) == 0); /* Half-close. */
+    assert(peer_pair_protocol_next_retire(b, 1, &candidate, &type) == 0); /* Half-close. */
     transfer(b, a, DMESH_PEER_MSG_STREAM_FIN, h, NULL, 0);
-    assert(peer_pair_wire_next_retire(a, 1, &candidate, &type) == 0); /* Reader still holds it. */
-    assert(!peer_pair_wire_local_closed(a, h));
-    assert(peer_pair_wire_next_retire(a, 0, &candidate, &type) == 0); /* Delayed NIC CQ. */
-    assert(peer_pair_wire_next_retire(a, 1, &candidate, &type) == 1);
+    assert(peer_pair_protocol_next_retire(a, 1, &candidate, &type) == 0); /* Reader still holds it. */
+    assert(!peer_pair_protocol_local_closed(a, h));
+    assert(peer_pair_protocol_next_retire(a, 0, &candidate, &type) == 0); /* Delayed NIC CQ. */
+    assert(peer_pair_protocol_next_retire(a, 1, &candidate, &type) == 1);
     assert(candidate == h && type == DMESH_PEER_MSG_STREAM_READY);
     /* Would-block before encoding neither loses nor duplicates the action. */
-    assert(peer_pair_wire_next_retire(a, 1, &candidate, &type) == 1);
+    assert(peer_pair_protocol_next_retire(a, 1, &candidate, &type) == 1);
     transfer(a, b, type, h, NULL, 0);
-    assert(peer_pair_wire_next_retire(b, 1, &candidate, &type) ==
+    assert(peer_pair_protocol_next_retire(b, 1, &candidate, &type) ==
            0); /* Peer reader still holds it. */
-    assert(!peer_pair_wire_local_closed(b, h));
-    assert(peer_pair_wire_next_retire(b, 1, &candidate, &type) == 1);
+    assert(!peer_pair_protocol_local_closed(b, h));
+    assert(peer_pair_protocol_next_retire(b, 1, &candidate, &type) == 1);
     assert(type == DMESH_PEER_MSG_STREAM_READY);
     transfer(b, a, type, h, NULL, 0);
     if (channel) {
         peer_handle_release(channel, &channel->handles[0]);
         assert(channel->handles[0].in_use); /* Both FINs/READYs still do not permit reuse. */
     }
-    assert(peer_pair_wire_next_retire(b, 0, &candidate, &type) == 0); /* READY send CQ delayed. */
-    assert(peer_pair_wire_next_retire(b, 1, &candidate, &type) == 1);
+    assert(peer_pair_protocol_next_retire(b, 0, &candidate, &type) == 0); /* READY send CQ delayed. */
+    assert(peer_pair_protocol_next_retire(b, 1, &candidate, &type) == 1);
     assert(type == DMESH_PEER_MSG_STREAM_RELEASE);
     transfer(b, a, type, h, NULL, 0);
-    assert(peer_pair_wire_next_retire(a, 1, &candidate, &type) == 1);
+    assert(peer_pair_protocol_next_retire(a, 1, &candidate, &type) == 1);
     assert(type == DMESH_PEER_MSG_STREAM_RELEASE_ACK);
     size_t n = encode(a, type, h, NULL, 0);
-    assert(!peer_pair_wire_released(b, h)); /* RELEASE_ACK delayed in transport. */
+    assert(!peer_pair_protocol_released(b, h)); /* RELEASE_ACK delayed in transport. */
     receive(b, n);
-    assert(!peer_pair_wire_released(b, h)); /* Final local send CQ must also settle. */
-    assert(peer_pair_wire_next_retire(b, 0, &candidate, &type) == 0);
-    assert(peer_pair_wire_next_retire(b, 1, &candidate, &type) == 2);
-    assert(peer_pair_wire_released(a, h) && peer_pair_wire_released(b, h));
+    assert(!peer_pair_protocol_released(b, h)); /* Final local send CQ must also settle. */
+    assert(peer_pair_protocol_next_retire(b, 0, &candidate, &type) == 0);
+    assert(peer_pair_protocol_next_retire(b, 1, &candidate, &type) == 2);
+    assert(peer_pair_protocol_released(a, h) && peer_pair_protocol_released(b, h));
     if (channel) {
         peer_handle_release(channel, &channel->handles[0]);
         assert(!channel->handles[0].in_use && !channel->handle_count);
     }
-    assert(peer_pair_wire_next_retire(a, 1, &candidate, &type) == 0);
-    assert(peer_pair_wire_next_retire(b, 1, &candidate, &type) == 0);
+    assert(peer_pair_protocol_next_retire(a, 1, &candidate, &type) == 0);
+    assert(peer_pair_protocol_next_retire(b, 1, &candidate, &type) == 0);
 }
 
 static void control_header_versions(void)
@@ -148,7 +148,7 @@ static void control_header_versions(void)
 
 static void wire_boundaries(void)
 {
-    _Static_assert(PEER_WIRE_HEADER_BYTES == 4, "four actual wire bytes");
+    _Static_assert(PEER_CARRIER_HEADER_BYTES == 4, "four actual wire bytes");
     struct peer_sec_data_header h = {
         .type = PEER_SEC_DATA, .handle = DMESH_PEER_HANDLE_OWNER_BIT | 4095, .body_len = 65532};
     assert(!peer_sec_data_encode(&h, wire));
@@ -175,22 +175,22 @@ static void wire_boundaries(void)
 
 static void control_backpressure(const struct dmesh_peer_pair *pair)
 {
-    struct peer_pair_wire *a = peer_pair_wire_new(pair, 0);
-    struct peer_pair_wire *b = peer_pair_wire_new(pair, DMESH_PEER_HANDLE_OWNER_BIT);
+    struct peer_pair_protocol *a = peer_pair_protocol_new(pair, 0);
+    struct peer_pair_protocol *b = peer_pair_protocol_new(pair, DMESH_PEER_HANDLE_OWNER_BIT);
     uint32_t handle = DMESH_PEER_HANDLE_OWNER_BIT | 1;
     open_stream(a, b, 1, handle);
     const struct dmesh_peer_transport transport = {
         .frame_reserve = reserve, .frame_commit = commit, .frame_cancel = cancel};
     struct dmesh_peer_table table = {.transport = &transport};
     struct dmesh_peer_channel channel = {
-        .pair_scoped = 1, .pair_wire = a, .conn = a, .state = DMESH_PEER_OPEN, .incarnation = 1};
+        .pair_scoped = 1, .pair_protocol = a, .conn = a, .state = DMESH_PEER_OPEN, .incarnation = 1};
     channel.tx_frame = calloc(1, sizeof(struct dmesh_peer_msg_header) + DMESH_PEER_FRAME_MAX);
     assert(channel.tx_frame);
     uint8_t previous[4];
     memcpy(previous, wire, sizeof(previous));
     blocked = 1;
     commits = 0;
-    assert(peer_wire_send(&table, &channel, DMESH_PEER_MSG_STREAM_FIN, handle, NULL, 0) == 0);
+    assert(peer_carrier_send(&table, &channel, DMESH_PEER_MSG_STREAM_FIN, handle, NULL, 0) == 0);
     assert(channel.tx_len && channel.tx_parts_type == DMESH_PEER_MSG_STREAM_FIN);
     assert(peer_send_parts(&table, &channel, channel.tx_parts_type, handle, NULL, 0) == 1);
     assert(!commits && !memcmp(previous, wire, sizeof(previous)));
@@ -200,8 +200,8 @@ static void control_backpressure(const struct dmesh_peer_pair *pair)
     receive(b, 4);
     assert(message.type == DMESH_PEER_MSG_STREAM_FIN);
     free(channel.tx_frame);
-    peer_pair_wire_free(a);
-    peer_pair_wire_free(b);
+    peer_pair_protocol_free(a);
+    peer_pair_protocol_free(b);
 }
 
 int main(void)
@@ -210,11 +210,11 @@ int main(void)
     wire_boundaries();
     struct dmesh_peer_pair pair = {.lane_id = 1, .lane_generation = 1, .association = {1}};
     control_backpressure(&pair);
-    struct peer_pair_wire *a = peer_pair_wire_new(&pair, 0);
-    struct peer_pair_wire *b = peer_pair_wire_new(&pair, DMESH_PEER_HANDLE_OWNER_BIT);
+    struct peer_pair_protocol *a = peer_pair_protocol_new(&pair, 0);
+    struct peer_pair_protocol *b = peer_pair_protocol_new(&pair, DMESH_PEER_HANDLE_OWNER_BIT);
     assert(a && b);
     uint32_t handle = DMESH_PEER_HANDLE_OWNER_BIT | 1;
-    struct dmesh_peer_channel channel = {.pair_scoped = 1, .pair_wire = b, .handle_count = 1};
+    struct dmesh_peer_channel channel = {.pair_scoped = 1, .pair_protocol = b, .handle_count = 1};
     channel.handles = calloc(1, sizeof(*channel.handles));
     assert(channel.handles);
     channel.handles[0] = (struct dmesh_peer_handle){.in_use = 1, .wire_handle = handle};
@@ -250,12 +250,12 @@ int main(void)
     open_stream(a, b, 65538, handle);
     open_stream(b, a, 1, 1);
     uint8_t hdr[4];
-    assert(!peer_pair_wire_data_header(a, handle, 0, 1, hdr));
-    assert(!peer_pair_wire_data_header(b, 1, 0, 1, hdr));
-    assert(peer_pair_wire_data_header(a, 1, 1, 1, hdr) == -1);
+    assert(!peer_pair_protocol_data_header(a, handle, 0, 1, hdr));
+    assert(!peer_pair_protocol_data_header(b, 1, 0, 1, hdr));
+    assert(peer_pair_protocol_data_header(a, 1, 1, 1, hdr) == -1);
     free(channel.handles);
-    peer_pair_wire_free(a);
-    peer_pair_wire_free(b);
+    peer_pair_protocol_free(a);
+    peer_pair_protocol_free(b);
     puts("dmesh4: exact wire, small/max frames, namespace isolation, bilateral/CQ/reader barriers, "
          "65537 slot reuses: PASS");
     return 0;

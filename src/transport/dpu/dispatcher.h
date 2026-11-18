@@ -12,11 +12,12 @@ struct dmesh_conn;
 struct dmesh_session;
 struct dmesh_dispatcher;
 struct dmesh_worker_mailbox;
-struct peer_session_control;
+struct local_control_session;
+struct peer_flow_origin;
 /* Optional inter-node runtime. Installed before group initialization. Tests
  * and single-node apps do not need to link the RDMA SDK. */
 struct dmesh_dispatch_peer_ops {
-    int (*start)(struct peer_session_control *, struct objects **, size_t, void **);
+    int (*start)(struct local_control_session *, struct objects **, size_t, void **);
     void (*progress)(void *);
     int (*free)(void **);
 };
@@ -47,6 +48,8 @@ int dmesh_dispatcher_registration_required(struct objects *);
 int dmesh_dispatcher_register(struct objects *, struct dmesh_session *, const void *, size_t);
 struct peer_authority;
 struct peer_authority *dmesh_dispatch_worker_authority(struct objects *);
+/* 1 verified/current; 0 legacy mode; negative errno when retired/invalid. */
+int dmesh_dispatch_flow_origin(struct objects *, unsigned slot, struct peer_flow_origin *);
 /* Worker control request; no SDK access, copied into the dispatcher's mailbox. */
 int dmesh_dispatch_backend_request(struct objects *, uint32_t ip, uint16_t port);
 /* Thread-safe membership only; no SDK or live session pointers escape. */

@@ -1,23 +1,23 @@
 # ARM implementations and their authenticated control plane. The hardware
 # crypto owner is a separate process; never link its main() into Linkerd.
 peer_deps = deps + [dependency('libssl'), dependency('libcrypto'),
-  dependency('libibverbs'), dependency('librdmacm'), dependency('doca-rdma'),
+  dependency('libibverbs'), dependency('doca-rdma'),
   dependency('doca-verbs'), meson.get_compiler('c').find_library('dl')]
 peer_sources = files(
-  'peer_channel.c', 'peer_datapath_config.c', 'peer_pair_wire.c',
-  'peer_tls.c', 'peer_security_wire.c', 'peer_control.c', 'peer_association.c',
-  'peer_manager.c', 'peer_crypto_ipc.c', 'peer_pair_transport.c',
-  'peer_pair_verbs.c', 'peer_transport.c', 'peer_wire_tcp.c', 'peer_wire_rdma.c',
-  'peer_wire_write_imm.c', 'peer_wire_write_sync.c', 'peer_sync_event.c',
-  'peer_pair_dpa.c', 'peer_write_sync_dpa.c', 'peer_sync_native.c',
-  'peer_dpa_owner.c', 'peer_topology.c', 'peer_workload_identity.c',
-  'peer_local_control.c', 'peer_authority.c', 'peer_session_control.c', 'peer_stream.c',
+  'peer_channel.c', 'peer_pair_protocol.c',
+  'peer_tls.c', 'peer_control_protocol.c', 'peer_control_session.c', 'peer_association.c',
+  'peer_manager.c', 'peer_crypto_ipc.c', 'peer_crypto_client.c',
+  'peer_pair_transport.c',
+  'peer_carrier_tcp.c',
+  'peer_carrier_write_imm.c',
+  'peer_write_imm_dpa.c', 'peer_imm_native.c',
+  'peer_dpa_owner.c', 'peer_topology.c', 'peer_identity.c',
+  'peer_authority.c', 'local_control_session.c', 'peer_connection_io.c',
   'peer_node.c',
 )
 dmesh_peer = static_library('dmesh_peer', peer_sources,
   dependencies : peer_deps,
   include_directories : include_directories('.'),
-  c_args : ['-DDMESH_DPA_RDMA_OFFLOAD=1'],
 )
 
 # Optional standalone inline-IPsec owner. It is shared by native and migrated

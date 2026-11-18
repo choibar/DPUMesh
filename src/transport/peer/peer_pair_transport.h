@@ -1,15 +1,60 @@
 #ifndef DMESH_PEER_PAIR_TRANSPORT_H
 #define DMESH_PEER_PAIR_TRANSPORT_H
+#include <assert.h>
+#include <stdint.h>
+#include "peer_config.h"
 #include "peer_association.h"
 #include "peer_channel.h"
-#include "peer_wire_verbs.h"
+#include "peer_control_protocol.h"
+
+struct ibv_context;
+
+/* Authenticated native DPA lane setup parameters. */
+struct peer_verbs_endpoint {
+    uint32_t qpn, psn;
+    uint8_t gid[16];
+    uint16_t mtu;
+    struct peer_native_setup native;
+};
+
+/* Owner-thread-only active slot indices for transport drivers and connections.
+ * Move IDs, never connection objects:
+ * native handles, shared lane IDs and generation checks keep stable addresses.
+ * Zero initialization is an empty list; positions encode offset + 1. */
+struct dmesh_live_slots {
+    uint16_t ids[DMESH_LIVE_SLOTS_MAX];
+    uint16_t positions[DMESH_LIVE_SLOTS_MAX];
+    unsigned count;
+};
+
+static inline void dmesh_live_add(struct dmesh_live_slots *s, unsigned id)
+{
+    assert(id < DMESH_LIVE_SLOTS_MAX && !s->positions[id]);
+    assert(s->count < DMESH_LIVE_SLOTS_MAX);
+    s->ids[s->count] = (uint16_t)id;
+    s->positions[id] = (uint16_t)(++s->count);
+}
+
+static inline void dmesh_live_remove(struct dmesh_live_slots *s, unsigned id)
+{
+    assert(id < DMESH_LIVE_SLOTS_MAX);
+    if (!s->positions[id])
+        return; /* partially initialized/closed handle */
+    unsigned pos = s->positions[id] - 1;
+    assert(pos < s->count && s->ids[pos] == id);
+    unsigned last = s->ids[--s->count];
+    if (pos < s->count) {
+        s->ids[pos] = (uint16_t)last;
+        s->positions[last] = (uint16_t)(pos + 1);
+    }
+    s->positions[id] = 0;
+}
 
 /* One data-worker owner and one node-control owner. Neither owner calls into
  * the other's state: the two bounded SPSC mailboxes copy secret-free messages.
  * These are process-local messages, never wire structs or authorization from a Pod.
  * Native connection exports remain daemon-only setup metadata under this owner.
  */
-#define PEER_PAIR_MAILBOX_CAP 64u
 
 struct peer_pair_ref {
     uint64_t runtime, generation;
@@ -22,7 +67,7 @@ struct peer_pair_offer {
     uint32_t ip_be, incarnation;
     uint16_t port;
     struct dmesh_peer_pair pair;
-    struct dmesh_peer_stream_open intent;
+    struct dmesh_peer_connection_open intent;
 };
 
 enum peer_pair_command_type {
@@ -30,7 +75,7 @@ enum peer_pair_command_type {
     PEER_PAIR_PREPARE,       /* recheck first-port authorization; create INIT QP/RQ */
     PEER_PAIR_ENABLE,        /* both RX/TX HW installed; allow RTR/RTS, no app data */
     PEER_PAIR_GRANT,         /* association ACTIVE + peer barrier; publish readiness */
-    PEER_PAIR_QUIESCE,       /* pause new OPEN/DATA, wait SEND + channel + DMA custody */
+    PEER_PAIR_QUIESCE,       /* pause new OPEN/DATA, wait NIC + channel + DMA custody */
     PEER_PAIR_RESUME,        /* rekey epoch staged; keep admission paused until GRANT */
     PEER_PAIR_BLOCK,         /* stop data, reset channel; node owner separately fences HW */
     PEER_PAIR_DESTROY,       /* ONLY after HW block completion; QP close + DMA fence */
@@ -46,7 +91,7 @@ struct peer_pair_command {
     int hardware_ready; /* ENABLE: RX/TX ready; DESTROY: BLOCK complete */
     /* Zero-ref PREPARE: 0 accepts an inbound lane (the offer's intent names
      * this node as destination), 1 prepares an outbound lane for a worker whose
-     * own stream has not opened yet; connect_pair adopts it when one does. */
+     * own connection has not opened yet; connect_pair adopts it when one does. */
     int outbound;
     struct peer_pair_offer offer;  /* AUTHORIZE/PREPARE: authenticated remote identity */
     struct peer_sec_lane lane;     /* ENABLE only */
@@ -72,12 +117,12 @@ struct peer_pair_event {
     struct peer_verbs_endpoint endpoint;
 };
 
-/* The injectable driver is for deterministic failure tests. The production
- * factory below selects manual verbs, never TCP or TLS for application data.
+/* Production uses WRITE_WITH_IMM+DPA; the injectable driver also supports
+ * deterministic failure tests.
  * close must retain its handle/MR on failure; ctx_free follows successful close.
  */
 struct peer_pair_driver {
-    const struct peer_wire_ops *wire;
+    const struct peer_carrier_ops *carrier;
     void *ctx;
     int (*prepare)(void *, void **, struct peer_verbs_endpoint *);
     /* Optional affinity-aware prepare. The transport supplies the locally
@@ -88,12 +133,7 @@ struct peer_pair_driver {
                         struct peer_verbs_endpoint *);
     int (*activate)(void *, const struct peer_verbs_endpoint *, int);
     int (*send_drained)(void *);
-    /* Optional, owning ARM worker only. Active polling-only QPs need service
-     * even with no SEND in flight: remote RECV completions have no wake fd. */
-    int (*poll_required)(void *);
     int (*close)(void *);
-    /* Optional diagnostics, called by owner maintenance outside timed drain. */
-    void (*profile_report)(void *, int force);
     /* Optional owner-thread query: zero guarantees progress has no work,
      * including setup/retirement work. NULL preserves unconditional service. */
     int (*has_live)(void *);
@@ -113,7 +153,7 @@ struct peer_pair_transport_config {
     int (*dma_fenced)(void *, struct dmesh_peer_channel *, uint32_t incarnation);
     void *dma_ctx;
     /* Production arena RX arena pool. NULL preserves standalone/legacy carriers. */
-    const struct peer_wire_rx_pool *rx_pool;
+    const struct peer_carrier_rx_pool *rx_pool;
 };
 struct peer_pair_transport;
 /* Group homogeneous polling drivers owned by one ARM worker. select returns
@@ -125,14 +165,6 @@ int peer_pair_driver_group_new(const struct peer_pair_driver *,
                                int (*select)(void *, const struct dmesh_peer_pair *),
                                void *select_ctx,
                                struct peer_pair_driver *out);
-int peer_pair_transport_new(const struct peer_pair_transport_config *,
-                            struct ibv_context *,
-                            uint8_t port,
-                            uint32_t gid_index,
-                            uint16_t mtu,
-                            struct peer_pair_transport **,
-                            char *error,
-                            size_t error_len);
 /* Driver ownership transfers only on success. Constructor/destructor run while
  * both owners are stopped; data-path functions run on the owning worker. */
 int peer_pair_transport_new_driver(const struct peer_pair_transport_config *,
@@ -142,13 +174,10 @@ int peer_pair_transport_free(struct peer_pair_transport *); /* -1 if not fully r
 void peer_pair_transport_attach(struct peer_pair_transport *, struct dmesh_peer_table *);
 const struct dmesh_peer_transport *peer_pair_transport_ops(void);
 int peer_pair_transport_epfd(struct peer_pair_transport *);
-/* Scheduling hint, not progress. Called only by the owning worker. */
-int peer_pair_transport_poll_required(struct peer_pair_transport *);
 /* Owner-worker retirement check, including prepared/quarantined lanes that
  * have not yet published a channel. Not a datapath lookup. */
 int peer_pair_transport_registration_busy(struct peer_pair_transport *, const char *uid,
                                           uint64_t generation);
-void peer_pair_transport_profile_report(struct peer_pair_transport *, int force);
 /* Only node-control owner uses these; 1 copied, 0 bounded backpressure, -1 error. */
 int peer_pair_manager_submit(struct peer_pair_transport *, const struct peer_pair_command *);
 int peer_pair_manager_poll(struct peer_pair_transport *, struct peer_pair_event *);

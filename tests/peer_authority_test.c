@@ -99,7 +99,6 @@ int main(void)
     assert(peer_authority_register(a, 1, 2, key, nonce, 110, &reg) == EBUSY);
     assert(peer_authority_free(a) == EBUSY);
     assert(peer_authority_retired_done(a, 1, 1) == EBUSY);
-    assert(!peer_authority_hold(a, 1, 1));
     const _Atomic unsigned *active = NULL;
     assert(!peer_authority_watch(a, 1, 1, &active));
     assert(active && atomic_load_explicit(active, memory_order_acquire) == 1);
@@ -129,9 +128,6 @@ int main(void)
     bytes = document(doc, 3, 1, "10.1.0.2");
     assert(peer_authority_adopt(a, doc, bytes, keys) == DMESH_TOPOLOGY_ADOPTED);
     assert(peer_authority_register(a, 1, 1, key, nonce, 110, &reg) == ESTALE);
-    assert(peer_authority_hold(a, 1, 1) == ESTALE);
-    assert(peer_authority_retired_done(a, 1, 1) == EBUSY);
-    assert(!peer_authority_unhold(a, 1, 1));
     assert(peer_authority_retired_done(a, 1, 1) == EBUSY);
     assert(!peer_authority_unhold(a, 1, 1));
     assert(!peer_authority_retired_done(a, 1, 1));

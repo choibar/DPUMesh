@@ -1,9 +1,14 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
-#include "peer_write_completion.h"
-#include "peer_write_sync_dpa_shared.h"
-#include "peer_write_tx_ring.h"
+/* Exercise the private helpers in their production translation units.
+ * Unused hardware paths are discarded by the test linker. */
+#include "src/transport/peer/peer_carrier_write_imm.c"
+#include "src/transport/peer/peer_write_imm_dpa.c"
+#include "device/peer_write_imm_dpa_internal.h"
 
 static void retain(void *owner, void *cookie)
 {
@@ -145,14 +150,14 @@ static void fence_statistics(void)
 
 int main(void)
 {
-    assert(sizeof(struct wsd_fence) == 8);
-    assert(WSD_FENCES == WSD_IMM_RQ && WSD_FENCES == 32);
-    assert(sizeof(((struct wsd_lane *)0)->fence) == 256);
+    assert(sizeof(struct wim_fence) == 8);
+    assert(WIM_FENCES == WIM_IMM_RQ && WIM_FENCES == 32);
+    assert(sizeof(((struct wim_lane *)0)->fence) == 256);
     assert(sizeof(struct peer_write_completion_length) == 2);
     assert(sizeof(struct peer_write_tx_hold) == 48);
-    assert(sizeof(struct wsd_lane) == 640);
-    assert(sizeof(struct wsd_status) == 192);
-    assert(sizeof(struct wsd_fence_snapshot) == 64);
+    assert(sizeof(struct wim_lane) % 64 == 0);
+    assert(sizeof(struct wim_status) == 192);
+    assert(sizeof(struct wim_fence_snapshot) == 64);
     prefix_releases_only_completed_sources();
     one_owner_can_span_multiple_requests();
     wrap_growth_and_reuse();

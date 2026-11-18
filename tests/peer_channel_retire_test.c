@@ -4,8 +4,8 @@
 
 #include "src/transport/peer/peer_channel.h"
 
-struct peer_pair_wire;
-void peer_pair_wire_free(struct peer_pair_wire *wire)
+struct peer_pair_protocol;
+void peer_pair_protocol_free(struct peer_pair_protocol *wire)
 {
     assert(!wire);
 }
@@ -35,5 +35,5 @@ int main(void)
     assert(dmesh_peer_reap_closed(table) == 0);
 
     free(table);
-    puts("peer channel retirement: idle revocation, reader and DMA fences: PASS");
+    puts("peer channel retirement: reader and DMA fences: PASS");
 }

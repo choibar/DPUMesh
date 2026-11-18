@@ -1,7 +1,8 @@
+#include "peer_config.h"
 #include "../common/dpa_runtime.h"
 #include "peer_dpa_owner.h"
 #include "peer_dpa_abi.h"
-#include "peer_write_sync_dpa.h"
+#include "peer_write_imm_dpa.h"
 #include <doca_dpa.h>
 #include <doca_comch_msgq.h>
 #include <doca_comch_consumer.h>
@@ -13,7 +14,6 @@
 #include <string.h>
 #include <time.h>
 
-#define CREDITS 128u
 extern doca_dpa_func_t dpumesh_peer_run, dpumesh_peer_yield, dpumesh_peer_start;
 
 struct peer_dpa_owner {
@@ -65,7 +65,7 @@ static void receive(struct doca_comch_consumer_task_post_recv *recv,
         memcpy(&m, data, sizeof(m));
         valid = dpa_rdma_counter_valid(&m, bytes, worker, workers, workers);
         if (valid)
-            peer_wsd_counter_message(&m);
+            peer_wim_counter_message(&m);
     } else if (data && bytes == sizeof(struct dpa_rdma_notify_msg)) {
         struct dpa_rdma_notify_msg m;
         memcpy(&m, data, sizeof(m));
@@ -165,7 +165,7 @@ int peer_dpa_owner_new(struct doca_dev *dev, struct doca_dpa *dpa, unsigned work
 
     TRY(doca_pe_create(&o->pe));
     TRY(doca_pe_get_notification_handle(o->pe, &o->fd));
-    TRY(DMESH_DPA_CALL(doca_dpa_completion_create(dpa, CREDITS, &o->completion)));
+    TRY(DMESH_DPA_CALL(doca_dpa_completion_create(dpa, PEER_DPA_NOTIFY_CREDITS, &o->completion)));
     TRY(DMESH_DPA_CALL(doca_dpa_completion_start(o->completion)));
     o->completion_started = 1;
     TRY(DMESH_DPA_CALL(doca_dpa_completion_get_dpa_handle(o->completion, &o->arg.dpa_producer_comp)));
@@ -179,16 +179,16 @@ int peer_dpa_owner_new(struct doca_dev *dev, struct doca_dpa *dpa, unsigned work
     TRY(doca_ctx_set_user_data(doca_comch_consumer_as_ctx(o->consumer), (union doca_data){.ptr = o}));
     TRY(doca_comch_consumer_set_imm_data_len(o->consumer, sizeof(struct dpa_rdma_counter_msg)));
     TRY(doca_pe_connect_ctx(o->pe, doca_comch_consumer_as_ctx(o->consumer)));
-    TRY(doca_comch_consumer_task_post_recv_set_conf(o->consumer, receive, receive_error, CREDITS));
+    TRY(doca_comch_consumer_task_post_recv_set_conf(o->consumer, receive, receive_error, PEER_DPA_NOTIFY_CREDITS));
     TRY(doca_ctx_start(doca_comch_consumer_as_ctx(o->consumer)));
     TRY(doca_comch_consumer_get_id(o->consumer, &o->arg.dpu_consumer_id));
     TRY(doca_comch_msgq_producer_create(o->msgq, &o->producer));
     TRY(doca_ctx_set_datapath_on_dpa(doca_comch_producer_as_ctx(o->producer), dpa));
-    TRY(doca_comch_producer_set_dev_max_num_send(o->producer, CREDITS));
+    TRY(doca_comch_producer_set_dev_max_num_send(o->producer, PEER_DPA_NOTIFY_CREDITS));
     TRY(doca_comch_producer_dpa_completion_attach(o->producer, o->completion));
     TRY(doca_ctx_start(doca_comch_producer_as_ctx(o->producer)));
     TRY(doca_comch_producer_get_dpa_handle(o->producer, &o->arg.dpa_producer));
-    for (unsigned i = 0; i < CREDITS; i++) {
+    for (unsigned i = 0; i < PEER_DPA_NOTIFY_CREDITS; i++) {
         struct doca_comch_consumer_task_post_recv *recv;
         TRY(doca_comch_consumer_task_post_recv_alloc_init(o->consumer, NULL, &recv));
         struct doca_task *task = doca_comch_consumer_task_post_recv_as_task(recv);
@@ -206,7 +206,7 @@ int peer_dpa_owner_fd(struct peer_dpa_owner *o) { return o->fd; }
 int peer_dpa_owner_progress(struct peer_dpa_owner *o)
 {
     unsigned work = 0;
-    while (work < 2 * CREDITS && doca_pe_progress(o->pe))
+    while (work < 2 * PEER_DPA_NOTIFY_CREDITS && doca_pe_progress(o->pe))
         work++;
     return o->failed ? -1 : !!work;
 }
@@ -215,11 +215,11 @@ int peer_dpa_owner_arm(struct peer_dpa_owner *o)
     if (o->failed)
         return -1;
     TRY(doca_pe_request_notification(o->pe));
-    return peer_wsd_arm_worker(o->runtime.owner_worker);
+    return peer_wim_arm_worker(o->runtime.owner_worker);
 }
 int peer_dpa_owner_disarm(struct peer_dpa_owner *o)
 {
-    peer_wsd_disarm_worker(o->runtime.owner_worker);
+    peer_wim_disarm_worker(o->runtime.owner_worker);
     return checked(doca_pe_clear_notification(o->pe, o->fd), "clear notification");
 }
 

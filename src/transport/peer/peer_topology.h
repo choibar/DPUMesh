@@ -4,22 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "workload_limits.h"
-
-
-/* Bounds a generation may not exceed; a larger one is refused rather than
- * truncated, because a truncated table would read as withdrawal. The byte
- * bound applies to one complete topology document. */
-#define DMESH_GEN_POD_MAX 65536u
-#define DMESH_GEN_NODE_MAX 1024u
-#define DMESH_GEN_SERVICE_MAX 4096u
-#define DMESH_GEN_ENDPOINT_MAX 65536u
-#define DMESH_TOPOLOGY_MAX_BYTES (16u * 1024u * 1024u)
-/* Controller public keys held for rotation overlap, enforced at load like the
- * configured topology key overlap. */
-#define DMESH_CONTROLLER_KEYS_MAX 4u
-/* Node-local compact Service ids the DPU may intern ([0, 127]). */
-#define DMESH_TOPOLOGY_INTERN_MAX 128
+#include "peer_config.h"
 
 struct dmesh_gen_node {
     char name[DMESH_K8S_NAME_MAX];

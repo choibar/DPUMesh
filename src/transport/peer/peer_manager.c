@@ -1,6 +1,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include "peer_config.h"
 #include "peer_manager.h"
 #include <errno.h>
 #include <pthread.h>
@@ -16,7 +17,6 @@
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 
-#define NOTICE_CAP 64u
 #define SECOND_NS 1000000000ull
 #ifdef PEER_MANAGER_TRACE
 #include <stdio.h>
@@ -49,8 +49,8 @@ enum pair_state {
 struct lane {
     unsigned worker;
     struct peer_pair_ref ref;             /* zero until a worker owns a lane conn */
-    uint32_t incarnation;                 /* the conn's own, when a stream opened it */
-    struct dmesh_peer_stream_open intent; /* likewise */
+    uint32_t incarnation;                 /* the conn's own, when a connection opened it */
+    struct dmesh_peer_connection_open intent; /* likewise */
     struct peer_verbs_endpoint endpoint;
     uint64_t op;      /* outstanding worker operation */
     int done, status; /* current round */
@@ -68,7 +68,7 @@ struct pair {
     uint32_t ip_be, incarnation;
     uint16_t port;
     struct dmesh_peer_pair pair;
-    struct dmesh_peer_stream_open intent;
+    struct dmesh_peer_connection_open intent;
     uint8_t association[16];
     uint32_t spi[2];
     unsigned lane_count, origin;
@@ -88,7 +88,7 @@ struct session {
     int used, initiator;
     uint64_t id;
     char node[DMESH_K8S_NAME_MAX];
-    struct peer_control *control;
+    struct peer_control_session *control;
     struct peer_manager *m;
 };
 
@@ -116,7 +116,7 @@ struct peer_manager {
     uint64_t session_ids, lane_generation, authority_generation, authority_deadline, last_now;
     int epfd, notify_fd;
     pthread_mutex_t notify_mu;
-    struct notice notices[NOTICE_CAP];
+    struct notice notices[PEER_MANAGER_NOTICE_CAP];
     unsigned notice_head, notice_count;
     pthread_t thread;
     int running;
@@ -248,7 +248,7 @@ static struct session *pair_session(struct peer_manager *m, struct pair *p)
 }
 
 /* A lane slot counts once the lane count is fixed, or earlier while it holds
- * the conn of a stream that opened before PROPOSE fixed the count. */
+ * the conn of a connection that opened before PROPOSE fixed the count. */
 static int lane_live(const struct pair *p, unsigned i)
 {
     return i < p->lane_count || ref_set(p->lane[i].ref);
@@ -279,7 +279,7 @@ static uint64_t worker_submit(struct peer_manager *m, unsigned w, struct peer_pa
 }
 
 /* The offer a worker sees for lane i: the pair's identity plus the intent and
- * incarnation of the stream that opened this lane, when one did. */
+ * incarnation of the connection that opened this lane, when one did. */
 static void pair_offer(struct pair *p, unsigned i, struct peer_pair_offer *o)
 {
     memset(o, 0, sizeof(*o));
@@ -441,7 +441,7 @@ static struct session *session_slot(struct peer_manager *m)
 }
 
 static void
-session_config(struct peer_manager *m, struct session *s, struct peer_control_config *cfg)
+session_config(struct peer_manager *m, struct session *s, struct peer_control_session_config *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     strcpy(cfg->local.cluster, m->cfg.cluster);
@@ -462,7 +462,7 @@ session_config(struct peer_manager *m, struct session *s, struct peer_control_co
 static struct session *session_open(struct peer_manager *m,
                                     const char *node,
                                     const uint8_t *key,
-                                    void *wire,
+                                    void *carrier_conn,
                                     int initiator,
                                     uint64_t now)
 {
@@ -474,7 +474,7 @@ static struct session *session_open(struct peer_manager *m,
     s->m = m;
     s->initiator = initiator;
 
-    struct peer_control_config cfg;
+    struct peer_control_session_config cfg;
     session_config(m, s, &cfg);
 
     if (node) {
@@ -482,7 +482,7 @@ static struct session *session_open(struct peer_manager *m,
         memcpy(cfg.remote_key, key, 32);
         strcpy(s->node, node);
     }
-    if (peer_control_new(&cfg, m->tls, initiator, m->cfg.wire, wire, now, &s->control))
+    if (peer_control_session_new(&cfg, m->tls, initiator, m->cfg.carrier, carrier_conn, now, &s->control))
         return NULL;
 
     s->used = 1;
@@ -497,21 +497,21 @@ static struct session *session_dial(struct peer_manager *m, const char *node, ui
     const uint8_t *key = NULL;
     uint32_t ip = 0;
     uint16_t port = 0;
-    void *wire = NULL;
+    void *carrier_conn = NULL;
     if (m->cfg.ops->node_binding(m->cfg.ops_ctx, node, &key, &ip, &port) != 1 || !key ||
-        m->cfg.wire->connect(m->cfg.wire_ctx, ip, port, &wire) || !wire)
+        m->cfg.carrier->connect(m->cfg.carrier_ctx, ip, port, &carrier_conn) || !carrier_conn)
         return NULL;
 
-    struct session *s = session_open(m, node, key, wire, 1, now);
+    struct session *s = session_open(m, node, key, carrier_conn, 1, now);
     if (!s)
-        m->cfg.wire->close(wire);
+        m->cfg.carrier->close(carrier_conn);
 
     return s;
 }
 
 static void session_close(struct peer_manager *m, struct session *s)
 {
-    peer_control_free(s->control);
+    peer_control_session_free(s->control);
     memset(s, 0, sizeof(*s));
     m->stats.sessions--;
 }
@@ -537,7 +537,7 @@ static int session_send(struct peer_manager *m,
     if (!s)
         return -1;
 
-    return peer_control_send(s->control, type, p->association, epoch, body, len, now);
+    return peer_control_session_send(s->control, type, p->association, epoch, body, len, now);
 }
 
 static void session_error(struct peer_manager *m, struct pair *p, uint16_t code, uint64_t now)
@@ -588,7 +588,7 @@ static void pair_revoke(struct peer_manager *m, struct pair *p, uint64_t now)
 
 static int pair_propose(struct peer_manager *m, struct pair *p, struct session *s, uint64_t now)
 {
-    const struct peer_sec_hello *remote = peer_control_remote(s->control);
+    const struct peer_sec_hello *remote = peer_control_session_remote(s->control);
     if (!remote)
         return 0;
 
@@ -624,13 +624,13 @@ static int pair_propose(struct peer_manager *m, struct pair *p, struct session *
     if (peer_sec_propose_encode(&body, bytes, sizeof(bytes), &len))
         return -1;
 
-    int rc = peer_control_send(s->control, PEER_SEC_PROPOSE, p->association, 1, bytes, len, now);
+    int rc = peer_control_session_send(s->control, PEER_SEC_PROPOSE, p->association, 1, bytes, len, now);
     if (rc != 1)
         return rc;
 
     m->lane_generation = generation;
     p->lane_count = n;
-    p->deadline[2] = peer_control_lease_deadline(s->control);
+    p->deadline[2] = peer_control_session_lease_deadline(s->control);
 
     for (unsigned i = 0; i < n; i++) {
         p->lanes[i] =
@@ -691,7 +691,7 @@ static int pair_open_association(struct peer_manager *m, struct pair *p, uint64_
     struct session *s = pair_session(m, p);
     struct peer_sec_binding b = {0};
     struct peer_sec_lane_params local_halves;
-    const struct peer_sec_hello *remote = s ? peer_control_remote(s->control) : NULL;
+    const struct peer_sec_hello *remote = s ? peer_control_session_remote(s->control) : NULL;
     if (!remote || pair_local_halves(p, &local_halves))
         return -1;
 
@@ -715,18 +715,18 @@ static int pair_open_association(struct peer_manager *m, struct pair *p, uint64_
         memcpy(e[i]->registration_nonce, r[i]->nonce, sizeof(e[i]->registration_nonce));
     }
 
-    memcpy(b.session, peer_control_session(s->control), 16);
+    memcpy(b.session, peer_control_session_id(s->control), 16);
     memcpy(b.association, p->association, 16);
     b.epoch = 1;
     b.spi[0] = p->spi[0];
     b.spi[1] = p->spi[1];
 
-    if (!peer_control_binding_valid(s->control, &b, p->local, now)) {
+    if (!peer_control_session_binding_valid(s->control, &b, p->local, now)) {
         TRACE("%s: binding invalid (valid=%d)", m->cfg.node, peer_sec_binding_valid(&b));
         return -1;
     }
     if (peer_association_open(m->registry,
-                              peer_control_tls(s->control, now),
+                              peer_control_session_tls(s->control, now),
                               &b,
                               p->local,
                               p->lanes,
@@ -778,7 +778,7 @@ static int pair_send_halves(struct peer_manager *m, struct pair *p, int accept, 
     return session_send(m, p, accept ? PEER_SEC_ACCEPT : PEER_SEC_LANE_PARAMS, 1, bytes, len, now);
 }
 
-/* A worker's stream opened a Pod-pair lane: start a proposal, or attach the
+/* A worker's connection opened a Pod-pair lane: start a proposal, or attach the
  * lane to a proposal already under way for the same pair. */
 static void
 pair_open_event(struct peer_manager *m, unsigned w, const struct peer_pair_event *e, uint64_t now)
@@ -858,7 +858,7 @@ static int handle_propose(struct peer_manager *m,
     const uint8_t *key = NULL;
     uint32_t ip = 0;
     uint16_t port = 0;
-    const struct peer_sec_hello *remote = peer_control_remote(s->control);
+    const struct peer_sec_hello *remote = peer_control_session_remote(s->control);
     if (peer_sec_propose_decode(body, h->body_len, &in) || !remote || h->epoch != 1 ||
         memcmp(in.association, h->association, 16) || strcmp(in.cluster, m->cfg.cluster))
         return -1;
@@ -909,7 +909,7 @@ static int handle_propose(struct peer_manager *m,
         if (peer_sec_error_encode(code, err))
             return -1;
 
-        return peer_control_send(
+        return peer_control_session_send(
                    s->control, PEER_SEC_ERROR, in.association, 1, err, sizeof(err), now) < 0
                    ? -1
                    : 0;
@@ -947,7 +947,7 @@ static int handle_propose(struct peer_manager *m,
 
     p->deadline[0] = m->authority_deadline;
     p->deadline[1] = after(now, m->cfg.lease_ns);
-    p->deadline[2] = peer_control_lease_deadline(s->control);
+    p->deadline[2] = peer_control_session_lease_deadline(s->control);
 
     if (!p->spi[1 - local] || p->deadline[0] <= now || p->deadline[2] <= now) {
         pair_free(m, p);
@@ -965,7 +965,7 @@ static int unknown_association(struct session *s, const struct peer_sec_header *
     if (peer_sec_error_encode(PEER_SEC_ERR_REVOKED, err))
         return -1;
 
-    return peer_control_send(s->control, PEER_SEC_ERROR, h->association, 1, err, sizeof(err), now) <
+    return peer_control_session_send(s->control, PEER_SEC_ERROR, h->association, 1, err, sizeof(err), now) <
                    0
                ? -1
                : 0;
@@ -1093,7 +1093,7 @@ static int message_cb(void *ctx, const struct peer_sec_header *h, const uint8_t 
     struct peer_manager *m = s->m;
     uint64_t now = m->last_now;
     if (!s->node[0]) {
-        const struct peer_sec_hello *remote = peer_control_remote(s->control);
+        const struct peer_sec_hello *remote = peer_control_session_remote(s->control);
         if (!remote)
             return -1;
 
@@ -1182,7 +1182,7 @@ static void notices_drain(struct peer_manager *m, uint64_t now)
         }
 
         note = m->notices[m->notice_head];
-        m->notice_head = (m->notice_head + 1) % NOTICE_CAP;
+        m->notice_head = (m->notice_head + 1) % PEER_MANAGER_NOTICE_CAP;
         m->notice_count--;
         pthread_mutex_unlock(&m->notify_mu);
 
@@ -1199,7 +1199,7 @@ static void notices_drain(struct peer_manager *m, uint64_t now)
 
             for (unsigned i = 0; i < PEER_MANAGER_SESSIONS_MAX; i++)
                 if (m->sessions[i].used)
-                    (void)peer_control_authority(
+                    (void)peer_control_session_authority(
                         m->sessions[i].control, note.generation, note.deadline, now);
         }
     }
@@ -1210,12 +1210,12 @@ static int sessions_progress(struct peer_manager *m, uint64_t now)
     int moved = 0;
     void *accepted[4];
     int count = 0;
-    if (m->cfg.wire->progress(m->cfg.wire_ctx, accepted, 4, &count) > 0)
+    if (m->cfg.carrier->progress(m->cfg.carrier_ctx, accepted, 4, &count) > 0)
         moved = 1;
 
     for (int i = 0; i < count; i++)
         if (!session_open(m, NULL, NULL, accepted[i], 0, now)) {
-            m->cfg.wire->close(accepted[i]);
+            m->cfg.carrier->close(accepted[i]);
             m->stats.refused++;
         }
 
@@ -1224,15 +1224,15 @@ static int sessions_progress(struct peer_manager *m, uint64_t now)
         if (!s->used)
             continue;
 
-        int faulted = peer_control_faulted(s->control);
+        int faulted = peer_control_session_faulted(s->control);
         if (!faulted) {
             m->last_now = now;
             for (unsigned turn = 0; turn < 2 && !faulted; turn++)
-                faulted = peer_control_progress(s->control, now) < 0;
+                faulted = peer_control_session_progress(s->control, now) < 0;
         }
 
         if (!faulted && !s->node[0]) {
-            const struct peer_sec_hello *remote = peer_control_remote(s->control);
+            const struct peer_sec_hello *remote = peer_control_session_remote(s->control);
             if (remote) {
                 strcpy(s->node, remote->node);
                 moved = 1;
@@ -1588,7 +1588,7 @@ static void pair_progress_open(struct peer_manager *m, struct pair *p, uint64_t 
     /* Leases: the control lease follows the challenge heartbeat, authority
      * follows the newest notification, and a destination re-asks its policy
      * before its lease runs out. Every renewal reaches workers as a new grant. */
-    uint64_t control = s ? peer_control_lease_deadline(s->control) : 0;
+    uint64_t control = s ? peer_control_session_lease_deadline(s->control) : 0;
     if (control > p->deadline[2] &&
         !peer_association_renew(m->registry, p->token, 2, ++p->generation[2], control, now)) {
         p->deadline[2] = control;
@@ -1673,7 +1673,7 @@ static int pairs_progress(struct peer_manager *m, uint64_t now)
                 p->session = (unsigned)(s - m->sessions);
                 p->session_id = s->id;
             }
-            if (!peer_control_ready(s->control, now))
+            if (!peer_control_session_ready(s->control, now))
                 break;
 
             {
@@ -1839,14 +1839,6 @@ static int pair_rekey_start(struct peer_manager *m, struct pair *p, uint64_t now
     return 0;
 }
 
-int peer_manager_rekey(struct peer_manager *m, const uint8_t association[16])
-{
-    if (!m || !association)
-        return -1;
-
-    return pair_rekey_start(m, pair_by_association(m, association), m->last_now);
-}
-
 static int notify(struct peer_manager *m, const struct notice *note)
 {
     if (!m)
@@ -1854,13 +1846,13 @@ static int notify(struct peer_manager *m, const struct notice *note)
 
     pthread_mutex_lock(&m->notify_mu);
 
-    if (m->notice_count == NOTICE_CAP) {
+    if (m->notice_count == PEER_MANAGER_NOTICE_CAP) {
         pthread_mutex_unlock(&m->notify_mu);
 
         return 0;
     }
 
-    m->notices[(m->notice_head + m->notice_count) % NOTICE_CAP] = *note;
+    m->notices[(m->notice_head + m->notice_count) % PEER_MANAGER_NOTICE_CAP] = *note;
     m->notice_count++;
     pthread_mutex_unlock(&m->notify_mu);
 
@@ -1890,11 +1882,6 @@ void peer_manager_stats(struct peer_manager *m, struct peer_manager_stats *out)
 {
     if (m && out)
         *out = m->stats;
-}
-
-int peer_manager_fd(struct peer_manager *m)
-{
-    return m ? m->epfd : -1;
 }
 
 int peer_manager_attach_worker(struct peer_manager *m,
@@ -1927,14 +1914,14 @@ int peer_manager_new(const struct peer_manager_config *cfg,
     *out = NULL;
 
     const char *why = "invalid configuration";
-    if (!cfg || !cfg->seed || !cfg->wire || !cfg->wire_ctx || !cfg->ops ||
+    if (!cfg || !cfg->seed || !cfg->carrier || !cfg->carrier_ctx || !cfg->ops ||
         !cfg->ops->node_binding || !cfg->ops->node_by_key ||
         !peer_crypto_adapter_valid(&cfg->crypto) || !cfg->workers ||
         cfg->workers > PEER_ASSOC_LANES_MAX || !cfg->node[0] || !cfg->cluster[0] ||
         !memchr(cfg->node, 0, sizeof(cfg->node)) ||
         !memchr(cfg->cluster, 0, sizeof(cfg->cluster)) || !peer_sec_nonzero(cfg->boot, 16) ||
-        !cfg->lease_ns || !cfg->wire->connect || !cfg->wire->progress || !cfg->wire->close ||
-        !cfg->wire->ctx_free)
+        !cfg->lease_ns || !cfg->carrier->connect || !cfg->carrier->progress || !cfg->carrier->close ||
+        !cfg->carrier->ctx_free)
         goto fail_early;
 
     struct peer_manager *m = calloc(1, sizeof(*m));
@@ -1994,7 +1981,7 @@ int peer_manager_new(const struct peer_manager_config *cfg,
     }
 
     struct epoll_event e = {.events = EPOLLIN};
-    int carrier = cfg->wire->epfd ? cfg->wire->epfd(cfg->wire_ctx) : -1,
+    int carrier = cfg->carrier->epfd ? cfg->carrier->epfd(cfg->carrier_ctx) : -1,
         hw = cfg->crypto.fd(cfg->crypto.ctx);
     if (epoll_ctl(m->epfd, EPOLL_CTL_ADD, m->notify_fd, &e) ||
         (carrier >= 0 && epoll_ctl(m->epfd, EPOLL_CTL_ADD, carrier, &e)) ||
@@ -2054,7 +2041,7 @@ int peer_manager_free(struct peer_manager *m)
     close(m->epfd);
     close(m->notify_fd);
     pthread_mutex_destroy(&m->notify_mu);
-    m->cfg.wire->ctx_free(m->cfg.wire_ctx);
+    m->cfg.carrier->ctx_free(m->cfg.carrier_ctx);
     OPENSSL_cleanse(m->pairs, m->pair_cap * sizeof(*m->pairs));
     free(m->pairs);
     free(m);
@@ -2098,25 +2085,6 @@ static int manager_start(struct peer_manager *m, const pthread_attr_t *attr)
 int peer_manager_start(struct peer_manager *m)
 {
     return manager_start(m, NULL);
-}
-
-int peer_manager_start_on_cpu(struct peer_manager *m, unsigned cpu)
-{
-    if (cpu >= CPU_SETSIZE)
-        return -1;
-
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(cpu, &set);
-
-    pthread_attr_t attr;
-    if (pthread_attr_init(&attr))
-        return -1;
-
-    int rc = pthread_attr_setaffinity_np(&attr, sizeof(set), &set) ? -1 : manager_start(m, &attr);
-    pthread_attr_destroy(&attr);
-
-    return rc;
 }
 
 int peer_manager_thread_snapshot(struct peer_manager *m, struct peer_manager_thread_snapshot *out)

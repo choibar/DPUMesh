@@ -1,6 +1,45 @@
 #include <doca_dpa_dev.h>
 #include <doca_dpa_dev_comch_msgq.h>
-#include "peer_dpa_rdma.h"
+#include "peer_write_imm_dpa.h"
+
+static int peer_dpa_attached(const struct peer_dpa_thread_arg *arg)
+{
+    if (arg->rdma_state)
+        return 1;
+    unsigned count = arg->rdma_count < DPA_RDMA_CONTEXTS ? arg->rdma_count : DPA_RDMA_CONTEXTS;
+    for (unsigned i = 0; i < count; i++)
+        if (arg->rdma_states[i])
+            return 1;
+    return 0;
+}
+
+static unsigned drain_context(struct peer_dpa_thread_arg *arg, unsigned context, unsigned budget)
+{
+    uint64_t state = context == DPA_RDMA_CONTEXTS ? arg->rdma_state : arg->rdma_states[context];
+    return state && budget ? peer_write_imm_dpa_drain(arg, context, state, budget) : 0;
+}
+
+static unsigned peer_dpa_drain(struct peer_dpa_thread_arg *arg, unsigned budget)
+{
+    if (!budget)
+        return 0;
+    if (!arg->rdma_count)
+        return drain_context(arg, DPA_RDMA_CONTEXTS, budget); /* standalone probe */
+
+    unsigned count = arg->rdma_count;
+    if (count > DPA_RDMA_CONTEXTS)
+        return 0;
+
+    unsigned first = arg->rdma_cursor % count, work = 0;
+    for (unsigned visit = 0; visit < count && work < budget; visit++) {
+        unsigned context = (first + visit) % count;
+        unsigned left = budget - work;
+        work += drain_context(arg, context, left < 64 ? left : 64);
+        arg->rdma_cursor = (context + 1) % count;
+    }
+
+    return work;
+}
 
 /* Separate entry and argument ABI from the native Host DMA kernel. The two
  * threads share an exact EU affinity, as in the original jukebox scheduler. */

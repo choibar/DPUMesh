@@ -1,9 +1,40 @@
 #include "peer_association.h"
+#include "peer_tls.h"
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+
+/* Bind directional IPsec material to this association and pinned TLS peer.
+ * QPNs belong to the lane transcript, not the shared directional SA key.
+ * Both endpoint keys must match this pinned TLS connection. */
+static int association_derive(struct peer_tls_conn *tls,
+                    const struct peer_sec_binding *b,
+                    unsigned local,
+                    unsigned direction,
+                    uint8_t out[20])
+{
+    uint8_t context[PEER_TLS_IPSEC_CONTEXT_MAX], key[32];
+    size_t len = 0;
+    if (!out)
+        return -1;
+
+    OPENSSL_cleanse(out, 20);
+
+    if (local > 1 || direction > 1 || !peer_sec_binding_valid(b) || peer_tls_local_key(tls, key) ||
+        CRYPTO_memcmp(key, b->endpoint[local].public_key, 32) || peer_tls_peer_key(tls, key) ||
+        CRYPTO_memcmp(key, b->endpoint[1 - local].public_key, 32) ||
+        peer_sec_binding_encode(b, context, sizeof(context) - 1, &len))
+        return -1;
+
+    context[len++] = (uint8_t)direction;
+
+    int rc = peer_tls_export_ipsec(tls, context, len, out);
+    OPENSSL_cleanse(context, sizeof(context));
+
+    return rc;
+}
 
 struct association {
     struct peer_assoc_token token;
@@ -162,7 +193,7 @@ int peer_association_open(struct peer_associations *m,
         return -1;
 
     uint8_t material[20], lane_bytes[PEER_SEC_LANE_LEN];
-    if (peer_sec_derive(tls, b, local, local, material))
+    if (association_derive(tls, b, local, local, material))
         return -1;
 
     OPENSSL_cleanse(material, sizeof(material));
@@ -377,7 +408,7 @@ int peer_associations_next(struct peer_associations *m,
         out->old_epoch = a->old_epoch;
 
         if ((action == PEER_CRYPTO_INSTALL_RX || action == PEER_CRYPTO_INSTALL_TX) &&
-            peer_sec_derive(a->tls,
+            association_derive(a->tls,
                             &a->binding,
                             a->local,
                             action == PEER_CRYPTO_INSTALL_TX ? a->local : 1 - a->local,

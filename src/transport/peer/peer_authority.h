@@ -3,7 +3,6 @@
 
 #include "peer_identity.h"
 #include "peer_topology.h"
-#include "peer_workload_identity.h"
 #include <stdatomic.h>
 
 /* The dispatcher publishes authority. Worker and manager readers retain a
@@ -57,7 +56,7 @@ int peer_authority_session(struct peer_authority *, uint64_t session_id,
                            uint64_t session_epoch, struct peer_local_registration *out);
 int peer_authority_local(struct peer_authority *, const char *uid,
                          struct peer_local_registration *out);
-/* A peer stream/QP holds registration ownership until its DMA fence. The
+/* A peer connection/QP holds registration ownership until its DMA fence. The
  * dispatcher cannot recycle an otherwise closed Host session while held. */
 int peer_authority_hold(struct peer_authority *, uint64_t id, uint64_t epoch);
 /* Pins the registration and exposes only its revocation flag. Immutable

@@ -1,6 +1,7 @@
 #ifndef DMESH_PEER_MANAGER_H
 #define DMESH_PEER_MANAGER_H
-#include "peer_control.h"
+#include "peer_config.h"
+#include "peer_control_session.h"
 #include "peer_crypto.h"
 #include "peer_pair_transport.h"
 
@@ -18,7 +19,6 @@
  * and never race to converge on one. Every function here runs on the manager
  * owner (its own thread in the runtime, the caller in tests) except the two
  * notify calls, which any thread may use. */
-#define PEER_MANAGER_SESSIONS_MAX 64u
 
 struct peer_manager_ops {
     /* Both read the held authority snapshot; neither consults the peer. */
@@ -34,8 +34,8 @@ struct peer_manager_config {
     uint8_t boot[16];                 /* this process incarnation, fresh per start */
     unsigned workers;                 /* data workers on this node, 1..16 */
     uint16_t mtu;                     /* RoCE path MTU every lane uses */
-    const struct peer_wire_ops *wire; /* control carrier; owned on success */
-    void *wire_ctx;
+    const struct peer_carrier_ops *carrier; /* control carrier; owned on success */
+    void *carrier_ctx;
     struct peer_crypto_adapter crypto;
     struct peer_assoc_limits limits;
     /* Authority and policy leases granted to a pair until the signed security
@@ -71,22 +71,15 @@ int peer_manager_attach_worker(struct peer_manager *,
  * registry and every pair. Returns 1 when anything moved. Time is monotonic and
  * never runs backwards. */
 int peer_manager_progress(struct peer_manager *, uint64_t now_ns);
-/* Readable when a turn may have work; -1 when unavailable. */
-int peer_manager_fd(struct peer_manager *);
 /* From the control thread. Bounded, copied, never blocking. */
 int peer_manager_notify_unregister(struct peer_manager *, const char *pod_uid);
 int peer_manager_notify_authority(struct peer_manager *, uint64_t generation, uint64_t deadline_ns);
-/* Start a rekey of one active association this node proposed or accepted.
- * 0 started, -1 not active or already rekeying. */
-int peer_manager_rekey(struct peer_manager *, const uint8_t association[16]);
 void peer_manager_stats(struct peer_manager *, struct peer_manager_stats *);
 /* The runtime's owner thread: progress on readiness, a 100 ms backstop tick. */
 int peer_manager_start(struct peer_manager *);
-/* Same owner loop, with affinity installed before the first turn. */
-int peer_manager_start_on_cpu(struct peer_manager *, unsigned cpu);
 
 /* Read-only owner-thread telemetry, safe while the manager thread runs.
- * cpu is the CPU observed at thread entry; pinned starts keep that affinity.
+ * cpu is the CPU observed at thread entry.
  * pairs=UINT32_MAX until its first completed turn. Sample CPU before stop. */
 struct peer_manager_thread_snapshot {
     uint64_t cpu_ns;

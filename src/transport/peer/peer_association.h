@@ -1,9 +1,10 @@
 #ifndef DMESH_PEER_ASSOCIATION_H
 #define DMESH_PEER_ASSOCIATION_H
-#include "peer_security_wire.h"
+#include "peer_config.h"
+#include "peer_control_protocol.h"
 #include "peer_identity.h"
 
-#define PEER_ASSOC_LANES_MAX 16u
+struct peer_tls_conn;
 
 /* The control owner never performs verbs/flow operations on a worker's behalf.
  * It emits commands, and accepts completions only for the exact token issued.

@@ -20,6 +20,7 @@
  *
  * One SA per direction per epoch; the lanes of one association share it. */
 #define _GNU_SOURCE
+#include "peer_config.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -81,12 +82,8 @@ DOCA_LOG_REGISTER(DPUMESH_CRYPTO_OWNER);
         0, priority, pipe, match, mask, NULL, NULL, NULL, NULL, NULL, fwd, ctx, entry)
 #endif
 
-#define ASSOC_MAX 256u
-#define PEERS_MAX 64u
-#define SA_DEFAULT 4096u
 #define ROCE_PORT 4791u
-#define PROCESS_TIMEOUT_US 10000
-#define CLIENT_RX_MAX (PEER_CRYPTO_IPC_FRAME_MAX * 4)
+#define CLIENT_RX_MAX (PEER_CRYPTO_IPC_FRAME_MAX * PEER_CRYPTO_OWNER_RX_FRAMES)
 
 /* meta.pkt_meta layout shared by every rule: two path bits and the SA id. */
 union pkt_meta {
@@ -156,8 +153,8 @@ struct owner {
      * reconfiguring a shared resource the device already holds leaves the port
      * unable to stop; exhaustion refuses new installs until a restart. */
     uint32_t sa_next;
-    struct peer peers[PEERS_MAX];
-    struct assoc assocs[ASSOC_MAX];
+    struct peer peers[PEER_CRYPTO_OWNER_PEERS_MAX];
+    struct assoc assocs[PEER_CRYPTO_OWNER_ASSOC_MAX];
     int eal, flow;
     /* IPC */
     int listen_fd, client_fd;
@@ -214,7 +211,7 @@ static void drain(struct owner *o, const char *why)
     o->await_entry = NULL;
 
     for (unsigned n = 0; n < 50; n++) {
-        doca_error_t r = doca_flow_entries_process(o->sw, 0, PROCESS_TIMEOUT_US, 64);
+        doca_error_t r = doca_flow_entries_process(o->sw, 0, PEER_CRYPTO_OWNER_PROCESS_TIMEOUT_US, 64);
         if (r != DOCA_SUCCESS) {
             DOCA_LOG_ERR("drain %s: %s", why, doca_error_get_descr(r));
             return;
@@ -239,7 +236,7 @@ static int end_await(struct owner *o, struct doca_flow_pipe_entry *entry)
     o->await_entry = entry;
 
     for (unsigned n = 0; n < 200 && !o->await_done; n++) {
-        doca_error_t r = doca_flow_entries_process(o->sw, 0, PROCESS_TIMEOUT_US, 8);
+        doca_error_t r = doca_flow_entries_process(o->sw, 0, PEER_CRYPTO_OWNER_PROCESS_TIMEOUT_US, 8);
         if (r != DOCA_SUCCESS) {
             DOCA_LOG_ERR("entries_process: %s", doca_error_get_descr(r));
             break;
@@ -504,7 +501,7 @@ static int build_egress_root(struct owner *o)
     match.outer.ip4.dst_ip = UINT32_MAX;
     mask.outer.ip4.src_ip = UINT32_MAX;
     mask.outer.ip4.dst_ip = UINT32_MAX;
-    TRY(pipe_cfg(o, "DMESH_EGRESS_ROOT", 1, DOCA_FLOW_PIPE_DOMAIN_EGRESS, PEERS_MAX * 2, &cfg));
+    TRY(pipe_cfg(o, "DMESH_EGRESS_ROOT", 1, DOCA_FLOW_PIPE_DOMAIN_EGRESS, PEER_CRYPTO_OWNER_PEERS_MAX * 2, &cfg));
     TRY(doca_flow_pipe_cfg_set_match(cfg, &match, &mask));
     TRY(doca_flow_pipe_create(cfg, &fwd, NULL, &o->egress_root));
     doca_flow_pipe_cfg_destroy(cfg);
@@ -607,7 +604,7 @@ static int build_ingress_root(struct owner *o)
     match.outer.ip4.src_ip = UINT32_MAX;
     match.outer.ip4.dst_ip = UINT32_MAX;
     match.outer.ip4.next_proto = UINT8_MAX;
-    TRY(pipe_cfg(o, "DMESH_INGRESS_ROOT", 1, DOCA_FLOW_PIPE_DOMAIN_DEFAULT, PEERS_MAX * 3, &cfg));
+    TRY(pipe_cfg(o, "DMESH_INGRESS_ROOT", 1, DOCA_FLOW_PIPE_DOMAIN_DEFAULT, PEER_CRYPTO_OWNER_PEERS_MAX * 3, &cfg));
     TRY(doca_flow_pipe_cfg_set_match(cfg, &match, NULL));
     TRY(doca_flow_pipe_create(cfg, &fwd, NULL, &o->ingress_root));
     doca_flow_pipe_cfg_destroy(cfg);
@@ -631,7 +628,7 @@ static int build_graph(struct owner *o)
 static struct peer *peer_get(struct owner *o, uint32_t local_ip, uint32_t peer_ip, int create)
 {
     struct peer *slot = NULL;
-    for (unsigned i = 0; i < PEERS_MAX; i++) {
+    for (unsigned i = 0; i < PEER_CRYPTO_OWNER_PEERS_MAX; i++) {
         struct peer *p = &o->peers[i];
         if (p->used && p->local_ip == local_ip && p->peer_ip == peer_ip)
             return p; /* refs may be 0; entries persist */
@@ -778,7 +775,7 @@ static int sa_configure(struct owner *o, uint32_t id, const uint8_t material[20]
 static struct assoc *assoc_find(struct owner *o, const struct peer_crypto_request *r, int create)
 {
     struct assoc *slot = NULL;
-    for (unsigned i = 0; i < ASSOC_MAX; i++) {
+    for (unsigned i = 0; i < PEER_CRYPTO_OWNER_ASSOC_MAX; i++) {
         struct assoc *a = &o->assocs[i];
         if (a->used && !memcmp(a->session, r->binding.session, 16) &&
             !memcmp(a->association, r->binding.association, 16))
@@ -1453,7 +1450,7 @@ fail:
 
 static void teardown(struct owner *o)
 {
-    for (unsigned i = 0; i < ASSOC_MAX; i++) {
+    for (unsigned i = 0; i < PEER_CRYPTO_OWNER_ASSOC_MAX; i++) {
         struct assoc *a = &o->assocs[i];
         if (!a->used)
             continue;
@@ -1525,7 +1522,7 @@ int main(int argc, char **argv)
     static struct owner o;
     o.pf_port_id = o.sf_port_id = UINT16_MAX;
     o.listen_fd = o.client_fd = -1;
-    o.sa_limit = SA_DEFAULT;
+    o.sa_limit = PEER_CRYPTO_OWNER_SA_DEFAULT;
 
     static const struct option options[] = {{"socket", required_argument, NULL, 's'},
                                             {"pci", required_argument, NULL, 'p'},

@@ -31,6 +31,8 @@ int peer_crypto_ipc_hello_decode(const void *body,
                                  size_t len,
                                  unsigned *sdk_major,
                                  unsigned *sdk_minor);
+/* Shared request validation for the codec and runtime client. */
+int peer_crypto_ipc_request_valid(const struct peer_crypto_request *);
 /* The request encoding includes the material; callers cleanse `buf` after it
  * has been written to the socket. */
 int peer_crypto_ipc_request_encode(const struct peer_crypto_request *,
@@ -45,17 +47,4 @@ int peer_crypto_ipc_completion_encode(const struct peer_crypto_completion *,
 int peer_crypto_ipc_completion_decode(const void *body,
                                       size_t len,
                                       struct peer_crypto_completion *);
-
-/* The runtime side: a `peer_crypto_adapter` that connects to the owner's
- * socket, reconnects when it drops, and answers the manager honestly when it
- * cannot reach hardware. Requests in flight when the owner disappears are
- * completed as unknown outcome (-2); an install that cannot be sent is refused
- * (-1); `healthy` reports whether an owner is connected right now. */
-struct peer_crypto_ipc;
-int peer_crypto_ipc_new(const char *socket_path,
-                        struct peer_crypto_ipc **out,
-                        char *error,
-                        size_t error_len);
-void peer_crypto_ipc_free(struct peer_crypto_ipc *);
-struct peer_crypto_adapter peer_crypto_ipc_adapter(struct peer_crypto_ipc *);
 #endif

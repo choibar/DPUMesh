@@ -2,7 +2,7 @@
 #define DMESH_HOST_REGISTRATION_CLIENT_H
 
 #include <stdint.h>
-#include "../peer/peer_registration_wire.h"
+#include "../peer/local_registration_protocol.h"
 
 struct dmesh_registration_client {
     int fd;

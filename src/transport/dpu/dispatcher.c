@@ -2,8 +2,8 @@
 #include "dispatcher.h"
 #include "placement.h"
 #include "object.h"
-#include "../peer/peer_session_control.h"
-#include "../peer/peer_flow_origin.h"
+#include "../peer/local_control_session.h"
+#include "../peer/peer_identity.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <limits.h>
@@ -102,7 +102,7 @@ struct scale {
     bool pending, acked, scaled_in;
 };
 struct dmesh_dispatcher {
-    struct peer_session_control *peer_control;
+    struct local_control_session *local_control;
     const struct dmesh_dispatch_peer_ops *peer_ops;
     void *peer_node;
     size_t count, cursor;
@@ -853,8 +853,8 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
 {
     struct dmesh_dispatcher *d = o->dispatcher;
     struct peer_local_registration registration = {0};
-    if (d->peer_control && !peer_authority_session(
-            peer_session_control_authority(d->peer_control), session_id(d, o, s),
+    if (d->local_control && !peer_authority_session(
+            local_control_session_authority(d->local_control), session_id(d, o, s),
             s->epoch, &registration)) {
         s->closing = true;
         dmesh_dispatcher_session_lost(o, s);
@@ -871,7 +871,7 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         s->listen_status = (!ip || !port || port > UINT16_MAX) ? EINVAL :
             ((existing && existing != s) || (s->listen_port &&
                 (s->listen_ip != ip || s->listen_port != port))) ? EADDRINUSE : 0;
-        if (d->peer_control && ip != htonl(registration.pod_ip))
+        if (d->local_control && ip != htonl(registration.pod_ip))
             s->listen_status = EACCES;
         if (!s->listen_status) s->listen_status = remember_listener(d, ip, (uint16_t)port);
         if (!s->listen_status) { s->listen_ip = ip; s->listen_port = (uint16_t)port; }
@@ -969,7 +969,7 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     }
     struct dmesh_export_metadata_msg metadata;
     memcpy(&metadata, payload, sizeof(metadata));
-    if (d->peer_control) {
+    if (d->local_control) {
         /* A host-provided workload label is not evidence. The L7 bridge must
          * obtain the complete verified identity through the session lookup. */
         memset(metadata.flow.src_workload, 0, sizeof(metadata.flow.src_workload));
@@ -1041,7 +1041,7 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
 void dmesh_dispatcher_session_lost(struct objects *o, struct dmesh_session *s)
 {
     struct dmesh_dispatcher *d = o->dispatcher;
-    peer_authority_retire_session(peer_session_control_authority(d->peer_control),
+    peer_authority_retire_session(local_control_session_authority(d->local_control),
                                    session_id(d, o, s), s->epoch);
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i)
         if (d->flows[i].used && d->flows[i].session == s) d->flows[i].lost_pending = true;
@@ -1064,7 +1064,7 @@ bool dmesh_dispatcher_accepting(struct objects *o)
 
 int dmesh_dispatcher_registration_required(struct objects *o)
 {
-    return o && o->dispatcher && o->dispatcher->peer_control != NULL;
+    return o && o->dispatcher && o->dispatcher->local_control != NULL;
 }
 
 int dmesh_dispatcher_register(struct objects *o, struct dmesh_session *s,
@@ -1077,7 +1077,7 @@ int dmesh_dispatcher_register(struct objects *o, struct dmesh_session *s,
     struct dmesh_registration_assertion_msg assertion;
     memcpy(&assertion, payload, sizeof(assertion));
     struct dmesh_dispatcher *d = o->dispatcher;
-    return peer_session_control_register(d->peer_control, session_id(d, o, s), s->epoch,
+    return local_control_session_register(d->local_control, session_id(d, o, s), s->epoch,
                                           s->registration_nonce, &assertion);
 }
 
@@ -1085,7 +1085,7 @@ struct peer_authority *dmesh_dispatch_worker_authority(struct objects *o)
 {
     if (!o || !o->mailbox)
         return NULL;
-    return peer_session_control_authority(o->mailbox->dispatcher->peer_control);
+    return local_control_session_authority(o->mailbox->dispatcher->local_control);
 }
 
 int dmesh_dispatch_flow_origin(struct objects *o, unsigned slot, struct peer_flow_origin *out)
@@ -1117,13 +1117,13 @@ int dmesh_dispatch_flow_origin(struct objects *o, unsigned slot, struct peer_flo
 
 static void advance_peer_authority(struct dmesh_dispatcher *d)
 {
-    if (!d->peer_control)
+    if (!d->local_control)
         return;
 
-    peer_session_control_progress(d->peer_control);
+    local_control_session_progress(d->local_control);
     if (d->peer_ops)
         d->peer_ops->progress(d->peer_node);
-    struct peer_authority *authority = peer_session_control_authority(d->peer_control);
+    struct peer_authority *authority = local_control_session_authority(d->local_control);
     unsigned cursor = 0;
     struct peer_local_registration r;
     while (peer_authority_retiring(authority, &cursor, &r)) {
@@ -1400,7 +1400,7 @@ static void *dispatch_main(void *arg)
         (void)poll(fds, d->count + 1, 10);
     }
     forget_listeners(d);
-    peer_authority_retire_all(peer_session_control_authority(d->peer_control));
+    peer_authority_retire_all(local_control_session_authority(d->local_control));
     advance_peer_authority(d);
     /* No worker can retain exported buffers here: failed cleanup deliberately
      * retains its mailbox reference. Retire idle physical sessions last. */
@@ -1437,7 +1437,7 @@ static void *dispatch_main(void *arg)
         fprintf(stderr, "[dispatcher] retaining node runtime after incomplete RDMA retirement\n");
         return NULL;
     }
-    if (peer_session_control_free(d->peer_control)) {
+    if (local_control_session_free(d->local_control)) {
         fprintf(stderr, "[dispatcher] retaining peer control with unretired registrations\n");
         return NULL;
     }
@@ -1458,7 +1458,7 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
     d->flows = calloc(count * DMESH_MAX_CONNECTIONS, sizeof(*d->flows));
     d->pollfds = calloc(count + 1, sizeof(*d->pollfds));
     if (!d->controls || !d->workers || !d->loads || !d->flows || !d->pollfds) goto fail;
-    if (peer_session_control_new((unsigned)count * DMESH_MAX_SESSIONS, &d->peer_control)) goto fail;
+    if (local_control_session_new((unsigned)count * DMESH_MAX_SESSIONS, &d->local_control)) goto fail;
     size_t initialized = 0;
     d->policy = dmesh_placement_least_instructions;
     d->migrate_period_ms = env_u64("DMESH_MIGRATE_PERIOD_MS", 0);
@@ -1517,9 +1517,9 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
         d->workers[i].objs = workers[i];
     }
     d->peer_ops = configured_peer_ops;
-    const char *peer_transport = getenv("DPUMESH_PEER_TRANSPORT");
-    if ((peer_transport && *peer_transport && !d->peer_ops) ||
-        (d->peer_ops && d->peer_ops->start(d->peer_control, workers, count, &d->peer_node))) {
+    const char *peer_device = getenv("DPUMESH_PEER_RDMA_DEVICE");
+    if ((peer_device && *peer_device && !d->peer_ops) ||
+        (d->peer_ops && d->peer_ops->start(d->local_control, workers, count, &d->peer_node))) {
         for (size_t i = 0; i < count; ++i) { controls[i]->dispatcher = NULL; workers[i]->mailbox = NULL; }
         /* A failed SDK startup may retain device mappings; preserve its
          * authority/control owner instead of freeing pointers it still uses. */
@@ -1541,7 +1541,7 @@ fail_initialized:
         pthread_mutex_destroy(&d->workers[i].replies.lock);
     }
 fail:
-    (void)peer_session_control_free(d->peer_control);
+    (void)local_control_session_free(d->local_control);
     if (d->fd >= 0) close(d->fd);
     free(d->pollfds); free(d->controls); free(d->workers); free(d->loads); free(d->flows); free(d);
     return DOCA_ERROR_INITIALIZATION;
