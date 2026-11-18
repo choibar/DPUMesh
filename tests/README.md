@@ -4,6 +4,14 @@
 
 | Test | Covers |
 |---|---|
+| `peer_imm_bootstrap_test` | Production IMM+DPA ARM adapter: exact 64B native HELLO, rejection of legacy/corrupt metadata, IPsec-before-connect, delayed local SEND readiness barrier, 128B scratch, mirrored-ring wrap and source retention across failed descriptor publication/QP destruction |
+| `peer_dpa_runtime_test` | Production peer scheduler: per-context work budgets, round-robin fairness, detached context skipping, last STOP and idle yield |
+| `peer_dmesh4_test` | Control HELLO/PROPOSE headers accept the current protocol version and reject legacy/future versions; actual four-byte header and one-byte/max DATA, namespace isolation, delayed reader/NIC/RELEASE_ACK barriers, production handle-return gate, 65,537 complete slot reuses without stream generations |
+| `peer_rdma_layout_test` and its 2/8/129-node builds; `test-peer-config` | Shared D2D lane capacities, derived CQ/hash bounds, counter notification bounds, invalid settings and production per-peer admission including retained slots, using real transport structs and live lists |
+| `peer_write_completion_test` | Compact 8B DPA fences and 2B ARM WRITE lengths, cumulative completion and arena reference release, 64KiB frames, ID wrap, FIFO growth/reuse, failed-publication rollback and invalid completion rejection |
+| `peer_connection_test` | Direct arena TX source addresses and exclusive header headroom, pressure retry, ACK-before-NIC completion, connection/token reuse with outstanding NIC holds, failed-post destroy fence, connection/worker arena caps, RX wrap and partial ACK |
+| `peer_write_completion_dpa_test` | Production IMM+DPA: 64B bootstrap, zero-byte RQ reposts, DATA/credit counter wrap and validation, WRITE coalescing, delayed CQEs, logical/physical/fence-ring wrap, SQ/fence backpressure, epoch wake retry/suppression and STOP writeback |
+| `peer_fence_stats_test.py` | Batch-weighted fence summaries, duplicate log suppression, whole-window trimming and histogram percentile ranges |
 | `native_header_contract_test.py` | Public headers compile as C and C++ |
 | `abi_contract_test.sh` | Exported symbols of `libdpumesh.so.5` and the preload shim match `fixtures/native_abi_lp64.txt` |
 | `native_api_contract_test`, `preload_api_contract_test` | Façade argument validation without a transport |
@@ -24,6 +32,12 @@
 | `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression, TX completion cursors and descriptor-publication failure |
 | `dpa_cleanup_test` | DPA issued/completed close fence, kernel error retention, MsgQ/context/thread cleanup failures and retryable ownership |
 | `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, descriptor-sized RX space checks including wrap padding and the full/empty boundary, CQ draining while RX is full, consume/resume, shutdown, errors and TLS across retriggers |
+
+The DPA WRITE test includes the production device implementation with host SDK
+substitutes in `support/dpa_sdk/`. These headers apply only to that test target.
+Layout variants and invalid-configuration compiler checks are built by Make.
+Archived SEND, Sync and ARM-only IMM tests reside in
+`src/transport/peer/legacy/tests` and are excluded from the test/build graph.
 
 The session tests do not open a device. They exercise production control and cleanup code with mock SDK objects.
 Real DMA completion, hardware context teardown and sibling traffic during close
@@ -59,3 +73,5 @@ after Rust IO can no longer access staging, including acknowledgement retry.
 They also verify that publication does not free TX space, partial completions
 release only their own prefix across wrap, FIN waits for completion, and a
 detached handle cannot release a replacement flow's staging.
+Peer TX tests also cover chunk sealing across publication retries, direct writes
+with untouched header headroom, chunk starvation/wakeup, and detach/FIN fencing.
