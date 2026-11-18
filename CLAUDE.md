@@ -207,6 +207,17 @@ wrap the DOCA Comch consumer/producer used as the DPA↔host completion channel.
   pool (`DPA_THREAD_POOL_SIZE`, one thread handed out per connection) and the
   msgq/completion plumbing; `dma.c` builds each connection's private
   `doca_dma` engine + task pool.
+- **Pod-multiplexed forward DMA (`DMESH_DPA_MUX=n`, off by default):** one DPA
+  thread per host session (one pod's process; `run_dma_mux`, `dpu/dpa_mux.c`)
+  drains all of that session's forward rings on every worker, at most n threads
+  per process, so EU use grows with pods, not flows, and one pod's traffic never
+  queues behind another's. The thread polls the session's tail table (TAILS,
+  session protocol v9: one u32 per flow, 16 per cache line) and visits only rings
+  whose tail moved; its copies' messages reach a consumer per worker. The ARM
+  opens and closes a ring by writing its `cmd` into the thread's local storage,
+  and the DPA answers in the ring's `state`; Linkerd is unchanged. Known limit:
+  a copy from a host process that died blocks its thread's producer for good,
+  which stops only that process's flows. Design: `docs/2026-10-13_dpa-mux-design.md`.
 - **Reverse (proxy→host):** the DPU exports its `rcv_ring` + `tx_staging`; the
   host launches its **own** DPA thread (on `94:00.0`) that mirrors the forward
   datapath in reverse, pulling response bytes back. See `setup_reverse_dpa()` in
@@ -273,7 +284,11 @@ run**):
   a control plane that removes a terminating pod's endpoints the proxy writes to
   dying pods on every pod deletion. Every destroy of a context on the consumer
   PE is therefore preceded by `dmesh_pe_read_events()` (`common/object.h`), once
-  the context is idle. Do the same for any new context on that PE.
+  the context is idle. Do the same for any new context on that PE. A Comch
+  consumer is different: its SDK object ends when the context reaches idle, and
+  stopping it flushes its posted receives, which raises an event of its own. Its
+  events are read around the stop instead, before the PE is progressed
+  (`dmesh_pe_take_events()`; the pod mux's worker consumers, `dpu/dpa_mux.c`).
 - Editing `device/dpa_kernel.c` requires a `ninja` rebuild (dpacc reruns); DPA
   device code uses the `doca_dpa_dev_*` API and `dpaintrin.h`, a different world
   from host DOCA code.

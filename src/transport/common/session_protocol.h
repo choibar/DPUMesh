@@ -6,19 +6,20 @@
  * v2 adds listener registration and worker-pinned backend requests, v4 the
  * ARM/DOORBELL idle wake, v5 the PING keepalive, v6 PREPARE/SPARE_READY, v7
  * SCALE/SCALE_ACK, v8 WAKE_READY, the SHUTDOWN half close, and PREPARE and
- * SCALE on the flow they concern. DMA metadata payloads retain the existing
- * LP64 host/DPU layout. */
+ * SCALE on the flow they concern, v9 the session's TAILS table. DMA metadata
+ * payloads retain the existing LP64 host/DPU layout. */
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
 #define DMESH_SESSION_MAGIC UINT32_C(0x444d5348)
-#define DMESH_SESSION_VERSION 8u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING + spare + scale + wake + SHUTDOWN */
+#define DMESH_SESSION_VERSION 9u /* v3 completion-fenced ownership + ARM/DOORBELL idle wake + PING + spare + scale + wake + SHUTDOWN + TAILS */
 #define DMESH_SESSION_HEADER_SIZE 24u
 #define DMESH_SESSION_MAX_PAYLOAD 2048u
 #define DMESH_SESSION_MAX_FRAME (DMESH_SESSION_HEADER_SIZE + DMESH_SESSION_MAX_PAYLOAD)
 #define DMESH_SESSION_MAX_FLOWS 32u
 #define DMESH_SESSION_MAX_WORKERS 128u
+#define DMESH_SESSION_TAILS_MAX 512u /* export descriptor of the TAILS table */
 
 enum dmesh_session_message_type {
     DMESH_SESSION_HELLO = 1,
@@ -69,6 +70,12 @@ enum dmesh_session_message_type {
      * the proxy reads end of stream after all of them, and the flow stays
      * open until CLOSE. */
     DMESH_SESSION_SHUTDOWN = 22,
+    /* TAILS (host -> DPU, session level, sent once right after HELLO_ACK and
+     * so before any OPEN): the PCI export descriptor of the session's tail
+     * table, one u32 per flow slot holding the low 32 bits of that flow's
+     * forward producer_tail (dpa_common.h, DMESH_TAILS_BYTES). The DPA thread
+     * that serves the session's rings polls the table instead of each ring. */
+    DMESH_SESSION_TAILS = 23,
 };
 
 /* ARM payload: u64 epoch, u32 count, u32 zero, then count entries of
@@ -127,6 +134,9 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
                                      DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE &&
                (h->payload_len - DMESH_SESSION_ARM_HEADER_SIZE) % DMESH_SESSION_ARM_FLOW_SIZE == 0;
     }
+    if (h->type == DMESH_SESSION_TAILS)
+        return h->flow_id == 0 && h->generation == 0 && h->status == 0 && h->payload_len != 0 &&
+               h->payload_len <= DMESH_SESSION_TAILS_MAX;
     if (h->type == DMESH_SESSION_PING || h->type == DMESH_SESSION_WAKE_READY)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 && h->status == 0;
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)

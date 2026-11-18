@@ -7,6 +7,7 @@
 #include <doca_ctx.h>
 #include <doca_dma.h>
 
+#include <poll.h>
 #include <sys/queue.h>
 #include "buffer.h"
 #include "comch_server.h"
@@ -18,6 +19,7 @@
 struct dmesh_doca_dpa_thread;
 struct dmesh_doca_dpa_comch;
 struct dmesh_dpa_thread_pool;
+struct dmesh_mux;
 struct dma_ring;
 struct objects;
 struct dmesh_conn;
@@ -89,6 +91,10 @@ struct dmesh_session {
     /* Flow wake: the session's further host consumers, one per host flow
      * slot, any of which an OPEN may name (0 = free entry). */
     uint32_t flow_consumers[DMESH_SESSION_FLOW_CONSUMERS];
+    /* TAILS: the export descriptor of the host's tail table (0 = none yet).
+     * Every flow of the session carries a copy to its worker, whose pod mux
+     * thread maps the table once. */
+    struct dmesh_tails_export tails;
 };
 
 /* Flow wake consumers of a session: record an arrival or an expiry, and
@@ -166,10 +172,22 @@ struct dmesh_conn {
     uint64_t flow_stats[DMESH_FLOW_STATS];
     int32_t error_status;
     struct dmesh_export_metadata_msg *pending_metadata;
+    struct dmesh_tails_export *pending_tails; /* the session's TAILS, until its pod thread maps it */
 
     struct dmesh_doca_dpa_thread *dpa_thread; /* assigned from objs->dpa_pool */
     uint32_t rx_consumed_pos_published; /* last DPU RX consumed position sent to the DPA */
     struct dmesh_doca_dpa_comch *dpa_comch;   /* msgqs bound to dpa_thread */
+
+    /* Pod-multiplexed forward DMA (dpu/dpa_mux.h) instead of dpa_thread/dpa_comch:
+     * this flow's forward ring is ring mux_ring (flow id - 1) of its session's
+     * thread mux_pod. */
+    bool mux, mux_close_sent;
+    struct dmesh_pod_thread *mux_pod;
+    uint8_t mux_ring;
+    uint32_t mux_gen;                 /* echoed by every message of this ring */
+    uint32_t mux_error;               /* enum dmesh_mux_ring_error the DPA reported */
+    uint64_t mux_received;            /* DMA_DONE messages taken for this flow */
+    uint64_t mux_deadline_ns;         /* CLOCK_MONOTONIC bound for the close */
 
     struct local_mem_bufs *consumer_mem;
     struct doca_comch_consumer *consumer;
@@ -327,7 +345,9 @@ struct objects {
     struct doca_buf_arr *buf_arr;
 
     doca_error_t (*release_dpa)(struct objects *); /* optional checked worker cleanup */
+    doca_error_t (*release_mux)(struct objects *); /* stops and frees the mux threads */
     struct dmesh_dpa_thread_pool *dpa_pool;   /* pre-created DPA threads */
+    struct dmesh_mux *mux;                    /* DMESH_DPA_MUX threads, NULL when off */
     struct dmesh_doca_dpa_thread *dpa_thread; /* thread assigned to the active connection */
 	struct dmesh_doca_dpa_comch *dpa_comch;
     doca_dpa_dev_comch_producer_t remote_dpa_producer;
@@ -431,6 +451,31 @@ static inline void dmesh_pe_read_events(struct doca_pe *pe)
 {
     if (pe != NULL)
         (void)doca_pe_request_notification(pe);
+}
+
+/* Reads the events waiting in a progress engine's notification channel
+ * without arming it again, after waiting up to wait_ms for one to arrive.
+ *
+ * For a context whose SDK object ends when it reaches idle, not at destroy (a
+ * Comch consumer): stopping it flushes its posted receives through its
+ * completion queue, and on an armed PE the flush raises an event. Read the
+ * events before the stop (wait_ms 0: what earlier completions queued) and
+ * again right after doca_ctx_stop(), before the PE is progressed: the context
+ * is still stopping then, and its completion queue, having fired, raises
+ * nothing more. Progressing first would end the context with its event still
+ * queued. */
+static inline void dmesh_pe_take_events(struct doca_pe *pe, int wait_ms)
+{
+    doca_notification_handle_t handle;
+
+    if (pe == NULL || doca_pe_get_notification_handle(pe, &handle) != DOCA_SUCCESS)
+        return;
+    for (int round = 0; round < 2; ++round) {
+        struct pollfd fd = {.fd = (int)handle, .events = POLLIN};
+        if (poll(&fd, 1, wait_ms) <= 0)
+            return;
+        (void)doca_pe_clear_notification(pe, handle);
+    }
 }
 
 #endif // OBJECT_H_

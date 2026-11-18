@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <doca_error.h>
 #include <doca_mmap.h>
+#include "session_protocol.h"
 
 struct objects;
 
@@ -137,6 +138,12 @@ struct dmesh_export_metadata_msg {
     uint8_t ring_desc[512];
     uint8_t snd_desc[512];
     uint8_t rcv_desc[512];
+};
+
+/* A session's tail table as TAILS exported it (session_protocol.h). */
+struct dmesh_tails_export {
+    uint32_t desc_len;          /* 0: the session sent none */
+    uint8_t desc[DMESH_SESSION_TAILS_MAX];
 };
 
 typedef uint64_t doca_dpa_dev_comch_consumer_completion_t;

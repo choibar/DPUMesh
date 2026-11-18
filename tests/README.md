@@ -17,17 +17,17 @@
 | `carrier_logic_test` | Forward chunking to the DPUMesh copy rule, the in-order release window, async open and close, held flow ids, and a flow's DPU requests announced once and answered on the open client flow only |
 | `service_resolve_test` | Service target grammar, DNS answer caching and invalidation, address ids, fail-closed `DPUMESH_TARGETS` membership |
 | `topology_test` | Topology header |
-| `session_protocol_test` | Versioned Comch envelopes, malformed frames, unaligned input and flow identities |
+| `session_protocol_test` | Versioned Comch envelopes, malformed frames, unaligned input, flow identities and the TAILS shape |
 | `session_flow_test` | Shared-session flow lookup, generation checks, independent DPA pool ownership, disconnect fan-out, native/benchmark TLS allocation and failed TLS setup ownership |
-| `channel_session_test` | Production host session code with mock Comch: one client for multiple flows, stale replies, isolated close/errors, failed-close retention and session failure |
+| `channel_session_test` | Production host session code with mock Comch: one client for multiple flows, the session's tail table exported once with each flow on its own slot, stale replies, isolated close/errors, failed-close retention and session failure |
 | `channel_flow_wake_test` | Flow wake consumers against a Comch connection with few internal tasks: started one at a time, stopped through the control PE, all or none |
-| `session_server_test` | Production DPU session progress: HELLO timeout, distinct OPEN metadata, stale requests, close failure/retry, reader detachment, no-teardown and quarantine |
+| `session_server_test` | Production DPU session progress: HELLO timeout, TAILS kept once per session and copied to its flows, distinct OPEN metadata, stale requests, close failure/retry, reader detachment, no-teardown and quarantine |
 | `backend_dispatch_test` | Backend dispatch: lazy allocation, pinned owner, dedup, backpressure, stale fencing; a retired listener address stays DMA-known for `DMESH_LISTENER_GRACE_MS` only |
 | `dispatch_request_test` | DPU requests on their flow: PREPARE on the flow a migration moves, SCALE on the flow it was asked on, then another client flow to the destination, or waiting for one, and sent again until acknowledged; SCALE_ACK matched by token |
 | `dispatch_wake_test` | Dispatcher idle wake: ARM reaches each listed flow's worker, one DOORBELL per ARM, immediate ring, stale epochs/generations ignored, full worker queue rings at once, malformed ARM fails the session |
 | `dma_cleanup_test` | CPU DMA stop/drain failures, submitted-task ownership, callback chaining suppression, TX completion cursors and descriptor-publication failure |
 | `dpa_cleanup_test` | DPA issued/completed close fence, kernel error retention, MsgQ/context/thread cleanup failures and retryable ownership |
-| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, descriptor-sized RX space checks including wrap padding and the full/empty boundary, CQ draining while RX is full, consume/resume, shutdown, errors and TLS across retriggers |
+| `dpa_poll_test.py` | Production kernel with delayed DMA/CQEs: source lifetime, bounded pipelining, descriptor-sized RX space checks including wrap padding and the full/empty boundary, CQ draining while RX is full, consume/resume, shutdown, errors and TLS across retriggers; the pod mux thread: one read per tail line, only rings whose tail moved visited, each ring's copies and messages to its worker's consumer, a worker without credit holding back only its rings, tail errors, close, refill and stop |
 
 The session tests do not open a device. They exercise production control and cleanup code with mock SDK objects.
 Real DMA completion, hardware context teardown and sibling traffic during close
@@ -43,7 +43,8 @@ and does not validate this completion protocol on devices. v4 adds the
 ARM/DOORBELL idle wake on top of v3. v5 adds the PING an idle host sends, the only way it
 notices a DPU proxy that exited. v6 adds the migration spare (PREPARE/SPARE_READY), v7
 flow scaling (SCALE/SCALE_ACK), v8 the Comch fast-path WAKE_READY and the SHUTDOWN half
-close, and carries PREPARE and SCALE on the client flow they concern.
+close, and carries PREPARE and SCALE on the client flow they concern; v9 adds the session's
+TAILS table the DPU's pod mux thread polls.
 
 `support/native_memory_transport.c` is a deterministic loopback carrier for the
 core: it implements the private carrier contract in memory, can hold custody
