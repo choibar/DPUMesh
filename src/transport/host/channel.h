@@ -30,6 +30,7 @@ struct channel_conn; /* Forward declaration: one logical flow with its own rings
 #define CHANNEL_DATA_OFF 4096u            /* Data ring offset inside a window */
 #define CHANNEL_WINDOW   (1024u * 1024u)  /* One connection's receive window */
 #define CHANNEL_DESC_MAX      8064u            /* Forward descriptor bytes */
+#define CHANNEL_RING_SIZE     1024u            /* Forward ring depth of a flow */
 #define CHANNEL_DESC_ALIGN    128u             /* Forward descriptor alignment */
 
 #define CHANNEL_MODE_CLIENT_HOST_DPA  0u /* DPUMesh CLIENT: client flow, reverse by the host DPA */
@@ -62,15 +63,18 @@ int channel_session_close(struct channel_dev *dev);
  * outside control callbacks; completion retains errors until Comch accepts. */
 int channel_session_listen(struct channel_dev *, uint32_t ip, uint16_t port);
 int channel_backend_next(struct channel_dev *, uint32_t *worker, uint32_t *token);
-/* Migration spares: take one PREPARE (destination ip/port, network order ip),
- * and report that a spare flow has its server's first bytes. */
-int channel_prepare_next(struct channel_dev *, uint32_t *ip, uint16_t *port);
+/* The DPU's requests on a client flow, which concern that flow's
+ * destination: PREPARE (open a spare stream to it) and SCALE (keep count
+ * streams to it, answered with token). The session's progress records them;
+ * channel_conn_announced reports once that one arrived since the last call,
+ * and channel_conn_take_request returns the next (1) or none (0). */
+enum { CHANNEL_REQ_PREPARE = 1, CHANNEL_REQ_SCALE = 2 };
+int channel_conn_announced(struct channel_conn *);
+int channel_conn_take_request(struct channel_conn *, int *kind, uint32_t *count, uint32_t *token);
+/* Answers on the flow: a spare has its server's first bytes (SPARE_READY,
+ * on the spare), and how many clients took a SCALE (SCALE_ACK). */
 int channel_conn_spare_ready(struct channel_conn *);
-/* Flow scaling: take one SCALE (destination ip/port, network order ip; the
- * stream count each client keeps; the token to answer), and answer it. */
-int channel_scale_next(struct channel_dev *, uint32_t *ip, uint16_t *port,
-                       uint32_t *count, uint32_t *token);
-int channel_scale_ack(struct channel_dev *, uint32_t token, uint32_t applied);
+int channel_conn_scale_ack(struct channel_conn *, uint32_t token, uint32_t applied);
 void channel_backend_finish(struct channel_dev *, uint32_t worker, uint32_t token, int error);
 /* Nonzero when the device runs the host-dpa reverse path (host DPA reverse path) */
 int channel_dev_host_dpa(const struct channel_dev *dev);
@@ -78,11 +82,14 @@ int channel_dev_host_dpa(const struct channel_dev *dev);
  * (DOORBELL, CLOSED, ERROR) arrives. channel_dev_arm first sends one ARM for
  * the push flows, so the DPU rings for descriptors this host has not read.
  * It fails, leaving the caller to keep polling, when the session is down or
- * the ARM cannot be queued. channel_dev_clear acknowledges a raised fd. */
+ * the ARM cannot be queued. The control PE runs in PROGRESS_ALL, so the next
+ * channel_dev_arm also clears a raised fd. */
 int channel_dev_fd(struct channel_dev *dev);
 int channel_dev_arm(struct channel_dev *dev);
-void channel_dev_clear(struct channel_dev *dev);
 void channel_dev_wake_counters(struct channel_dev *dev, uint64_t *arms_sent, uint64_t *doorbells);
+/* Nonzero when the DPU publishes every push descriptor as a Comch fast-path
+ * completion (WAKE_READY): each receive raises channel_dev_fd without an ARM */
+int channel_dev_rx_signaled(const struct channel_dev *dev);
 
 /* Memory: allocates, registers and PCI-exports `bytes`; the buffer is owned by mem */
 int channel_mem_alloc(struct channel_dev *dev, size_t bytes, struct channel_mem **out);
@@ -108,6 +115,13 @@ int channel_conn_close(struct channel_conn *conn);
  * progresses the session; CLOSED lands through channel_dev_progress. */
 int channel_conn_close_start(struct channel_conn *conn);
 int channel_conn_close_finish(struct channel_conn *conn);
+/* Whether flow_id can open. An open that failed after OPEN was sent, and whose
+ * close the DPU did not confirm, holds the id and its receive window; this
+ * releases them once the DPU's CLOSED has arrived. */
+int channel_flow_free(struct channel_dev *dev, uint32_t flow_id);
+/* End the forward stream (SHUTDOWN): the DPU's reader sees end of stream
+ * after every descriptor posted so far; the flow keeps receiving. */
+int channel_conn_shutdown(struct channel_conn *conn);
 /* Progresses the control path (and the reverse completions on the host-dpa reverse path).
  * Returns 1 for CLOSED, -1 with errno for flow/session failure, otherwise 0. */
 int channel_conn_progress(struct channel_conn *conn);
@@ -116,6 +130,28 @@ int channel_conn_progress(struct channel_conn *conn);
  * every flow even if another poller performed the shared progress. */
 int channel_dev_progress(struct channel_dev *dev);
 int channel_conn_poll(struct channel_conn *conn);
+
+/* Flow wake (every fast-path session): every flow slot (1..32) has a Comch
+ * consumer of its own on its own PE, created with the session (a failure
+ * fails the session), so a push flow's descriptors complete on its slot's
+ * consumer and raise that slot's fd alone; the flow's OPEN names the
+ * consumer. The slot calls are serialized by the caller (the carrier's slot
+ * lock). The fd is stable for the session; channel_flow_arm makes the next
+ * completion raise it and clears the last raise; channel_flow_progress
+ * publishes the completed descriptors into the slot's flow. The fd carries
+ * no control message: channel_dev_take_news returns, and clears, bit
+ * (flow_id - 1) for each flow-wake flow that got CLOSED or ERROR. */
+int channel_dev_flow_wake(const struct channel_dev *dev);
+int channel_flow_fd(struct channel_dev *dev, uint32_t flow_id);
+void channel_flow_progress(struct channel_dev *dev, uint32_t flow_id);
+int channel_flow_arm(struct channel_dev *dev, uint32_t flow_id);
+uint32_t channel_dev_take_news(struct channel_dev *dev);
+/* Nonzero when channel_conn_poll and channel_conn_rx_next have nothing to
+ * report: a push flow with no new batch, no peer close and no error. A
+ * hint read without the session lock by the flow's single consumer (which
+ * owns the receive cursor); a drain skips the flow on it. Host-dpa flows
+ * always return 0: their reverse engine needs progress. */
+int channel_conn_idle(const struct channel_conn *conn);
 
 /* Doorbells: private reverse-completion engines only. The shared control PE
  * is serialized and polled through the carrier fallback tick. Returns the

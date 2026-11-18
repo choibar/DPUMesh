@@ -4,10 +4,10 @@
  *
  * This is the legacy host_worker.c benchmark role (one connection per thread,
  * fixed-size messages streamed as fast as the transport takes them) ported
- * onto the host library: one channel per process, one EQ + one client QP per
- * thread, dmesh_alloc/dmesh_post_send under the library's credit and tail
- * policy, replies read zero-copy from the RX region. The DPU peer is
- * dpumesh_dpu in the matching mode.
+ * onto the host library: one channel per process, whose work a thread of its
+ * own does, one client QP per thread, dmesh_alloc/dmesh_post_send under the
+ * library's credit and tail policy, replies read zero-copy from the RX
+ * region. The DPU peer is dpumesh_dpu in the matching mode.
  *
  * Modes (BENCH_MODE):
  *   sink   one-way host -> DPU stream; the DPU counts the completions
@@ -85,9 +85,10 @@ static double gbps(uint64_t bytes, double seconds) { return (double)bytes * 8.0 
 /* Forward descriptors one post of `size` bytes becomes (>= 8 KiB messages only). */
 static double descs_per_post(uint32_t size) { return (double)((size + CHANNEL_DESC_MAX - 1) / CHANNEL_DESC_MAX); }
 
-/* Waits for the EQ readiness fd (bounded). Returns poll()'s result. The fd is
- * level-triggered: the next dmesh_poll_eq run to empty settles it. */
-static int wait_eq(int fd, int timeout_ms)
+/* Waits for a readiness fd, a QP's or the channel's (bounded). Returns
+ * poll()'s result. The fd is level-triggered: the next dmesh_poll_qp (or
+ * dmesh_accept) run to empty settles it. */
+static int wait_fd(int fd, int timeout_ms)
 {
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
     int rc;
@@ -177,12 +178,11 @@ static void reframer_feed(struct worker *w, struct reframer *rf, const uint8_t *
 }
 
 /* ------------------------------------------------------------------------
- * Worker — one EQ + one QP, post / poll / drain
+ * Worker — one QP, post / poll / drain
  * ------------------------------------------------------------------------ */
 struct stream {
-    dmesh_eq_t *eq;
     dmesh_qp_t *qp;
-    int eq_fd;
+    int qp_fd;
     struct reframer rf;
     uint64_t inflight;          /* echo: bytes posted but not yet received back */
     int blocked;                /* dmesh_alloc returned EAGAIN; wait for TX_READY */
@@ -233,12 +233,12 @@ static void stream_recv(struct worker *w, struct stream *s, dmesh_event_t *ev)
     dmesh_release_rx_buffer(w->ch, ev);
 }
 
-/* Drains the EQ. Returns 1 if any event was seen, -1 when the stream ended. */
+/* Drains the QP. Returns 1 if any event was seen, -1 when the stream ended. */
 static int stream_poll(struct worker *w, struct stream *s)
 {
     dmesh_event_t events[EVENT_BATCH];
     int n, i, seen = 0;
-    while ((n = dmesh_poll_eq(s->eq, events, EVENT_BATCH)) > 0) {
+    while ((n = dmesh_poll_qp(s->qp, events, EVENT_BATCH)) > 0) {
         seen = 1;
         for (i = 0; i < n; i++) {
             dmesh_event_t *ev = &events[i];
@@ -270,10 +270,10 @@ static void stream_drain(struct worker *w, struct stream *s)
     while (s->inflight > 0 && now_sec() < until) {
         dmesh_event_t events[EVENT_BATCH];
         int n, i;
-        while ((n = dmesh_poll_eq(s->eq, events, EVENT_BATCH)) > 0)
+        while ((n = dmesh_poll_qp(s->qp, events, EVENT_BATCH)) > 0)
             for (i = 0; i < n; i++)
                 if (events[i].type == DMESH_EVENT_RECV) stream_recv(w, s, &events[i]);
-        wait_eq(s->eq_fd, 1);
+        wait_fd(s->qp_fd, 1);
     }
 }
 
@@ -284,11 +284,10 @@ static void *worker_main(void *arg)
     struct stream s = {0};
     double t0, t_end;
 
-    /* setup: this thread's EQ and its client QP to the service */
-    s.eq = dmesh_create_eq(w->ch);
-    s.qp = s.eq ? dmesh_create_qp(s.eq, cfg->service) : NULL;
-    s.eq_fd = s.eq ? dmesh_eq_fd(s.eq) : -1;
-    if (!s.eq || !s.qp || s.eq_fd < 0) {
+    /* setup: this thread's client QP to the service */
+    s.qp = dmesh_create_qp(w->ch, cfg->service);
+    s.qp_fd = s.qp ? dmesh_qp_fd(s.qp) : -1;
+    if (!s.qp || s.qp_fd < 0) {
         fprintf(stderr, "worker %d: DPUmesh setup failed: %s\n", w->idx, strerror(errno));
         w->failed = 1;
         goto out;
@@ -311,7 +310,7 @@ static void *worker_main(void *arg)
         if (!posted && !seen) {
             /* nothing to do until the library signals; bounded so the
              * duration check and a lost TX_READY cannot hang the worker */
-            wait_eq(s.eq_fd, 1);
+            wait_fd(s.qp_fd, 1);
             s.blocked = 0;
         }
     }
@@ -320,7 +319,29 @@ static void *worker_main(void *arg)
 
 out:
     dmesh_destroy_qp(s.qp);
-    dmesh_destroy_eq(s.eq);
+    return NULL;
+}
+
+/* The channel's work (dmesh_accept), on a thread of its own: the workers wait
+ * on their QPs alone. A client is offered no stream. */
+struct channel_thread {
+    dmesh_channel_t *ch;
+    atomic_int stop;
+};
+
+static void *channel_main(void *arg)
+{
+    struct channel_thread *c = arg;
+    int fd = dmesh_channel_fd(c->ch);
+    while (!atomic_load(&c->stop)) {
+        dmesh_qp_t *qp;
+        while ((qp = dmesh_accept(c->ch)) != NULL) dmesh_abort_qp(qp);
+        if (errno != EAGAIN) {
+            fprintf(stderr, "channel: %s\n", strerror(errno));
+            break;
+        }
+        wait_fd(fd, 100);       /* bounded, so stop is seen */
+    }
     return NULL;
 }
 
@@ -445,6 +466,12 @@ int main(void)
         fprintf(stderr, "dmesh_create_channel: %s\n", strerror(errno));
         return 1;
     }
+    struct channel_thread chan = { .ch = ch };
+    pthread_t chan_tid;
+    if (pthread_create(&chan_tid, NULL, channel_main, &chan) != 0) {
+        fprintf(stderr, "failed to start the channel thread\n");
+        return 1;
+    }
 
     /* workers: QP setup takes milliseconds each, so start the clock a bit later */
     memset(w, 0, sizeof(w));
@@ -486,6 +513,8 @@ int main(void)
 
     failed = report_final(&cfg, w);
     for (i = 0; i < cfg.threads; i++) free(w[i].hist);
+    atomic_store(&chan.stop, 1);
+    pthread_join(chan_tid, NULL);
     dmesh_destroy_channel(ch);
     return failed ? 1 : 0;
 }

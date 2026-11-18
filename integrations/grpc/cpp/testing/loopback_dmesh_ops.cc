@@ -1,13 +1,15 @@
 // In-memory native operations that connect a process to itself: every
-// dmesh_create_qp() becomes an inbound stream on the same process's first EQ.
+// dmesh_create_qp() becomes an inbound stream the same process accepts.
 // libdpumesh_stream_loopback.so exports the stream C ABI over them, so the
 // language adapters run real gRPC clients and servers in their tests without
 // a DOCA device.
 //
-// It keeps the native contract the reactor relies on: a RECV holds one
-// credit until dmesh_release_rx_buffer(); a sender whose peer holds `window`
-// credits gets EAGAIN and, once one returns, TX_READY; a destroyed QP reclaims
-// its queued events and sends its peer RECV_FIN. DPUMESH_LOOPBACK_POST_MAX and
+// It keeps the native contract the reactor relies on: the channel's fd and
+// each QP's fd are readable while an accept or a poll has something to return,
+// and settle when it returns nothing; a RECV holds one credit until
+// dmesh_release_rx_buffer(); a sender whose peer holds `window` credits gets
+// EAGAIN and, once one returns, TX_READY; a destroyed QP reclaims its queued
+// events and sends its peer RECV_FIN. DPUMESH_LOOPBACK_POST_MAX and
 // DPUMESH_LOOPBACK_WINDOW override the post size (8064) and window (64).
 #include "loopback_dmesh_ops.h"
 
@@ -36,68 +38,79 @@ int EnvInt(const char* name, int fallback) {
   return parsed > 0 ? parsed : fallback;
 }
 
+void Raise(int fd) {
+  const uint64_t one = 1;
+  const ssize_t result = ::write(fd, &one, sizeof(one));
+  (void)result;
+}
+
+void Settle(int fd) {
+  uint64_t value;
+  const ssize_t result = ::read(fd, &value, sizeof(value));
+  (void)result;
+}
+
 class LoopbackDmeshApiOps final : public DmeshApiOps {
  public:
   LoopbackDmeshApiOps()
       : post_max_(EnvInt("DPUMESH_LOOPBACK_POST_MAX", 8064)),
-        window_(static_cast<size_t>(EnvInt("DPUMESH_LOOPBACK_WINDOW", 64))) {
-    channel_.pod_id = 1;
-    channel_.slot_size = post_max_;
+        window_(static_cast<size_t>(EnvInt("DPUMESH_LOOPBACK_WINDOW", 64))),
+        channel_fd_(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {
     channel_.block_size = post_max_;
   }
 
   ~LoopbackDmeshApiOps() override {
-    for (auto& eq : eqs_) {
-      if (eq->fd >= 0) ::close(eq->fd);
+    for (auto& entry : qps_) {
+      if (entry.second->fd >= 0) ::close(entry.second->fd);
     }
+    if (channel_fd_ >= 0) ::close(channel_fd_);
   }
 
-  dmesh_channel_t* CreateChannel() override { return &channel_; }
+  dmesh_channel_t* CreateChannel() override {
+    if (channel_fd_ < 0) return nullptr;
+    return &channel_;
+  }
   int DestroyChannel(dmesh_channel_t*) override { return 0; }
+  int PostMax(dmesh_channel_t*) override { return post_max_; }
+  int ChannelFd(dmesh_channel_t*) override { return channel_fd_; }
 
-  dmesh_eq_t* CreateEq(dmesh_channel_t*) override {
+  dmesh_qp_t* Accept(dmesh_channel_t*) override {
     std::lock_guard<std::mutex> lock(mu_);
-    auto eq = std::make_unique<Eq>();
-    eq->fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (eq->fd < 0) return nullptr;
-    Eq* raw = eq.get();
-    eqs_.push_back(std::move(eq));
-    return reinterpret_cast<dmesh_eq_t*>(raw);
+    if (inbound_.empty()) {
+      Settle(channel_fd_);
+      errno = EAGAIN;
+      return nullptr;
+    }
+    Qp* server = inbound_.front();
+    inbound_.pop_front();
+    return &server->value;
   }
 
-  int DestroyEq(dmesh_eq_t* eq) override {
+  dmesh_qp_t* CreateQp(dmesh_channel_t*, const char* target) override {
     std::lock_guard<std::mutex> lock(mu_);
-    Eq* e = reinterpret_cast<Eq*>(eq);
-    if (e->fd >= 0) ::close(e->fd);
-    e->fd = -1;
-    e->destroyed = true;
-    return 0;
-  }
-
-  int EqFd(dmesh_eq_t* eq) override {
-    std::lock_guard<std::mutex> lock(mu_);
-    return reinterpret_cast<Eq*>(eq)->fd;
-  }
-
-  dmesh_qp_t* CreateQp(dmesh_eq_t* eq, const char* service) override {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (service == nullptr || service[0] == '\0') {
+    if (target == nullptr || target[0] == '\0') {
       errno = EINVAL;
       return nullptr;
     }
-    Eq* listening = FirstLiveEq();
-    if (listening == nullptr) {
-      errno = ENOENT;
+    Qp* client = NewQp(DMESH_ROLE_CLIENT);
+    Qp* server = NewQp(DMESH_ROLE_SERVER);
+    if (client == nullptr || server == nullptr) {
+      errno = EMFILE;
       return nullptr;
     }
-    Qp* client = NewQp(reinterpret_cast<Eq*>(eq), DMESH_ROLE_CLIENT);
-    Qp* server = NewQp(listening, DMESH_ROLE_SERVER);
     client->peer = server;
     server->peer = client;
-    server->value.remote_pod = static_cast<int16_t>(channel_.pod_id);
+    server->value.remote_pod = 1;  // this process, the loopback's only pod
     server->value.remote_port = client->value.local_port;
-    Push(listening, Event(server, DMESH_EVENT_CONN_REQ));
+    inbound_.push_back(server);
+    Raise(channel_fd_);
     return &client->value;
+  }
+
+  int QpFd(dmesh_qp_t* qp) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    Qp* q = Find(qp);
+    return q != nullptr && q->alive ? q->fd : -1;
   }
 
   int DestroyQp(dmesh_qp_t* qp) override { return Close(qp); }
@@ -141,20 +154,25 @@ class LoopbackDmeshApiOps final : public DmeshApiOps {
     event.buf = payload.bytes.data();
     event.len = len;
     event._rx_token = token;
-    Push(peer->eq, event);
+    Push(peer, event);
     return 0;
   }
 
   int Flush(dmesh_qp_t*) override { return 0; }
 
-  int PollEq(dmesh_eq_t* eq, dmesh_event_t* events, int max_events) override {
+  int PollQp(dmesh_qp_t* qp, dmesh_event_t* events, int max_events) override {
     std::lock_guard<std::mutex> lock(mu_);
-    Eq* e = reinterpret_cast<Eq*>(eq);
-    int count = 0;
-    while (count < max_events && !e->events.empty()) {
-      events[count++] = e->events.front();
-      e->events.pop_front();
+    Qp* q = Find(qp);
+    if (q == nullptr || !q->alive) {
+      errno = EINVAL;
+      return -1;
     }
+    int count = 0;
+    while (count < max_events && !q->events.empty()) {
+      events[count++] = q->events.front();
+      q->events.pop_front();
+    }
+    if (count == 0) Settle(q->fd);
     return count;
   }
 
@@ -164,26 +182,15 @@ class LoopbackDmeshApiOps final : public DmeshApiOps {
     event->_rx_token = -1;
   }
 
-  int PostMax(dmesh_channel_t*) override { return post_max_; }
-  int PodId(dmesh_channel_t*) override { return channel_.pod_id; }
-  int64_t EqNextDeadlineNs(dmesh_eq_t*) override { return -1; }
-
  private:
-  struct Qp;
-
-  struct Eq {
-    int fd = -1;
-    bool destroyed = false;
-    std::deque<dmesh_event_t> events;
-  };
-
   struct Qp {
     dmesh_qp_t value{};
-    Eq* eq = nullptr;
+    int fd = -1;
     Qp* peer = nullptr;
     bool alive = true;
     bool blocked = false;
     size_t held = 0;
+    std::deque<dmesh_event_t> events;
     std::vector<uint8_t> reservation;
   };
 
@@ -200,18 +207,11 @@ class LoopbackDmeshApiOps final : public DmeshApiOps {
     return event;
   }
 
-  Eq* FirstLiveEq() {
-    for (auto& eq : eqs_) {
-      if (!eq->destroyed) return eq.get();
-    }
-    return nullptr;
-  }
-
-  Qp* NewQp(Eq* eq, int role) {
+  Qp* NewQp(int role) {
     auto qp = std::make_unique<Qp>();
-    qp->eq = eq;
+    qp->fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (qp->fd < 0) return nullptr;
     qp->value.ep = &channel_;
-    qp->value.eq = reinterpret_cast<dmesh_eq_t*>(eq);
     qp->value.role = role;
     qp->value.local_port = next_port_++;
     qp->value.rx_slot = -1;
@@ -225,12 +225,10 @@ class LoopbackDmeshApiOps final : public DmeshApiOps {
     return found == qps_.end() ? nullptr : found->second.get();
   }
 
-  void Push(Eq* eq, const dmesh_event_t& event) {
-    if (eq == nullptr || eq->destroyed) return;
-    eq->events.push_back(event);
-    const uint64_t one = 1;
-    const ssize_t result = ::write(eq->fd, &one, sizeof(one));
-    (void)result;
+  void Push(Qp* qp, const dmesh_event_t& event) {
+    if (!qp->alive) return;
+    qp->events.push_back(event);
+    Raise(qp->fd);
   }
 
   // Returns a receive credit; a sender waiting on it gets TX_READY.
@@ -244,7 +242,7 @@ class LoopbackDmeshApiOps final : public DmeshApiOps {
     if (sender != nullptr && sender->alive && sender->blocked &&
         receiver->held < window_) {
       sender->blocked = false;
-      Push(sender->eq, Event(sender, DMESH_EVENT_TX_READY));
+      Push(sender, Event(sender, DMESH_EVENT_TX_READY));
     }
   }
 
@@ -253,22 +251,19 @@ class LoopbackDmeshApiOps final : public DmeshApiOps {
     Qp* q = Find(qp);
     if (q == nullptr || !q->alive) return 0;
     q->alive = false;
-    // Queued events for this QP are reclaimed with their credits.
-    auto& queue = q->eq->events;
-    for (auto it = queue.begin(); it != queue.end();) {
-      if (it->qp == qp) {
-        if (it->_rx_token >= 0) Release(it->_rx_token);
-        it = queue.erase(it);
-      } else {
-        ++it;
-      }
+    // Queued events are reclaimed with their credits.
+    for (const dmesh_event_t& event : q->events) {
+      if (event._rx_token >= 0) Release(event._rx_token);
     }
+    q->events.clear();
+    ::close(q->fd);
+    q->fd = -1;
     Qp* peer = q->peer;
     if (peer != nullptr && peer->alive) {
-      Push(peer->eq, Event(peer, DMESH_EVENT_RECV_FIN));
+      Push(peer, Event(peer, DMESH_EVENT_RECV_FIN));
       if (peer->blocked) {
         peer->blocked = false;
-        Push(peer->eq, Event(peer, DMESH_EVENT_TX_READY));
+        Push(peer, Event(peer, DMESH_EVENT_TX_READY));
       }
     }
     return 0;
@@ -278,9 +273,11 @@ class LoopbackDmeshApiOps final : public DmeshApiOps {
   dmesh_channel_t channel_{};
   const int post_max_;
   const size_t window_;
+  const int channel_fd_;
   uint16_t next_port_ = 1;
   int32_t next_token_ = 1;
-  std::vector<std::unique_ptr<Eq>> eqs_;
+  // Streams dialed and not yet accepted.
+  std::deque<Qp*> inbound_;
   std::unordered_map<dmesh_qp_t*, std::unique_ptr<Qp>> qps_;
   std::unordered_map<int32_t, Payload> payloads_;
 };

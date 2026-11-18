@@ -4,6 +4,38 @@
 #include <assert.h>
 #include "src/transport/dpu/dispatcher.c"
 
+/* The fast-path producer is exercised on hardware, not here: the stub only
+ * records which host consumer a flow was bound to. */
+static uint32_t attached_consumer;
+doca_error_t dmesh_wake_attach(struct dmesh_conn *c, struct doca_comch_connection *connection, uint32_t consumer)
+{
+    (void)c; (void)connection;
+    attached_consumer = consumer;
+    return DOCA_SUCCESS;
+}
+
+/* OPEN of a push flow on session s, optionally naming a host consumer; the
+ * consumer its worker bound it to, or 0 when no flow was admitted. */
+static uint32_t open_named(struct dmesh_dispatcher *d, struct objects *workers, struct dmesh_session *s,
+                           uint32_t flow, uint32_t consumer, uint32_t extra)
+{
+    struct dmesh_export_metadata_msg metadata = {0};
+    metadata.flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
+    uint8_t payload[sizeof(metadata) + 4];
+    memcpy(payload, &metadata, sizeof(metadata));
+    dmesh_session_put_u32(payload + sizeof(metadata), consumer);
+    struct dmesh_session_header open = {.type = DMESH_SESSION_OPEN, .flow_id = flow, .generation = 1,
+                                        .payload_len = (uint32_t)(sizeof(metadata) + extra)};
+    attached_consumer = 0;
+    dmesh_dispatcher_request(d->controls[0], s, &open, payload);
+    struct assignment *a = find(d, s, flow);
+    if (!a) return 0;
+    struct objects *w = &workers[a->location.worker];
+    dmesh_dispatch_worker_drain(w);
+    assert(w->conns[a->location.slot].state == DMESH_CONN_NEW);
+    return attached_consumer;
+}
+
 doca_error_t dmesh_session_send(struct objects *o, struct dmesh_session *s, uint16_t type,
     uint32_t id, uint32_t generation, const void *payload, size_t length, int32_t status)
 {
@@ -121,6 +153,28 @@ int main(void)
     assert(s->armed && s->armed_epoch == 14);
     assert(queued(&w1->mailbox->requests) == before1 && queued(&w2->mailbox->requests) == before2);
 
+    /* SHUTDOWN reaches its flow's owner, also past a full queue, and leaves the
+     * flow running; a stale generation reaches nobody. */
+    {
+        uint8_t posted[8];
+        dmesh_session_put_u64(posted, 6);
+        struct dmesh_session_header shut = {.type = DMESH_SESSION_SHUTDOWN, .flow_id = 2,
+                                            .generation = 4, .payload_len = sizeof(posted)};
+        dmesh_dispatcher_request(d.controls[0], s, &shut, posted);
+        assert(!a2->shut_pending);
+        shut.generation = 5;
+        dmesh_dispatcher_request(d.controls[0], s, &shut, posted);
+        struct message full = {.type = CLOSE}, out;
+        while (push(&w2->mailbox->requests, &full)) {}
+        flush_commands(&d);
+        assert(a2->shut_pending);
+        while (peek(&w2->mailbox->requests, &out, true)) {}
+        flush_commands(&d);
+        assert(!a2->shut_pending && queued(&w2->mailbox->requests) == 1);
+        dmesh_dispatch_worker_drain(w2);
+        assert(c2->host_shut && c2->host_shut_descs == 6 && c2->state == DMESH_CONN_RUNNING);
+    }
+
     /* An owner whose queue is full cannot hold the ARM: ring at once. */
     struct message filler = {.type = CLOSE};
     while (push(&w1->mailbox->requests, &filler)) {}
@@ -137,6 +191,22 @@ int main(void)
     dmesh_dispatcher_request(d.controls[0], s, &h, bad);
     assert(s->closing && a1->lost_pending && a2->lost_pending);
 
+    /* Flow wake: an OPEN naming a consumer the session has seen sends that
+     * flow's descriptors there; an unknown one, or none, keeps the session's. */
+    struct dmesh_session *fs = &d.controls[0]->sessions[1];
+    fs->occupied = fs->negotiated = true; fs->epoch = 4;
+    fs->connection = (struct doca_comch_connection *)fs;
+    fs->wake_consumer = 7;
+    dmesh_session_flow_consumer_set(fs, 9, true);
+    dmesh_session_flow_consumer_set(fs, 10, true);
+    dmesh_session_flow_consumer_set(fs, 10, false);           /* expired */
+    assert(dmesh_session_flow_consumer(fs, 9) && !dmesh_session_flow_consumer(fs, 10));
+    assert(!dmesh_session_flow_consumer(fs, 0));
+    assert(open_named(&d, workers, fs, 1, 9, 4) == 9);
+    assert(open_named(&d, workers, fs, 2, 10, 4) == 7);
+    assert(open_named(&d, workers, fs, 3, 9, 0) == 7);        /* a host without flow wake */
+    assert(open_named(&d, workers, fs, 4, 9, 2) == 0);        /* malformed length: refused */
+
     for (unsigned w = 0; w < d.count; ++w) {
         for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) free(workers[w].conns[i].pending_metadata);
         close(d.workers[w].fd);
@@ -145,5 +215,5 @@ int main(void)
         free(d.controls[w]);
     }
     close(d.fd); free(d.controls); free(d.workers); free(d.loads); free(d.flows); free(workers);
-    puts("dispatch wake: ARM to owners, one DOORBELL per ARM, immediate ring, stale fencing, backpressure: PASS");
+    puts("dispatch wake: ARM to owners, one DOORBELL per ARM, immediate ring, stale fencing, backpressure, flow consumers: PASS");
 }

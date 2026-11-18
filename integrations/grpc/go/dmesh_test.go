@@ -56,8 +56,8 @@ func (r *rig) pair(t *testing.T) (client, server *Conn) {
 	return c, s.(*Conn)
 }
 
-// shutdown closes whatever the test left, stops both pollers and verifies the
-// fake saw no contract violation and no leaked lease.
+// shutdown closes whatever the test left, stops both transports and verifies
+// the fake saw no contract violation and no leaked lease.
 func (r *rig) shutdown(t *testing.T) {
 	t.Helper()
 	if r.lis != nil {
@@ -320,8 +320,7 @@ func TestListenerCloseAbortsPendingAndWakesAccept(t *testing.T) {
 // With no listener, an inbound stream is aborted and its client sees EOF.
 func TestInboundWithoutListenerIsAborted(t *testing.T) {
 	r := newRig(t, 1<<20, 8064, 64<<10, false)
-	// A listener keeps the server polling; closing it leaves the poller
-	// active only while connections exist, so poll through a live stream.
+	// A stream accepted while a listener existed stays live after it closes.
 	l, err := r.srv.listen(&net.TCPAddr{Port: 9095})
 	if err != nil {
 		t.Fatal(err)
@@ -346,6 +345,10 @@ func TestInboundWithoutListenerIsAborted(t *testing.T) {
 	}
 	if r.srvN.aborts.Load() != 1 {
 		t.Fatalf("%d server aborts, want 1", r.srvN.aborts.Load())
+	}
+	// The refused stream leaves no QP behind: s0's alone.
+	if n := r.srvN.liveQPs(); n != 1 {
+		t.Fatalf("%d server QPs after a refusal, want 1", n)
 	}
 	for _, conn := range []net.Conn{c, c0, s0} {
 		_ = conn.Close()
@@ -411,12 +414,12 @@ func TestInboundBeforeListenIsHandedToListener(t *testing.T) {
 }
 
 // The peer can speak and even close before the dial returns (an HTTP/2
-// server sends SETTINGS at once). Those events wait for the dialer instead
-// of being dropped, and events held for an abandoned dial are returned.
+// server sends SETTINGS at once). Those events wait in the dialed QP
+// instead of being dropped, and those of an abandoned dial are returned.
 func TestPeerSpeaksBeforeDialReturns(t *testing.T) {
 	r := newRig(t, 1<<20, 3, 64<<10, true)
-	// An open stream keeps the client polling through the dial, as in a
-	// process that already has connections.
+	// Another live stream on the client, as in a process that already has
+	// connections.
 	keep, keepPeer := r.pair(t)
 	defer keep.Close()
 	defer keepPeer.Close()
@@ -458,9 +461,7 @@ func TestPeerSpeaksBeforeDialReturns(t *testing.T) {
 		t.Fatalf("abandoned dial: %v", err)
 	}
 	eventually(t, "the abandoned stream's leases to return", func() bool {
-		r.cli.mu.Lock()
-		defer r.cli.mu.Unlock()
-		return r.cliN.aborts.Load() == 1 && len(r.cli.early) == 0 && r.net.outstanding() == 0
+		return r.cliN.aborts.Load() == 1 && r.net.outstanding() == 0
 	})
 }
 
@@ -521,15 +522,14 @@ func TestTransportFailureWakesWaitersAndCloseCompletes(t *testing.T) {
 	_ = s.Close()
 }
 
+// A client polls a connection's QP only for a caller that waits: an idle
+// connection nobody reads never polls, and the channel goroutine sleeps after
+// a single accept.
 func TestIdleTransportDoesNotPoll(t *testing.T) {
 	fn := newFakeNet(1<<20, 8064, 64<<10)
 	n := fn.native(false)
 	tr := newTransport(n)
 	defer tr.close()
-	time.Sleep(20 * time.Millisecond)
-	if polls := n.polls.Load(); polls != 0 {
-		t.Fatalf("idle transport polled %d times", polls)
-	}
 	srvN := fn.native(true)
 	srv := newTransport(srvN)
 	defer srv.close()
@@ -542,12 +542,27 @@ func TestIdleTransportDoesNotPoll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "a live connection to be polled", func() bool { return n.polls.Load() > 0 })
-	_ = c.Close()
 	s, err := l.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(20 * time.Millisecond)
+	if polls := n.polls.Load(); polls != 0 {
+		t.Fatalf("idle connection polled %d times", polls)
+	}
+	if accepts := n.accepts.Load(); accepts > 1 {
+		t.Fatalf("idle channel accepted %d times", accepts)
+	}
+	if err := c.SetReadDeadline(time.Now().Add(10 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("read of an idle stream: %v", err)
+	}
+	if n.polls.Load() == 0 {
+		t.Fatal("a waiting read did not poll its QP")
+	}
+	_ = c.Close()
 	_ = s.Close()
 }
 
@@ -612,8 +627,8 @@ func TestCloseTransportBusyAndRetry(t *testing.T) {
 	}
 }
 
-// A Close racing transport shutdown is never stranded: the poller runs every
-// destroy queued before it stops.
+// A Close racing transport shutdown is never stranded: the transport closes
+// only once the connection is gone.
 func TestCloseRacingTransportShutdown(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		fn := newFakeNet(1<<20, 8064, 64<<10)
@@ -752,5 +767,32 @@ func TestServiceListenerNeedsNoAddress(t *testing.T) {
 		if (err == nil) != c.ok || err == nil && addr.String() != c.addr {
 			t.Errorf("serviceAddr() with DPUMESH_SERVICE=%q: %v, %v", c.target, addr, err)
 		}
+	}
+}
+
+// Reading moves the unread leases to the front of the queue's array, so a
+// connection that delivers and reads in turn stops allocating.
+func TestReceiveQueueReusesItsArray(t *testing.T) {
+	c := &Conn{}
+	lease := []byte("abcd")
+	p := make([]byte, 8)
+	cycle := func() {
+		c.deliver(lease, 1)
+		c.deliver(lease, 2)
+		c.mu.Lock()
+		n := c.takeLocked(p[:6])
+		n += c.takeLocked(p[6:])
+		c.mu.Unlock()
+		if n != 8 || string(p) != "abcdabcd" || len(c.done) != 2 || c.done[0] != 1 || c.done[1] != 2 || len(c.rx) != 0 {
+			t.Fatalf("read %d bytes %q, leases done %v, %d queued", n, p, c.done, len(c.rx))
+		}
+		c.done = c.done[:0]
+	}
+	cycle()
+	if raceEnabled {
+		return
+	}
+	if allocs := testing.AllocsPerRun(100, cycle); allocs != 0 {
+		t.Fatalf("%v allocations per delivery and read", allocs)
 	}
 }

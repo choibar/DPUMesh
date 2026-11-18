@@ -2,6 +2,7 @@
 #include "dispatcher.h"
 #include "placement.h"
 #include "object.h"
+#include "comch_wake.h"
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -19,13 +20,17 @@
 /* Only control messages cross these queues. In particular no DMA descriptor,
  * payload, data completion or credit update visits the dispatcher. */
 #define QUEUE_SIZE 128u
-enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, ARM, DRAIN };
+enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, ARM, DRAIN, SHUTDOWN };
 struct message {
     struct dmesh_flow_key key;
     struct dmesh_flow_location location;
     uint16_t type;
     int32_t status;
     size_t length;
+    /* OPEN of a session with a fast-path consumer: the worker creates its
+     * producer on this connection (under the SDK lock). */
+    struct doca_comch_connection *wake_connection;
+    uint32_t wake_consumer;
     unsigned char payload[DMESH_SESSION_MAX_PAYLOAD];
 };
 struct queue {
@@ -48,7 +53,8 @@ struct dmesh_worker_mailbox {
     uint64_t instr_prev;
 };
 struct assignment {
-    bool used, opening, ready, close_pending, lost_pending;
+    bool used, opening, ready, close_pending, lost_pending, shut_pending;
+    uint64_t shut_descs;           /* SHUTDOWN's descriptor count */
     struct objects *control;
     struct dmesh_session *session;
     struct dmesh_flow_key key;
@@ -89,12 +95,13 @@ struct steer {
     uint64_t instr_ps;          /* the migrating flow's measured cost */
 };
 /* Flow scaling: the stream count asked of one session's clients of a
- * destination. The entry stays after its ACK, so a count is asked once. */
+ * destination. The entry stays after its ACK, so a count is asked once. It
+ * travels on a client flow to that destination (flow_id/generation). */
 struct scale {
     struct objects *control;
     struct dmesh_session *session;
     uint64_t session_epoch, sent_ms;
-    uint32_t dst_ip, count, token, applied;
+    uint32_t dst_ip, count, token, applied, flow_id, generation;
     uint16_t dst_port;
     bool pending, acked, scaled_in;
 };
@@ -114,7 +121,6 @@ struct dmesh_dispatcher {
     uint64_t migrate_period_ms, steer_ms;
     unsigned long migrate_max, migrations;
     bool migrate_spare;         /* DMESH_MIGRATE_SPARE=1: PREPARE first */
-    uint32_t next_prepare_token;
     struct steer steers[DMESH_MAX_CONNECTIONS];
     /* DMESH_SCALE_AFTER_MS: once a client flow has been ready this long, ask
      * its session's clients of that destination for DMESH_SCALE_COUNT
@@ -135,6 +141,7 @@ struct dmesh_dispatcher {
     int fd;
     pthread_t thread;
     _Atomic unsigned remaining;
+    pthread_mutex_t sdk_lock;   /* see dmesh_dispatch_sdk_lock */
 };
 
 /* Read-only membership snapshots for Rust routing before any backend exists.
@@ -529,11 +536,12 @@ static struct scale *find_scale(struct dmesh_dispatcher *d, const struct dmesh_s
 }
 
 /* The flow-scaling hook: ask session s's clients of ip:port to keep count
- * streams to it. count is clamped to the eligible workers, the most streams
- * the pair placement can put on distinct workers. Returns the count asked,
- * or -1 when no entry is free. */
+ * streams to it, on the client flow `via` (NULL: the flow the entry used
+ * before). count is clamped to the eligible workers, the most streams the
+ * pair placement can put on distinct workers. Returns the count asked, or
+ * -1 when no entry is free. */
 static int dmesh_scale(struct dmesh_dispatcher *d, struct objects *o, struct dmesh_session *s,
-                       uint32_t ip, uint16_t port, unsigned count)
+                       uint32_t ip, uint16_t port, unsigned count, const struct dmesh_flow_key *via)
 {
     unsigned eligible = 0;
     for (size_t w = 0; w < d->count; ++w)
@@ -548,33 +556,71 @@ static int dmesh_scale(struct dmesh_dispatcher *d, struct objects *o, struct dme
     }
     if (!e) return -1;
     if (!++d->next_scale_token) ++d->next_scale_token;
-    bool scaled_in = e->session == s && e->scaled_in;
+    bool same = e->session == s && e->session_epoch == s->epoch;
+    bool scaled_in = same && e->scaled_in;
+    uint32_t flow_id = via ? via->flow_id : same ? e->flow_id : 0;
+    uint32_t generation = via ? via->generation : same ? e->generation : 0;
     *e = (struct scale){.control = o, .session = s, .session_epoch = s->epoch,
         .dst_ip = ip, .dst_port = port, .count = count, .token = d->next_scale_token,
-        .pending = true, .scaled_in = scaled_in};
+        .flow_id = flow_id, .generation = generation, .pending = true, .scaled_in = scaled_in};
     return (int)count;
 }
 
+static bool scale_rides(const struct assignment *a, const struct scale *e)
+{
+    return a->used && a->session == e->session && a->ready && !a->draining && !a->backend_token &&
+           !a->close_pending && !a->lost_pending &&
+           (a->mode == DMESH_FLOW_MODE_CLIENT || a->mode == DMESH_FLOW_MODE_INGRESS_PUSH) &&
+           a->dst_ip == e->dst_ip && a->dst_port == e->dst_port;
+}
+
+/* The client flow a SCALE travels on: the one it was asked on or, once that
+ * one is gone, another of the session's ready client flows to the
+ * destination. NULL while the session has none: the SCALE waits for one. */
+static struct assignment *scale_flow(struct dmesh_dispatcher *d, struct scale *e)
+{
+    struct assignment *a = find(d, e->session, e->flow_id);
+    if (a && a->key.generation == e->generation && scale_rides(a, e)) return a;
+    for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
+        a = &d->flows[i];
+        if (scale_rides(a, e)) {
+            e->flow_id = a->key.flow_id;
+            e->generation = a->key.generation;
+            return a;
+        }
+    }
+    return NULL;
+}
+
+/* A SCALE unacknowledged this long is sent again: the flow it went on may
+ * have closed before its host took it. A host applies a count idempotently. */
+#define SCALE_RESEND_MS 1000
+
 static void flush_scales(struct dmesh_dispatcher *d)
 {
+    uint64_t now = membership_now_ms();
     for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
         struct scale *e = &d->scales[i];
+        if (e->session && !e->pending && !e->acked && e->sent_ms && now - e->sent_ms >= SCALE_RESEND_MS)
+            e->pending = true;
         if (!e->pending) continue;
         if (!e->session->occupied || e->session->closing || e->session->epoch != e->session_epoch) {
             e->pending = false;
             continue;
         }
-        uint8_t payload[12];
-        dmesh_session_put_u32(payload, e->dst_ip);
-        dmesh_session_put_u32(payload + 4, e->dst_port);
-        dmesh_session_put_u32(payload + 8, e->count);
-        if (dmesh_session_send(e->control, e->session, DMESH_SESSION_SCALE, 0, e->token,
-                               payload, sizeof(payload), 0) != DOCA_SUCCESS) continue;
+        struct assignment *a = scale_flow(d, e);
+        if (!a) continue;
+        uint8_t payload[8];
+        dmesh_session_put_u32(payload, e->count);
+        dmesh_session_put_u32(payload + 4, e->token);
+        if (dmesh_session_send(e->control, e->session, DMESH_SESSION_SCALE, a->key.flow_id,
+                               a->key.generation, payload, sizeof(payload), 0) != DOCA_SUCCESS) continue;
         e->pending = false;
-        e->sent_ms = membership_now_ms();
-        fprintf(stderr, "[dispatcher] scale session=%lu/%lu dst=%08x:%u count=%u token=%u unix_ns=%llu\n",
-                session_id(d, e->control, e->session), e->session_epoch, e->dst_ip, e->dst_port,
-                e->count, e->token, (unsigned long long)realtime_ns());
+        e->sent_ms = now;
+        fprintf(stderr, "[dispatcher] scale session=%lu/%lu flow=%u/%u dst=%08x:%u count=%u token=%u unix_ns=%llu\n",
+                session_id(d, e->control, e->session), e->session_epoch, a->key.flow_id,
+                a->key.generation, e->dst_ip, e->dst_port, e->count, e->token,
+                (unsigned long long)realtime_ns());
     }
 }
 
@@ -586,7 +632,7 @@ static void scale_due(struct dmesh_dispatcher *d)
         struct scale *e = &d->scales[i];
         if (!e->session || e->pending || e->scaled_in || e->count < 2 || !e->sent_ms ||
             now - e->sent_ms < d->scale_in_after_ms) continue;
-        if (dmesh_scale(d, e->control, e->session, e->dst_ip, e->dst_port, 1) > 0)
+        if (dmesh_scale(d, e->control, e->session, e->dst_ip, e->dst_port, 1, NULL) > 0)
             e->scaled_in = true;
     }
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
@@ -597,7 +643,7 @@ static void scale_due(struct dmesh_dispatcher *d)
             now - a->ready_ms < d->scale_after_ms ||
             find_scale(d, a->session, a->dst_ip, a->dst_port))
             continue;
-        (void)dmesh_scale(d, a->control, a->session, a->dst_ip, a->dst_port, d->scale_count);
+        (void)dmesh_scale(d, a->control, a->session, a->dst_ip, a->dst_port, d->scale_count, &a->key);
     }
 }
 
@@ -801,12 +847,8 @@ static void migrate_due(struct dmesh_dispatcher *d)
             .replaced_key = a->key, .instr_ps = cost};
         a->draining = true;
         if (d->migrate_spare) {
-            uint8_t target[8];
-            dmesh_session_put_u32(target, a->dst_ip);
-            dmesh_session_put_u32(target + 4, a->dst_port);
-            if (!++d->next_prepare_token) ++d->next_prepare_token;
-            if (dmesh_session_send(a->control, a->session, DMESH_SESSION_PREPARE, 0,
-                                   d->next_prepare_token, target, sizeof(target), 0) == DOCA_SUCCESS) {
+            if (dmesh_session_send(a->control, a->session, DMESH_SESSION_PREPARE, a->key.flow_id,
+                                   a->key.generation, NULL, 0, 0) == DOCA_SUCCESS) {
                 a->awaiting_spare = true;
                 a->spare_deadline_ms = now + d->steer_ms;
             } else {
@@ -859,10 +901,11 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     if (h->type == DMESH_SESSION_SCALE_ACK) {
         for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
             struct scale *e = &d->scales[i];
-            if (e->session != s || e->session_epoch != s->epoch || e->token != h->generation)
+            if (e->session != s || e->session_epoch != s->epoch ||
+                e->token != dmesh_session_get_u32(payload))
                 continue;
             e->acked = true;
-            e->applied = dmesh_session_get_u32(payload);
+            e->applied = dmesh_session_get_u32(payload + 4);
             fprintf(stderr, "[dispatcher] scale-ack session=%lu/%lu dst=%08x:%u count=%u applied=%u unix_ns=%llu\n",
                     session_id(d, o, s), s->epoch, e->dst_ip, e->dst_port, e->count, e->applied,
                     (unsigned long long)realtime_ns());
@@ -872,6 +915,13 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     if (!h->flow_id || h->flow_id > DMESH_MAX_CONNECTIONS) return;
     unsigned idx = h->flow_id - 1;
     struct assignment *a = find(d, s, h->flow_id);
+    if (h->type == DMESH_SESSION_SHUTDOWN) {
+        if (a && a->key.generation == h->generation) {
+            a->shut_descs = dmesh_session_get_u64(payload);
+            a->shut_pending = true;  /* durable like CLOSE */
+        }
+        return;
+    }
     if (h->type == DMESH_SESSION_SPARE_READY) {
         if (!a || a->key.generation != h->generation || !a->replaces) return;
         a->replaces = false;
@@ -901,8 +951,10 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     }
     bool backend = h->type == DMESH_SESSION_BACKEND_OPEN;
     uint32_t requested_worker = 0, request_token = 0;
+    /* A flow-wake host appends the u32 id of the flow's own consumer. */
+    size_t base = sizeof(struct dmesh_export_metadata_msg) + (backend ? 8 : 0);
     if ((h->type != DMESH_SESSION_OPEN && !backend) ||
-        h->payload_len != sizeof(struct dmesh_export_metadata_msg) + (backend ? 8 : 0)) {
+        (h->payload_len != base && h->payload_len != base + 4)) {
         reply_error(o, s, h, EINVAL); return;
     }
     if (h->generation < s->generation[idx] ||
@@ -934,6 +986,8 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     }
     struct dmesh_export_metadata_msg metadata;
     memcpy(&metadata, payload, sizeof(metadata));
+    uint32_t flow_consumer = h->payload_len == base + 4 ?
+        dmesh_session_get_u32((const uint8_t *)payload + sizeof(metadata)) : 0;
     bool backend_mode = metadata.flow.mode == DMESH_FLOW_MODE_BACKEND ||
                         metadata.flow.mode == DMESH_FLOW_MODE_BACKEND_PULL;
     if (backend != backend_mode || (backend && (metadata.flow.dst_ip != s->listen_ip ||
@@ -980,6 +1034,12 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
         .replaced_key = steer.replaced_key};
     struct message m = {.key = a->key, .location = a->location, .type = OPEN, .length = sizeof(metadata)};
     memcpy(m.payload, &metadata, sizeof(metadata));
+    if (s->wake_consumer && s->connection && DMESH_FLOW_USES_PUSH(metadata.flow.mode)) {
+        m.wake_connection = s->connection;
+        /* A named consumer this session has not seen arrive yet leaves the
+         * flow on the session's: the host publishes from either. */
+        m.wake_consumer = dmesh_session_flow_consumer(s, flow_consumer) ? flow_consumer : s->wake_consumer;
+    }
     if (!admit(&d->workers[owner], &m)) {
         memset(a, 0, sizeof(*a)); reply_error(o, s, h, EAGAIN); return;
     }
@@ -1030,12 +1090,14 @@ static void flush_commands(struct dmesh_dispatcher *d)
                 wake(d->workers[a->location.worker].fd);
             }
         }
-        if (!a->lost_pending && !a->close_pending) continue;
+        if (!a->lost_pending && !a->close_pending && !a->shut_pending) continue;
         struct message m = {.key = a->key, .location = a->location,
-                            .type = a->lost_pending ? LOST : CLOSE};
+                            .type = a->lost_pending ? LOST : a->close_pending ? CLOSE : SHUTDOWN};
+        if (m.type == SHUTDOWN) { m.length = 8; dmesh_session_put_u64(m.payload, a->shut_descs); }
         if (push(&d->workers[a->location.worker].requests, &m)) {
             if (m.type == LOST) a->lost_pending = false;
-            else a->close_pending = false;
+            else if (m.type == CLOSE) a->close_pending = false;
+            a->shut_pending = false;     /* sent, or moot after a close or loss */
             wake(d->workers[a->location.worker].fd);
         }
     }
@@ -1119,6 +1181,10 @@ static void arm_flow(struct dmesh_conn *c, const struct message *m)
     }
 }
 
+pthread_mutex_t *dmesh_dispatch_sdk_lock(struct objects *o)
+{
+    return o && o->mailbox ? &o->mailbox->dispatcher->sdk_lock : NULL;
+}
 int dmesh_dispatch_worker_fd(struct objects *o) { return o->mailbox->fd; }
 void dmesh_dispatch_worker_arm(struct objects *o) { clear(o->mailbox->fd); }
 void dmesh_dispatch_worker_ready(struct objects *o)
@@ -1153,10 +1219,23 @@ void dmesh_dispatch_worker_drain(struct objects *o)
                 memcpy(c->pending_metadata, m.payload, sizeof(*c->pending_metadata));
                 c->state = DMESH_CONN_NEW;
             } else { c->error_status = ENOMEM; c->state = DMESH_CONN_ERROR; }
+            /* The host of a fast-path session no longer ARMs: a flow that
+             * cannot publish through a producer must fail rather than fall
+             * back to descriptors nobody is woken for. */
+            if (c->state == DMESH_CONN_NEW && m.wake_connection &&
+                dmesh_wake_attach(c, m.wake_connection, m.wake_consumer) != DOCA_SUCCESS) {
+                c->error_status = EIO;
+                c->state = DMESH_CONN_ERROR;
+            }
         } else if (same_key(&c->key, &m.key) &&
                    c->location.ownership_epoch == m.location.ownership_epoch && c->state != DMESH_CONN_FREE) {
             if (m.type == ARM) { arm_flow(c, &m); continue; }
             if (m.type == DRAIN) { c->migrate_requested = o->migrate_pending = true; continue; }
+            if (m.type == SHUTDOWN) {
+                c->host_shut_descs = dmesh_session_get_u64(m.payload);
+                c->host_shut = true;
+                continue;
+            }
             if (m.type == LOST) c->session->closing = true;
             if (m.type == CLOSE) c->close_requested = true;
             c->state = DMESH_CONN_CLOSING;
@@ -1252,6 +1331,7 @@ static void *dispatch_main(void *arg)
     struct pollfd *fds = d->pollfds;
     while (atomic_load(&d->remaining)) {
         clear(d->fd);
+        pthread_mutex_lock(&d->sdk_lock);
         for (size_t i = 0; i < d->count; ++i) {
             (void)dmesh_doca_ctrl_arm(d->controls[i]);
             (void)dmesh_doca_ctrl_drain(d->controls[i]);
@@ -1264,6 +1344,7 @@ static void *dispatch_main(void *arg)
         flush_listeners(d);
         flush_scales(d);
         for (size_t i = 0; i < d->count; ++i) dmesh_sessions_advance(d->controls[i]);
+        pthread_mutex_unlock(&d->sdk_lock);
         /* Retry pending SDK sends/HELLO deadlines without busy polling. */
         (void)poll(fds, d->count + 1, 10);
     }
@@ -1299,7 +1380,9 @@ static void *dispatch_main(void *arg)
         pthread_mutex_destroy(&d->workers[i].requests.lock);
         pthread_mutex_destroy(&d->workers[i].replies.lock);
     }
-    close(d->fd); free(d->controls); free(d->workers); free(d->loads); free(d->flows); free(d);
+    close(d->fd); free(d->controls); free(d->workers); free(d->loads); free(d->flows);
+    pthread_mutex_destroy(&d->sdk_lock);
+    free(d);
     return NULL;
 }
 
@@ -1309,6 +1392,7 @@ doca_error_t dmesh_dispatcher_start(struct objects **controls, struct objects **
     if (!count || count > 128 || !controls || !workers || !out) return DOCA_ERROR_INVALID_VALUE;
     struct dmesh_dispatcher *d = calloc(1, sizeof(*d));
     if (!d) return DOCA_ERROR_NO_MEMORY;
+    if (pthread_mutex_init(&d->sdk_lock, NULL) != 0) { free(d); return DOCA_ERROR_NO_MEMORY; }
     d->count = count; d->fd = -1;
     d->controls = calloc(count, sizeof(*d->controls));
     d->workers = calloc(count, sizeof(*d->workers));
@@ -1388,6 +1472,7 @@ fail_initialized:
     }
 fail:
     if (d->fd >= 0) close(d->fd);
+    pthread_mutex_destroy(&d->sdk_lock);
     free(d->pollfds); free(d->controls); free(d->workers); free(d->loads); free(d->flows); free(d);
     return DOCA_ERROR_INITIALIZATION;
 }

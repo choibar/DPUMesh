@@ -853,6 +853,7 @@ msgq_destroy_checked(struct dmesh_doca_dpa_msgq *msgq, struct doca_pe *pe)
         result = stop_ctx_checked(doca_comch_producer_as_ctx(msgq->producer), pe);
         if (result != DOCA_SUCCESS)
             return result;
+        dmesh_pe_read_events(pe);
         result = DMESH_DPA_CALL(doca_comch_producer_destroy(msgq->producer));
         if (result != DOCA_SUCCESS)
             return result;
@@ -862,6 +863,7 @@ msgq_destroy_checked(struct dmesh_doca_dpa_msgq *msgq, struct doca_pe *pe)
         result = stop_ctx_checked(doca_comch_consumer_as_ctx(msgq->consumer), pe);
         if (result != DOCA_SUCCESS)
             return result;
+        dmesh_pe_read_events(pe);
         result = DMESH_DPA_CALL(doca_comch_consumer_destroy(msgq->consumer));
         if (result != DOCA_SUCCESS)
             return result;
@@ -995,10 +997,12 @@ dmesh_doca_dpa_msgq_destroy(struct dmesh_doca_dpa_msgq *msgq, struct doca_pe *pe
         stop_ctx_bounded(doca_comch_consumer_as_ctx(msgq->consumer), pe);
 
     if (msgq->producer != NULL) {
+        dmesh_pe_read_events(pe);
         (void)DMESH_DPA_CALL(doca_comch_producer_destroy(msgq->producer));
         msgq->producer = NULL;
     }
     if (msgq->consumer != NULL) {
+        dmesh_pe_read_events(pe);
         (void)DMESH_DPA_CALL(doca_comch_consumer_destroy(msgq->consumer));
         msgq->consumer = NULL;
     }

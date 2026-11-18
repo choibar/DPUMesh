@@ -40,11 +40,12 @@ static inline int carrier_window_add(struct carrier_rx_window *w, uint64_t seq, 
     return 0;
 }
 /* Marks the batch landing at `pos` released. Returns 0, or -1 when no live
- * batch starts there. */
+ * batch starts there. Releases come mostly in order, so the search starts at
+ * the oldest batch not yet released. */
 static inline int carrier_window_release(struct carrier_rx_window *w, uint32_t pos)
 {
     for (unsigned i = 0; i < CHANNEL_DESC_N; ++i) {
-        struct carrier_batch *b = &w->batch[i];
+        struct carrier_batch *b = &w->batch[(w->next_release + i) % CHANNEL_DESC_N];
         if (b->live && !b->released && b->pos == pos) { b->released = 1; return 0; }
     }
     return -1;
@@ -61,5 +62,11 @@ static inline int carrier_window_advance(struct carrier_rx_window *w, uint64_t *
     }
     *seq = w->next_release - 1; *bytes = w->consumed_bytes;
     return moved;
+}
+/* No batch is held. Batches are added in sequence from next_release on, so
+ * the window is empty exactly when that one is not live. */
+static inline int carrier_window_empty(const struct carrier_rx_window *w)
+{
+    return !w->batch[w->next_release % CHANNEL_DESC_N].live;
 }
 #endif

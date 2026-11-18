@@ -53,6 +53,21 @@ int main(void)
         assert(held + 2u * 8064u < BUFFER_SIZE);
     }
     assert(copies == 3 + 10000 / 64);
+    /* After the host's SHUTDOWN the pop reports end of stream only once every
+     * descriptor it posted completed and its segment was popped. */
+    struct dmesh_recv_seg segs[DMESH_RECV_SEG_MAX];
+    struct dmesh_doca_dpa_comch comch = {.dma_completed = 1};
+    uint32_t pos, len;
+    conn->recv_segs = segs; conn->dpa_comch = &comch;
+    segs[0] = (struct dmesh_recv_seg){0, 64}; conn->recv_seg_cnt = 1;
+    conn->host_shut = true; conn->host_shut_descs = 2;
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_SUCCESS && len == 64);
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_EMPTY);
+    comch.dma_completed = 2;
+    segs[1] = (struct dmesh_recv_seg){64, 32}; conn->recv_seg_cnt = 1;
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_SUCCESS && pos == 64);
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
+    assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
     free(objs);
-    puts("rx_consumed_pos_test: batching, SDK lock, failure retry and staging wraps: PASS");
+    puts("rx_consumed_pos_test: batching, SDK lock, failure retry, staging wraps and end of stream: PASS");
 }

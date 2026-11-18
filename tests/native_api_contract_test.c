@@ -9,17 +9,13 @@ static uint8_t reservation[64];
 static int reserve_calls;
 static int reserve_error;
 static int commit_calls;
-static int after_commit_calls;
+static int publish_calls;
 static int qp_valid_calls;
-static int gate_depth;
-static int publish_due_calls;
-static int pressure_calls;
+static int open_call;                     /* the stubbed core holds a reservation */
 static int rx_free_calls;
 static int last_rx_slot = -1;
 static dmesh_qp_t *tx_ready_qp;
 static dmesh_qp_t *tx_error_qp;
-static int accept_calls;
-static int accept_errno = EAGAIN;
 
 uint8_t *
 dpumesh_tx_reserve(dpumesh_ctx_t *ctx, uint16_t port, uint32_t len)
@@ -29,6 +25,7 @@ dpumesh_tx_reserve(dpumesh_ctx_t *ctx, uint16_t port, uint32_t len)
     assert(len == 32);
     reserve_calls++;
     if (reserve_error) { errno = reserve_error; return NULL; }
+    open_call = 1;
     return reservation;
 }
 
@@ -38,60 +35,35 @@ dpumesh_tx_commit(dpumesh_ctx_t *ctx, uint16_t port,
 {
     (void)ctx;
     commit_calls++;
-    if (port == 17 && buf == reservation && len == 32) return 0;
+    if (port == 17 && buf == reservation && len == 32) { open_call = 0; return 0; }
     errno = EINVAL;
     return -1;
 }
 
-int dmesh_tx_qp_valid(dmesh_qp_t *qp) { assert(qp != NULL); qp_valid_calls++; gate_depth++; return 0; }
-void dmesh_tx_call_done(dmesh_qp_t *qp) { assert(qp != NULL); assert(gate_depth == 1); gate_depth--; }
-int dmesh_tx_call_active(dmesh_qp_t *qp) { return qp != NULL && gate_depth > 0; }
-int dmesh_tx_after_commit(dmesh_qp_t *qp) { assert(qp != NULL); after_commit_calls++; return 0; }
-void dmesh_tx_pressure(dmesh_qp_t *qp) { assert(qp != NULL); pressure_calls++; }
-void dpumesh_publish_due_tails(struct dmesh_eq *eq) { assert(eq != NULL); publish_due_calls++; }
+int dmesh_tx_qp_valid(dmesh_qp_t *qp)
+{
+    assert(qp != NULL);
+    qp_valid_calls++;
+    if (open_call) { errno = EDEADLK; return -1; }
+    return 0;
+}
+int dmesh_tx_call_active(dmesh_qp_t *qp) { return qp != NULL && open_call; }
+int dmesh_tx_publish(dmesh_qp_t *qp) { assert(qp != NULL); publish_calls++; return 0; }
 int dpumesh_eq_drain(struct dmesh_eq *eq) { assert(eq != NULL); return 0; }
 void dpumesh_eq_arm(struct dmesh_eq *eq) { assert(eq != NULL); }
+int dpumesh_qp_pending(dmesh_qp_t *qp) { assert(qp != NULL); return 0; }
 int dpumesh_lost(dpumesh_ctx_t *ctx) { (void)ctx; return 0; }
-void dpumesh_eq_awake(struct dmesh_eq *eq) { assert(eq != NULL); }
-void dpumesh_eq_note_work(struct dmesh_eq *eq) { assert(eq != NULL); }
-/* No DPU here: never a migration PREPARE or a SCALE. */
-int dpumesh_prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len) { (void)ctx; (void)target; (void)len; return 0; }
+/* No DPU here: no request arrives, no spare is reported and no SCALE answered. */
+int dpumesh_qp_requests(dmesh_qp_t *c, dmesh_event_t *events, int max) { (void)c; (void)events; (void)max; return 0; }
 int dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port) { (void)ctx; (void)port; return 0; }
-int dpumesh_scale_next(dpumesh_ctx_t *ctx, dmesh_scale_t *out) { (void)ctx; (void)out; return 0; }
-int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied) { (void)ctx; (void)token; (void)applied; return 0; }
-void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta)
-{
-    assert(eq != NULL && (delta == 1 || delta == -1));
-}
+int dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint16_t port, uint32_t token, uint32_t applied) { (void)ctx; (void)port; (void)token; (void)applied; return 0; }
 
-dmesh_qp_t *dmesh_accept(dmesh_eq_t *eq)
+int dpumesh_qp_take(dmesh_qp_t *qp, unsigned event)
 {
-    (void)eq;
-    accept_calls++;
-    errno = accept_errno;
-    return NULL;
-}
-
-void *dpumesh_next_tx_ready(struct dmesh_eq *eq)
-{
-    (void)eq;
-    dmesh_qp_t *qp = tx_ready_qp;
-    tx_ready_qp = NULL;
-    return qp;
-}
-
-void *dpumesh_next_tx_error(struct dmesh_eq *eq)
-{
-    (void)eq;
-    dmesh_qp_t *qp = tx_error_qp;
-    tx_error_qp = NULL;
-    return qp;
-}
-
-dmesh_qp_t *dmesh_next_ready(dmesh_eq_t *eq)
-{
-    (void)eq;
-    return NULL;
+    dmesh_qp_t **raised = event == DMESH_EQ_TX_READY ? &tx_ready_qp : &tx_error_qp;
+    if (*raised != qp) return 0;
+    *raised = NULL;
+    return 1;
 }
 
 int dpumesh_conn_recv(dpumesh_ctx_t *ctx, uint16_t port, sw_descriptor_t *out)
@@ -123,83 +95,55 @@ main(void)
     dmesh_qp_t qp = {0};
     qp.ep = &channel;
     qp.local_port = 17;
+    qp.rx_slot = -1;                      /* no accept-held first message */
 
-    /* Every reservation validates the handle and takes the transmit gate; the
-     * committing post_send releases it. */
+    /* A reservation validates the handle and opens the transmit call; the
+     * committing post_send publishes it at once. */
     assert(dmesh_alloc(&qp, 32) == reservation);
-    assert(reserve_calls == 1);
-    assert(qp_valid_calls == 1 && pressure_calls == 0);
-    assert(gate_depth == 1);              /* held across the reservation */
+    assert(reserve_calls == 1 && qp_valid_calls == 1 && open_call);
     assert(dmesh_post_send(&qp, reservation, 32) == 0);
-    assert(commit_calls == 1);
-    assert(after_commit_calls == 1);
-    assert(gate_depth == 0);
+    assert(commit_calls == 1 && publish_calls == 1 && !open_call);
 
     reserve_error = EAGAIN;
     assert(dmesh_alloc(&qp, 32) == NULL && errno == EAGAIN);
-    assert(pressure_calls == 1 && gate_depth == 0);
+    assert(!open_call && publish_calls == 1);
     reserve_error = 0;
 
-    /* post_send commits and asks the core to publish complete transport batches;
-     * it does not force the trailing partial through the public dmesh_flush. */
-    assert(dmesh_alloc(&qp, 32) == reservation);
-    assert(dmesh_post_send(&qp, reservation, 32) == 0);
-    assert(commit_calls == 2);
-    assert(after_commit_calls == 2);
-
+    /* A rejected commit publishes nothing and leaves the call open, so the
+     * next reservation reports it; a valid post then closes it. */
     errno = 0;
     assert(dmesh_alloc(&qp, 32) == reservation);
     assert(dmesh_post_send(&qp, reservation + 1, 32) == -1);
     assert(errno == EINVAL);
-    assert(commit_calls == 3);
-    assert(after_commit_calls == 2);
-    assert(gate_depth == 0);              /* a rejected commit still releases */
+    assert(commit_calls == 2 && publish_calls == 1 && open_call);
+    errno = 0;
+    assert(dmesh_alloc(&qp, 32) == NULL && errno == EDEADLK);
+    assert(dmesh_post_send(&qp, reservation, 32) == 0);
+    assert(commit_calls == 3 && publish_calls == 2 && !open_call);
 
-    /* Without an open transmit call, post_send rejects before committing or
-     * releasing the gate. */
+    /* Without an open transmit call, post_send rejects before committing. */
     errno = 0;
     assert(dmesh_post_send(&qp, reservation, 32) == -1);
-    assert(errno == EINVAL);
-    assert(commit_calls == 3);            /* no commit attempted */
-    assert(gate_depth == 0);              /* and no gate released */
+    assert(errno == EINVAL && commit_calls == 3);
 
-    /* A zero-length commit is invalid, but it still closes the transmit call.
-     * Otherwise one bad post leaves the QP's gate held forever. */
-    assert(dmesh_alloc(&qp, 32) == reservation);
-    errno = 0;
-    assert(dmesh_post_send(&qp, reservation, 0) == -1);
-    assert(errno == EINVAL);
-    assert(commit_calls == 4);
-    assert(after_commit_calls == 2);
-    assert(gate_depth == 0);
-    assert(dmesh_alloc(&qp, 32) == reservation);
-    assert(dmesh_post_send(&qp, reservation, 32) == 0);
-    assert(commit_calls == 5);
-    assert(after_commit_calls == 3);
-
-    /* poll_eq exposes the core one-shot as a payload-free API event. */
+    /* poll_qp exposes the core one-shot as a payload-free API event. */
     struct dmesh_eq eq = {0};
     dmesh_event_t event = {0};
     eq.ch = &channel;
-    accept_errno = ENOMEM;
-    accept_calls = 0;
-    assert(dmesh_poll_eq(&eq, &event, 1) == 0);
-    assert(accept_calls == 1);
-    /* Entering the loop is a publication point for tails whose deadline
-     * expired. */
-    assert(publish_due_calls == 1);
-    accept_errno = EAGAIN;
+    qp.eq = &eq;
+    assert(dmesh_poll_qp(&qp, &event, 1) == 0);
     tx_error_qp = &qp;
-    assert(dmesh_poll_eq(&eq, &event, 1) == 1);
+    assert(dmesh_poll_qp(&qp, &event, 1) == 1);
     assert(event.qp == &qp);
     assert(event.type == DMESH_EVENT_TX_ERROR);
     assert(event.buf == NULL && event.len == 0 && event._rx_token == -1);
     tx_ready_qp = &qp;
-    assert(dmesh_poll_eq(&eq, &event, 1) == 1);
+    assert(dmesh_poll_qp(&qp, &event, 1) == 1);
     assert(event.qp == &qp);
     assert(event.type == DMESH_EVENT_TX_READY);
     assert(event.buf == NULL && event.len == 0 && event._rx_token == -1);
-    assert(dmesh_poll_eq(&eq, &event, 1) == 0);
+    assert(dmesh_poll_qp(&qp, &event, 1) == 0);
+    assert(dmesh_poll_qp(NULL, &event, 1) == -1 && errno == EINVAL);
 
     uint8_t payload = 0x5a;
     event = (dmesh_event_t){
