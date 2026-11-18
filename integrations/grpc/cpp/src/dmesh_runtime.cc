@@ -64,9 +64,9 @@ absl::StatusOr<std::shared_ptr<DmeshRuntime>> DmeshRuntime::Create(
         "DPUmesh runtime requires at least one reactor");
   }
 
-  // Normal receive and TX_READY progress stays on the EQ owner. One callback
-  // executor, shared by every shard, carries connect/accept delivery and the
-  // endpoint completions deliberately deferred by DmeshEndpoint.
+  // Normal receive and TX_READY progress stays on the QP's reactor. One
+  // callback executor, shared by every shard, carries connect/accept delivery
+  // and the endpoint completions deliberately deferred by DmeshEndpoint.
   if (callback_executor == nullptr) {
     callback_executor = std::make_shared<ThreadExecutor>();
   }
@@ -98,10 +98,17 @@ absl::StatusOr<std::shared_ptr<DmeshRuntime>> DmeshRuntime::Create(
     }
     runtime->reactors_.push_back(std::move(*reactor));
   }
+  // Only now, with every reactor in place to take what it accepts.
+  DmeshRuntime* const self = runtime.get();
+  const absl::Status listening = runtime->reactors_.front()->Listen(
+      [self](dmesh_qp_t* qp) { self->Route(qp); });
+  if (!listening.ok()) return listening;
   return runtime;
 }
 
 DmeshRuntime::~DmeshRuntime() {
+  // The listening reactor first: it hands accepted streams to the others.
+  if (!reactors_.empty()) reactors_.front()->Shutdown();
   reactors_.clear();
   if (channel_ != nullptr) {
     ops_->DestroyChannel(channel_);
@@ -109,11 +116,19 @@ DmeshRuntime::~DmeshRuntime() {
   }
 }
 
-void DmeshRuntime::Connect(std::string service,
-                           DmeshReactor::ConnectCallback callback) {
+DmeshReactor& DmeshRuntime::NextReactor() {
   const size_t index =
       next_reactor_.fetch_add(1, std::memory_order_relaxed) % reactors_.size();
-  reactors_[index]->Connect(std::move(service), std::move(callback));
+  return *reactors_[index];
+}
+
+void DmeshRuntime::Connect(std::string service,
+                           DmeshReactor::ConnectCallback callback) {
+  NextReactor().Connect(std::move(service), std::move(callback));
+}
+
+void DmeshRuntime::Route(dmesh_qp_t* qp) {
+  if (!NextReactor().Adopt(qp)) ops_->DestroyQp(qp);
 }
 
 DmeshReactor::Stats DmeshRuntime::stats() const {
@@ -121,7 +136,7 @@ DmeshReactor::Stats DmeshRuntime::stats() const {
   for (const auto& reactor : reactors_) {
     const DmeshReactor::Stats shard = reactor->stats();
     total.receive_credit_hold_dropped += shard.receive_credit_hold_dropped;
-    total.eq_drain_budget_exhausted += shard.eq_drain_budget_exhausted;
+    total.drain_budget_exhausted += shard.drain_budget_exhausted;
   }
   return total;
 }

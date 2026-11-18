@@ -87,9 +87,9 @@ struct Reservation {
 };
 
 // Seam between a connection's consumer (the EventEngine endpoint state machine
-// or a stream binding) and the EQ reactor. Post() and Flush() run on whichever
+// or a stream binding) and the reactor. Post() and Flush() run on whichever
 // thread pumps the write: initially the writer and, after native backpressure,
-// the EQ owner that delivers TX_READY. Post(), Close() and BindSink() must not
+// the reactor that delivers TX_READY. Post(), Close() and BindSink() must not
 // invoke the sink inline; reactor events are delivered separately.
 class EndpointTransport {
  public:

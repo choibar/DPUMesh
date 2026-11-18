@@ -109,6 +109,7 @@ bool dmesh_doca_dpa_failed(struct doca_dpa *dpa)
     return false;
 }
 
+
 /* A pool thread for the slots under test; teardown reads it (kept_comch). */
 static struct dmesh_doca_dpa_thread fake_dpa_thread;
 
@@ -226,18 +227,22 @@ static void receive_test(void)
     assert(live_flows(objs) == 0 && response_attempts == 0);
     deliver(peer_a, DMESH_SESSION_PING, 0, 0, NULL, 0);   /* keepalive: no reply, no failure */
     assert(!sa->closing && live_flows(objs) == 0 && response_attempts == 0);
+    /* TAILS: kept on the session, copied to each flow it opens (below). */
+    const uint8_t tails_desc[3] = {0x5a, 0x00, 0xa5};
+    deliver(peer_a, DMESH_SESSION_TAILS, 0, 0, tails_desc, sizeof(tails_desc));
+    assert(!sa->closing && sa->tails.desc_len == 3 && memcmp(sa->tails.desc, tails_desc, 3) == 0);
 
     struct dmesh_export_metadata_msg first = {0}, second = {0};
     first.type = second.type = DMESH_MSG_EXPORT_METADATA;
     first.flow.src_port = 101;
     first.flow.dst_port = 8080;
-    first.flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
+    first.flow.mode = DMESH_FLOW_MODE_CLIENT;
     first.ring_desc_len = 2;
     first.ring_desc[0] = 0x11;
     first.ring_desc[1] = 0xaa;
     second.flow.src_port = 202;
     second.flow.dst_port = 9090;
-    second.flow.mode = DMESH_FLOW_MODE_BACKEND_PULL;
+    second.flow.mode = DMESH_FLOW_MODE_BACKEND;
     second.ring_desc_len = 1;
     second.ring_desc[0] = 0x22;
 
@@ -253,6 +258,8 @@ static void receive_test(void)
     assert(memcmp(a->pending_metadata, &first, sizeof(first)) == 0);
     assert(memcmp(b->pending_metadata, &second, sizeof(second)) == 0);
     assert(sa->generation[0] == 7 && sa->generation[1] == 4);
+    assert(a->pending_tails && b->pending_tails && a->pending_tails != b->pending_tails);
+    assert(a->pending_tails->desc_len == 3 && memcmp(a->pending_tails->desc, tails_desc, 3) == 0);
 
     /* Retransmitting an OPEN while setup is pending keeps the original flow
      * and its owned metadata, even if the duplicate payload differs. */
@@ -271,6 +278,15 @@ static void receive_test(void)
     expect_error(before, peer_a, 1, 8, EBUSY);
     assert(a->pending_metadata == owned && sa->generation[0] == 7);
 
+    /* SHUTDOWN half closes the live generation only and leaves it open. */
+    uint8_t posted[8];
+    dmesh_session_put_u64(posted, 5);
+    before = response_attempts;
+    deliver(peer_a, DMESH_SESSION_SHUTDOWN, 1, 6, posted, sizeof(posted));
+    deliver(peer_a, DMESH_SESSION_SHUTDOWN, 2, 4, posted, sizeof(posted));
+    assert(!a->host_shut && b->host_shut && b->host_shut_descs == 5);
+    assert(b->state == DMESH_CONN_NEW && response_attempts == before);
+
     /* An old incarnation's delayed CLOSE must not close the live generation. */
     before = response_attempts;
     deliver(peer_a, DMESH_SESSION_CLOSE, 1, 6, NULL, 0);
@@ -288,6 +304,7 @@ static void receive_test(void)
     struct dmesh_conn *other = dmesh_flow_get(objs, peer_b, 1, 7);
     struct dmesh_session *sb = session_get(objs, peer_b, false);
     assert(other && other != a && other->session == sb && sb != sa);
+    assert(!other->pending_tails); /* a session without TAILS hands none on */
     assert(other->state == DMESH_CONN_NEW && live_flows(objs) == 3);
 
     server_disconnection_event_callback(NULL, peer_a, 1);
@@ -299,9 +316,16 @@ static void receive_test(void)
     server_disconnection_event_callback(NULL, peer_a, 1);
     assert(other->state == DMESH_CONN_NEW);
     assert(sa->sends_pending == 0 && sb->sends_pending == 0);
+    /* TAILS comes once per session: a second one fails it. */
+    deliver(peer_b, DMESH_SESSION_TAILS, 0, 0, tails_desc, sizeof(tails_desc));
+    assert(!sb->closing && sb->tails.desc_len == 3);
+    deliver(peer_b, DMESH_SESSION_TAILS, 0, 0, tails_desc, sizeof(tails_desc));
+    assert(sb->closing && other->state == DMESH_CONN_CLOSING);
 
-    for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
+    for (int i = 0; i < DMESH_MAX_CONNECTIONS; ++i) {
         free(objs->conns[i].pending_metadata);
+        free(objs->conns[i].pending_tails);
+    }
     free(objs);
     callback_objects = NULL;
 }
@@ -357,12 +381,12 @@ static void reader_fence_test(void)
     assert(disconnect_attempts == disconnects);
     assert(dmesh_flow_readers_detached(objs, (int)(conn - objs->conns)) == DOCA_ERROR_BAD_STATE);
 
-    /* Slot reuse clears the local reader fence, including session-loss paths. */
+    /* Slot reuse clears the local reader fence, including session-loss paths:
+     * a lost session's flow tears down once its readers are gone. */
     conn = new_test_flow(objs, peer, 1, 2);
     assert(!conn->readers_detached);
     conn->close_requested = false;
-    conn->reverse_exported = true;
-    conn->flow.mode = DMESH_FLOW_MODE_BACKEND_PULL;
+    conn->reverse_ready = true;
     session_fail(objs, s);
     reset_cleanup();
     dmesh_flow_close_advance(conn);
@@ -371,8 +395,8 @@ static void reader_fence_test(void)
     assert(cleanup_count == 0 && disconnect_attempts == disconnects);
     assert(dmesh_flow_readers_detached(objs, (int)(conn - objs->conns)) == DOCA_SUCCESS);
     dmesh_flow_close_advance(conn);
-    assert(conn->quarantined && strcmp(cleanup_order, "Q") == 0);
-    assert(dmesh_objects_have_live_flows(objs) && release_count == 0);
+    assert(conn->state == DMESH_CONN_FREE && !conn->quarantined && release_count == 1);
+    assert(!dmesh_objects_have_live_flows(objs));
     free(objs);
 }
 
@@ -414,13 +438,12 @@ static void physical_disconnect_test(void)
     for (int i = 0; i < 4; ++i) dmesh_sessions_advance(objs);
     assert(disconnect_attempts == disconnects + 1);
 
-    /* Terminal peer retirement does not release quarantined DMA resources,
-     * and another session can safely receive a reused SDK pointer. */
+    /* A lost peer's flows tear down and release their mappings, its session
+     * retires, and another session can safely receive a reused SDK pointer. */
     struct dmesh_conn *conn = new_test_flow(objs, peer, 1, 9);
     s = conn->session;
     conn->close_requested = false;
-    conn->reverse_exported = true;
-    conn->flow.mode = DMESH_FLOW_MODE_BACKEND_PULL;
+    conn->reverse_ready = true;
     conn->ring_mmap = (void *)(uintptr_t)7;
     struct dmesh_session *other = session_get(objs, other_peer, true);
     other->negotiated = true;
@@ -428,12 +451,13 @@ static void physical_disconnect_test(void)
     assert(conn->state == DMESH_CONN_CLOSING && !conn->connection);
     reset_cleanup();
     dmesh_flow_close_advance(conn);
+    assert(conn->state == DMESH_CONN_FREE && !conn->quarantined && !conn->ring_mmap);
+    assert(release_count == 1);
     dmesh_sessions_advance(objs);
-    assert(conn->quarantined && conn->ring_mmap && s->occupied && !s->connection);
-    assert(other->connection == other_peer && !other->closing);
-    assert(disconnect_attempts == disconnects + 1 && release_count == 0);
+    assert(!s->occupied && other->connection == other_peer && !other->closing);
+    assert(disconnect_attempts == disconnects + 1);
     struct dmesh_session *replacement = session_get(objs, peer, true);
-    assert(replacement && replacement != s && replacement->connection == peer);
+    assert(replacement && replacement->connection == peer && !replacement->closing);
     disconnect_result = DOCA_SUCCESS;
     free(objs);
     callback_objects = NULL;
@@ -519,29 +543,27 @@ static void checked_close_test(void)
     assert(cleanup_count == 0 && release_count == 0);
     unsetenv("DMESH_NO_TEARDOWN");
 
-    /* A lost session cannot prove that the host's reverse DPA has stopped.
-     * Keep its mappings/slot, but detach its old Comch address after close. */
+    /* A lost session's flow tears down like a closed one, its mappings
+     * included; the session's Comch address goes once its flows are gone,
+     * and a refused disconnect is retried. */
     conn->close_requested = false;
-    conn->reverse_exported = true;
-    conn->flow.mode = DMESH_FLOW_MODE_BACKEND_PULL;
+    conn->reverse_ready = true;
     conn->ring_mmap = (void *)(uintptr_t)9;
     session_fail(objs, s);
     reset_cleanup();
     dmesh_flow_close_advance(conn);
-    assert(conn->quarantined && conn->ring_mmap && conn->dpa_thread);
-    assert(conn->state == DMESH_CONN_ERROR && strcmp(cleanup_order, "Q") == 0);
-    assert(release_count == 0 && mmap_calls == 0);
+    assert(conn->state == DMESH_CONN_FREE && !conn->quarantined && !conn->ring_mmap);
+    assert(release_count == 1 && mmap_calls == 1);
     dmesh_flow_close_advance(sibling); /* Explicitly closed sibling may drain. */
     assert(sibling->state == DMESH_CONN_FREE);
     disconnect_result = DOCA_ERROR_AGAIN;
     dmesh_sessions_advance(objs);
-    assert(s->connection == peer && conn->connection == peer);
+    assert(s->occupied && s->connection == peer);
     disconnect_result = DOCA_SUCCESS;
     dmesh_sessions_advance(objs);
-    assert(s->occupied && !s->connection && !conn->connection);
-    assert(conn->quarantined && conn->ring_mmap);
+    assert(!s->occupied);
     struct dmesh_session *replacement = session_get(objs, peer, true);
-    assert(replacement && replacement != s); /* no stale pointer alias */
+    assert(replacement && replacement->connection == peer && !replacement->closing);
 
     /* A legacy or silent peer times out without consuming any flow slot. */
     struct doca_comch_connection *peer2 = (void *)&peers[1];
@@ -550,105 +572,6 @@ static void checked_close_test(void)
     disconnects = disconnect_attempts;
     dmesh_sessions_advance(objs);
     assert(disconnect_attempts == disconnects + 1 && !unnegotiated->occupied);
-    free(objs);
-    callback_objects = NULL;
-}
-
-static void deliver_arm(struct doca_comch_connection *peer, uint64_t epoch,
-                        const struct dmesh_session_arm_flow *flows, uint32_t count)
-{
-    uint8_t payload[DMESH_SESSION_ARM_HEADER_SIZE +
-                    DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE];
-    size_t len = dmesh_session_arm_encode(payload, sizeof(payload), epoch, flows, count);
-    assert(len);
-    deliver(peer, DMESH_SESSION_ARM, 0, 0, payload, len);
-}
-
-static void expect_doorbell(unsigned before, struct doca_comch_connection *peer)
-{
-    assert(response_attempts == before + 1 && response_peer == peer);
-    assert(attempted_response.type == DMESH_SESSION_DOORBELL);
-    assert(attempted_response.flow_id == 0 && attempted_response.generation == 0);
-    assert(attempted_response.payload_len == DMESH_SESSION_DOORBELL_SIZE);
-}
-
-static void idle_wake_test(void)
-{
-    unsigned char peer_storage[2];
-    struct doca_comch_connection *peer = (void *)&peer_storage[0];
-    struct doca_comch_connection *stranger = (void *)&peer_storage[1];
-    struct objects *objs = calloc(1, sizeof(*objs));
-    assert(objs);
-    callback_objects = objs;
-    objs->cc_server = (void *)&server_storage;
-    struct dmesh_conn *push = new_test_flow(objs, peer, 1, 3);
-    struct dmesh_conn *pull = new_test_flow(objs, peer, 2, 5);
-    struct dmesh_session *s = push->session;
-    push->state = pull->state = DMESH_CONN_RUNNING;
-    push->close_requested = pull->close_requested = false;
-    push->flow.mode = DMESH_FLOW_MODE_INGRESS_PUSH;
-    pull->flow.mode = DMESH_FLOW_MODE_BACKEND_PULL;
-    push->push_seq = 4;          /* descriptors 1..4 are in host memory */
-    pull->push_seq = 99;         /* a pull flow never counts */
-
-    /* The host saw everything published: stay armed, send nothing. */
-    struct dmesh_session_arm_flow seen[] = {{1, 3, 5}, {2, 5, 1}};
-    unsigned before = response_attempts;
-    deliver_arm(peer, 11, seen, 2);
-    assert(s->armed && s->armed_epoch == 11 && !s->closing);
-    dmesh_sessions_advance(objs);
-    assert(response_attempts == before);
-
-    /* The next completion rings once; later completions do not re-ring. */
-    dmesh_session_push_published(s);
-    assert(!s->armed && s->doorbell_pending_epoch == 11);
-    dmesh_session_push_published(s);
-    assert(s->doorbell_pending_epoch == 11);
-    dmesh_sessions_advance(objs);
-    expect_doorbell(before, peer);
-    /* A rejected send (the mock's full queue) is retried, never dropped. */
-    dmesh_sessions_advance(objs);
-    expect_doorbell(before + 1, peer);
-    s->doorbell_sent_epoch = s->doorbell_pending_epoch;   /* model an accepted send */
-    before = response_attempts;
-    dmesh_sessions_advance(objs);
-    assert(response_attempts == before);
-
-    /* A descriptor the ARM had not accounted for rings at once. */
-    struct dmesh_session_arm_flow behind[] = {{1, 3, 4}};
-    deliver_arm(peer, 12, behind, 1);
-    assert(!s->armed && s->doorbell_pending_epoch == 12);
-    dmesh_sessions_advance(objs);
-    expect_doorbell(before, peer);
-    s->doorbell_sent_epoch = 12;
-
-    /* Stale generations and unknown flows are ignored, not trusted. */
-    struct dmesh_session_arm_flow stale[] = {{1, 2, 1}, {7, 1, 1}};
-    before = response_attempts;
-    deliver_arm(peer, 13, stale, 2);
-    assert(s->armed && s->armed_epoch == 13);
-    dmesh_sessions_advance(objs);
-    assert(response_attempts == before);
-
-    /* An ARM with no push flow still arms the session. */
-    deliver_arm(peer, 14, NULL, 0);
-    assert(s->armed && s->armed_epoch == 14 && !s->closing);
-
-    /* Malformed ARM payloads and host DOORBELLs fail the session. */
-    uint8_t bad[DMESH_SESSION_ARM_HEADER_SIZE + DMESH_SESSION_ARM_FLOW_SIZE];
-    assert(dmesh_session_arm_encode(bad, sizeof(bad), 15, seen, 1) == sizeof(bad));
-    dmesh_session_put_u32(bad + 16, 0);                   /* flow id 0 */
-    deliver(peer, DMESH_SESSION_ARM, 0, 0, bad, sizeof(bad));
-    assert(s->closing);
-    struct dmesh_session *other = session_get(objs, stranger, true);
-    uint8_t epoch[DMESH_SESSION_DOORBELL_SIZE] = {0};
-    deliver(stranger, DMESH_SESSION_ARM, 0, 0, bad, DMESH_SESSION_ARM_HEADER_SIZE);
-    assert(other->closing && !other->armed);             /* before HELLO */
-    other = session_get(objs, stranger, false);
-    other->closing = false;
-    other->negotiated = true;
-    deliver(stranger, DMESH_SESSION_DOORBELL, 0, 0, epoch, sizeof(epoch));
-    assert(other->closing);
     free(objs);
     callback_objects = NULL;
 }
@@ -681,6 +604,12 @@ static void pending_registration_test(void)
     assert(response_attempts == before + 1);
     assert(attempted_response.type == DMESH_SESSION_HELLO_ACK);
 
+    /* Registration must complete before the upstream TAILS setup proceeds. */
+    const uint8_t tails[] = {1, 2, 3, 4};
+    deliver(peer, DMESH_SESSION_TAILS, 0, 0, tails, sizeof(tails));
+    assert(!s->closing && s->tails.desc_len == sizeof(tails));
+    assert(memcmp(s->tails.desc, tails, sizeof(tails)) == 0);
+
     /* Waiting for topology never permits an expired/invalid assertion. */
     s->negotiated = s->hello_pending = false;
     registration_result = EAGAIN;
@@ -708,7 +637,6 @@ static void pending_registration_test(void)
 int main(void)
 {
     receive_test();
-    idle_wake_test();
     checked_close_test();
     reader_fence_test();
     physical_disconnect_test();

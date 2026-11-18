@@ -1,9 +1,9 @@
 // Package dmeshgrpc puts a gRPC-go program on DPUMesh by configuration alone.
-// With DPUMESH_ENABLE=1, Listen serves the process's DPUMESH_SERVICE target and
-// DialOptions route "<ip>:<port>" targets through the DPU. Otherwise both keep
-// their TCP behavior, so one build runs with or without the mesh. A target
-// written "dmesh:///<ip>:<port>" also follows the DPU's flow scaling (see
-// Scheme).
+// With DPUMESH_ENABLE=1, Listen serves the process's target (DPUMESH_PORT on
+// the Pod IP, or DPUMESH_SERVICE) and DialOptions route "<ip>:<port>" targets
+// through the DPU. Otherwise both keep their TCP behavior, so one build runs
+// with or without the mesh. A target written "dmesh:///<ip>:<port>" also
+// follows the DPU's flow scaling (see Scheme).
 package dmeshgrpc
 
 import (
@@ -19,7 +19,7 @@ import (
 // Enabled reports whether DPUMESH_ENABLE is "1".
 func Enabled() bool { return os.Getenv("DPUMESH_ENABLE") == "1" }
 
-// Listen serves DPUMESH_SERVICE over DPUMesh when Enabled, and otherwise
+// Listen serves the process's target over DPUMesh when Enabled, and otherwise
 // listens on tcpAddr over TCP.
 func Listen(tcpAddr string) (net.Listener, error) {
 	if !Enabled() {

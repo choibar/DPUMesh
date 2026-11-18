@@ -49,9 +49,11 @@ typedef struct {
     int16_t  dst_pod;               /* dest pod; DMESH_POD_BLANK(-1) -> DPU resolves dst_service */
     uint16_t dst_port;              /* dest port; DMESH_PORT_BLANK(0) -> accept queue */
     uint16_t seq;                   /* per-conn sequence (match key with port) */
-    uint16_t flags;                 /* private carrier: explicit object adapter */
+    uint16_t flags;                 /* DMESH_DESC_* */
     int8_t   valid;
 } sw_descriptor_t;
+/* A FIN that ends only the sender's half: the flow keeps receiving. */
+#define DMESH_DESC_HALF_CLOSE 1u
 
 /* ====== Opaque context ====== */
 typedef struct dpumesh_ctx dpumesh_ctx_t;
@@ -62,83 +64,48 @@ typedef struct dpumesh_ctx dpumesh_ctx_t;
  * upper bound check at the API surface. */
 _Static_assert(DMESH_PORT_SPACE == (UINT16_MAX + 1),
                "the port table must cover every uint16_t port");
-/* Max EQs per channel (= max parallel RX consumers). Each costs a ready ring +
- * an eventfd, so the cap is what bounds the accept-path notify fan-out. */
+/* Max EQs per channel: one per QP. The carrier has at most 32 flows, so this
+ * leaves room for an accept or a dial in progress. */
 #define DMESH_MAX_EQ      64
-#define DMESH_TX_READY_WORDS (DMESH_PORT_SPACE / 64)
 
-/* One consumer thread owns each EQ and its RX ready list. The channel-wide accept
- * queue allows any EQ to claim a new connection. */
+/* Events other threads raise for a QP, in dmesh_eq.events. */
+/* DMESH_EQ_REQUEST: the DPU raised a request on the QP's flow. */
+enum { DMESH_EQ_TX_READY = 1, DMESH_EQ_TX_ERROR = 2, DMESH_EQ_REQUEST = 4 };
+
+/* Idle-wake counters of one EQ (DPUMESH_WAIT_STATS). Its poller alone writes
+ * them, with plain stores; the channel's dump reads them. */
+struct dmesh_wait_stats {
+    atomic_uint_fast64_t busy, arms, backstop_wakes, backstop_work, custody_sleeps;
+    atomic_uint_fast64_t fired[4];       /* EQ_FIRED_* bit i, per empty poll */
+};
+
+/* A QP's private wait set and event state (dmesh_qp_fd, dmesh_poll_qp), with
+ * one consumer at a time: the QP's poller. The QP is its only connection. */
+typedef struct dmesh_eq dmesh_eq_t;
 struct dmesh_eq {
     dmesh_channel_t   *ch;
+    atomic_uint_fast32_t stripes;   /* stripes bound here (stripe_bind) */
     char               prepare_target[24]; /* PREPARE event text, valid until the next poll */
     dmesh_scale_t      scale;              /* SCALE event body, valid until the next poll */
-    atomic_int no_accept; /* private accelerator EQs leave incoming RPCs to reactors */
     struct dmesh_qp *accept_spare; /* preallocated before consuming an accept descriptor;
                                     * prevents OOM from stranding SERVER_PENDING */
-    struct dmesh_qp *drain_cur;   /* poll_eq resume cursor: the conn whose inbox was only
-                                  * partially drained because the caller's events[] filled (its
-                                  * inbox never went empty, so the ready list holds no fresh
-                                  * edge — this is the only path back to it). Owned by this
-                                  * EQ's thread; dmesh_destroy_qp clears it on a matching conn. */
-    int                epfd;        /* this EQ's readiness fd (dmesh_eq_fd): an epoll set
-                                     * nesting notify_efd, tick_fd, the spare stripes'
-                                     * doorbells and the doorbells of the stripes it owns */
-    int                notify_efd;  /* eventfd other threads write on ready edges; writes
-                                     * begin when dmesh_eq_fd hands out epfd (wants_notify). */
-    int                tick_fd;     /* one-shot timerfd: the next nap, linger poll or the
-                                     * backstop of a sleeping EQ (dpumesh_eq_arm) */
-    int                tail_fd;     /* timerfd: fires at tx_earliest_ns so a sleeping EQ
-                                     * thread wakes to publish its retained tails */
-    /* Idle wake state, owned by this EQ's thread except the atomics. */
-    uint64_t           nap_ns;      /* next nap; above the cap once the naps are spent */
-    int                timer_backstop; /* tick_fd holds the backstop, not a nap */
-    int                work_since_arm; /* this EQ found work since it last armed */
-    uint64_t           seen_doorbells; /* channel DOORBELLs this EQ has reacted to */
-    atomic_int         asleep;      /* doorbells armed: a submit on this EQ must wake it */
-    atomic_int         kick;        /* a send on this EQ: naps restart */
-    atomic_uint_fast64_t last_work_ns; /* last work or send, for the linger */
-    /* Set when dmesh_eq_fd exposes epfd. Poll-only EQs skip eventfd writes and
+    int                epfd;        /* the QP's readiness fd (dmesh_qp_fd): an epoll set
+                                     * nesting notify_efd, tick_fd and the doorbell of
+                                     * its stripe */
+    int                notify_efd;  /* eventfd other threads write for this QP; writes
+                                     * begin when dmesh_qp_fd hands out epfd (wants_notify). */
+    int                tick_fd;     /* timerfd: the periodic backstop, armed with the fd,
+                                     * and one-shot re-polls ahead of it (dpumesh_eq_arm) */
+    /* Idle wake state, owned by this EQ's poller. */
+    int                repoll;      /* tick_fd holds a re-poll ahead of the backstop */
+    int                events_since_arm; /* its poller got events since it last armed */
+    atomic_int         asleep;      /* doorbells armed: a sender waiting for space wakes it */
+    /* Set when dmesh_qp_fd exposes epfd. Poll-only EQs skip eventfd writes and
      * never arm doorbells. */
     atomic_int         wants_notify;
-    atomic_int         suppress_notify;
     int                reg_idx;     /* slot in ctx->eqs[], for destroy */
-    atomic_int         nqp;         /* live QPs bound here; enforces destroy_eq's EBUSY
-                                     * rule (a conn outliving its EQ reports events into
-                                     * freed memory). Atomic because dmesh_create_qp may
-                                     * run off the EQ's thread; touched only at conn
-                                     * create/destroy, never on the data path. */
-    /* TX readiness is multi-producer: the drain side can reclaim a QP while any
-     * owner thread can return a surplus block to the channel pool, so it is a
-     * bit per port. At most one bit is live per automatically armed QP. */
-    atomic_uint_fast64_t tx_ready[DMESH_TX_READY_WORDS];
-    atomic_uint_fast32_t tx_ready_count;
-    uint32_t             tx_ready_cursor; /* EQ-consumer round-robin word cursor */
-    /* One sticky bit per QP whose deferred tail publication failed, delivered
-     * as an ordinary EQ edge. */
-    atomic_uint_fast64_t tx_error[DMESH_TX_READY_WORDS];
-    atomic_uint_fast32_t tx_error_count;
-    uint32_t             tx_error_cursor;
-    /* QPs on this EQ holding a retained transmit tail. The owner arms a bit;
-     * this EQ's thread publishes it. */
-    atomic_uint_fast64_t tx_armed[DMESH_TX_READY_WORDS];
-    atomic_uint_fast32_t tx_armed_count;
-    uint32_t             tx_armed_cursor;
-    /* Earliest deadline among the armed bits; zero when nothing is
-     * retained. tail_fd is programmed to it. */
-    atomic_uint_fast64_t tx_earliest_ns;
-    /* Ready list for this EQ's conns. The drain side pushes a conn's port when
-     * its inbox goes empty->non-empty; the EQ thread drains it through
-     * dmesh_next_ready. MPSC: draining EQ threads produce (CAS on
-     * ready_tail), this EQ's thread is the sole consumer (ready_head).
-     * Sized to the port space; the on_ready flag admits each live conn at most
-     * once. */
-    char _rl_pad0[64];
-    atomic_uint_fast32_t ready_head;   /* consumer (this EQ's thread) */
-    char _rl_pad1[64];
-    atomic_uint_fast32_t ready_tail;   /* producers (drain side, CAS) */
-    char _rl_pad2[64];
-    uint16_t ready_ring[DMESH_PORT_SPACE];
+    atomic_uint        events;      /* DMESH_EQ_* raised by any thread, taken by the poller */
+    struct dmesh_wait_stats st;
 };
 
 /* ====== Lifecycle ====== */
@@ -161,30 +128,18 @@ int dmesh_resolve_addr_via(dpumesh_ctx_t *ctx, uint32_t ip_net, uint16_t port_ho
 void dmesh_resolve_invalidate(uint32_t ip_net, uint16_t port_host);
 
 /* Integer entry point for the CLIENT QP, shared by the shim and the public
- * name-taking wrapper. The public dmesh_create_qp(eq, name) lives in
+ * name-taking wrapper. The public dmesh_create_qp(ch, name) lives in
  * dmesh_core.c and calls this after resolve_name. */
-dmesh_qp_t *dmesh_qp_open(dmesh_eq_t *eq, int dst_service_id);
+dmesh_qp_t *dmesh_qp_open(dmesh_channel_t *ch, int dst_service_id);
 
 /* ====== Query configured values ====== */
-int dpumesh_get_slot_size(dpumesh_ctx_t *ctx);
 /* Max contiguous message = the per-conn TX block size (the reserve/alloc length cap). */
 int dpumesh_get_block_size(dpumesh_ctx_t *ctx);
-
-/* Split of grow_waits by cause: the QP's own block window, or the shared pool. */
-void dpumesh_get_wait_split(dpumesh_ctx_t *ctx, unsigned long long *window,
-                            unsigned long long *pool);
-
-/* TX pool counters: dmesh_tx_stats_t / dmesh_get_tx_stats, in <dpumesh/dmesh.h>
- * (public — grow_waits is the observable counterpart of dmesh_alloc's EAGAIN). */
-
-/* ====== Info ====== */
-int         dpumesh_get_pod_id(dpumesh_ctx_t *ctx);
 
 /* ====== Raw Buffer API ====== */
 
 /* Pop one new-connection descriptor off the accept ring. Nonblocking: 0 + *desc,
- * or -1 when empty. Readiness comes from any EQ's fd (dmesh_eq_fd): the ring is
- * MPMC, so every EQ is woken and may pop. */
+ * or -1 when empty. The channel's poller (dmesh_accept) is its consumer. */
 int dpumesh_dequeue(dpumesh_ctx_t *ctx, sw_descriptor_t *desc);
 
 /* Get pointer to RX buffer data for a slot (zero-copy read). */
@@ -195,13 +150,13 @@ void dpumesh_rx_free(dpumesh_ctx_t *ctx, int slot);
 
 /* Per-connection TX byte-ring lifecycle: reserve, fill, commit, select, track,
  * and enqueue. Reserve is nonblocking and arms TX_READY on EAGAIN. Selection
- * returns full units unless flush_partial is set or block-ordering requires a
- * sealed tail. Tracking precedes ring publication. */
+ * returns the next committed bytes, at most one unit. Tracking precedes ring
+ * publication. */
 uint8_t *dpumesh_tx_reserve(dpumesh_ctx_t *ctx, uint16_t port, uint32_t len);
 int      dpumesh_tx_commit(dpumesh_ctx_t *ctx, uint16_t port,
                            const void *buf, uint32_t len);
 void     dpumesh_tx_discard_unsent(dpumesh_ctx_t *ctx, uint16_t port);
-int      dpumesh_tx_next_send(dpumesh_ctx_t *ctx, uint16_t port, int flush_partial,
+int      dpumesh_tx_next_send(dpumesh_ctx_t *ctx, uint16_t port,
                               size_t *out_moff, uint32_t *out_len);
 int      dpumesh_tx_track(dpumesh_ctx_t *ctx, uint16_t port, uint16_t seq, uint32_t len);
 
@@ -217,10 +172,10 @@ int dpumesh_enqueue(dpumesh_ctx_t *ctx, const sw_descriptor_t *desc);
 /* DMESH_ROLE_* live in <dpumesh/dmesh_common.h> (shared with the DPU side). */
 
 /* Allocate a host-unique conn port (>=1) as CLIENT or SERVER (allocates its inbound
- * ring); 0 on exhaustion. `user` is the app's conn handle, returned later by
- * dpumesh_next_ready; `eq` is the event queue this conn's ready-edges go to.
- * Both are stored before the port goes live, so a ready-list entry never dereferences
- * NULL. Release with dpumesh_free_port (reclaims undelivered inbound credits). */
+ * ring); 0 on exhaustion. `user` is the app's conn handle and `eq` the QP's own
+ * event queue, which deliveries from other threads wake. Both are stored before
+ * the port goes live. Release with dpumesh_free_port (reclaims undelivered
+ * inbound credits). */
 uint16_t dpumesh_alloc_port(dpumesh_ctx_t *ctx, int role, void *user, struct dmesh_eq *eq);
 /* Promote a drain-created DMESH_ROLE_SERVER_PENDING slot to a live SERVER conn: attach
  * the app's conn handle `user` and bind it to the accepting `eq`. Returns `port` on
@@ -233,45 +188,45 @@ void     dpumesh_free_port(dpumesh_ctx_t *ctx, uint16_t port);
  * via dpumesh_rx_free after reading), or 0 if the conn inbox is empty. */
 int dpumesh_conn_recv(dpumesh_ctx_t *ctx, uint16_t port, sw_descriptor_t *out);
 
-/* Pop the next ready conn on this EQ — one whose inbox went empty→non-empty since
- * it was last drained — and return the `user` handle registered at alloc; NULL
- * when drained. The EQ's fd (dmesh_eq_fd) wakes the caller, and this names the
- * conns to service without scanning every conn or holding a per-conn fd. Drain
- * each returned conn to EAGAIN. Single-consumer (this EQ's thread). */
-void *dpumesh_next_ready(struct dmesh_eq *eq);
-/* Pop one QP whose automatically armed dmesh_alloc(EAGAIN) became retryable. */
-void *dpumesh_next_tx_ready(struct dmesh_eq *eq);
-/* Pop one QP whose deferred tail submission failed. The failure remains sticky. */
-void *dpumesh_next_tx_error(struct dmesh_eq *eq);
+/* Take one raised DMESH_EQ_* event of a QP: 1 if it was pending. TX_READY is
+ * taken only while the QP's armed dmesh_alloc(EAGAIN) is still waiting;
+ * TX_ERROR leaves the failure sticky. Single-consumer (the QP's poller). */
+int dpumesh_qp_take(dmesh_qp_t *c, unsigned event);
+/* The DPU's requests on a client QP's flow (after DMESH_EQ_REQUEST), as up to
+ * max PREPARE / SCALE events whose text lives in the EQ; what does not fit
+ * stays raised. */
+int dpumesh_qp_requests(dmesh_qp_t *c, dmesh_event_t *events, int max);
 
-/* Publish every retained tail on this EQ whose deadline has expired. Runs on
- * the EQ's thread and takes each QP's transmit gate, so it never races the
- * QP's owner. */
-void dpumesh_publish_due_tails(struct dmesh_eq *eq);
-
-/* The reverse path has no background thread. An awake EQ thread drains it:
- * dpumesh_eq_drain acknowledges the doorbells that woke this EQ and interprets
- * the published reverse entries of every stripe under the stripe locks;
- * dpumesh_eq_arm, called when dmesh_poll_eq runs empty, arms the doorbells of
- * the stripes this EQ owns (and the spares) and the fallback tick, so the EQ's
- * fd wakes its thread. */
+/* The reverse path has no background thread. A QP's poller drains its stripe:
+ * dpumesh_eq_drain interprets the stripe's published reverse entries under its
+ * lock; dpumesh_eq_arm, called when dmesh_poll_qp runs empty, arms the
+ * stripe's doorbell, so the QP's fd wakes its poller. The session and the
+ * unowned stripes are the channel's (dmesh_accept). */
 int  dpumesh_eq_drain(struct dmesh_eq *eq);
 void dpumesh_eq_arm(struct dmesh_eq *eq);
-/* dmesh_poll_eq returned events: naps restart. */
-void dpumesh_eq_note_work(struct dmesh_eq *eq);
-/* Entering dmesh_poll_eq: the EQ is no longer asleep. */
-void dpumesh_eq_awake(struct dmesh_eq *eq);
+/* The drain does not write its own EQ's eventfd: before an empty
+ * dmesh_poll_qp returns, dpumesh_qp_pending says whether anything queued for
+ * the QP is still unconsumed, and dpumesh_qp_kick_pending raises the eventfd
+ * if so (a caller that stops polling before the QP is empty). */
+int  dpumesh_qp_pending(dmesh_qp_t *c);
+void dpumesh_qp_kick_pending(dmesh_qp_t *c);
+/* dmesh_poll_qp returned events: an arm that only the backstop prompted
+ * then reports a missed wake. */
+static inline void dpumesh_eq_note_work(struct dmesh_eq *eq) { eq->events_since_arm = 1; }
+/* Entering dmesh_poll_qp: the EQ is no longer asleep. */
+static inline void dpumesh_eq_awake(struct dmesh_eq *eq)
+{
+    if (atomic_load_explicit(&eq->asleep, memory_order_relaxed))
+        atomic_store_explicit(&eq->asleep, 0, memory_order_relaxed);
+}
 /* The errno of a lost transport session, or 0. Without DPUMESH_EXIT_ON_LOSS=0
  * the process exits with DMESH_EXIT_LOST when the loss is first seen. */
 #define DMESH_EXIT_LOST 75   /* EX_TEMPFAIL */
 int  dpumesh_lost(dpumesh_ctx_t *ctx);
-/* Migration spares: format the next PREPARE destination as "ip:port" (1),
- * or 0 when none is queued; report a client port's stream as a ready spare. */
-int  dpumesh_prepare_next(dpumesh_ctx_t *ctx, char *target, size_t len);
+/* Answers to the DPU's requests on a client port's flow: the stream is a
+ * ready spare (PREPARE), and how many clients took a SCALE. */
 int  dpumesh_spare_ready(dpumesh_ctx_t *ctx, uint16_t port);
-/* Flow scaling: the next SCALE request (1) or none (0); answer one. */
-int  dpumesh_scale_next(dpumesh_ctx_t *ctx, dmesh_scale_t *out);
-int  dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied);
+int  dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint16_t port, uint32_t token, uint32_t applied);
 
 /* ====== Connection lifecycle — internal, shared by both surfaces ======
  *
@@ -282,39 +237,24 @@ int  dpumesh_scale_ack(dpumesh_ctx_t *ctx, uint32_t token, uint32_t applied);
  * <dpumesh/dmesh.h>. */
 
 /* Pop the next inbound connection off the channel-wide accept queue and bind it to
- * `eq`: allocate a SERVER conn that learns its peer (pod,port) and holds the first
- * fragment (c->rx_slot). NULL+EAGAIN if none pending; NULL+ENOMEM on alloc failure,
- * which drops the message and reclaims its RX credit. dmesh_poll_eq folds this
- * in as DMESH_EVENT_CONN_REQ for both the native API and the shim's dispatcher.
- * The queue is MPMC: several EQs may call this concurrently and each conn goes
- * to exactly one of them, which owns it from then on. */
-dmesh_qp_t *dmesh_accept(dmesh_eq_t *eq);
+ * `eq`, the new QP's own: allocate a SERVER conn that learns its peer (pod,port)
+ * and holds the first fragment (c->rx_slot). NULL+EAGAIN if none pending;
+ * NULL+ENOMEM on alloc failure, which drops the message and reclaims its RX
+ * credit. dmesh_accept(), the channel's poller, is its only caller. */
+dmesh_qp_t *dpumesh_accept(dmesh_eq_t *eq);
 
-/* Pop the next conn that has inbound from this EQ's ready list, which the
- * drain side publishes, so there is no scan and no per-conn fd. Returns the
- * conn handle created at accept/connect, or NULL when drained. Single-consumer. */
-dmesh_qp_t *dmesh_next_ready(dmesh_eq_t *eq);
-
-/* dmesh_tx_qp_valid() validates the handle and takes the QP's transmit gate,
- * reporting EDEADLK when a transmit call is already open; dmesh_tx_call_done()
- * releases it. dmesh_tx_call_active() reports whether a transmit call is open.
- * dmesh_tx_after_commit() submits complete units and applies the internal
- * idle/deadline tail policy; dmesh_tx_pressure() expedites a retained tail
- * after alloc reports EAGAIN. */
+/* dmesh_tx_qp_valid() validates the handle, reporting EDEADLK when a transmit
+ * call is already open; dmesh_tx_call_active() reports whether one is open.
+ * dmesh_tx_publish() submits every committed byte at once. */
 int  dmesh_tx_qp_valid(dmesh_qp_t *c);
-void dmesh_tx_call_done(dmesh_qp_t *c);
 int  dmesh_tx_call_active(dmesh_qp_t *c);
-int  dmesh_tx_after_commit(dmesh_qp_t *c);
-void dmesh_tx_pressure(dmesh_qp_t *c);
+int  dmesh_tx_publish(dmesh_qp_t *c);
 
-/* Temporarily suppress eventfd writes while an in-process EQ consumer drains work. */
-void dmesh_eq_suppress_notify(dmesh_eq_t *eq, int delta);
-
-/* Send an ordered zero-length FIN on the connection's forward ring. The call
- * first waits (bounded) for submitted data's DMA copies to complete. A drain
- * or ring timeout returns EBADMSG without latching fin_sent; an open transmit
- * call returns EDEADLK. The FIN remains in flight until the DPU retires the
- * old connection key, which quarantines the local port across close. */
+/* Close the sending half: an ordered zero-length FIN on the connection's
+ * forward ring, after which the QP keeps receiving until the peer's FIN. The
+ * call first waits (bounded) for submitted data's DMA copies to complete. A
+ * drain or ring timeout returns EBADMSG without latching fin_sent; an open
+ * transmit call returns EDEADLK. */
 int dmesh_send_fin(dmesh_qp_t *c);
 
 #ifdef __cplusplus

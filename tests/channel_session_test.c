@@ -10,37 +10,68 @@
 #endif
 
 static struct dmesh_comch_client *mock_control;
-static unsigned client_creates, client_destroys, ring_allocs, ring_frees;
+static unsigned client_creates, client_destroys;
 static unsigned opens, closes;
 static unsigned shared_progress_calls;
 static int next_close_status;
+/* A slow DPU: OPEN or CLOSE gets no answer; a refused CLOSE is not queued. */
+static int silent_open, silent_close, refuse_close;
 static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
-/* Idle wake: the last ARM the host sent, and the control PE notification. */
-static unsigned arms_seen, pings_seen, notify_requests, notify_clears;
-static uint64_t arm_epoch_seen;
-static uint32_t arm_count_seen;
-static struct dmesh_session_arm_flow arm_flows_seen[DMESH_SESSION_MAX_FLOWS];
+/* Control wake: the control PE notification. */
+static unsigned pings_seen, notify_requests, notify_clears;
+/* The session's tail table: allocated once, exported once per session. */
+static unsigned tails_allocs, tails_seen;
+static char fake_tails_mmap, fake_tails_desc[40];
+static uint32_t fake_tails[DMESH_TAILS_ALLOC / 4] __attribute__((aligned(64))); /* the page: tails, then sync event words */
 static doca_error_t send_result = DOCA_SUCCESS;
 static int control_notify_fd = -1;
 
-enum cleanup_phase {
-    FAIL_NONE, FAIL_QUIESCE, FAIL_COMCH, FAIL_BUF_ARRAY, FAIL_THREAD,
-    FAIL_PE, FAIL_TX_IMPORT, FAIL_RING_IMPORT, FAIL_FORWARD_RING, FAIL_PHASES
-};
-static enum cleanup_phase fail_once;
-static unsigned cleanup_attempts[FAIL_PHASES], cleanup_done[FAIL_PHASES];
-static char fake_buf_array, fake_reverse_pe, fake_tx_import, fake_ring_import, fake_thread;
+/* The forward ring's release after CLOSED can fail once. */
 
-static doca_error_t cleanup_result(enum cleanup_phase phase)
+/* Flow wakes: every slot's PE and sync event, running at once (the flow wake
+ * test models their states). */
+#define FLOW_OBJS (DMESH_SESSION_MAX_FLOWS + 1)
+static char fake_flow_pes[FLOW_OBJS], fake_events[FLOW_OBJS];
+static unsigned flow_pes_live, events_live, next_flow_pe, next_event;
+static int event_stopped[FLOW_OBJS];
+static int is_flow_pe(const void *p)
+{ return (const char *)p >= fake_flow_pes && (const char *)p < fake_flow_pes + FLOW_OBJS; }
+static int is_event(const void *p)
+{ return (const char *)p >= fake_events && (const char *)p < fake_events + FLOW_OBJS; }
+doca_error_t doca_pe_create(struct doca_pe **pe)
+{ *pe = (struct doca_pe *)&fake_flow_pes[next_flow_pe++ % FLOW_OBJS]; ++flow_pes_live; return DOCA_SUCCESS; }
+doca_error_t doca_pe_set_event_mode(struct doca_pe *pe, enum doca_pe_event_mode mode)
+{ assert(is_flow_pe(pe) && mode == DOCA_PE_EVENT_MODE_PROGRESS_ALL); return DOCA_SUCCESS; }
+doca_error_t doca_sync_event_create(struct doca_sync_event **event)
 {
-    ++cleanup_attempts[phase];
-    if (fail_once == phase) { fail_once = FAIL_NONE; return DOCA_ERROR_TIME_OUT; }
-    ++cleanup_done[phase];
+    unsigned i = next_event++ % FLOW_OBJS;
+    event_stopped[i] = 0;
+    *event = (struct doca_sync_event *)&fake_events[i];
+    ++events_live;
     return DOCA_SUCCESS;
 }
-
-void thread_init_rpc(void) { assert(!"unexpected DPA invocation"); }
+doca_error_t doca_sync_event_add_publisher_location_remote_pci(struct doca_sync_event *event)
+{ assert(is_event(event)); return DOCA_SUCCESS; }
+doca_error_t doca_sync_event_add_subscriber_location_cpu(struct doca_sync_event *event, struct doca_dev *dev)
+{ (void)dev; assert(is_event(event)); return DOCA_SUCCESS; }
+doca_error_t doca_sync_event_set_addr(struct doca_sync_event *event, uint64_t *addr)
+{
+    assert(is_event(event));
+    assert((uint8_t *)addr >= (uint8_t *)fake_tails + 1024 && (uint8_t *)addr < (uint8_t *)fake_tails + sizeof(fake_tails));
+    return DOCA_SUCCESS;
+}
+struct doca_ctx *doca_sync_event_as_ctx(struct doca_sync_event *event) { return (struct doca_ctx *)event; }
+doca_error_t doca_pe_connect_ctx(struct doca_pe *pe, struct doca_ctx *ctx)
+{ assert(is_flow_pe(pe) && is_event(ctx)); return DOCA_SUCCESS; }
+doca_error_t doca_sync_event_task_wait_neq_set_conf(struct doca_sync_event *event,
+    doca_sync_event_task_wait_neq_completion_cb_t done, doca_sync_event_task_wait_neq_completion_cb_t failed,
+    uint32_t n)
+{ (void)done; (void)failed; (void)n; assert(is_event(event)); return DOCA_SUCCESS; }
+doca_error_t doca_ctx_start(struct doca_ctx *ctx)
+{ assert(is_event(ctx)); return DOCA_SUCCESS; }
+doca_error_t doca_sync_event_destroy(struct doca_sync_event *event)
+{ assert(is_event(event) && event_stopped[(char *)event - fake_events]); --events_live; return DOCA_SUCCESS; }
 
 static void reply(uint16_t type, uint32_t id, uint32_t generation, int status)
 {
@@ -70,13 +101,13 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
     if (send_result != DOCA_SUCCESS)
         return send_result;
     switch (h.type) {
-    case DMESH_SESSION_ARM:
-        ++arms_seen;
-        assert(dmesh_session_arm_decode(payload, h.payload_len, &arm_epoch_seen,
-                                        arm_flows_seen, &arm_count_seen) == 0);
-        break;
     case DMESH_SESSION_HELLO:
         reply(DMESH_SESSION_HELLO_ACK, 0, 0, 0);
+        break;
+    case DMESH_SESSION_TAILS:
+        assert(h.flow_id == 0 && h.generation == 0 && h.payload_len == sizeof(fake_tails_desc));
+        assert(memcmp(payload, fake_tails_desc, sizeof(fake_tails_desc)) == 0);
+        ++tails_seen;
         break;
     case DMESH_SESSION_PING:
         assert(h.flow_id == 0 && h.generation == 0 && h.payload_len == 0);
@@ -92,14 +123,15 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
     case DMESH_SESSION_OPEN:
         assert(h.payload_len == sizeof(struct dmesh_export_metadata_msg));
         ++opens;
-        reply(DMESH_SESSION_READY, h.flow_id, h.generation, 0);
+        if (!silent_open) reply(DMESH_SESSION_READY, h.flow_id, h.generation, 0);
         break;
     case DMESH_SESSION_CLOSE: {
+        if (refuse_close) return DOCA_ERROR_AGAIN;
         struct channel_dev *dev = objs->owner;
         struct channel_conn *flow = dev->flows[h.flow_id];
-        assert(flow && !flow->reverse && !flow->tx_mmap && !flow->ring_mmap);
+        assert(flow);
         ++closes;
-        reply(DMESH_SESSION_CLOSED, h.flow_id, h.generation, next_close_status);
+        if (!silent_close) reply(DMESH_SESSION_CLOSED, h.flow_id, h.generation, next_close_status);
         next_close_status = 0;
         break;
     }
@@ -111,7 +143,7 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
 
 uint8_t doca_pe_progress(struct doca_pe *pe)
 {
-    if (pe == (struct doca_pe *)&fake_reverse_pe) return 0;
+    if (is_flow_pe(pe)) return 0;
     assert(pe == (struct doca_pe *)mock_control);
     ++shared_progress_calls;
     if (!pending_len) return 0;
@@ -122,13 +154,14 @@ uint8_t doca_pe_progress(struct doca_pe *pe)
 }
 doca_error_t doca_pe_request_notification(struct doca_pe *pe)
 {
-    if (pe == (struct doca_pe *)&fake_reverse_pe) return DOCA_SUCCESS;
+    if (is_flow_pe(pe)) return DOCA_SUCCESS;
     assert(pe == (struct doca_pe *)mock_control);
     ++notify_requests;
     return DOCA_SUCCESS;
 }
 doca_error_t doca_pe_get_notification_handle(const struct doca_pe *pe, doca_notification_handle_t *handle)
 {
+    if (is_flow_pe(pe)) { *handle = (doca_notification_handle_t)-1; return DOCA_SUCCESS; }
     assert(pe == (const struct doca_pe *)mock_control && control_notify_fd >= 0);
     *handle = (doca_notification_handle_t)control_notify_fd;
     return DOCA_SUCCESS;
@@ -144,90 +177,55 @@ doca_error_t doca_pe_clear_notification(struct doca_pe *pe, doca_notification_ha
 struct doca_ctx *doca_comch_client_as_ctx(struct doca_comch_client *client)
 { return (struct doca_ctx *)client; }
 doca_error_t doca_ctx_stop(struct doca_ctx *ctx)
-{ assert(ctx == (struct doca_ctx *)mock_control); return DOCA_SUCCESS; }
+{
+    if (is_event(ctx)) { event_stopped[(char *)ctx - fake_events] = 1; return DOCA_SUCCESS; }
+    assert(ctx == (struct doca_ctx *)mock_control); return DOCA_SUCCESS;
+}
 doca_error_t doca_ctx_get_state(const struct doca_ctx *ctx, enum doca_ctx_states *state)
-{ assert(ctx == (struct doca_ctx *)mock_control); *state = DOCA_CTX_STATE_IDLE; return DOCA_SUCCESS; }
+{
+    if (is_event(ctx)) {
+        *state = event_stopped[(const char *)ctx - fake_events] ? DOCA_CTX_STATE_IDLE : DOCA_CTX_STATE_RUNNING;
+        return DOCA_SUCCESS;
+    }
+    assert(ctx == (struct doca_ctx *)mock_control); *state = DOCA_CTX_STATE_IDLE; return DOCA_SUCCESS;
+}
 doca_error_t doca_comch_client_destroy(struct doca_comch_client *client)
 { assert(client == (struct doca_comch_client *)mock_control); ++client_destroys; return DOCA_SUCCESS; }
 doca_error_t doca_pe_destroy(struct doca_pe *pe)
 {
-    if (pe == (struct doca_pe *)&fake_reverse_pe) return cleanup_result(FAIL_PE);
+    if (is_flow_pe(pe)) { --flow_pes_live; return DOCA_SUCCESS; }
     assert(pe == (struct doca_pe *)mock_control); return DOCA_SUCCESS;
 }
-doca_error_t doca_buf_arr_destroy(struct doca_buf_arr *array)
-{ assert(array == (struct doca_buf_arr *)&fake_buf_array); return cleanup_result(FAIL_BUF_ARRAY); }
-doca_error_t doca_mmap_destroy(struct doca_mmap *mmap)
-{
-    if (mmap == (struct doca_mmap *)&fake_tx_import) return cleanup_result(FAIL_TX_IMPORT);
-    assert(mmap == (struct doca_mmap *)&fake_ring_import);
-    return cleanup_result(FAIL_RING_IMPORT);
-}
-doca_error_t doca_mmap_stop(struct doca_mmap *mmap)
-{ (void)mmap; assert(!"imported mmaps must not be explicitly stopped"); return DOCA_ERROR_NOT_PERMITTED; }
 
-static int fail_ring_alloc;
-doca_error_t alloc_dma_ring(struct dma_ring **out, struct doca_dev *dev, size_t size)
+doca_error_t alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
+                                       void **buffer, size_t size, uint32_t access)
+{
+    (void)dev; (void)access;
+    assert(size == sizeof(fake_tails));
+    ++tails_allocs;
+    *mmap = (struct doca_mmap *)&fake_tails_mmap;
+    *buffer = fake_tails;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_mmap_export_pci(struct doca_mmap *mmap, const struct doca_dev *dev,
+                                  const void **desc, size_t *len)
 {
     (void)dev;
-    if (fail_ring_alloc) { fail_ring_alloc = 0; return DOCA_ERROR_NO_MEMORY; }
-    struct dma_ring *ring = calloc(1, sizeof(*ring) + sizeof(struct dma_ring_ctrl));
-    assert(ring);
-    ring->size = (uint32_t)size;
-    ring->ctrl = (void *)(ring + 1);
-    ring->mmap = (struct doca_mmap *)ring;
-    *out = ring;
-    ++ring_allocs;
+    assert(mmap == (struct doca_mmap *)&fake_tails_mmap);
+    *desc = fake_tails_desc;
+    *len = sizeof(fake_tails_desc);
     return DOCA_SUCCESS;
 }
 doca_error_t destroy_mmap_and_free_buffer(struct doca_mmap *mmap, void *buffer)
 {
-    assert(mmap && !buffer);
-    doca_error_t result = cleanup_result(FAIL_FORWARD_RING);
-    if (result == DOCA_SUCCESS) ++ring_frees;
-    return result;
+    /* A flow's ring lives in the channel's region: only the tail table is freed here. */
+    assert(mmap == (struct doca_mmap *)&fake_tails_mmap && buffer == fake_tails);
+    return DOCA_SUCCESS;
 }
 doca_error_t dmesh_build_dma_metadata(struct doca_dev *dev, const struct dma_ring *ring,
     const struct dmesh_buffer *sndbuf, const struct dmesh_buffer *rcvbuf,
     const struct dmesh_flow_id *flow, struct dmesh_export_metadata_msg *msg)
 { (void)dev; (void)sndbuf; (void)rcvbuf; (void)flow; assert(ring); memset(msg, 0, sizeof(*msg)); return DOCA_SUCCESS; }
-doca_error_t dmesh_validate_reverse_metadata(const struct dmesh_export_rcv_ring_msg *msg)
-{ (void)msg; return DOCA_SUCCESS; }
-
-/* These mocks expose each host cleanup phase; common checked-helper internals
- * have separate tests. Success represents the explicit DMA completion fence. */
-doca_error_t dmesh_dpa_quiesce_checked(struct dmesh_doca_dpa_thread *t,
-    struct dmesh_doca_dpa_comch *comch, struct doca_pe *pe)
-{
-    (void)comch; (void)pe;
-    if (!t || !t->running || t->quiesced) return DOCA_SUCCESS;
-    doca_error_t result = cleanup_result(FAIL_QUIESCE);
-    if (result == DOCA_SUCCESS) t->quiesced = true;
-    return result;
-}
-doca_error_t dmesh_dpa_comch_destroy_checked(struct dmesh_doca_dpa_thread *t,
-    struct dmesh_doca_dpa_comch **comch, struct doca_pe *pe)
-{
-    (void)pe;
-    if (!*comch) return DOCA_SUCCESS;
-    assert(!t || !t->running || t->quiesced);
-    doca_error_t result = cleanup_result(FAIL_COMCH);
-    if (result == DOCA_SUCCESS) { free(*comch); *comch = NULL; }
-    return result;
-}
-doca_error_t dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *t)
-{
-    if (!t->thread) return DOCA_SUCCESS;
-    doca_error_t result = cleanup_result(FAIL_THREAD);
-    if (result == DOCA_SUCCESS) t->thread = NULL;
-    return result;
-}
-doca_error_t dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *t)
-{ (void)t; assert(!"unexpected DPA creation"); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_dpa_endpoint_init_comch(struct dmesh_dpa_endpoint *c, struct doca_dev *dev)
-{ (void)c; (void)dev; assert(!"unexpected DPA creation"); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *q, void *m, uint32_t n)
-{ (void)q; (void)m; (void)n; assert(!"unexpected DPA send"); return DOCA_ERROR_NOT_SUPPORTED; }
-
 static void dispatch(struct channel_dev *dev, uint16_t type, uint32_t id,
                      uint32_t generation, int status)
 {
@@ -239,94 +237,21 @@ static void dispatch(struct channel_dev *dev, uint16_t type, uint32_t id,
     pthread_mutex_unlock(&dev->session_lock);
 }
 
-static void attach_reverse(struct channel_conn *flow, int running)
-{
-    flow->reverse = calloc(1, sizeof(*flow->reverse));
-    assert(flow->reverse);
-    flow->reverse->dpa_thread = calloc(1, sizeof(*flow->reverse->dpa_thread));
-    flow->reverse->dpa_comch = calloc(1, sizeof(*flow->reverse->dpa_comch));
-    assert(flow->reverse->dpa_thread && flow->reverse->dpa_comch);
-    flow->reverse->dpa_thread->thread = (struct doca_dpa_thread *)&fake_thread;
-    flow->reverse->dpa_thread->running = running;
-    flow->reverse->buf_arr = (struct doca_buf_arr *)&fake_buf_array;
-    flow->reverse->pe = (struct doca_pe *)&fake_reverse_pe;
-    flow->tx_mmap = (struct doca_mmap *)&fake_tx_import;
-    flow->ring_mmap = (struct doca_mmap *)&fake_ring_import;
-}
-
-static void dispatch_doorbell(struct channel_dev *dev)
-{
-    uint8_t frame[DMESH_SESSION_MAX_FRAME], epoch[DMESH_SESSION_DOORBELL_SIZE] = {0};
-    size_t len = dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_DOORBELL, 0, 0, 0,
-                                      epoch, sizeof(epoch));
-    assert(len);
-    pthread_mutex_lock(&dev->session_lock);
-    session_message(dev, frame, len);
-    pthread_mutex_unlock(&dev->session_lock);
-}
-
-/* ARM lists the unread descriptor of each live push flow, at most one ARM is
- * outstanding until a DOORBELL, and the control PE is armed then progressed. */
-static void test_idle_wake(struct channel_dev *dev, struct channel_conn *a, struct channel_conn *b)
+/* Receives raise their slot's fd: the control fd is armed for control
+ * messages only, sends nothing and is not progressed (the caller's next drain
+ * progresses it). */
+static void test_control_wake(struct channel_dev *dev)
 {
     control_notify_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     assert(control_notify_fd >= 0 && channel_dev_fd(dev) == control_notify_fd);
-    unsigned arms = arms_seen, requests = notify_requests, progress = shared_progress_calls;
-    b->expected = 5;
-    assert(channel_dev_arm(dev) == 0);
-    assert(arms_seen == arms + 1 && arm_epoch_seen == 1 && arm_count_seen == 2);
-    assert(arm_flows_seen[0].flow_id == 1 && arm_flows_seen[0].generation == a->generation &&
-           arm_flows_seen[0].expected_seq == 1);
-    assert(arm_flows_seen[1].flow_id == 2 && arm_flows_seen[1].expected_seq == 5);
-    assert(notify_requests == requests + 1 && shared_progress_calls == progress + 1);
-    assert(dev->arm_outstanding);
-
-    /* Outstanding: the next sleep re-arms the PE but sends nothing. */
-    assert(channel_dev_arm(dev) == 0);
-    assert(arms_seen == arms + 1 && notify_requests == requests + 2);
-
-    /* DOORBELL releases it; ended, closed and failed flows are left out. */
-    dispatch_doorbell(dev);
-    assert(!dev->arm_outstanding && dev->doorbells == 1);
-    b->rx_ended = 1;
-    assert(channel_dev_arm(dev) == 0);
-    assert(arms_seen == arms + 2 && arm_epoch_seen == 2 && arm_count_seen == 1 &&
-           arm_flows_seen[0].flow_id == 1);
-    dispatch_doorbell(dev);
-    a->peer_closed = 1;
-    assert(channel_dev_arm(dev) == 0);              /* no push flow: no ARM */
-    assert(arms_seen == arms + 2 && !dev->arm_outstanding);
-    a->peer_closed = 0;
-    b->rx_ended = 0;
-
-    /* A queue-full ARM fails the arm: the caller keeps polling. */
-    send_result = DOCA_ERROR_AGAIN;
-    assert(channel_dev_arm(dev) == -1 && errno == EAGAIN && !dev->arm_outstanding);
-    send_result = DOCA_SUCCESS;
-
-    /* host-dpa receives have their own doorbells: no ARM, PE still armed. */
-    dev->host_dpa = 1;
-    requests = notify_requests;
-    assert(channel_dev_arm(dev) == 0 && arms_seen == arms + 2 && notify_requests == requests + 1);
-    dev->host_dpa = 0;
-
-    /* A raised fd is cleared once; an idle one is left alone. */
-    uint64_t one = 1;
-    assert(write(control_notify_fd, &one, sizeof(one)) == sizeof(one));
-    unsigned clears = notify_clears;
-    channel_dev_clear(dev);
-    channel_dev_clear(dev);
-    assert(notify_clears == clears + 1);
+    unsigned requests = notify_requests, progress = shared_progress_calls;
+    assert(channel_dev_arm(dev) == 0 && channel_dev_arm(dev) == 0);
+    assert(notify_requests == requests + 2 && shared_progress_calls == progress);
 
     /* A failed session cannot arm. */
     dev->session_error = ECONNRESET;
     assert(channel_dev_arm(dev) == -1 && errno == ECONNRESET);
     dev->session_error = 0;
-
-    uint64_t sent = 0, rung = 0;
-    channel_dev_wake_counters(dev, &sent, &rung);
-    assert(sent == 2 && rung == 2);
-    dev->arm_outstanding = 0;
     close(control_notify_fd);
     control_notify_fd = -1;
 }
@@ -338,68 +263,87 @@ static void test_checked_close(void)
     assert(channel_session_open(&dev, "unit-session") == 0);
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
     struct channel_mem rx = {.buf = calloc(1, 2 * CHANNEL_WINDOW), .bytes = 2 * CHANNEL_WINDOW};
-    assert(tx.buf && rx.buf);
-    struct channel_conn_config cfg = {.tx = &tx, .rx = &rx, .mode = CHANNEL_MODE_CLIENT_DPU_DMA};
+    struct channel_mem rings = {.buf = calloc(1, 2 * CHANNEL_RING_STRIDE), .bytes = 2 * CHANNEL_RING_STRIDE};
+    assert(tx.buf && rx.buf && rings.buf);
+    struct channel_conn_config cfg = {.tx = &tx, .rx = &rx, .rings = &rings, .mode = CHANNEL_MODE_CLIENT};
 
-    /* Failed ring allocation never publishes OPEN and leaves no stale map. */
-    cfg.flow_id = 1;
+    /* A ring outside the ring region never publishes OPEN and leaves no stale map. */
+    cfg.flow_id = 1; cfg.ring_offset = 2 * CHANNEL_RING_STRIDE;
     struct channel_conn *unopened = NULL;
     unsigned before_open = opens;
-    fail_ring_alloc = 1;
-    assert(channel_conn_open(&dev, &cfg, &unopened) == -1 && errno == ENOMEM);
+    assert(channel_conn_open(&dev, &cfg, &unopened) == -1 && errno == EINVAL);
     assert(!unopened && !dev.flows[1] && opens == before_open);
 
-    for (enum cleanup_phase phase = FAIL_QUIESCE; phase < FAIL_PHASES; ++phase) {
-        dev.host_dpa = 0; /* Exercise OPEN separately from SDK reverse setup. */
-        cfg.flow_id = 1; cfg.rx_offset = 0;
-        struct channel_conn *a, *b;
-        assert(channel_conn_open(&dev, &cfg, &a) == 0);
-        cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW;
-        assert(channel_conn_open(&dev, &cfg, &b) == 0);
-        attach_reverse(a, 1);
-        dev.host_dpa = 1;
-        memset(cleanup_attempts, 0, sizeof(cleanup_attempts));
-        memset(cleanup_done, 0, sizeof(cleanup_done));
-        unsigned before_close = closes, before_free = ring_frees;
-        struct dmesh_comch_client *control = dev.control;
-        fail_once = phase;
-        assert(channel_conn_close(a) == -1 && errno == ETIMEDOUT);
-        assert(dev.flows[1] == a && dev.flows[2] == b && dev.control == control);
-        assert(ring_frees == before_free);
-        assert(closes == before_close + (phase == FAIL_FORWARD_RING));
-        assert(cleanup_attempts[phase] == 1 && cleanup_done[phase] == 0);
-        /* Retried polling must not access a PE destroyed by an earlier phase. */
-        (void)channel_conn_progress(a);
-        /* A late application RX release must not write a freed thread arg. */
-        if (phase != FAIL_QUIESCE)
-            channel_conn_rx_consumed(a, CHANNEL_DESC_N / 2, CHANNEL_RX_CONSUMED_POS_BATCH);
-        assert(channel_conn_close(a) == 0);
-        assert(!dev.flows[1] && dev.flows[2] == b && dev.control == control);
-        assert(closes == before_close + 1 && ring_frees == before_free + 1);
-        for (enum cleanup_phase step = FAIL_QUIESCE; step < FAIL_PHASES; ++step)
-            assert(cleanup_done[step] == 1); /* No completed phase is repeated. */
-        assert(channel_conn_close(b) == 0);
-    }
-
-    /* A never-run thread and a partially allocated connection need cleanup,
-     * but cannot wait for a kernel stop acknowledgement that will never exist. */
-    for (int missing_thread = 0; missing_thread < 2; ++missing_thread) {
-        dev.host_dpa = 0; cfg.flow_id = 1; cfg.rx_offset = 0;
-        struct channel_conn *flow;
-        assert(channel_conn_open(&dev, &cfg, &flow) == 0);
-        attach_reverse(flow, 0);
-        if (missing_thread) { free(flow->reverse->dpa_thread); flow->reverse->dpa_thread = NULL; }
-        dev.host_dpa = 1;
-        unsigned attempts = cleanup_attempts[FAIL_QUIESCE];
-        fail_once = FAIL_QUIESCE;
-        assert(channel_conn_close(flow) == 0);
-        assert(cleanup_attempts[FAIL_QUIESCE] == attempts && fail_once == FAIL_QUIESCE);
-        fail_once = FAIL_NONE;
-    }
+    /* Each flow's ring is its slot's part of the region. A closed flow leaves
+     * it there without closing a sibling; the slot's next flow finds it empty. */
+    cfg.flow_id = 1; cfg.rx_offset = 0; cfg.ring_offset = 0;
+    struct channel_conn *a, *b, *again;
+    assert(channel_conn_open(&dev, &cfg, &a) == 0);
+    cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW; cfg.ring_offset = CHANNEL_RING_STRIDE;
+    assert(channel_conn_open(&dev, &cfg, &b) == 0);
+    assert(a->forward_ring->buffer == rings.buf && a->forward_ring->mmap == rings.mmap);
+    assert(b->forward_ring->buffer == (char *)rings.buf + CHANNEL_RING_STRIDE);
+    a->forward_ring->ctrl->producer_tail = 7;
+    a->forward_ring->ctrl->consumer_head = 5;
+    unsigned before_close = closes;
+    struct dmesh_comch_client *control = dev.control;
+    assert(channel_conn_close(a) == 0);
+    assert(!dev.flows[1] && dev.flows[2] == b && dev.control == control && closes == before_close + 1);
+    cfg.flow_id = 1; cfg.rx_offset = 0; cfg.ring_offset = 0;
+    assert(channel_conn_open(&dev, &cfg, &again) == 0);
+    assert(again->forward_ring->buffer == rings.buf && again->forward_ring->ctrl->producer_tail == 0 &&
+           again->forward_ring->ctrl->consumer_head == 0 && again->forward_ring->head == 0);
+    assert(channel_conn_close(again) == 0);
+    assert(channel_conn_close(b) == 0);
     assert(channel_session_close(&dev) == 0);
     pthread_mutex_destroy(&dev.session_lock);
-    free(tx.buf); free(rx.buf);
-    assert(ring_allocs == ring_frees);
+    free(tx.buf); free(rx.buf); free(rings.buf);
+}
+
+/* An OPEN the DPU answers only after the host stopped waiting: the
+ * unconfirmed close keeps the id, which channel_flow_free releases for the
+ * next open once CLOSED arrives. */
+static void test_late_open(void)
+{
+    struct channel_dev dev = {0};
+    pthread_mutex_init(&dev.session_lock, NULL);
+    assert(channel_session_open(&dev, "unit-session") == 0);
+    struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
+    struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW), .bytes = CHANNEL_WINDOW};
+    struct channel_mem rings = {.buf = calloc(1, CHANNEL_RING_STRIDE), .bytes = CHANNEL_RING_STRIDE};
+    assert(tx.buf && rx.buf && rings.buf);
+    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx, .rings = &rings,
+                                      .mode = CHANNEL_MODE_CLIENT};
+    struct channel_conn *flow = NULL;
+
+    silent_open = silent_close = 1;
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == ETIMEDOUT && !flow);
+    struct channel_conn *held = dev.flows[1];
+    assert(held && held->abandoned && held->close_sent);
+    assert(!channel_flow_free(&dev, 1));
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == EBUSY);
+    silent_open = silent_close = 0;
+    dispatch(&dev, DMESH_SESSION_READY, 1, held->generation, 0);
+    assert(!channel_flow_free(&dev, 1) && dev.flows[1] == held);
+    dispatch(&dev, DMESH_SESSION_CLOSED, 1, held->generation, 0);
+    assert(channel_flow_free(&dev, 1) && !dev.flows[1]);
+    assert(channel_conn_open(&dev, &cfg, &flow) == 0 && flow->ready);
+    assert(channel_conn_close(flow) == 0);
+
+    /* A CLOSE the queue refused is sent by the next check. */
+    silent_open = refuse_close = 1;
+    assert(channel_conn_open(&dev, &cfg, &flow) == -1 && errno == ETIMEDOUT);
+    held = dev.flows[1];
+    assert(held && held->abandoned && !held->close_sent);
+    silent_open = refuse_close = 0;
+    unsigned sent = closes;
+    assert(!channel_flow_free(&dev, 1) && held->close_sent && closes == sent + 1);
+    assert(channel_dev_progress(&dev) == 0);
+    assert(channel_flow_free(&dev, 1) && !dev.flows[1]);
+
+    assert(channel_session_close(&dev) == 0);
+    pthread_mutex_destroy(&dev.session_lock);
+    free(tx.buf); free(rx.buf); free(rings.buf);
 }
 
 static void test_backend_requests(struct channel_dev *dev)
@@ -435,19 +379,25 @@ int main(void)
     pthread_mutex_init(&dev.session_lock, NULL);
     assert(channel_session_open(&dev, "unit-session") == 0);
     assert(client_creates == 1 && dev.hello_ready);
+    assert(tails_allocs == 1 && tails_seen == 1 && dev.tails == fake_tails);
+    /* Every flow slot has its wake once the session is open. */
+    assert(flow_pes_live == DMESH_SESSION_MAX_FLOWS && events_live == DMESH_SESSION_MAX_FLOWS);
     test_backend_requests(&dev);
     struct dmesh_comch_client *control = dev.control;
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
     struct channel_mem rx = {.buf = calloc(1, CHANNEL_WINDOW * 3), .bytes = CHANNEL_WINDOW * 3};
-    assert(tx.buf && rx.buf);
-    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx,
-                                      .mode = CHANNEL_MODE_CLIENT_DPU_DMA};
+    struct channel_mem rings = {.buf = calloc(1, CHANNEL_RING_STRIDE * 3), .bytes = CHANNEL_RING_STRIDE * 3};
+    assert(tx.buf && rx.buf && rings.buf);
+    struct channel_conn_config cfg = {.flow_id = 1, .tx = &tx, .rx = &rx, .rings = &rings,
+                                      .mode = CHANNEL_MODE_CLIENT};
     struct channel_conn *a, *b, *again;
     assert(channel_conn_open(&dev, &cfg, &a) == 0);
-    cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW;
+    cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW; cfg.ring_offset = CHANNEL_RING_STRIDE;
     assert(channel_conn_open(&dev, &cfg, &b) == 0);
     assert(client_creates == 1 && opens == 2 && a->ready && b->ready);
-    test_idle_wake(&dev, a, b);
+    /* Each flow publishes its tail in its own slot of the session's table. */
+    assert(a->tail == &dev.tails[0] && b->tail == &dev.tails[1] && dev.tails[1] == 0);
+    test_control_wake(&dev);
 
     /* One session progress delivers replies for all flows; status checks must
      * neither re-progress that shared PE nor hide a sibling's error. */
@@ -474,8 +424,8 @@ int main(void)
 
     assert(channel_conn_close(a) == 0);
     assert(dev.flows[1] == NULL && dev.flows[2] == b);
-    assert(dev.control == control && client_destroys == 0 && ring_frees == 1);
-    cfg.flow_id = 1; cfg.rx_offset = 0;
+    assert(dev.control == control && client_destroys == 0);
+    cfg.flow_id = 1; cfg.rx_offset = 0; cfg.ring_offset = 0;
     assert(channel_conn_open(&dev, &cfg, &again) == 0);
     assert(again->generation == 2 && client_creates == 1);
     dispatch(&dev, DMESH_SESSION_CLOSED, 1, 1, 0);
@@ -491,15 +441,14 @@ int main(void)
     control->peer_gone = 0; dev.session_error = 0; /* Test-only reset. */
 
     /* A failed close retains the flow and its ring, without closing siblings. */
-    unsigned freed = ring_frees;
     next_close_status = EBUSY;
     assert(channel_conn_close(b) == -1 && errno == EBUSY);
-    assert(dev.flows[2] == b && ring_frees == freed && dev.control == control);
+    assert(dev.flows[2] == b && dev.control == control);
     assert(channel_conn_close(b) == 0);
 
     /* No wraparound to an old generation, and no RX-window overwrite on reject. */
     dev.generations[3] = UINT32_MAX;
-    cfg.flow_id = 3; cfg.rx_offset = CHANNEL_WINDOW * 2;
+    cfg.flow_id = 3; cfg.rx_offset = CHANNEL_WINDOW * 2; cfg.ring_offset = CHANNEL_RING_STRIDE * 2;
     memset((char *)rx.buf + cfg.rx_offset, 0xa5, 64);
     struct channel_conn *unused = NULL;
     assert(channel_conn_open(&dev, &cfg, &unused) == -1 && errno == EOVERFLOW);
@@ -516,10 +465,12 @@ int main(void)
 
     assert(channel_session_close(&dev) == 0);
     assert(!dev.control && !dev.flows[1] && client_destroys == 1);
-    assert(ring_allocs == ring_frees && closes == 4);
+    assert(flow_pes_live == 0 && events_live == 0);
+    assert(closes == 4);
     pthread_mutex_destroy(&dev.session_lock);
-    free(tx.buf); free(rx.buf);
+    free(tx.buf); free(rx.buf); free(rings.buf);
     test_checked_close();
+    test_late_open();
     puts("channel session: isolated flows, checked cleanup failures and retry verified");
     return 0;
 }

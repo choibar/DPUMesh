@@ -18,16 +18,8 @@ project('dma-bench', 'c',
 #                  flows, counts every forward DMA completion per second and,
 #                  in echo mode, pushes the bytes back.
 #
-#   dpumesh_v0_{host,dpu}   legacy/: the original worker pair on the old
-#                  CLIENT-mode reverse path (fused completions, host DPA reverse). Kept
-#                  for the h2load bridges (DMESH_BRIDGE_PORT, DMESH_PUSH_BRIDGE_
-#                  PORT, DMESH_BACKEND_CONNECT) the proxy benchmark scripts use
-#                  and for the host DPA microbench (DMESH_DPA_BENCH_MODE).
-#                  ("v0", and <= 15 characters, so `pkill -x` still matches the
-#                  kernel's truncated comm.)
-#
-# Everything DPU-side links the transport archives whole (dpu and common
-# reference each other) plus the dpacc output dpa_kernel.a.
+# The DPU side links the transport archives whole (dpu and common reference
+# each other) plus the dpacc output dpa_kernel.a.
 add_project_arguments('-D DOCA_ALLOW_EXPERIMENTAL_API', language : 'c')
 
 fs = import('fs')
@@ -36,19 +28,9 @@ repo_root = meson.project_source_root() / '..' / '..'
 transport = repo_root / 'src' / 'transport'
 transport_build = transport / 'build'
 
-foreach a : ['libdmesh_dpu.a', 'libdmesh_common.a', 'libdmesh_host.a', 'device/dpa_kernel.a']
-  if not fs.exists(transport_build / a)
-    error(transport_build / a + ' not found — run `ninja -C src/transport/build` first')
-  endif
-endforeach
-transport_link_args = ['-Wl,--whole-archive', transport_build / 'libdmesh_dpu.a',
-                       transport_build / 'libdmesh_common.a', transport_build / 'peer/libdmesh_peer.a', '-Wl,--no-whole-archive',
-                       transport_build / 'libdmesh_host.a']
-dpa_program_lib = cc.find_library('dpa_kernel', dirs : transport_build / 'device', static : true)
-
-inc_dirs = include_directories('/opt/mellanox/doca/include/', 'legacy',
+inc_dirs = include_directories('/opt/mellanox/doca/include/',
                                '../../src/transport/common', '../../src/transport/dpu',
-                               '../../src/transport/host')
+                               '../../src/transport/host', '../../src/transport/peer')
 
 deps = [
   dependency('threads'),
@@ -71,9 +53,19 @@ if side == 'auto'
   side = host_machine.cpu_family() == 'aarch64' ? 'dpu' : 'host'
 endif
 dpu_side = side == 'dpu'
-message('building the ' + side + ' side (dpumesh_' + side + ', dpumesh_v0_' + side + ')')
+message('building the ' + side + ' side (dpumesh_' + side + ')')
 
 if dpu_side
+  foreach a : ['libdmesh_dpu.a', 'libdmesh_common.a', 'libdmesh_host.a', 'peer/libdmesh_peer.a', 'device/dpa_kernel.a']
+    if not fs.exists(transport_build / a)
+      error(transport_build / a + ' not found — run `ninja -C src/transport/build` first')
+    endif
+  endforeach
+  transport_link_args = ['-Wl,--whole-archive', transport_build / 'libdmesh_dpu.a',
+                         transport_build / 'libdmesh_common.a', transport_build / 'peer/libdmesh_peer.a', '-Wl,--no-whole-archive',
+                         transport_build / 'libdmesh_host.a']
+  dpa_program_lib = cc.find_library('dpa_kernel', dirs : transport_build / 'device', static : true)
+
   # shim.c lives in the linkerd2-proxy submodule.
   shim_c = repo_root / 'linkerd2-proxy' / 'linkerd' / 'doca' / 'src' / 'shim.c'
   if not fs.exists(shim_c)
@@ -102,13 +94,3 @@ else
     install : false,
   )
 endif
-
-executable('dpumesh_v0_' + side,
-  files('legacy/main.c', 'legacy/config.c') +
-    (dpu_side ? files('legacy/dpu_worker.c') : files('legacy/host_worker.c')),
-  c_args : ['-DDPUMESH_DPU_SIDE=' + (dpu_side ? '1' : '0')],
-  dependencies : deps + [dependency('doca-argp'), dpa_program_lib],
-  include_directories : inc_dirs,
-  link_args : transport_link_args,
-  install : false,
-)

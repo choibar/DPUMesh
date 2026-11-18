@@ -2,9 +2,9 @@
 
 This fixture keeps DPUMesh's native Comch session/flow dispatcher and Linkerd
 `DMESH_SHARDED=1` execution path. It adds the jukebox peer transport beneath
-Linkerd's connector. Each worker keeps its own current-thread Tokio runtime;
-the App, tracing subscriber and metrics registry are still shared.
-`DMESH_SHARDED=1` does not create a private tracing subscriber per worker.
+Linkerd's connector. Each worker keeps its own current-thread Tokio runtime. With `DMESH_SHARDED=1`,
+tracing subscribers and datapath metrics default to worker scope; the fixture
+explicitly selects shared scope. See the proxy README for scope configuration.
 
 The path is:
 
@@ -47,7 +47,11 @@ The peer data path is always WRITE_WITH_IMM+DPA. Setting
 runtime remains local-only. The former transport, offload and Sync-wait
 selectors have been removed. SEND, WRITE+Sync and ARM-only IMM sources and
 their tests are archived in `src/transport/peer/legacy`, outside the build.
-Native Host DMA remains independent. Rebuild ARM, DPA and the proxy together
+Native Host DMA remains independent and follows the upstream ABI 6 / session
+protocol 10, including the DPU-owned reverse DPA thread and sync-event wake.
+The optional registration extension uses message IDs 24/25, preserving upstream
+SHUTDOWN=22 and TAILS=23. Rebuild the Host library and applications as well as
+ARM, DPA and the proxy together
 when updating the private peer ABI. Bootstrap still uses one protected 64-byte
 SEND per lane; steady-state DATA and credits use WRITE_WITH_IMM.
 

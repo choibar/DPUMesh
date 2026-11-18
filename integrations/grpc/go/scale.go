@@ -28,8 +28,8 @@ func SetScaleHandler(h func(target string, count int, seq uint32) int) {
 	scaleState.Unlock()
 }
 
-// scale runs on its own goroutine for one SCALE.
-func (t *transport) scale(target string, count int, token uint32) {
+// scale runs on its own goroutine for one SCALE, which came on c.
+func (t *transport) scale(c *Conn, target string, count int, token uint32) {
 	scaleState.Lock()
 	h := scaleState.handler
 	scaleState.Unlock()
@@ -37,7 +37,7 @@ func (t *transport) scale(target string, count int, token uint32) {
 	if h != nil {
 		applied = h(target, count, token)
 	}
-	if err := t.n.scaleAck(token, applied); err != nil {
+	if err := c.answer(func(qp qpID) error { return t.n.scaleAck(qp, token, applied) }); err != nil {
 		log.Printf("DMESH_SCALE ack %s: %v", target, err)
 	}
 	log.Printf("DMESH_SCALE target=%s count=%d applied=%d unix_ns=%d", target, count, applied,

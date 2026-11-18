@@ -40,7 +40,7 @@ def generate(workers, replicas, frontends, pci, cpus, gomax, placement='round-ro
             ports.add(port)
             env={'DSB_PORT':str(port), 'DPUMESH_PCI_ADDR':pci, 'DPUMESH_SERVER':f'DPUMesh{worker}',
                  'DPUMESH_POD_IP':f'10.81.{service_index+1}.{r+1}',
-                 'DPUMESH_WORKLOAD':f'hotel-{name}-{r}', 'DPUMESH_REVERSE':'dpu-dma',
+                 'DPUMESH_WORKLOAD':f'hotel-{name}-{r}',
                  'GOMAXPROCS':str(gomax), 'LOG_LEVEL':'warn', 'JAEGER_SAMPLE_RATIO':'0', 'TLS':'false'}
             if name!='frontend':
                 s=services[f'srv-{name}']

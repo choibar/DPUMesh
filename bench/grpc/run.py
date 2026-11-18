@@ -172,7 +172,7 @@ def main():
         env["LD_LIBRARY_PATH"] = a.lib
     env.update(kv.split("=", 1) for kv in a.env)
     if native:
-        env.update(DPUMESH_PCI_ADDR=a.pci, DPUMESH_SERVER=a.comch, DPUMESH_REVERSE="dpu-dma")
+        env.update(DPUMESH_PCI_ADDR=a.pci, DPUMESH_SERVER=a.comch)
     server_env = dict(env, DPUMESH_POD_IP=SERVER_POD, DPUMESH_SERVICE=f"{SERVICE_IP}:{SERVICE_PORT}",
                       DPUMESH_BACKEND_POOL=pool, DPUMESH_BACKEND_MAX=pool)
     client_env = dict(env, DPUMESH_POD_IP=CLIENT_POD, DPUMESH_SERVICE_IP=SERVICE_IP,

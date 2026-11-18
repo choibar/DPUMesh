@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 #include "session_protocol.h"
 
 struct objects;
@@ -50,6 +51,8 @@ struct peer_authority;
 struct peer_authority *dmesh_dispatch_worker_authority(struct objects *);
 /* 1 verified/current; 0 legacy mode; negative errno when retired/invalid. */
 int dmesh_dispatch_flow_origin(struct objects *, unsigned slot, struct peer_flow_origin *);
+/* Workers of the worker's dispatcher; 1 without a dispatcher. */
+unsigned dmesh_dispatch_worker_count(struct objects *);
 /* Worker control request; no SDK access, copied into the dispatcher's mailbox. */
 int dmesh_dispatch_backend_request(struct objects *, uint32_t ip, uint16_t port);
 /* Thread-safe membership only; no SDK or live session pointers escape. */
@@ -72,6 +75,11 @@ void dmesh_dispatch_worker_ready(struct objects *);
 void dmesh_dispatch_worker_depart(struct objects *);
 bool dmesh_dispatch_worker_stop_admission(struct objects *);
 doca_error_t dmesh_dispatch_reply(struct dmesh_conn *, uint16_t, const void *, size_t, int32_t);
+/* Held by the dispatcher while it progresses the control PEs and sends; a
+ * worker takes it around the Comch calls that go through a session's
+ * connection (fast-path producer create/start/stop/destroy). NULL without a
+ * dispatcher. */
+pthread_mutex_t *dmesh_dispatch_sdk_lock(struct objects *);
 
 /* Dispatcher-only helpers implemented alongside the Comch callbacks. */
 doca_error_t dmesh_session_send(struct objects *, struct dmesh_session *, uint16_t,

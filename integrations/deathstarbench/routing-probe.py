@@ -27,7 +27,7 @@ source=Path(start['source']); native=start['native']
 env={k:v for k,v in os.environ.items() if not k.startswith(('DSB_','DPUMESH_','DMESH_'))}
 env.update(DSB_TRANSPORT=start['mode'],DSB_TOPOLOGY=str(run/'topology.json'),DPUMESH_CONFIG=str(run/'registry'),
  DPUMESH_SERVER=f'DPUMesh{a.worker}',DPUMESH_PCI_ADDR=t['processes'][0]['env']['DPUMESH_PCI_ADDR'],
- DPUMESH_POD_IP='10.81.250.1',DPUMESH_WORKLOAD='routing-probe',DPUMESH_REVERSE='dpu-dma',
+ DPUMESH_POD_IP='10.81.250.1',DPUMESH_WORKLOAD='routing-probe',
  GOMAXPROCS='2',TLS='false',LD_LIBRARY_PATH=native+':/opt/mellanox/doca/lib/x86_64-linux-gnu:/opt/mellanox/flexio/lib')
 def snapshot():
  return {f.stem:json.loads(f.read_text()) for f in (run/'stats').glob('*.json')}

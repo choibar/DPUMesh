@@ -4,6 +4,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -42,19 +43,14 @@ class FakeDmeshState::Impl final {
     dmesh_event_t value{};
   };
 
-  struct Eq {
+  struct Qp {
+    dmesh_qp_t value{};
     int fd = -1;
-    bool destroyed = false;
+    bool alive = true;
     bool batch_active = false;
     std::thread::id poll_thread;
     int next_poll_error = 0;
     std::deque<Event> events;
-  };
-
-  struct Qp {
-    dmesh_qp_t value{};
-    Eq* eq = nullptr;
-    bool alive = true;
     size_t alloc_calls = 0;
     size_t flush_calls = 0;
     std::deque<int> alloc_failures;
@@ -64,16 +60,13 @@ class FakeDmeshState::Impl final {
     std::vector<std::vector<uint8_t>> posts;
   };
 
+  Impl() : channel_fd(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {}
+
   ~Impl() {
-    for (auto& eq : eqs) {
-      if (eq->fd >= 0) ::close(eq->fd);
+    for (auto& entry : qps) {
+      if (entry.second->fd >= 0) ::close(entry.second->fd);
     }
-  }
-
-  Eq* AsEq(dmesh_eq_t* eq) const { return reinterpret_cast<Eq*>(eq); }
-
-  dmesh_eq_t* AsPublic(Eq* eq) const {
-    return reinterpret_cast<dmesh_eq_t*>(eq);
+    if (channel_fd >= 0) ::close(channel_fd);
   }
 
   Qp* FindQp(dmesh_qp_t* qp) const {
@@ -81,11 +74,11 @@ class FakeDmeshState::Impl final {
     return found == qps.end() ? nullptr : found->second.get();
   }
 
-  Qp* NewQp(Eq* eq, int role) {
+  Qp* NewQp(int role) {
     auto qp = std::make_unique<Qp>();
-    qp->eq = eq;
+    qp->fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (qp->fd < 0) return nullptr;
     qp->value.ep = &channel;
-    qp->value.eq = AsPublic(eq);
     qp->value.role = role;
     qp->value.local_port = next_port++;
     qp->value.rx_slot = -1;
@@ -97,11 +90,22 @@ class FakeDmeshState::Impl final {
     return FindQp(result);
   }
 
-  void Signal(Eq* eq) {
-    if (eq == nullptr || eq->fd < 0) return;
+  static void Raise(int fd) {
+    if (fd < 0) return;
     const uint64_t one = 1;
-    const ssize_t result = ::write(eq->fd, &one, sizeof(one));
+    const ssize_t result = ::write(fd, &one, sizeof(one));
     (void)result;
+  }
+
+  static void Settle(int fd) {
+    uint64_t value;
+    const ssize_t result = ::read(fd, &value, sizeof(value));
+    (void)result;
+  }
+
+  void Push(Qp* qp, const Event& event) {
+    qp->events.push_back(event);
+    Raise(qp->fd);
   }
 
   void QueueReceive(Qp* qp, const std::string& bytes) {
@@ -115,18 +119,37 @@ class FakeDmeshState::Impl final {
     event.value.buf = payload->data();
     event.value.len = static_cast<uint32_t>(payload->size());
     event.value._rx_token = slot;
-    qp->eq->events.push_back(event);
+    Push(qp, event);
+  }
+
+  // As the native teardown: the receives never polled return their credit,
+  // and the fd closes.
+  void Kill(Qp* qp) {
+    if (qp->batch_active) ++mid_batch_destroys;
+    for (const Event& event : qp->events) {
+      if (event.value._rx_token < 0) continue;
+      rx_payloads.erase(event.value._rx_token);
+      ++releases;
+    }
+    qp->events.clear();
+    qp->alive = false;
+    qp->allocation.clear();
+    if (qp->fd >= 0) ::close(qp->fd);
+    qp->fd = -1;
+    ++destroys;
   }
 
   mutable std::mutex mu;
-  dmesh_channel_t channel{nullptr, 7, 8192, 65536};
+  dmesh_channel_t channel{nullptr, 65536};
+  const int channel_fd;
+  // Streams no accept has taken yet.
+  std::deque<dmesh_qp_t*> inbound;
   int post_max = 65536;
   int next_create_qp_error = 0;
   uint16_t next_port = 1;
   int32_t next_rx_slot = 1;
   std::vector<dmesh_qp_t*> client_qps;
   std::vector<std::string> client_targets;
-  std::vector<std::unique_ptr<Eq>> eqs;
   std::unordered_map<dmesh_qp_t*, std::unique_ptr<Qp>> qps;
   std::unordered_map<int32_t, std::shared_ptr<std::vector<uint8_t>>>
       rx_payloads;
@@ -136,7 +159,6 @@ class FakeDmeshState::Impl final {
   size_t mid_batch_destroys = 0;
   size_t poll_thread_violations = 0;
   size_t channel_destroys = 0;
-  size_t eq_destroys = 0;
 };
 
 class FakeDmeshApiOps final : public DmeshApiOps {
@@ -146,65 +168,62 @@ class FakeDmeshApiOps final : public DmeshApiOps {
 
   dmesh_channel_t* CreateChannel() override {
     std::lock_guard<std::mutex> lock(impl_->mu);
+    if (impl_->channel_fd < 0) return nullptr;
     return &impl_->channel;
   }
 
+  // Like the native one, it refuses while a QP it handed out is live.
   int DestroyChannel(dmesh_channel_t* channel) override {
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (channel != &impl_->channel) {
       errno = EINVAL;
       return -1;
     }
+    for (const auto& entry : impl_->qps) {
+      if (entry.second->alive &&
+          std::find(impl_->inbound.begin(), impl_->inbound.end(),
+                    entry.first) == impl_->inbound.end()) {
+        errno = EBUSY;
+        return -1;
+      }
+    }
     ++impl_->channel_destroys;
     return 0;
   }
 
-  dmesh_eq_t* CreateEq(dmesh_channel_t* channel) override {
+  int PostMax(dmesh_channel_t* /*channel*/) override {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    return impl_->post_max;
+  }
+
+  int ChannelFd(dmesh_channel_t* channel) override {
+    if (channel != &impl_->channel) {
+      errno = EINVAL;
+      return -1;
+    }
+    return impl_->channel_fd;
+  }
+
+  dmesh_qp_t* Accept(dmesh_channel_t* channel) override {
     std::lock_guard<std::mutex> lock(impl_->mu);
     if (channel != &impl_->channel) {
       errno = EINVAL;
       return nullptr;
     }
-    auto eq = std::make_unique<FakeDmeshState::Impl::Eq>();
-    eq->fd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (eq->fd < 0) return nullptr;
-    auto* result = eq.get();
-    impl_->eqs.push_back(std::move(eq));
-    return impl_->AsPublic(result);
+    if (impl_->inbound.empty()) {
+      FakeDmeshState::Impl::Settle(impl_->channel_fd);
+      errno = EAGAIN;
+      return nullptr;
+    }
+    dmesh_qp_t* qp = impl_->inbound.front();
+    impl_->inbound.pop_front();
+    return qp;
   }
 
-  int DestroyEq(dmesh_eq_t* eq) override {
+  dmesh_qp_t* CreateQp(dmesh_channel_t* channel, const char* target) override {
     std::lock_guard<std::mutex> lock(impl_->mu);
-    auto* fake = impl_->AsEq(eq);
-    if (fake == nullptr || fake->destroyed) return 0;
-    for (const auto& entry : impl_->qps) {
-      if (entry.second->eq == fake && entry.second->alive) {
-        errno = EBUSY;
-        return -1;
-      }
-    }
-    fake->destroyed = true;
-    if (fake->fd >= 0) {
-      ::close(fake->fd);
-      fake->fd = -1;
-    }
-    ++impl_->eq_destroys;
-    return 0;
-  }
-
-  int EqFd(dmesh_eq_t* eq) override {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    auto* fake = impl_->AsEq(eq);
-    if (fake == nullptr || fake->destroyed) {
-      errno = EINVAL;
-      return -1;
-    }
-    return fake->fd;
-  }
-
-  dmesh_qp_t* CreateQp(dmesh_eq_t* eq, const char* service) override {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    if (service == nullptr || service[0] == '\0') {
+    if (channel != &impl_->channel || target == nullptr ||
+        target[0] == '\0') {
       errno = EINVAL;
       return nullptr;
     }
@@ -213,24 +232,29 @@ class FakeDmeshApiOps final : public DmeshApiOps {
       impl_->next_create_qp_error = 0;
       return nullptr;
     }
-    auto* fake_eq = impl_->AsEq(eq);
-    if (fake_eq == nullptr || fake_eq->destroyed) {
+    auto* fake = impl_->NewQp(DMESH_ROLE_CLIENT);
+    if (fake == nullptr) return nullptr;
+    impl_->client_targets.emplace_back(target);
+    return &fake->value;
+  }
+
+  // Raises the fd once, as the native call does, so the first wait polls.
+  int QpFd(dmesh_qp_t* qp) override {
+    std::lock_guard<std::mutex> lock(impl_->mu);
+    auto* fake = impl_->FindQp(qp);
+    if (fake == nullptr || !fake->alive) {
       errno = EINVAL;
-      return nullptr;
+      return -1;
     }
-    dmesh_qp_t* qp = &impl_->NewQp(fake_eq, DMESH_ROLE_CLIENT)->value;
-    impl_->client_targets.emplace_back(service);
-    return qp;
+    FakeDmeshState::Impl::Raise(fake->fd);
+    return fake->fd;
   }
 
   int DestroyQp(dmesh_qp_t* qp) override {
     std::lock_guard<std::mutex> lock(impl_->mu);
     auto* fake = impl_->FindQp(qp);
     if (fake == nullptr || !fake->alive) return 0;
-    if (fake->eq->batch_active) ++impl_->mid_batch_destroys;
-    fake->alive = false;
-    fake->allocation.clear();
-    ++impl_->destroys;
+    impl_->Kill(fake);
     return 0;
   }
 
@@ -238,10 +262,7 @@ class FakeDmeshApiOps final : public DmeshApiOps {
     std::lock_guard<std::mutex> lock(impl_->mu);
     auto* fake = impl_->FindQp(qp);
     if (fake == nullptr || !fake->alive) return 0;
-    if (fake->eq->batch_active) ++impl_->mid_batch_destroys;
-    fake->alive = false;
-    fake->allocation.clear();
-    ++impl_->destroys;
+    impl_->Kill(fake);
     ++impl_->aborts;
     return 0;
   }
@@ -300,19 +321,12 @@ class FakeDmeshApiOps final : public DmeshApiOps {
     return 0;
   }
 
-  int PollEq(dmesh_eq_t* eq, dmesh_event_t* events,
-             int max_events) override {
+  int PollQp(dmesh_qp_t* qp, dmesh_event_t* events, int max_events) override {
     std::lock_guard<std::mutex> lock(impl_->mu);
-    auto* fake = impl_->AsEq(eq);
-    if (fake == nullptr || fake->destroyed || events == nullptr ||
+    auto* fake = impl_->FindQp(qp);
+    if (fake == nullptr || !fake->alive || events == nullptr ||
         max_events <= 0) {
       errno = EINVAL;
-      return -1;
-    }
-    if (fake->next_poll_error != 0) {
-      errno = fake->next_poll_error;
-      fake->next_poll_error = 0;
-      fake->batch_active = false;
       return -1;
     }
     const std::thread::id caller = std::this_thread::get_id();
@@ -321,14 +335,20 @@ class FakeDmeshApiOps final : public DmeshApiOps {
     } else if (fake->poll_thread != caller) {
       ++impl_->poll_thread_violations;
     }
+    if (fake->next_poll_error != 0) {
+      errno = fake->next_poll_error;
+      fake->next_poll_error = 0;
+      fake->batch_active = false;
+      return -1;
+    }
 
-    fake->batch_active = false;
     int count = 0;
     while (count < max_events && !fake->events.empty()) {
       events[count++] = fake->events.front().value;
       fake->events.pop_front();
     }
     fake->batch_active = count != 0;
+    if (count == 0) FakeDmeshState::Impl::Settle(fake->fd);
     return count;
   }
 
@@ -343,18 +363,6 @@ class FakeDmeshApiOps final : public DmeshApiOps {
     event->buf = nullptr;
     ++impl_->releases;
   }
-
-  int PostMax(dmesh_channel_t* /*channel*/) override {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    return impl_->post_max;
-  }
-
-  int PodId(dmesh_channel_t* /*channel*/) override {
-    return impl_->channel.pod_id;
-  }
-
-  // The fake publishes on commit and retains no tail.
-  int64_t EqNextDeadlineNs(dmesh_eq_t* /*eq*/) override { return -1; }
 
  private:
   std::shared_ptr<FakeDmeshState> state_;
@@ -397,11 +405,12 @@ void FakeDmeshState::FailNextPost(dmesh_qp_t* qp, int error_number) {
   }
 }
 
-void FakeDmeshState::FailNextPoll(int error_number) {
+void FakeDmeshState::FailNextPoll(dmesh_qp_t* qp, int error_number) {
   std::lock_guard<std::mutex> lock(impl_->mu);
-  if (impl_->eqs.empty()) return;
-  impl_->eqs.front()->next_poll_error = error_number;
-  impl_->Signal(impl_->eqs.front().get());
+  auto* fake = impl_->FindQp(qp);
+  if (fake == nullptr || !fake->alive) return;
+  fake->next_poll_error = error_number;
+  Impl::Raise(fake->fd);
 }
 
 bool FakeDmeshState::WaitForClientQpCount(
@@ -461,7 +470,6 @@ void FakeDmeshState::InjectReceive(dmesh_qp_t* qp, const std::string& bytes) {
   auto* fake = impl_->FindQp(qp);
   if (fake == nullptr || !fake->alive) return;
   impl_->QueueReceive(fake, bytes);
-  impl_->Signal(fake->eq);
 }
 
 void FakeDmeshState::InjectReceiveBatch(
@@ -471,7 +479,6 @@ void FakeDmeshState::InjectReceiveBatch(
   auto* fake = impl_->FindQp(qp);
   if (fake == nullptr || !fake->alive) return;
   for (const auto& receive : receives) impl_->QueueReceive(fake, receive);
-  impl_->Signal(fake->eq);
 }
 
 void FakeDmeshState::InjectFin(dmesh_qp_t* qp) {
@@ -482,8 +489,7 @@ void FakeDmeshState::InjectFin(dmesh_qp_t* qp) {
   event.value.qp = qp;
   event.value.type = DMESH_EVENT_RECV_FIN;
   event.value._rx_token = -1;
-  fake->eq->events.push_back(event);
-  impl_->Signal(fake->eq);
+  impl_->Push(fake, event);
 }
 
 void FakeDmeshState::InjectTxReady(dmesh_qp_t* qp) {
@@ -494,8 +500,7 @@ void FakeDmeshState::InjectTxReady(dmesh_qp_t* qp) {
   event.value.qp = qp;
   event.value.type = DMESH_EVENT_TX_READY;
   event.value._rx_token = -1;
-  fake->eq->events.push_back(event);
-  impl_->Signal(fake->eq);
+  impl_->Push(fake, event);
 }
 
 void FakeDmeshState::InjectTxError(dmesh_qp_t* qp) {
@@ -506,23 +511,17 @@ void FakeDmeshState::InjectTxError(dmesh_qp_t* qp) {
   event.value.qp = qp;
   event.value.type = DMESH_EVENT_TX_ERROR;
   event.value._rx_token = -1;
-  fake->eq->events.push_back(event);
-  impl_->Signal(fake->eq);
+  impl_->Push(fake, event);
 }
 
 dmesh_qp_t* FakeDmeshState::InjectConnectionRequest(
     const std::string& first_bytes) {
   std::lock_guard<std::mutex> lock(impl_->mu);
-  if (impl_->eqs.empty()) return nullptr;
-  Impl::Eq* eq = impl_->eqs.front().get();
-  Impl::Qp* fake = impl_->NewQp(eq, DMESH_ROLE_SERVER);
-  Impl::Event request;
-  request.value.qp = &fake->value;
-  request.value.type = DMESH_EVENT_CONN_REQ;
-  request.value._rx_token = -1;
-  eq->events.push_back(request);
+  Impl::Qp* fake = impl_->NewQp(DMESH_ROLE_SERVER);
+  if (fake == nullptr) return nullptr;
   if (!first_bytes.empty()) impl_->QueueReceive(fake, first_bytes);
-  impl_->Signal(eq);
+  impl_->inbound.push_back(&fake->value);
+  Impl::Raise(impl_->channel_fd);
   return &fake->value;
 }
 
@@ -581,9 +580,17 @@ bool FakeDmeshState::WaitForChannelDestroyCount(
                    [this, count] { return impl_->channel_destroys >= count; });
 }
 
-size_t FakeDmeshState::eq_destroy_count() const {
-  std::lock_guard<std::mutex> lock(impl_->mu);
-  return impl_->eq_destroys;
+bool FakeDmeshState::WaitForPollThread(dmesh_qp_t* qp,
+                                       std::chrono::milliseconds timeout,
+                                       std::thread::id* thread) {
+  return WaitUntil(&impl_->mu, timeout, [this, qp, thread] {
+    auto* fake = impl_->FindQp(qp);
+    if (fake == nullptr || fake->poll_thread == std::thread::id()) {
+      return false;
+    }
+    *thread = fake->poll_thread;
+    return true;
+  });
 }
 
 std::unique_ptr<DmeshApiOps> MakeFakeDmeshApiOps(

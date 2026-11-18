@@ -18,7 +18,7 @@ source=Path(started['source']);result={'mode':started['mode'],'probe_placement':
 env={k:v for k,v in os.environ.items() if not k.startswith(('DSB_','DPUMESH_','DMESH_'))}
 env.update(DSB_TRANSPORT=started['mode'],DSB_TOPOLOGY=str(a.run/'topology.json'),
  DPUMESH_CONFIG=str(a.run/'registry'),DPUMESH_SERVER='DPUMesh0',DPUMESH_PCI_ADDR=t['processes'][0]['env']['DPUMESH_PCI_ADDR'],
- DPUMESH_POD_IP='10.81.250.1',DPUMESH_WORKLOAD='hotel-probe',DPUMESH_REVERSE='dpu-dma',
+ DPUMESH_POD_IP='10.81.250.1',DPUMESH_WORKLOAD='hotel-probe',
  GOMAXPROCS='2',TLS='false',LD_LIBRARY_PATH=started['native']+':/opt/mellanox/doca/lib/x86_64-linux-gnu:/opt/mellanox/flexio/lib')
 try:
  for service_index,s in enumerate(t['services']):
