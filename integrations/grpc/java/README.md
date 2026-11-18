@@ -12,7 +12,8 @@ Server server = DpumeshGrpc.serverBuilder().addService(service).build().start();
 ManagedChannel channel = DpumeshGrpc.channelBuilder("10.96.0.5:9555").build();
 ```
 
-The server serves `DPUMESH_SERVICE` (the `forPort` port is unused); a channel
+The server serves `DPUMESH_PORT` on the Pod IP, or `DPUMESH_SERVICE` (the
+`forPort` port is unused); a channel
 target is a `"<host>:<port>"` service address. A JNI library, packed in the
 jar, binds the [stream C ABI](../README.md), loaded with `dlopen`.
 

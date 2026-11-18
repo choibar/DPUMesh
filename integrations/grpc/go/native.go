@@ -43,7 +43,6 @@ import "C"
 
 import (
 	"fmt"
-	"os"
 	"syscall"
 	"time"
 	"unsafe"
@@ -52,7 +51,7 @@ import (
 // cgoNative drives libdpumesh: one channel for the process, its listening
 // socket, and its QPs.
 type cgoNative struct {
-	serving  bool // the channel serves DPUMESH_SERVICE
+	serving  bool // the channel serves a target (serviceAddr)
 	ch       *C.dmesh_channel_t
 	listener *fdWaiter // the channel's fd on Go's netpoller
 }
@@ -78,8 +77,9 @@ func (q *cgoQP) poll() bool {
 // On failure a non-nil native holds resources whose cleanup failed; close
 // retries it.
 func openCgoNative() (*cgoNative, error) {
-	// dmesh_create_channel serves DPUMESH_SERVICE when it is set.
-	n := &cgoNative{serving: os.Getenv("DPUMESH_SERVICE") != ""}
+	// dmesh_create_channel serves DPUMESH_SERVICE, or DPUMESH_PORT on the Pod IP.
+	_, err := serviceAddr()
+	n := &cgoNative{serving: err == nil}
 	ch, err := C.dmesh_create_channel()
 	if ch == nil {
 		return nil, fmt.Errorf("dmesh: create channel: %w", err)
