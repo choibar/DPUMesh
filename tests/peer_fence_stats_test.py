@@ -16,7 +16,7 @@ def line(stamp, samples, total, hist, peak=4, stalls=0):
               "window_ms": 1000, "capacity": 32, "current": 0, "samples": samples,
               "depth_sum": total, "max": peak, "full_stalls": stalls}
     fields.update({name: value for (name, _), value in zip(module.BUCKETS, hist)})
-    return "WRITE_SYNC_FENCE_STATS " + " ".join(f"{key}={value}" for key, value in fields.items())
+    return "WRITE_IMM_FENCE_STATS " + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
 class FenceStatsTest(unittest.TestCase):

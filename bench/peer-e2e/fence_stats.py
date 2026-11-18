@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize WRITE_SYNC_FENCE_STATS logs; all depths count unretired batches.
+"""Summarize WRITE_IMM_FENCE_STATS logs; all depths count unretired batches.
 
 The mean and histogram are weighted by batch submissions, not elapsed time.
 Percentiles are histogram ranges, never exact percentile measurements.
@@ -17,8 +17,9 @@ def summarize(lines, start_ns=None, end_ns=None):
     groups = {}
     seen = set()
     for line in lines:
-        marker = "WRITE_SYNC_FENCE_STATS "
-        if marker not in line:
+        marker = next((m for m in ("WRITE_IMM_FENCE_STATS ", "WRITE_SYNC_FENCE_STATS ")
+                       if m in line), None)
+        if marker is None:
             continue
         fields = dict(part.split("=", 1) for part in line.split(marker, 1)[1].split() if "=" in part)
         if "samples" not in fields:
