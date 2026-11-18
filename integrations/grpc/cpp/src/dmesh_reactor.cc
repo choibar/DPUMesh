@@ -33,10 +33,11 @@
 namespace dpumesh::grpc {
 namespace {
 
-// Receive events one connection may hold credit for. The credits belong to a
-// landing ring shared with the other connections on this shard, so a stalled
-// reader keeps its backpressure bounded and cannot withhold the ring.
-constexpr size_t kMaxHeldReceives = 64;
+// Receive events one connection may hold credit for. Each flow has a window of
+// its own, and the DPU lands at most 126 unread batches in it (its descriptor
+// slots), so holding them all is bounded and a stalled reader gets
+// backpressure, not a failed connection.
+constexpr size_t kMaxHeldReceives = 128;
 
 // Bytes accepted before gRPC has constructed and bound the Endpoint. Connect
 // and accept delivery are asynchronous, so a stalled callback executor must

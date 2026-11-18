@@ -54,32 +54,24 @@ doca_error_t dmesh_dma_engine_prewarm(struct objects *objs, struct dmesh_doca_dp
 doca_error_t
 submit_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);
 
-doca_error_t
-submit_dma_task_kind(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst,
-                     int kind);
+/* Largest batch the reverse DPA thread copies at once. */
+#define DMESH_PUSH_MAX_BATCH 65536u
 
-/* Backend (안 2) push: DMA up to one <=8KB batch already staged at
- * tx_staging+src_pos, DPU -> host rcvbuf data ring, and publish it via a 16B
- * descriptor slot (see struct dmesh_push_desc). No host DPA, no memcpy.
- * Returns bytes accepted (0 = batch in flight, retry) or a negative
- * doca_error_t. */
+/* DPU -> host: hand up to one batch already staged at tx_staging+src_pos to
+ * the worker's reverse DPA thread, which copies it into the host's data ring
+ * and publishes its descriptor (struct dmesh_push_desc). Several batches of
+ * a flow may be in flight; the thread starts each once the host has room for
+ * it. Returns bytes accepted (0 = the thread holds as many of the flow's
+ * batches as it can, or its ring is full: retry) or a negative doca_error_t. */
 int
 dmesh_dma_push_staged(struct dmesh_conn *conn, uint32_t src_pos, uint32_t len);
 
-/* End a push stream once push_fin_requested is set: after the last batch is
- * visible, publish one zero-length descriptor, which the host reads as end of
- * stream. Returns 0 (sent, or not due yet: the call is repeated from the
- * descriptor completion and the flow's advance) or a negative doca_error_t
- * when the flow no longer admits DMA. */
+/* End a push stream once push_fin_requested is set: a zero-length descriptor
+ * after the last batch, which the host reads as end of stream. Returns 0
+ * (posted, or not due yet: the flow's advance repeats the call) or a negative
+ * doca_error_t when the flow no longer admits DMA. */
 int
 dmesh_dma_push_fin(struct dmesh_conn *conn);
-
-/* Comch fast-path wake (comch_wake.h): the descriptor send completed or
- * failed; and a send the producer could not take yet, retried from the
- * flow's advance. */
-void dmesh_dma_push_desc_sent(struct dmesh_conn *conn);
-void dmesh_dma_push_desc_failed(struct dmesh_conn *conn);
-void dmesh_dma_push_retry_desc(struct dmesh_conn *conn);
 
 doca_error_t
 enqueue_dma_task(struct dmesh_conn *conn, const struct doca_buf *src, struct doca_buf *dst);

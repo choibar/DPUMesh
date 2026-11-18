@@ -16,8 +16,6 @@ enum msg_direction {
 
 enum dmesh_msg_type {
     DMESH_MSG_EXPORT_METADATA = 1,
-    DMESH_MSG_EXPORT_DPA_COMP = 2,
-    DMESH_MSG_EXPORT_RCV_RING = 3,  /* DPU -> host: reverse (response) path metadata */
 };
 
 /* Identity of the flow carried by a dmesh connection. The DMA path has no
@@ -29,18 +27,11 @@ enum dmesh_msg_type {
 /* What role this dmesh connection plays. CLIENT: an intercepted outbound flow
  * (the proxy serves it through the outbound stack). BACKEND: the host process
  * is a backend provider - the proxy CONNECTS THROUGH this channel to reach the
- * service at flow.dst instead of dialing TCP. */
-#define DMESH_FLOW_MODE_CLIENT  0u
+ * service at flow.dst instead of dialing TCP. Both carry their DPU -> host
+ * bytes through the worker's reverse DPA thread (dpu/ec_rev.h). */
 #define DMESH_FLOW_MODE_BACKEND 1u
-/* Client-semantics flow carried over the push transport (안 2): the DPU serves
- * it like CLIENT (h2 server), but the reverse path is the DPA-free push channel
- * so ingress host processes scale past the flexio one-per-function limit. */
-#define DMESH_FLOW_MODE_INGRESS_PUSH 2u
-/* BACKEND with the reverse path served like CLIENT: rcv_ring + tx_staging
- * exported, the host's DPA pulls (the host library's host-dpa reverse path). */
-#define DMESH_FLOW_MODE_BACKEND_PULL 3u
-/* True for modes whose reverse (DPU->host) path uses the push engine. */
-#define DMESH_FLOW_USES_PUSH(m) ((m) == DMESH_FLOW_MODE_BACKEND || (m) == DMESH_FLOW_MODE_INGRESS_PUSH)
+#define DMESH_FLOW_MODE_CLIENT  2u
+#define DMESH_FLOW_MODE_VALID(m) ((m) == DMESH_FLOW_MODE_CLIENT || (m) == DMESH_FLOW_MODE_BACKEND)
 
 struct dmesh_flow_id {
     uint32_t src_ip;
@@ -52,21 +43,16 @@ struct dmesh_flow_id {
     char src_workload[64];      /* source workload identity (pod/SA), NUL-terminated */
 };
 
-/* Backend (plan "안 2") push channel layout, in the HOST's rcvbuf of a BACKEND
- * connection. No host DPA is involved: the DPU pushes with its per-connection
- * doca_dma engine and the host busy-polls plain memory.
+/* DPU -> host layout, in the HOST's rcvbuf of every connection:
  *
  *   rcvbuf[0 .. 2048)                : desc slot ring, DMESH_PUSH_DESC_N x 16B
+ *   rcvbuf[DMESH_PUSH_CURSOR_OFF ..) : the host's consumption cursor
  *   rcvbuf[DMESH_PUSH_DATA_OFF .. )  : data ring
  *
- * Per batch (<= 8KB, the platform's single-DMA limit) the DPU DMAs the data
- * into the data ring, then - only after that copy completes - DMAs one 16B
- * descriptor into slot seq % N carrying {seq, pos, len}. The host consumes in
- * order: it waits for desc[expected % N].seq == expected, copies
- * data[pos, pos+len), and advances. Ordering is enforced by completion
- * chaining on the DPU (desc submitted from the data copy's completion
- * callback), and the slot ring tolerates the host lagging up to N batches
- * (N * 8KB = the data ring size, so data and descriptors overwrite together). */
+ * The worker's reverse DPA thread copies a batch into the data ring and, once
+ * the copy completed, stores its 16B descriptor {seq, pos, len} into slot
+ * seq % N, the sequence last. The host consumes in order: it waits for
+ * desc[expected % N].seq == expected, reads data[pos, pos+len) and advances. */
 struct dmesh_push_desc {
     volatile uint64_t seq;      /* 1-based batch sequence; 0 = empty slot */
     volatile uint32_t pos;      /* batch offset within the data ring */
@@ -74,39 +60,16 @@ struct dmesh_push_desc {
 };
 #define DMESH_PUSH_DESC_N    128u
 #define DMESH_PUSH_DATA_OFF  4096u
-
-/* Comch fast-path wake (DMESH_SESSION_WAKE_READY): instead of DMAing the 16B
- * descriptor into the slot ring, the DPU worker sends it as the immediate
- * data of a producer message to the host's consumer, after the data copy has
- * completed. The host's consumer completion writes it into the same slot
- * ring, so the receive side reads the ring as before; the completion is also
- * what wakes an idle host (its control PE notification), with no ARM. */
-struct dmesh_wake_desc {
-    uint32_t flow_id;           /* host flow slot, 1..32 */
-    uint32_t generation;
-    uint64_t seq;
-    uint32_t pos;
-    uint32_t len;               /* 0 = end of stream */
-};
-#define DMESH_WAKE_IMM_LEN ((uint32_t)sizeof(struct dmesh_wake_desc))
-
-/* Host side: publish a fast-path descriptor into a flow's slot ring. The
- * sequence is stored last, so a reader that sees it also sees pos and len. */
-static inline void dmesh_wake_desc_publish(volatile struct dmesh_push_desc *ring,
-                                           const struct dmesh_wake_desc *d)
-{
-    volatile struct dmesh_push_desc *slot = &ring[d->seq % DMESH_PUSH_DESC_N];
-    slot->pos = d->pos;
-    slot->len = d->len;
-    __atomic_store_n(&slot->seq, d->seq, __ATOMIC_RELEASE);
-}
+/* The rcvbuf (the host's receive window) and the DPU's tx_staging of every
+ * connection: room for many batches in flight, so a full window, and the
+ * reverse thread's wait for it, stays rare. */
+#define DMESH_PUSH_WINDOW    (4u * 1024u * 1024u)
 
 /* Push flow control: the host publishes its consumption cursor at a fixed
  * offset in its rcvbuf (the reserved gap between the desc slots and the data
- * ring). The DPU pulls it with a small read-DMA between batches and refuses
- * to publish a batch that would overrun unconsumed slots/bytes. MAGIC marks
- * a flow-control-aware host; without it the DPU keeps the legacy
- * no-backpressure behavior (old host + new DPU stays compatible). */
+ * ring). The worker's reverse DPA thread reads it and starts no copy that
+ * would overrun unconsumed slots or bytes. MAGIC marks a published cursor;
+ * until the thread sees it, it takes the host to have consumed nothing. */
 #define DMESH_PUSH_CURSOR_OFF   2048u
 #define DMESH_PUSH_FC_MAGIC     0xD3E5FC01D3E5FC01ull
 struct dmesh_push_cursor {
@@ -115,7 +78,6 @@ struct dmesh_push_cursor {
     uint64_t consumed_bytes;    /* total bytes drained from the data ring */
     uint64_t pad;
 };
-#define DMESH_PUSH_MAX_BATCH 8192u
 
 /* Single control-path message carrying all host-side DMA metadata: the DMA
  * ring, the send buffer and the receive buffer (address, size and PCI export
@@ -146,45 +108,11 @@ struct dmesh_tails_export {
     uint8_t desc[DMESH_SESSION_TAILS_MAX];
 };
 
-typedef uint64_t doca_dpa_dev_comch_consumer_completion_t;
-typedef uint64_t doca_dpa_dev_completion_t;
-typedef uint64_t doca_dpa_dev_comch_producer_t;
-typedef uint64_t doca_dpa_dev_comch_consumer_t;
-
-struct dmesh_dpa_comp_msg {
-    enum dmesh_msg_type type;
-    doca_dpa_dev_comch_consumer_completion_t dpa_consumer_comp;
-	doca_dpa_dev_completion_t dpa_producer_comp;
-	doca_dpa_dev_comch_producer_t dpa_producer;
-	doca_dpa_dev_comch_consumer_t dpa_consumer;
-};
-
-/* Reverse (response) path metadata, sent DPU -> host once the DPU has allocated
- * this connection's descriptor ring and staging buffer. It is the mirror of
- * dmesh_export_metadata_msg: the DPU exports the rcv_ring (host DPA polls it for
- * descriptors) and the tx_staging buffer (DMA source; host DPA copies it into
- * the host's rcvbuf). Both live in DPU memory and are PCI-exported to the host. */
-struct dmesh_export_rcv_ring_msg {
-    enum dmesh_msg_type type;
-    /* descriptor ring (DPU memory) the host DPA thread polls */
-    void *ring_buf;
-    size_t ring_buf_len;
-    size_t ring_desc_len;
-    /* tx staging buffer (DPU memory) the host DPA thread DMAs into the rcvbuf */
-    void *tx_staging;
-    size_t tx_staging_len;
-    size_t tx_desc_len;
-    uint8_t ring_desc[512];
-    uint8_t tx_desc[512];
-};
-
 struct dmesh_comch_msg {
     enum dmesh_msg_type type;
     union
     {
         struct dmesh_export_metadata_msg export_metadata_msg;
-        struct dmesh_dpa_comp_msg dpa_comp_msg;
-        struct dmesh_export_rcv_ring_msg export_rcv_ring_msg;
     };
 };
 
@@ -196,22 +124,7 @@ struct dmesh_buffer;
 doca_error_t dmesh_build_dma_metadata(struct doca_dev *dev, const struct dma_ring *ring,
     const struct dmesh_buffer *sndbuf, const struct dmesh_buffer *rcvbuf,
     const struct dmesh_flow_id *flow, struct dmesh_export_metadata_msg *msg);
-doca_error_t dmesh_validate_reverse_metadata(const struct dmesh_export_rcv_ring_msg *msg);
 
-doca_error_t
-build_dma_metadata(struct objects *objs, struct dmesh_export_metadata_msg *msg);
-doca_error_t
-export_dma_metadata(struct objects *objs);
 doca_error_t
 process_export_metadata_msg(struct dmesh_conn *conn, struct dmesh_export_metadata_msg *metadata_msg);
-doca_error_t
-process_dpa_comp_msg(struct objects *objs, struct dmesh_dpa_comp_msg *dpa_comp_msg);
-
-/* DPU side: allocate this connection's reverse rcv_ring + tx_staging (if not
- * already) and send their PCI export descriptors to the host. */
-doca_error_t
-export_rcv_ring_metadata(struct dmesh_conn *conn);
-/* Host side: import the DPU's rcv_ring + tx_staging from the export message. */
-doca_error_t
-process_export_rcv_ring_msg(struct objects *objs, struct dmesh_export_rcv_ring_msg *msg);
 #endif // COMCH_COMMON_H

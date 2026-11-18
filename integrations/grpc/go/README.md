@@ -111,15 +111,13 @@ It verifies payload bytes, keeps a sibling connection active during repeated
 close/reopen, checks native close errors, and recreates the process channel.
 The server handles SIGTERM by stopping gRPC and closing its native transport.
 
-Earlier versions of both `dpu-dma` and `host-dpa` passed on the jet1/BF-3 testbed. See the
+An earlier build passed on the jet1/BF-3 testbed. See the
 [hardware validation report](../../../docs/2026-09-25_channel-comch-grpc-validation.md)
 for topology, exact environment, build commands and results. That report predates
 the netpoller wait, the idle wake and the payload larger than 1 MiB added above.
 The waiter has unit coverage for nested readiness, fd ownership, interrupts,
-a raise that lands after an empty poll, and allocation-free waits.
-`dpu-dma` with this waiter passed the hardware regression
-(`bench-results/2026-09-30_host-idle-wake.md`); `host-dpa` was not available on
-that testbed.
+a raise that lands after an empty poll, and allocation-free waits; it passed
+the hardware regression (`bench-results/2026-09-30_host-idle-wake.md`).
 
 ### Worker-local backend benchmark
 

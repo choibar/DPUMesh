@@ -2,7 +2,6 @@
 #include "dispatcher.h"
 #include "placement.h"
 #include "object.h"
-#include "comch_wake.h"
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -20,17 +19,13 @@
 /* Only control messages cross these queues. In particular no DMA descriptor,
  * payload, data completion or credit update visits the dispatcher. */
 #define QUEUE_SIZE 128u
-enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, ARM, DRAIN, SHUTDOWN };
+enum command { OPEN = 100, CLOSE, LOST, RETIRED, BACKEND_DEMAND, DRAIN, SHUTDOWN };
 struct message {
     struct dmesh_flow_key key;
     struct dmesh_flow_location location;
     uint16_t type;
     int32_t status;
     size_t length;
-    /* OPEN of a session with a fast-path consumer: the worker creates its
-     * producer on this connection (under the SDK lock). */
-    struct doca_comch_connection *wake_connection;
-    uint32_t wake_consumer;
     /* OPEN: the session's tail table, for the worker's pod mux thread. */
     struct dmesh_tails_export tails;
     unsigned char payload[DMESH_SESSION_MAX_PAYLOAD];
@@ -412,39 +407,6 @@ static void flush_listeners(struct dmesh_dispatcher *d)
     }
 }
 
-/* The host is about to sleep. A listed flow's descriptor progress lives on its
- * worker: hand the owner the sequence the host expects, and the owner rings
- * through its reply queue (DOORBELL). A flow whose owner cannot take the
- * command rings at once; the host then re-polls and arms again. */
-static void arm_flows(struct dmesh_dispatcher *d, struct objects *o, struct dmesh_session *s,
-                      const void *payload, uint32_t len)
-{
-    struct dmesh_session_arm_flow flows[DMESH_SESSION_MAX_FLOWS];
-    uint64_t epoch;
-    uint32_t count;
-    if (dmesh_session_arm_decode(payload, len, &epoch, flows, &count) != 0) {
-        s->closing = true;
-        dmesh_dispatcher_session_lost(o, s);
-        return;
-    }
-    s->armed_epoch = epoch;
-    s->armed = true;
-    for (uint32_t i = 0; i < count; ++i) {
-        struct assignment *a = find(d, s, flows[i].flow_id);
-        /* Stale generations and unknown flows are ignored, not trusted. */
-        if (!a || a->key.generation != flows[i].generation || !a->ready) continue;
-        struct message m = {.key = a->key, .location = a->location, .type = ARM, .length = 16};
-        dmesh_session_put_u64(m.payload, epoch);
-        dmesh_session_put_u64(m.payload + 8, flows[i].expected_seq);
-        if (push(&d->workers[a->location.worker].requests, &m)) {
-            wake(d->workers[a->location.worker].fd);
-        } else {
-            s->armed = false;
-            s->doorbell_pending_epoch = epoch;
-        }
-    }
-}
-
 /* A svc-to-svc pair: the source workload and the destination service. Client
  * flows of one pair are spread over workers, so a scaled-out pair gets the
  * extra cores it was scaled for. */
@@ -474,7 +436,7 @@ static void pending_instr(struct dmesh_dispatcher *d)
         for (size_t s = 0; s < DMESH_MAX_CONNECTIONS; ++s) {
             const struct assignment *a = &d->flows[w * DMESH_MAX_CONNECTIONS + s];
             if (a->used && !a->backend_token && !a->stat_valid &&
-                (a->mode == DMESH_FLOW_MODE_CLIENT || a->mode == DMESH_FLOW_MODE_INGRESS_PUSH))
+                a->mode == DMESH_FLOW_MODE_CLIENT)
                 ++pending;
         }
         d->loads[w].pending_instr_ps = pending * d->flow_instr_mean;
@@ -572,7 +534,7 @@ static bool scale_rides(const struct assignment *a, const struct scale *e)
 {
     return a->used && a->session == e->session && a->ready && !a->draining && !a->backend_token &&
            !a->close_pending && !a->lost_pending &&
-           (a->mode == DMESH_FLOW_MODE_CLIENT || a->mode == DMESH_FLOW_MODE_INGRESS_PUSH) &&
+           a->mode == DMESH_FLOW_MODE_CLIENT &&
            a->dst_ip == e->dst_ip && a->dst_port == e->dst_port;
 }
 
@@ -641,7 +603,7 @@ static void scale_due(struct dmesh_dispatcher *d)
         struct assignment *a = &d->flows[i];
         if (!a->used || !a->ready || a->backend_token || a->close_pending || a->lost_pending ||
             a->session->closing ||
-            (a->mode != DMESH_FLOW_MODE_CLIENT && a->mode != DMESH_FLOW_MODE_INGRESS_PUSH) ||
+            a->mode != DMESH_FLOW_MODE_CLIENT ||
             now - a->ready_ms < d->scale_after_ms ||
             find_scale(d, a->session, a->dst_ip, a->dst_port))
             continue;
@@ -721,7 +683,7 @@ static void flowstat_due(struct dmesh_dispatcher *d)
     for (size_t i = 0; i < d->count * DMESH_MAX_CONNECTIONS; ++i) {
         struct assignment *a = &d->flows[i];
         if (!a->used || !a->ready || a->backend_token ||
-            (a->mode != DMESH_FLOW_MODE_CLIENT && a->mode != DMESH_FLOW_MODE_INGRESS_PUSH))
+            a->mode != DMESH_FLOW_MODE_CLIENT)
             continue;
         size_t w = a->location.worker;
         const struct dmesh_conn *c = &d->workers[w].objs->conns[a->location.slot];
@@ -831,7 +793,7 @@ static void migrate_due(struct dmesh_dispatcher *d)
         struct assignment *a = &d->flows[i];
         if (!a->used || !a->ready || a->draining || a->backend_token ||
             a->close_pending || a->lost_pending || a->session->closing ||
-            (a->mode != DMESH_FLOW_MODE_CLIENT && a->mode != DMESH_FLOW_MODE_INGRESS_PUSH) ||
+            a->mode != DMESH_FLOW_MODE_CLIENT ||
             now - a->ready_ms < d->migrate_period_ms)
             continue;
         size_t from = a->location.worker;
@@ -871,10 +833,6 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
                               const struct dmesh_session_header *h, const void *payload)
 {
     struct dmesh_dispatcher *d = o->dispatcher;
-    if (h->type == DMESH_SESSION_ARM) {
-        arm_flows(d, o, s, payload, h->payload_len);
-        return;
-    }
     if (h->type == DMESH_SESSION_LISTEN) {
         const uint8_t *p = payload;
         uint32_t ip = dmesh_session_get_u32(p), port = dmesh_session_get_u32(p + 4);
@@ -953,10 +911,8 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     }
     bool backend = h->type == DMESH_SESSION_BACKEND_OPEN;
     uint32_t requested_worker = 0, request_token = 0;
-    /* A flow-wake host appends the u32 id of the flow's own consumer. */
     size_t base = sizeof(struct dmesh_export_metadata_msg) + (backend ? 8 : 0);
-    if ((h->type != DMESH_SESSION_OPEN && !backend) ||
-        (h->payload_len != base && h->payload_len != base + 4)) {
+    if ((h->type != DMESH_SESSION_OPEN && !backend) || h->payload_len != base) {
         reply_error(o, s, h, EINVAL); return;
     }
     if (h->generation < s->generation[idx] ||
@@ -988,11 +944,9 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     }
     struct dmesh_export_metadata_msg metadata;
     memcpy(&metadata, payload, sizeof(metadata));
-    uint32_t flow_consumer = h->payload_len == base + 4 ?
-        dmesh_session_get_u32((const uint8_t *)payload + sizeof(metadata)) : 0;
-    bool backend_mode = metadata.flow.mode == DMESH_FLOW_MODE_BACKEND ||
-                        metadata.flow.mode == DMESH_FLOW_MODE_BACKEND_PULL;
-    if (backend != backend_mode || (backend && (metadata.flow.dst_ip != s->listen_ip ||
+    bool backend_mode = metadata.flow.mode == DMESH_FLOW_MODE_BACKEND;
+    if (!DMESH_FLOW_MODE_VALID(metadata.flow.mode) || backend != backend_mode ||
+        (backend && (metadata.flow.dst_ip != s->listen_ip ||
             metadata.flow.dst_port != s->listen_port))) {
         reply_error(o, s, h, EINVAL); return;
     }
@@ -1037,12 +991,6 @@ void dmesh_dispatcher_request(struct objects *o, struct dmesh_session *s,
     struct message m = {.key = a->key, .location = a->location, .type = OPEN, .length = sizeof(metadata),
                         .tails = s->tails};
     memcpy(m.payload, &metadata, sizeof(metadata));
-    if (s->wake_consumer && s->connection && DMESH_FLOW_USES_PUSH(metadata.flow.mode)) {
-        m.wake_connection = s->connection;
-        /* A named consumer this session has not seen arrive yet leaves the
-         * flow on the session's: the host publishes from either. */
-        m.wake_consumer = dmesh_session_flow_consumer(s, flow_consumer) ? flow_consumer : s->wake_consumer;
-    }
     if (!admit(&d->workers[owner], &m)) {
         memset(a, 0, sizeof(*a)); reply_error(o, s, h, EAGAIN); return;
     }
@@ -1130,14 +1078,6 @@ static void flush_replies(struct dmesh_dispatcher *d)
                     --d->loads[w].assigned;
                     if (a->opening) --d->loads[w].opening;
                     memset(a, 0, sizeof(*a));
-                } else if (m.type == DMESH_SESSION_DOORBELL) {
-                    /* One DOORBELL per ARM, from whichever worker rings first;
-                     * dmesh_sessions_advance sends it and retries until accepted. */
-                    uint64_t epoch = dmesh_session_get_u64(m.payload);
-                    if (s->armed && s->armed_epoch == epoch) {
-                        s->armed = false;
-                        s->doorbell_pending_epoch = epoch;
-                    }
                 } else if (!s->closing) {
                     doca_error_t r = dmesh_session_send(a->control, s, m.type, m.key.flow_id,
                         m.key.generation, m.payload, m.length, m.status);
@@ -1150,37 +1090,12 @@ static void flush_replies(struct dmesh_dispatcher *d)
                     if (r == DOCA_SUCCESS && m.type == DMESH_SESSION_READY) {
                         a->ready = true;
                         a->ready_ms = membership_now_ms();
-                        /* An outstanding ARM cannot list a flow that was not
-                         * ready yet, so nothing would ring for it and the
-                         * host, which re-ARMs only after a DOORBELL, sleeps to
-                         * its backstop while this flow carries traffic. */
-                        if (s->armed && DMESH_FLOW_USES_PUSH(a->mode)) {
-                            s->armed = false;
-                            s->doorbell_pending_epoch = s->armed_epoch;
-                        }
                         if (a->opening) { a->opening = false; --d->loads[w].opening; }
                     }
                 }
             }
             (void)peek(&d->workers[w].replies, &m, true);
         }
-    }
-}
-
-/* Worker side of ARM, on the flow's worker-local session: ring at once if the
- * flow already published the descriptor the host expects, otherwise on its
- * next publication (dmesh_session_push_published). */
-static void arm_flow(struct dmesh_conn *c, const struct message *m)
-{
-    if (!DMESH_FLOW_USES_PUSH(c->flow.mode)) return;
-    uint64_t epoch = dmesh_session_get_u64(m->payload);
-    struct dmesh_session *s = c->session;
-    if (c->push_seq >= dmesh_session_get_u64(m->payload + 8)) {
-        s->armed = false;
-        s->doorbell_pending_epoch = epoch;
-    } else {
-        s->armed = true;
-        s->armed_epoch = epoch;
     }
 }
 
@@ -1228,17 +1143,8 @@ void dmesh_dispatch_worker_drain(struct objects *o)
                 memcpy(c->pending_metadata, m.payload, sizeof(*c->pending_metadata));
                 c->state = DMESH_CONN_NEW;
             } else { c->error_status = ENOMEM; c->state = DMESH_CONN_ERROR; }
-            /* The host of a fast-path session no longer ARMs: a flow that
-             * cannot publish through a producer must fail rather than fall
-             * back to descriptors nobody is woken for. */
-            if (c->state == DMESH_CONN_NEW && m.wake_connection &&
-                dmesh_wake_attach(c, m.wake_connection, m.wake_consumer) != DOCA_SUCCESS) {
-                c->error_status = EIO;
-                c->state = DMESH_CONN_ERROR;
-            }
         } else if (same_key(&c->key, &m.key) &&
                    c->location.ownership_epoch == m.location.ownership_epoch && c->state != DMESH_CONN_FREE) {
-            if (m.type == ARM) { arm_flow(c, &m); continue; }
             if (m.type == DRAIN) { c->migrate_requested = o->migrate_pending = true; continue; }
             if (m.type == SHUTDOWN) {
                 c->host_shut_descs = dmesh_session_get_u64(m.payload);
@@ -1298,13 +1204,6 @@ void dmesh_dispatch_worker_flush(struct objects *o)
             if (dmesh_dispatch_reply(c, DMESH_SESSION_CLOSED, NULL, 0,
                                      c->session->close_status[c->flow_id - 1]) == DOCA_SUCCESS)
                 c->session->close_pending[c->flow_id - 1] = false;
-        }
-        if (c->state != DMESH_CONN_FREE &&
-            c->session->doorbell_pending_epoch != c->session->doorbell_sent_epoch) {
-            uint8_t epoch[DMESH_SESSION_DOORBELL_SIZE];
-            dmesh_session_put_u64(epoch, c->session->doorbell_pending_epoch);
-            if (dmesh_dispatch_reply(c, DMESH_SESSION_DOORBELL, epoch, sizeof(epoch), 0) == DOCA_SUCCESS)
-                c->session->doorbell_sent_epoch = c->session->doorbell_pending_epoch;
         }
     }
 }

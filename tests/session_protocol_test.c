@@ -12,7 +12,7 @@
 static void test_wire_layout(void)
 {
     static const uint8_t golden[] = {
-        0x48, 0x53, 0x4d, 0x44, 0x09, 0x00, 0x03, 0x00,
+        0x48, 0x53, 0x4d, 0x44, 0x0a, 0x00, 0x03, 0x00,
         0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
         0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
         0xa5, 0x00, 0x7e,
@@ -29,7 +29,7 @@ static void test_wire_layout(void)
     assert(memcmp(frame, golden, sizeof(golden)) == 0);
     assert(storage[0] == 0xcc && storage[sizeof(storage) - 1] == 0xcc);
     assert(dmesh_session_decode(frame, sizeof(golden), &h, &payload) == 0);
-    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 9);
+    assert(h.magic == DMESH_SESSION_MAGIC && h.version == 10);
     assert(h.type == DMESH_SESSION_OPEN && h.flow_id == 2);
     assert(h.generation == UINT32_C(0x12345678) && h.status == 0);
     assert(h.payload_len == 3 && payload == frame + 24);
@@ -67,7 +67,7 @@ static void test_message_shapes(void)
         {DMESH_SESSION_HELLO_ACK,      0, 0, 0,      0, 1},
         {DMESH_SESSION_HELLO_ACK,      0, 0, EPROTO, 0, 1},
         {DMESH_SESSION_OPEN,           1, 1, 0,      1, 1},
-        {DMESH_SESSION_REVERSE_EXPORT, 2, 9, 0,      1, 1},
+        {5,                            2, 9, 0,      1, 0},   /* the reverse export is gone */
         {DMESH_SESSION_READY,          1, 1, 0,      0, 1},
         {DMESH_SESSION_CLOSE,          1, 1, 0,      0, 1},
         {DMESH_SESSION_SHUTDOWN,       1, 1, 0,      8, 1},
@@ -98,8 +98,6 @@ static void test_message_shapes(void)
         {DMESH_SESSION_OPEN,           1, 0, 0,      1, 0},
         {DMESH_SESSION_OPEN,           1, 1, 0,      0, 0},
         {DMESH_SESSION_OPEN,           1, 1, EIO,    1, 0},
-        {DMESH_SESSION_REVERSE_EXPORT, 1, 1, 0,      0, 0},
-        {DMESH_SESSION_REVERSE_EXPORT, 1, 1, EIO,    1, 0},
         {DMESH_SESSION_READY,          1, 1, 0,      1, 0},
         {DMESH_SESSION_READY,          1, 1, EIO,    0, 0},
         {DMESH_SESSION_CLOSE,          1, 1, 0,      1, 0},
@@ -108,22 +106,14 @@ static void test_message_shapes(void)
         {DMESH_SESSION_ERROR,          1, 1, 0,      0, 0},
         {DMESH_SESSION_ERROR,          1, 1, EIO,    1, 0},
         {DMESH_SESSION_ERROR,          1, 1, -1,     0, 0},
-        {DMESH_SESSION_ARM,            0, 0, 0,     16, 1},
-        {DMESH_SESSION_ARM,            0, 0, 0,     32, 1},
-        {DMESH_SESSION_ARM,            0, 0, 0,    528, 1},
-        {DMESH_SESSION_ARM,            0, 0, 0,    544, 0},
-        {DMESH_SESSION_ARM,            0, 0, 0,     15, 0},
-        {DMESH_SESSION_ARM,            0, 0, 0,     24, 0},
-        {DMESH_SESSION_ARM,            1, 1, 0,     16, 0},
-        {DMESH_SESSION_ARM,            0, 1, 0,     16, 0},
-        {DMESH_SESSION_ARM,            0, 0, EIO,   16, 0},
-        {DMESH_SESSION_DOORBELL,       0, 0, 0,      8, 1},
+        {14,                           0, 0, 0,     16, 0},   /* no ARM */
+        {15,                           0, 0, 0,      8, 0},   /* no DOORBELL */
         {DMESH_SESSION_PING,           0, 0, 0,      0, 1},
         {DMESH_SESSION_PING,           1, 0, 0,      0, 0},
         {DMESH_SESSION_PING,           0, 1, 0,      0, 0},
         {DMESH_SESSION_PING,           0, 0, 0,      8, 0},
         {DMESH_SESSION_PING,           0, 0, EIO,    0, 0},
-        {DMESH_SESSION_WAKE_READY,     0, 0, 0,      0, 1},
+        {21,                           0, 0, 0,      0, 0},   /* no WAKE_READY */
         {DMESH_SESSION_TAILS,          0, 0, 0,      DMESH_SESSION_TAILS_MAX, 1},
         {DMESH_SESSION_TAILS,          0, 0, 0,      40, 1},
         {DMESH_SESSION_TAILS,          0, 0, 0,      0, 0},
@@ -131,14 +121,6 @@ static void test_message_shapes(void)
         {DMESH_SESSION_TAILS,          1, 1, 0,      40, 0},
         {DMESH_SESSION_TAILS,          0, 1, 0,      40, 0},
         {DMESH_SESSION_TAILS,          0, 0, EIO,    40, 0},
-        {DMESH_SESSION_WAKE_READY,     1, 0, 0,      0, 0},
-        {DMESH_SESSION_WAKE_READY,     0, 1, 0,      0, 0},
-        {DMESH_SESSION_WAKE_READY,     0, 0, 0,      8, 0},
-        {DMESH_SESSION_WAKE_READY,     0, 0, EIO,    0, 0},
-        {DMESH_SESSION_DOORBELL,       0, 0, 0,      0, 0},
-        {DMESH_SESSION_DOORBELL,       0, 0, 0,      9, 0},
-        {DMESH_SESSION_DOORBELL,       1, 1, 0,      8, 0},
-        {DMESH_SESSION_DOORBELL,       0, 0, EIO,    8, 0},
         {0,                           1, 1, 0,      0, 0},
         {UINT16_MAX,                  1, 1, 0,      0, 0},
     };
@@ -210,7 +192,9 @@ static void test_frame_limits(void)
     assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
     frame[4] = 2; /* v2 acknowledges submission, not DMA completion. */
     assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
-    frame[4] = 3; /* v3 has no ARM/DOORBELL and must fail at HELLO. */
+    frame[4] = 3;
+    assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
+    frame[4] = 9; /* v9 carried the data-path wake over the control channel. */
     assert(dmesh_session_decode(frame, len, &h, &payload) == -1);
     frame[4] = DMESH_SESSION_VERSION;
     dmesh_session_put_u32(frame + 8, DMESH_SESSION_MAX_PAYLOAD + 1);
@@ -230,10 +214,10 @@ static void test_interleaved_flow_tags(void)
     } messages[] = {
         {DMESH_SESSION_OPEN,           1, 7, {0x11, 0, 0, 1}},
         {DMESH_SESSION_OPEN,           2, 3, {0x22, 0, 0, 2}},
-        {DMESH_SESSION_REVERSE_EXPORT, 2, 3, {0xb2, 0, 0, 2}},
-        {DMESH_SESSION_REVERSE_EXPORT, 1, 7, {0xa1, 0, 0, 1}},
+        {DMESH_SESSION_BACKEND_OPEN,   2, 3, {0xb2, 0, 0, 2}},
+        {DMESH_SESSION_BACKEND_OPEN,   1, 7, {0xa1, 0, 0, 1}},
         {DMESH_SESSION_OPEN,           1, 8, {0x31, 0, 0, 1}},
-        {DMESH_SESSION_REVERSE_EXPORT, 1, 7, {0xa1, 0, 0, 1}},
+        {DMESH_SESSION_BACKEND_OPEN,   1, 7, {0xa1, 0, 0, 1}},
     };
     uint8_t frames[sizeof(messages) / sizeof(messages[0])][28];
     for (size_t i = 0; i < sizeof(messages) / sizeof(messages[0]); ++i) {
@@ -251,75 +235,9 @@ static void test_interleaved_flow_tags(void)
     }
 }
 
-static void test_arm_payload(void)
-{
-    struct dmesh_session_arm_flow in[DMESH_SESSION_MAX_FLOWS], out[DMESH_SESSION_MAX_FLOWS];
-    uint8_t payload[DMESH_SESSION_ARM_HEADER_SIZE + DMESH_SESSION_MAX_FLOWS * DMESH_SESSION_ARM_FLOW_SIZE];
-    uint64_t epoch;
-    uint32_t count;
-    for (uint32_t i = 0; i < DMESH_SESSION_MAX_FLOWS; ++i)
-        in[i] = (struct dmesh_session_arm_flow){i + 1, 100 + i, UINT64_C(0x0102030405060708) + i};
-
-    /* Golden bytes: little endian, independent of the host layout. */
-    size_t len = dmesh_session_arm_encode(payload, sizeof(payload), UINT64_C(0x1122334455667788), in, 1);
-    static const uint8_t golden[] = {
-        0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 1, 0, 0, 0, 0, 0, 0, 0,
-        1, 0, 0, 0, 100, 0, 0, 0, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-    };
-    assert(len == sizeof(golden) && memcmp(payload, golden, len) == 0);
-
-    len = dmesh_session_arm_encode(payload, sizeof(payload), 7, in, DMESH_SESSION_MAX_FLOWS);
-    assert(len == sizeof(payload));
-    assert(dmesh_session_arm_decode(payload, (uint32_t)len, &epoch, out, &count) == 0);
-    assert(epoch == 7 && count == DMESH_SESSION_MAX_FLOWS && memcmp(in, out, sizeof(in)) == 0);
-    uint8_t frame[DMESH_SESSION_MAX_FRAME];
-    assert(dmesh_session_encode(frame, sizeof(frame), DMESH_SESSION_ARM, 0, 0, 0,
-                                payload, len) == DMESH_SESSION_HEADER_SIZE + len);
-
-    assert(dmesh_session_arm_encode(payload, sizeof(payload), 7, in, DMESH_SESSION_MAX_FLOWS + 1) == 0);
-    assert(dmesh_session_arm_encode(payload, len - 1, 7, in, DMESH_SESSION_MAX_FLOWS) == 0);
-    assert(dmesh_session_arm_encode(payload, sizeof(payload), 7, NULL, 1) == 0);
-    assert(dmesh_session_arm_encode(payload, sizeof(payload), 7, NULL, 0) == DMESH_SESSION_ARM_HEADER_SIZE);
-
-    /* The count must agree with the length, the reserved word must be zero
-     * and every entry must name a real flow. */
-    len = dmesh_session_arm_encode(payload, sizeof(payload), 7, in, 2);
-    assert(dmesh_session_arm_decode(payload, (uint32_t)len - 16, &epoch, out, &count) == -1);
-    dmesh_session_put_u32(payload + 8, 3);
-    assert(dmesh_session_arm_decode(payload, (uint32_t)len, &epoch, out, &count) == -1);
-    dmesh_session_put_u32(payload + 8, 2);
-    dmesh_session_put_u32(payload + 12, 1);
-    assert(dmesh_session_arm_decode(payload, (uint32_t)len, &epoch, out, &count) == -1);
-    dmesh_session_put_u32(payload + 12, 0);
-    dmesh_session_put_u32(payload + 16, 0);
-    assert(dmesh_session_arm_decode(payload, (uint32_t)len, &epoch, out, &count) == -1);
-    dmesh_session_put_u32(payload + 16, DMESH_SESSION_MAX_FLOWS + 1);
-    assert(dmesh_session_arm_decode(payload, (uint32_t)len, &epoch, out, &count) == -1);
-    dmesh_session_put_u32(payload + 16, 1);
-    dmesh_session_put_u32(payload + 20, 0);
-    assert(dmesh_session_arm_decode(payload, (uint32_t)len, &epoch, out, &count) == -1);
-}
-
-/* A fast-path descriptor lands in the slot ring exactly as the desc copy
- * would: same slot, and the sequence (what the reader polls) last. */
-static void test_wake_desc(void)
-{
-    static struct dmesh_push_desc ring[DMESH_PUSH_DESC_N];
-    assert(DMESH_WAKE_IMM_LEN == 24 && DMESH_WAKE_IMM_LEN <= 96);   /* the consumer's imm cap */
-    struct dmesh_wake_desc d = {.flow_id = 3, .generation = 7, .seq = DMESH_PUSH_DESC_N + 5,
-                                .pos = 8192, .len = 300};
-    dmesh_wake_desc_publish(ring, &d);
-    assert(ring[5].seq == DMESH_PUSH_DESC_N + 5 && ring[5].pos == 8192 && ring[5].len == 300);
-    d.seq++; d.len = 0;                                             /* end of stream */
-    dmesh_wake_desc_publish(ring, &d);
-    assert(ring[6].seq == DMESH_PUSH_DESC_N + 6 && ring[6].len == 0 && ring[5].len == 300);
-}
-
 int main(void)
 {
-    test_wake_desc();
     test_wire_layout();
-    test_arm_payload();
     test_message_shapes();
     test_frame_limits();
     test_interleaved_flow_tags();

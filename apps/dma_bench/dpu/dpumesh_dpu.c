@@ -9,9 +9,8 @@
  *
  * Modes (DMESH_MODE):
  *   sink   count every forward DMA completion (host -> DPU) and drop the bytes
- *   echo   ...and send the same bytes back (DPU -> host). How they go back is
- *          the channel layer's business: a push batch (dpu-dma reverse path) or a descriptor the
- *          host's DPA pulls (host-dpa reverse path, CLIENT / BACKEND_PULL flows).
+ *   echo   ...and send the same bytes back (DPU -> host), through the worker's
+ *          reverse DPA thread.
  *
  * Output, once a second:
  *   TOTAL(N conns): recv: <DMA/s> (<Gbps>), sent: <push/s> (<Gbps>), ...
@@ -26,6 +25,9 @@
  *   DMESH_MODE           sink | echo           (echo)
  *   DMESH_BUSY_POLL      1 = poll the progress engines, 0 = sleep in epoll (0)
  *   DMESH_BENCH_EXIT_OPS exit after this many forward completions (0 = never)
+ *   DMESH_ECHO_DELAY_US  echo: send each echo this long after its bytes arrived,
+ *                        like a response from an upstream; killing a host
+ *                        process then leaves echoes to send to it (0)
  *
  * DPA multiplexing probe (docs/2026-10-13_dpa-mux-probe.md), started once
  * DMESH_MUX_PROBE_CONNS connections are running:
@@ -89,11 +91,13 @@ enum { CONN_FREE = 0, CONN_RUNNING = 3, CONN_ERROR = 4, CONN_CLOSING = 6 };
 #define MAX_SLOTS         64
 #define SEG_MAX           8192u  /* one forward completion covers at most this many bytes */
 #define IDLE_WAIT_MS      1      /* epoll timeout: the staged sends have no fd of their own */
+#define ECHO_MARKS        256    /* echo runs held back by DMESH_ECHO_DELAY_US per slot */
 
 /* ------------------------------------------------------------------------
  * Small helpers
  * ------------------------------------------------------------------------ */
 static volatile sig_atomic_t g_stop;
+static double g_echo_delay;     /* seconds; DMESH_ECHO_DELAY_US */
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 static double now_sec(void)
@@ -123,6 +127,7 @@ struct tx_ring {
     uint8_t *base;
     size_t len;
     uint64_t write, publish;
+    uint64_t ready;             /* with an echo delay: the bytes whose delay passed */
 };
 
 static size_t tx_room(const struct tx_ring *t)
@@ -150,7 +155,8 @@ static int tx_next_run(const struct tx_ring *t, uint32_t *pos, uint32_t *len)
     size_t off, pending, run;
     if (!t->base || t->write == t->publish) return 0;
     off = (size_t)(t->publish % t->len);
-    pending = (size_t)(t->write - t->publish);
+    pending = (size_t)((g_echo_delay > 0 ? t->ready : t->write) - t->publish);
+    if (pending == 0) return 0;
     run = pending < t->len - off ? pending : t->len - off;
     *pos = (uint32_t)off;
     *len = (uint32_t)run;
@@ -169,6 +175,10 @@ struct slot {
     struct tx_ring tx;          /* reverse staging (we write, the channel layer sends) */
     uint64_t segs, bytes;       /* forward completions consumed by this slot */
     uint64_t pushes, push_bytes;/* reverse batches published (echo) */
+    /* With an echo delay: when each run of echo bytes arrived, oldest first. */
+    uint64_t mark_end[ECHO_MARKS];
+    double mark_at[ECHO_MARKS];
+    uint32_t mark_head, mark_tail;
 };
 
 /* Fetches the staging regions once the connection is RUNNING; both may
@@ -199,6 +209,11 @@ static void slot_wire(struct objects *objs, int idx, struct slot *s)
 static void slot_publish(struct objects *objs, int idx, struct slot *s)
 {
     uint32_t pos, len;
+    if (g_echo_delay > 0) {
+        double now = now_sec();
+        while (s->mark_head != s->mark_tail && s->mark_at[s->mark_head % ECHO_MARKS] + g_echo_delay <= now)
+            s->tx.ready = s->mark_end[s->mark_head++ % ECHO_MARKS];
+    }
     while (tx_next_run(&s->tx, &pos, &len)) {
         int32_t rv = dmesh_doca_conn_send_staged(objs, idx, pos, len);
         if (rv <= 0) break;
@@ -224,6 +239,7 @@ static void slot_pump(struct objects *objs, int idx, struct slot *s, int echo)
         if (echo) {
             slot_publish(objs, idx, s);
             if (!s->tx.base || tx_room(&s->tx) < SEG_MAX) break;
+            if (g_echo_delay > 0 && s->mark_tail - s->mark_head == ECHO_MARKS) break;
         }
         if (dmesh_doca_conn_recv_pop(objs, idx, &pos, &len) != DOCA_SUCCESS) break;
         if ((size_t)pos + len > s->rx_len) {
@@ -232,7 +248,13 @@ static void slot_pump(struct objects *objs, int idx, struct slot *s, int echo)
         }
         s->segs++;
         s->bytes += len;
-        if (echo) tx_push(&s->tx, s->rx_base + pos, len);
+        if (echo) {
+            tx_push(&s->tx, s->rx_base + pos, len);
+            if (g_echo_delay > 0) {
+                s->mark_end[s->mark_tail % ECHO_MARKS] = s->tx.write;
+                s->mark_at[s->mark_tail++ % ECHO_MARKS] = now_sec();
+            }
+        }
         s->dpu_rx_consumed_pos = pos + len;
         s->dpu_rx_consumed_pos_changed = 1;
     }
@@ -545,6 +567,7 @@ int main(void)
     const int echo = strcmp(env_or("DMESH_MODE", "echo"), "sink") != 0;
     const int busy = atoi(env_or("DMESH_BUSY_POLL", "0")) != 0;
     const long exit_ops = atol(env_or("DMESH_BENCH_EXIT_OPS", "0"));
+    g_echo_delay = atof(env_or("DMESH_ECHO_DELAY_US", "0")) / 1e6;
     struct driver d = {0};
     struct slot slots[MAX_SLOTS];
     struct stats st = { .echo = echo };

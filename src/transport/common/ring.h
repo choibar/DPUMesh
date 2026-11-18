@@ -22,14 +22,6 @@ struct dma_ring {
     struct dma_desc *descs;
 };
 
-struct doca_dev;
-
-int setup_dma_ring(struct objects *objs, size_t size);
-
-/* Reverse-path ring helpers: allocate/free a standalone ring on an explicit
- * device (the DPU-owned rcv_ring the host DPA thread polls). */
-doca_error_t alloc_dma_ring(struct dma_ring **ring_out, struct doca_dev *dev, size_t size);
-void free_dma_ring(struct dma_ring *ring);
 
 struct dma_desc *get_next_dma_desc(struct dma_ring *ring);
 void commit_dma_desc(struct dma_ring *ring);

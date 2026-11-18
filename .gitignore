@@ -73,7 +73,6 @@ apps/dmesh-router-cpp/test/test_transcode
 /build/
 /src/transport/build/
 /apps/dma_bench/build/
-/apps/dmeshgo/hostlib/build/
 
 !bench-results/2026-09-29_deathstarbench-replica-routing.md
 !bench-results/2026-09-29_deathstarbench-replica-routing.json

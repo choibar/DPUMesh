@@ -1,275 +1,278 @@
-/* Flow wake setup and teardown against a fake Comch connection whose internal
- * message tasks are few, as on the BlueField: a consumer's start and stop each
- * hold one until the control PE progresses, and the consumer changes state on
- * its own PE only after that. */
+/* Flow wake against a fake SDK: every flow slot's PE and sync event over the
+ * slot's word of the tail table page, started with the session, all or none;
+ * a wait task armed on the word's current value and completed once the word
+ * changes; and the stop, which reads the PE's events and destroys the sync
+ * event before its PE. */
 #include <assert.h>
 #include <stdio.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include "src/transport/host/channel.c"
 
-#define INTERNAL_TASKS 16
-#define MAX_CONSUMERS 64
+#define SLOTS_N DMESH_SESSION_MAX_FLOWS
 
-struct fake_consumer {
-    struct doca_pe *pe;
+struct fake_se;
+struct fake_pe { int fd, requests; struct fake_se *se; };
+struct fake_wait { struct fake_se *se; uint64_t value; union doca_data data; int submitted; };
+struct fake_se {
+    struct fake_pe *pe;
     enum doca_ctx_states state;
-    int in_flight;                      /* holds an internal task */
-    int msg_done;                       /* its message completed on the control PE */
-    int destroyed;
-    uint32_t id;
-    union doca_data user_data;
-    doca_ctx_state_changed_callback_t state_cb;
-    doca_comch_consumer_task_post_recv_completion_cb_t recv_failed;
-    struct doca_comch_consumer_task_post_recv *posted[FLOW_WAKE_RECV_N];
-    unsigned nposted;
+    uint64_t *addr;
+    int destroyed, stuck, remote_pub, cpu_sub;
+    doca_sync_event_task_wait_neq_completion_cb_t done, failed;
+    struct fake_wait *pending;
 };
-struct fake_task { struct fake_consumer *c; struct doca_buf *buf; };
 
-static struct dmesh_comch_client control;
-static struct fake_consumer consumers[MAX_CONSUMERS];
-static unsigned nconsumers, live_consumers, live_pes, live_mmaps, live_invs;
-static int internal_tasks = INTERNAL_TASKS, peak_in_flight, faults;
-static unsigned fail_start_at;          /* 1-based consumer whose start fails, 0: none */
-static int buf_refs;
-static char fake_buf;
+static struct fake_se events[2 * SLOTS_N];
+static unsigned nevents, live_pes, live_events, waits_alloc, waits_freed;
+static unsigned fail_start_at;          /* 1-based sync event whose start fails, 0: none */
+static int faults;
 
-static int in_flight(void)
+doca_error_t doca_pe_create(struct doca_pe **pe)
 {
-    int n = 0;
-    for (unsigned i = 0; i < nconsumers; ++i) n += consumers[i].in_flight;
-    return n;
-}
-static void take_task(struct fake_consumer *c)
-{
-    --internal_tasks;
-    c->in_flight = 1;
-    if (in_flight() > peak_in_flight) peak_in_flight = in_flight();
-}
-static void set_state(struct fake_consumer *c, enum doca_ctx_states next)
-{
-    enum doca_ctx_states prev = c->state;
-    c->state = next;
-    if (c->state_cb) c->state_cb(c->user_data, (struct doca_ctx *)c, prev, next);
-}
-
-/* The control PE completes every message in flight; a consumer's own PE then
- * moves it on, and a stopped consumer flushes its receives. */
-uint8_t doca_pe_progress(struct doca_pe *pe)
-{
-    uint8_t work = 0;
-    if (pe == control.pe) {
-        for (unsigned i = 0; i < nconsumers; ++i) {
-            struct fake_consumer *c = &consumers[i];
-            if (!c->in_flight) continue;
-            if (c->destroyed) ++faults;     /* a completion for a freed consumer */
-            c->in_flight = 0;
-            c->msg_done = 1;
-            ++internal_tasks;
-            work = 1;
-        }
-        return work;
-    }
-    for (unsigned i = 0; i < nconsumers; ++i) {
-        struct fake_consumer *c = &consumers[i];
-        if (c->pe != pe || c->destroyed || !c->msg_done) continue;
-        c->msg_done = 0;
-        work = 1;
-        if (c->state == DOCA_CTX_STATE_STARTING) {
-            set_state(c, DOCA_CTX_STATE_RUNNING);
-        } else if (c->state == DOCA_CTX_STATE_STOPPING) {
-            while (c->nposted)
-                c->recv_failed(c->posted[--c->nposted], (union doca_data){0}, c->user_data);
-            set_state(c, DOCA_CTX_STATE_IDLE);
-        }
-    }
-    return work;
-}
-
-doca_error_t doca_pe_create(struct doca_pe **pe) { *pe = calloc(1, 1); ++live_pes; return DOCA_SUCCESS; }
-doca_error_t doca_pe_set_event_mode(struct doca_pe *pe, enum doca_pe_event_mode mode) { (void)pe; (void)mode; return DOCA_SUCCESS; }
-doca_error_t doca_pe_destroy(struct doca_pe *pe)
-{
-    for (unsigned i = 0; i < nconsumers; ++i)
-        if (consumers[i].pe == pe && !consumers[i].destroyed) ++faults;
-    free(pe); --live_pes; return DOCA_SUCCESS;
-}
-doca_error_t doca_mmap_create(struct doca_mmap **m) { *m = calloc(1, 1); ++live_mmaps; return DOCA_SUCCESS; }
-doca_error_t doca_mmap_add_dev(struct doca_mmap *m, struct doca_dev *d) { (void)m; (void)d; return DOCA_SUCCESS; }
-doca_error_t doca_mmap_set_permissions(struct doca_mmap *m, uint32_t a) { (void)m; (void)a; return DOCA_SUCCESS; }
-doca_error_t doca_mmap_set_memrange(struct doca_mmap *m, void *a, size_t n) { (void)m; (void)a; (void)n; return DOCA_SUCCESS; }
-doca_error_t doca_mmap_start(struct doca_mmap *m) { (void)m; return DOCA_SUCCESS; }
-doca_error_t doca_mmap_destroy(struct doca_mmap *m) { free(m); --live_mmaps; return DOCA_SUCCESS; }
-doca_error_t doca_buf_inventory_create(size_t n, struct doca_buf_inventory **inv) { (void)n; *inv = calloc(1, 1); ++live_invs; return DOCA_SUCCESS; }
-doca_error_t doca_buf_inventory_start(struct doca_buf_inventory *inv) { (void)inv; return DOCA_SUCCESS; }
-doca_error_t doca_buf_inventory_destroy(struct doca_buf_inventory *inv) { free(inv); --live_invs; return DOCA_SUCCESS; }
-doca_error_t doca_buf_inventory_buf_get_by_args(struct doca_buf_inventory *inv, struct doca_mmap *m, void *a,
-                                                size_t n, void *d, size_t dn, struct doca_buf **buf)
-{ (void)inv; (void)m; (void)a; (void)n; (void)d; (void)dn; ++buf_refs; *buf = (struct doca_buf *)&fake_buf; return DOCA_SUCCESS; }
-doca_error_t doca_buf_dec_refcount(struct doca_buf *buf, uint16_t *refcount) { (void)buf; (void)refcount; --buf_refs; return DOCA_SUCCESS; }
-
-doca_error_t doca_comch_consumer_create(struct doca_comch_connection *conn, struct doca_mmap *m,
-                                        struct doca_comch_consumer **out)
-{
-    (void)m;
-    assert(conn == control.connection && nconsumers < MAX_CONSUMERS);
-    struct fake_consumer *c = &consumers[nconsumers++];
-    memset(c, 0, sizeof(*c));
-    c->id = nconsumers + 1;              /* 1 is the session's */
-    ++live_consumers;
-    *out = (struct doca_comch_consumer *)c;
+    struct fake_pe *p = calloc(1, sizeof(*p));
+    p->fd = eventfd(0, EFD_NONBLOCK);
+    ++live_pes;
+    *pe = (struct doca_pe *)p;
     return DOCA_SUCCESS;
 }
-struct doca_ctx *doca_comch_consumer_as_ctx(struct doca_comch_consumer *c) { return (struct doca_ctx *)c; }
-doca_error_t doca_pe_connect_ctx(struct doca_pe *pe, struct doca_ctx *ctx) { ((struct fake_consumer *)ctx)->pe = pe; return DOCA_SUCCESS; }
-doca_error_t doca_comch_consumer_set_imm_data_len(struct doca_comch_consumer *c, uint32_t n) { (void)c; (void)n; return DOCA_SUCCESS; }
-doca_error_t doca_comch_consumer_task_post_recv_set_conf(struct doca_comch_consumer *c,
-    doca_comch_consumer_task_post_recv_completion_cb_t done, doca_comch_consumer_task_post_recv_completion_cb_t failed,
-    uint32_t n)
-{ (void)done; (void)n; ((struct fake_consumer *)c)->recv_failed = failed; return DOCA_SUCCESS; }
-doca_error_t doca_ctx_set_user_data(struct doca_ctx *ctx, union doca_data d) { ((struct fake_consumer *)ctx)->user_data = d; return DOCA_SUCCESS; }
-doca_error_t doca_ctx_set_state_changed_cb(struct doca_ctx *ctx, doca_ctx_state_changed_callback_t cb)
-{ ((struct fake_consumer *)ctx)->state_cb = cb; return DOCA_SUCCESS; }
+doca_error_t doca_pe_set_event_mode(struct doca_pe *pe, enum doca_pe_event_mode mode)
+{
+    (void)pe;
+    assert(mode == DOCA_PE_EVENT_MODE_PROGRESS_ALL);
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_pe_destroy(struct doca_pe *pe)
+{
+    struct fake_pe *p = (struct fake_pe *)pe;
+    if (p->se != NULL && !p->se->destroyed) ++faults;   /* its sync event goes first */
+    close(p->fd);
+    free(p);
+    --live_pes;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_pe_get_notification_handle(const struct doca_pe *pe, doca_notification_handle_t *handle)
+{
+    *handle = ((const struct fake_pe *)pe)->fd;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_pe_request_notification(struct doca_pe *pe)
+{
+    ++((struct fake_pe *)pe)->requests;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_pe_clear_notification(struct doca_pe *pe, doca_notification_handle_t handle)
+{
+    (void)pe; (void)handle;
+    return DOCA_SUCCESS;
+}
 
-/* Start and stop each send the DPU a message: no internal task, no start. */
+/* The sync event starts, completes a wait whose word changed, and on a stop
+ * flushes its wait and goes idle (unless stuck), all on its own PE. */
+uint8_t doca_pe_progress(struct doca_pe *pe)
+{
+    struct fake_se *se = ((struct fake_pe *)pe)->se;
+    if (se == NULL || se->destroyed)
+        return 0;
+    if (se->state == DOCA_CTX_STATE_STARTING) {
+        se->state = DOCA_CTX_STATE_RUNNING;
+        return 1;
+    }
+    struct fake_wait *w = se->pending;
+    if (se->state == DOCA_CTX_STATE_STOPPING) {
+        if (w != NULL) {
+            se->pending = NULL;
+            se->failed((struct doca_sync_event_task_wait_neq *)w, w->data, (union doca_data){0});
+            return 1;
+        }
+        if (!se->stuck)
+            se->state = DOCA_CTX_STATE_IDLE;
+        return 0;
+    }
+    if (se->state == DOCA_CTX_STATE_RUNNING && w != NULL && *se->addr != w->value) {
+        se->pending = NULL;
+        se->done((struct doca_sync_event_task_wait_neq *)w, w->data, (union doca_data){0});
+        return 1;
+    }
+    return 0;
+}
+
+doca_error_t doca_sync_event_create(struct doca_sync_event **event)
+{
+    assert(nevents < 2 * SLOTS_N);
+    struct fake_se *se = &events[nevents++];
+    memset(se, 0, sizeof(*se));
+    se->state = DOCA_CTX_STATE_IDLE;
+    ++live_events;
+    *event = (struct doca_sync_event *)se;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_sync_event_add_publisher_location_remote_pci(struct doca_sync_event *event)
+{
+    ((struct fake_se *)event)->remote_pub = 1;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_sync_event_add_subscriber_location_cpu(struct doca_sync_event *event, struct doca_dev *dev)
+{
+    (void)dev;
+    ((struct fake_se *)event)->cpu_sub = 1;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_sync_event_set_addr(struct doca_sync_event *event, uint64_t *addr)
+{
+    ((struct fake_se *)event)->addr = addr;
+    return DOCA_SUCCESS;
+}
+struct doca_ctx *doca_sync_event_as_ctx(struct doca_sync_event *event) { return (struct doca_ctx *)event; }
+doca_error_t doca_pe_connect_ctx(struct doca_pe *pe, struct doca_ctx *ctx)
+{
+    struct fake_se *se = (struct fake_se *)ctx;
+    se->pe = (struct fake_pe *)pe;
+    se->pe->se = se;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_sync_event_task_wait_neq_set_conf(struct doca_sync_event *event,
+                                                    doca_sync_event_task_wait_neq_completion_cb_t completion_cb,
+                                                    doca_sync_event_task_wait_neq_completion_cb_t error_cb,
+                                                    uint32_t num_tasks)
+{
+    struct fake_se *se = (struct fake_se *)event;
+    assert(num_tasks >= 1);
+    se->done = completion_cb;
+    se->failed = error_cb;
+    return DOCA_SUCCESS;
+}
 doca_error_t doca_ctx_start(struct doca_ctx *ctx)
 {
-    struct fake_consumer *c = (struct fake_consumer *)ctx;
-    if (fail_start_at && (unsigned)(c - consumers) + 1 == fail_start_at) return DOCA_ERROR_NO_MEMORY;
-    if (internal_tasks == 0) return DOCA_ERROR_NO_MEMORY;
-    take_task(c);
-    set_state(c, DOCA_CTX_STATE_STARTING);
+    struct fake_se *se = (struct fake_se *)ctx;
+    if (fail_start_at && (unsigned)(se - events) + 1 == fail_start_at)
+        return DOCA_ERROR_NO_MEMORY;
+    assert(se->state == DOCA_CTX_STATE_IDLE && se->pe && se->addr && se->remote_pub && se->cpu_sub);
+    se->state = DOCA_CTX_STATE_STARTING;
     return DOCA_ERROR_IN_PROGRESS;
 }
 doca_error_t doca_ctx_stop(struct doca_ctx *ctx)
 {
-    struct fake_consumer *c = (struct fake_consumer *)ctx;
-    if (c->state != DOCA_CTX_STATE_RUNNING && c->state != DOCA_CTX_STATE_STARTING) return DOCA_ERROR_BAD_STATE;
-    if (internal_tasks == 0) return DOCA_ERROR_NO_MEMORY;
-    take_task(c);
-    set_state(c, DOCA_CTX_STATE_STOPPING);
+    struct fake_se *se = (struct fake_se *)ctx;
+    if (se->state != DOCA_CTX_STATE_IDLE)
+        se->state = DOCA_CTX_STATE_STOPPING;
     return DOCA_ERROR_IN_PROGRESS;
 }
 doca_error_t doca_ctx_get_state(const struct doca_ctx *ctx, enum doca_ctx_states *state)
-{ *state = ((const struct fake_consumer *)ctx)->state; return DOCA_SUCCESS; }
-doca_error_t doca_comch_consumer_destroy(struct doca_comch_consumer *cc)
 {
-    struct fake_consumer *c = (struct fake_consumer *)cc;
-    if (c->state != DOCA_CTX_STATE_IDLE) return DOCA_ERROR_BAD_STATE;
-    if (c->in_flight) ++faults;
-    c->destroyed = 1;
-    --live_consumers;
+    *state = ((const struct fake_se *)ctx)->state;
     return DOCA_SUCCESS;
 }
-doca_error_t doca_comch_consumer_get_id(const struct doca_comch_consumer *c, uint32_t *id)
-{ *id = ((const struct fake_consumer *)c)->id; return DOCA_SUCCESS; }
-
-doca_error_t doca_comch_consumer_task_post_recv_alloc_init(struct doca_comch_consumer *c, struct doca_buf *buf,
-    struct doca_comch_consumer_task_post_recv **task)
+doca_error_t doca_sync_event_destroy(struct doca_sync_event *event)
 {
-    struct fake_task *t = malloc(sizeof(*t));
-    t->c = (struct fake_consumer *)c; t->buf = buf;
-    *task = (struct doca_comch_consumer_task_post_recv *)t;
+    struct fake_se *se = (struct fake_se *)event;
+    if (se->state != DOCA_CTX_STATE_IDLE || se->pending != NULL) ++faults;
+    se->destroyed = 1;
+    --live_events;
     return DOCA_SUCCESS;
 }
-struct doca_task *doca_comch_consumer_task_post_recv_as_task(struct doca_comch_consumer_task_post_recv *task)
-{ return (struct doca_task *)task; }
-struct doca_buf *doca_comch_consumer_task_post_recv_get_buf(const struct doca_comch_consumer_task_post_recv *task)
-{ return ((const struct fake_task *)task)->buf; }
+doca_error_t doca_sync_event_task_wait_neq_alloc_init(struct doca_sync_event *event, uint64_t wait_val, uint64_t mask,
+                                                      union doca_data user_data,
+                                                      struct doca_sync_event_task_wait_neq **task)
+{
+    struct fake_wait *w = calloc(1, sizeof(*w));
+    assert(mask == ~0ull && ((struct fake_se *)event)->state == DOCA_CTX_STATE_RUNNING);
+    w->se = (struct fake_se *)event;
+    w->value = wait_val;
+    w->data = user_data;
+    ++waits_alloc;
+    *task = (struct doca_sync_event_task_wait_neq *)w;
+    return DOCA_SUCCESS;
+}
+struct doca_task *doca_sync_event_task_wait_neq_as_doca_task(struct doca_sync_event_task_wait_neq *task)
+{
+    return (struct doca_task *)task;
+}
 doca_error_t doca_task_submit(struct doca_task *task)
 {
-    struct fake_consumer *c = ((struct fake_task *)task)->c;
-    assert(c->state == DOCA_CTX_STATE_RUNNING && c->nposted < FLOW_WAKE_RECV_N);
-    c->posted[c->nposted++] = (struct doca_comch_consumer_task_post_recv *)task;
+    struct fake_wait *w = (struct fake_wait *)task;
+    assert(!w->submitted && w->se->pending == NULL);
+    w->submitted = 1;
+    w->se->pending = w;
     return DOCA_SUCCESS;
 }
-void doca_task_free(struct doca_task *task) { free(task); }
+void doca_task_free(struct doca_task *task)
+{
+    free(task);
+    ++waits_freed;
+}
 
-/* channel.c's other dependencies; none runs here. */
-void thread_init_rpc(void) { assert(!"unexpected DPA invocation"); }
-doca_error_t dmesh_comch_client_open(const char *s, struct dmesh_comch_client *o) { (void)s; (void)o; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *o, const char *d, size_t n) { (void)o; (void)d; (void)n; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t alloc_dma_ring(struct dma_ring **r, struct doca_dev *d, size_t n) { (void)r; (void)d; (void)n; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t destroy_mmap_and_free_buffer(struct doca_mmap *m, void *b) { (void)m; (void)b; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_build_dma_metadata(struct doca_dev *d, const struct dma_ring *r, const struct dmesh_buffer *s,
-    const struct dmesh_buffer *rb, const struct dmesh_flow_id *f, struct dmesh_export_metadata_msg *m)
-{ (void)d; (void)r; (void)s; (void)rb; (void)f; (void)m; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_validate_reverse_metadata(const struct dmesh_export_rcv_ring_msg *m) { (void)m; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_dpa_quiesce_checked(struct dmesh_doca_dpa_thread *t, struct dmesh_doca_dpa_comch *c, struct doca_pe *p)
-{ (void)t; (void)c; (void)p; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_dpa_comch_destroy_checked(struct dmesh_doca_dpa_thread *t, struct dmesh_doca_dpa_comch **c, struct doca_pe *p)
-{ (void)t; (void)c; (void)p; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_doca_dpa_thread_destroy_checked(struct dmesh_doca_dpa_thread *t) { (void)t; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_doca_dpa_thread_create(struct dmesh_doca_dpa_thread *t) { (void)t; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_dpa_endpoint_init_comch(struct dmesh_dpa_endpoint *c, struct doca_dev *d) { (void)c; (void)d; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
-doca_error_t dmesh_doca_dpa_msgq_send(struct dmesh_doca_dpa_msgq *q, void *m, uint32_t n) { (void)q; (void)m; (void)n; assert(0); return DOCA_ERROR_NOT_SUPPORTED; }
+static uint64_t tails_page[DMESH_TAILS_ALLOC / 8];
 
-static void session(struct channel_dev *dev)
+static void open_dev(struct channel_dev *dev)
 {
     memset(dev, 0, sizeof(*dev));
-    pthread_mutex_init(&dev->session_lock, NULL);
-    control.pe = (struct doca_pe *)&control;
-    control.connection = (struct doca_comch_connection *)&control;
-    dev->control = &control;
-    dev->fastpath = 1;
-    nconsumers = 0; peak_in_flight = 0; faults = 0;
-}
-
-static int open_wakes(struct channel_dev *dev)
-{
-    pthread_mutex_lock(&dev->session_lock);
-    int rc = flow_wakes_open_locked(dev);
-    pthread_mutex_unlock(&dev->session_lock);
-    return rc;
-}
-
-static void close_wakes(struct channel_dev *dev)
-{
-    pthread_mutex_lock(&dev->session_lock);
-    flow_wakes_close_locked(dev);
-    pthread_mutex_unlock(&dev->session_lock);
-}
-
-/* Nothing outlives teardown, and no message completes for a freed consumer. */
-static void assert_released(struct channel_dev *dev)
-{
-    for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id) assert(dev->flow_wake[id] == NULL);
-    assert(!dev->flow_wake_on && faults == 0);
-    assert(live_consumers == 0 && live_pes == 0 && live_mmaps == 0 && live_invs == 0 && buf_refs == 0);
-    assert(internal_tasks == INTERNAL_TASKS);
+    dev->tails = (volatile uint32_t *)tails_page;
+    memset(tails_page, 0xff, sizeof(tails_page));
 }
 
 int main(void)
 {
     struct channel_dev dev;
 
-    /* Every slot gets a running consumer with its receives and its own id,
-     * although the connection holds fewer internal tasks than slots. */
-    session(&dev);
-    assert(open_wakes(&dev) == 0);
-    assert(dev.flow_wake_on && peak_in_flight == 1);
-    for (uint32_t id = 1; id <= DMESH_SESSION_MAX_FLOWS; ++id) {
-        struct fake_consumer *c = (struct fake_consumer *)dev.flow_wake[id]->consumer;
-        assert(c->state == DOCA_CTX_STATE_RUNNING && c->nposted == FLOW_WAKE_RECV_N);
-        assert(dev.flow_wake[id]->id == id + 1 && channel_dev_flow_wake(&dev));
+    /* Every slot's wake runs over its own word of the tail table page. */
+    open_dev(&dev);
+    assert(flow_wakes_open_locked(&dev) == 0);
+    assert(live_pes == SLOTS_N && live_events == SLOTS_N);
+    for (uint32_t id = 1; id <= SLOTS_N; ++id) {
+        struct channel_flow_wake *fw = dev.flow_wake[id];
+        struct fake_se *se = (struct fake_se *)fw->se;
+        assert(fw->slot == id && se->state == DOCA_CTX_STATE_RUNNING);
+        assert((uint8_t *)se->addr == (uint8_t *)tails_page + DMESH_EC_SE_OFF(id) && *se->addr == 0);
+        assert(channel_flow_fd(&dev, id) == ((struct fake_pe *)fw->pe)->fd);
     }
-    /* Session close stops each one: the stop completes on the control PE. */
-    close_wakes(&dev);
-    assert(nconsumers == DMESH_SESSION_MAX_FLOWS);
-    assert_released(&dev);
+    assert(channel_flow_fd(&dev, 0) == -1 && channel_flow_fd(&dev, SLOTS_N + 1) == -1);
 
-    /* A failed start fails the session, with every started consumer
-     * stopped before it is freed. */
-    session(&dev);
+    /* One wait task at a time, on the word's value when armed; every arm
+     * requests the PE's notification. */
+    struct channel_flow_wake *fw = dev.flow_wake[3];
+    struct fake_se *se = (struct fake_se *)fw->se;
+    struct fake_pe *pe = (struct fake_pe *)fw->pe;
+    assert(channel_flow_arm(&dev, 3) == 0 && fw->se_pending && se->pending->value == 0);
+    assert(channel_flow_arm(&dev, 3) == 0 && waits_alloc == 1 && pe->requests == 2);
+    channel_flow_progress(&dev, 3);
+    assert(fw->se_pending && fw->se_wakes == 0);       /* the word did not change */
+    *se->addr = (UINT64_C(2) << 48) | 1;                /* the DPA published a batch */
+    channel_flow_progress(&dev, 3);
+    assert(!fw->se_pending && fw->se_wakes == 1 && waits_freed == 1);
+    assert(channel_flow_arm(&dev, 3) == 0 && se->pending->value == ((UINT64_C(2) << 48) | 1));
+    assert(fw->se_waits == 2 && pe->requests == 3);
+
+    /* The stop flushes the pending wait and destroys each sync event before
+     * its PE. */
+    flow_wakes_close_locked(&dev);
+    assert(live_pes == 0 && live_events == 0 && waits_freed == waits_alloc && faults == 0);
+    for (uint32_t id = 1; id <= SLOTS_N; ++id)
+        assert(dev.flow_wake[id] == NULL);
+
+    /* All or none: a slot whose sync event cannot start fails the session
+     * and leaves no wake behind. */
+    nevents = 0;
+    open_dev(&dev);
     fail_start_at = 5;
-    assert(open_wakes(&dev) == -1);
+    errno = 0;
+    assert(flow_wakes_open_locked(&dev) == -1 && errno == ENOMEM);
+    assert(live_pes == 0 && live_events == 0 && faults == 0);
+    for (uint32_t id = 1; id <= SLOTS_N; ++id)
+        assert(dev.flow_wake[id] == NULL);
     fail_start_at = 0;
-    assert(nconsumers == 5 && !channel_dev_flow_wake(&dev));
-    assert_released(&dev);
 
-    /* No flow wake without the fast path. */
-    session(&dev);
-    dev.fastpath = 0;
-    assert(open_wakes(&dev) == 0);
-    assert(nconsumers == 0 && !channel_dev_flow_wake(&dev));
-    puts("channel flow wake: consumers start one at a time, stop through the control PE, all or the session fails: PASS");
+    /* A sync event that does not stop is retained with its PE. */
+    nevents = 0;
+    open_dev(&dev);
+    assert(flow_wakes_open_locked(&dev) == 0);
+    ((struct fake_se *)dev.flow_wake[7]->se)->stuck = 1;
+    flow_wakes_close_locked(&dev);
+    assert(dev.flow_wake[7] != NULL && live_pes == 1 && live_events == 1 && faults == 0);
+    ((struct fake_se *)dev.flow_wake[7]->se)->stuck = 0;
+    flow_wakes_close_locked(&dev);
+    assert(dev.flow_wake[7] == NULL && live_pes == 0 && live_events == 0 && faults == 0);
+
+    puts("channel flow wake: every slot's sync event over its word, one wait at a time, all or the session fails, retained when it does not stop: PASS");
     return 0;
 }

@@ -1162,7 +1162,7 @@ dmesh_doca_dpa_thread_stop_only(struct dmesh_doca_dpa_thread *dpa_thread)
         return;
     /* Opt-in (DMESH_THREAD_STOP): fixes the flexio thread-destroy wedge in the
      * standalone C-worker sibling-teardown reproducer (errors 2->0), but
-     * REGRESSES the proxy INGRESS_PUSH path (N=1 DSB 7.6k->17 req/s, flexio
+     * REGRESSES the proxy's client flows (N=1 DSB 7.6k->17 req/s, flexio
      * still fires) - the proxy client-channel teardown differs. Default off
      * until that path is understood. */
     if (getenv("DMESH_THREAD_STOP") == NULL)
@@ -1490,7 +1490,7 @@ setup_dpa_buf_array(struct dmesh_conn *conn, size_t num_elem, struct doca_mmap *
         goto destroy_buf_arr;
     }
 
-    result = DMESH_DPA_CALL(doca_buf_arr_set_params(conn->buf_arr, mmap, sizeof(struct dma_desc), 0));
+    result = DMESH_DPA_CALL(doca_buf_arr_set_params(conn->buf_arr, mmap, sizeof(struct dma_desc), conn->ring_off));
     if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to set buffer array params: %s", doca_error_get_descr(result));
         goto destroy_buf_arr;

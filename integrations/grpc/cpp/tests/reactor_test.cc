@@ -443,9 +443,10 @@ void TestReceiveRetentionOverflowFailsClosed() {
   Fixture fixture;
   const std::string chunk(64 * 1024, 'b');
   const size_t to_high_water = kReceiveHighWaterBytes / chunk.size();
-  /* The fake keeps injecting despite held native credits. This models a broken
-   * or excessively deep lower transport and verifies bounded adapter memory. */
-  for (size_t i = 0; i < to_high_water + 65; ++i) {
+  /* The fake keeps injecting despite held native credits, one past the 128 the
+   * adapter holds. This models a broken or excessively deep lower transport and
+   * verifies bounded adapter memory. */
+  for (size_t i = 0; i < to_high_water + 129; ++i) {
     fixture.state->InjectReceive(fixture.qp, chunk);
   }
   CHECK_TRUE(fixture.state->WaitForDestroyCount(1, 2s));

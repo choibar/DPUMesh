@@ -65,8 +65,16 @@ static uint64_t doca_dpa_dev_buf_get_external_ptr(unsigned b) {
  if(a>=2&&a<5){assert(i<=16);return (uintptr_t)(i ? (void *)&mring[a-2].desc[i-1] : (void *)&mring[a-2].ctrl);}
  assert(a==1&&i<=256);return (uintptr_t)(i ? (void *)&descriptors[i-1] : (void *)&ring);
 }
-/* The mux thread's status window: the handle is unused, the address is the ARM's copy. */
-static uint64_t doca_dpa_dev_mmap_get_external_ptr(uint64_t h,uint64_t addr) { assert(h==1);return addr; }
+/* The mux thread's ARM memory: the handle is unused, the address is the ARM's
+ * copy; reads of the rings' releases are counted. */
+static struct dpa_mux_arm marm;
+#define mstatus marm.status
+static unsigned release_reads;
+static uint64_t doca_dpa_dev_mmap_get_external_ptr(uint64_t h,uint64_t addr) {
+ assert(h==1);
+ if(addr>=(uintptr_t)&marm.release && addr<(uintptr_t)&marm.release+sizeof(marm.release))++release_reads;
+ return addr;
+}
 static void doca_dpa_dev_completion_request_notification(uint64_t c) { (void)c;++arms; }
 static int doca_dpa_dev_get_completion(uint64_t c,unsigned *comp) {
  (void)c;assert(arms);if(read_cq==ready)return 0;*comp=read_cq++;return 1;
@@ -109,7 +117,6 @@ prefix = prefix.replace('#define DMA_POLL_ACTIVATION_BUDGET 65536u',
     re.search(r'^#define DMA_POLL_ACTIVATION_BUDGET .+$', source, re.M)[0])
 tests = r'''
 static struct dpa_mux_ctx mctx;
-static struct dpa_mux_status mstatus; /* what the ARM reads */
 static const unsigned mux_ring[3] = {0, 1, 17};
 static void mux_open(unsigned k) {
  unsigned r=mux_ring[k];
@@ -118,6 +125,7 @@ static void mux_open(unsigned k) {
   .buf_size=65536,.ring_size=16,.host_base=(uintptr_t)src,.host_len=sizeof(src),
   .slot=10+k,.generation=100+k,.consumer=1+k,.cmd=DMESH_MUX_CMD_OPEN};
  memset(&mctx.s.st[r],0,sizeof(mctx.s.st[r]));memset(&mstatus.st[r],0,sizeof(mstatus.st[r]));
+ marm.release.rx_consumed_pos[r]=0;
  mtails[r]=0;mctx.ctl_seq++;
 }
 /* The host's post: descriptors, the ring's producer_tail, then its table slot. */
@@ -133,7 +141,7 @@ static void mux_post(unsigned k,unsigned n,unsigned len) {
 static void mux_tests(void) {
  memset(pending,0,sizeof(pending));memset(dst,0,sizeof(dst));
  copies=finished=ready=read_cq=acked=arms=0;credit_limit=1024;
- mctx.tails=100;mctx.status=1;mctx.status_addr=(uintptr_t)&mstatus;tls=(void *)&mctx;
+ mctx.tails=100;mctx.status=1;mctx.status_addr=(uintptr_t)&marm;tls=(void *)&mctx;
  for(unsigned k=0;k<3;k++)mux_open(k);
  unsigned rt=retriggers,f=finished;
  /* Idle: one read per tail line with an open ring, no ring visited. */
@@ -190,11 +198,22 @@ static void mux_tests(void) {
  /* The ARM fills ring 0 again for the session's next flow on that id. */
  mux_open(0);mctx.cfg[0].generation=200;mux_post(0,1,16);run_dma_mux();
  assert(copies==c1+1 && pending[c1].msg.ring==0 && pending[c1].msg.generation==200 && pending[c1].msg.pos==0);
+ /* The staging gate: a ring waits for its reader's release, which the DPA
+  * reads from ARM memory only when the last one it read leaves too little. */
+ unsigned reads=release_reads;
+ for(unsigned b=0;b<8;b++){mux_post(2,1,8064);run_dma_mux();complete_to(copies);run_dma_mux();}
+ assert(mctx.s.st[17].submit==10 && mctx.s.st[17].pos==64+8*8064 && release_reads==reads);
+ unsigned c2=copies;
+ mux_post(2,1,8064);run_dma_mux();
+ assert(copies==c2 && mctx.s.st[17].submit==10 && release_reads>reads); /* held back */
+ marm.release.rx_consumed_pos[17]=64+8*8064;run_dma_mux();
+ assert(copies==c2+1 && mctx.s.st[17].submit==11 && pending[c2].msg.ring==17 && pending[c2].msg.pos==0);
+ assert(mctx.released[17]==64+8*8064);
  /* Stop waits for the copy in flight, then the thread finishes. */
  mctx.stop=1;run_dma_mux();assert(!mctx.s.stopped && finished==f);
  assert(!mstatus.stopped);
  complete_to(copies);run_dma_mux();assert(mctx.s.stopped && finished==f+1 && mstatus.stopped);
- puts("DPA pod mux: tail lines read once per pass, only moved rings visited, per-worker consumers and credit, ring errors, close, refill, stop, status published PASS");
+ puts("DPA pod mux: tail lines read once per pass, only moved rings visited, per-worker consumers and credit, ring errors, close, refill, staging released by a store, stop, status published PASS");
 }
 
 int main(void) {

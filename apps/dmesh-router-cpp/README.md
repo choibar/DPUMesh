@@ -11,16 +11,15 @@ variable between them is the HTTP engine and its runtime — which is the point:
 it isolates what the h2 stack costs on an identical transport.
 
 ```
-h2load ──TCP──▶ host bridge ──forward DMA──▶ ┌───────────────────────────┐
-                (DMESH_BRIDGE_PORT)          │ dmesh-router-cpp (DPU)    │
-       ◀──TCP── host bridge ◀──reverse DMA── │  nghttp2 server session   │
-                                             │       ↓ route(flow dst)   │
-nginx ◀─TCP─ host backend bridge ◀──push DMA─│  nghttp2 client session   │
-             (DMESH_BACKEND_CONNECT)         └───────────────────────────┘
+h2load (host library) ──forward DMA──▶ ┌───────────────────────────┐
+                                        │ dmesh-router-cpp (DPU)    │
+                      ◀──reverse DMA── │  nghttp2 server session   │
+                                        │       ↓ route(flow dst)   │
+nginx (host library)  ◀──reverse DMA── │  nghttp2 client session   │
+                                        └───────────────────────────┘
 ```
 
-No C-side changes are needed: the host bridges in `apps/dma_bench/host/host_worker.c` are
-the same ones the Rust router uses.
+The host side is the same for both routers.
 
 ## How it maps onto the datapath
 
@@ -81,24 +80,18 @@ appears, it is used instead.
 
 ## Run (testbed)
 
-Identical to the Rust router — see `linkerd2-proxy/dmesh-router/README.md` for
-the host-side commands. In short:
+Identical to the Rust router (`linkerd2-proxy/dmesh-router/README.md`). On the
+DPU:
 
 ```bash
-# DPU
 ./build/dmesh-router-cpp
-
-# host, backend bridge first, then the h2load ingress
-DMESH_BACKEND_CONNECT=127.0.0.1:8086 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 \
-  ~/bf-workspace/apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1
-DMESH_BRIDGE_PORT=8080 DMESH_REV_PCI=94:00.1 DMESH_DST_IP=10.0.0.1 DMESH_DST_PORT=8086 \
-  ~/bf-workspace/apps/dma_bench/build/dpumesh_v0_host -p 94:00.1 -t 1 -d 1
-
-h2load -c1 -m100 -n20000 http://127.0.0.1:8080/
 ```
 
-The host bridges are single-connection and must be restarted per run. This
-binary itself survives teardown and can serve run after run — unlike the Rust
+On the host, the backend and the load generator run over the host library:
+the backend (nginx) under the preload façade with `DPUMESH_SERVICE` and
+`DPUMESH_PORT`, h2load under it with `DPUMESH_TARGETS` naming that service
+(`examples/README.md`, preload). This binary survives teardown and can serve
+run after run — unlike the Rust
 router, which the shared datapath's teardown fault kills (see CLAUDE.md
 gotchas). Kill it before starting the Rust router: both want `03:00.1`, and a
 leftover process makes the other fail with `DOCA_ERROR_CONNECTION_ABORTED`.
@@ -116,7 +109,7 @@ legs, 20000/20000 → 200:
 | dmesh-router (hyper) | 30,138 / 31,483 | 3.30 ms |
 | DMA linkerd2-proxy (full tower stack) | ~16,600 | — |
 
-Same host bridges, same DMA transport, same nginx — so the spread is the L7
+Same host side, same DMA transport, same nginx — so the spread is the L7
 engine and its runtime, not the datapath.
 
 ### Where the cycles went (perf, 500k requests, DWARF call stacks)

@@ -16,8 +16,8 @@
 #include "comch_msgq.h"
 #include "dma.h"
 #include "dpa_mux.h"
+#include "ec_rev.h"
 #include "ring.h"
-#include "comch_wake.h"
 
 #include <doca_pe.h>
 #include <doca_comch.h>
@@ -187,33 +187,6 @@ static void session_flow_error(struct objects *objs, struct dmesh_session *s,
                              h->generation, NULL, 0, status);
 }
 
-/* The host is about to sleep. Ring at once if a listed flow already published
- * a descriptor the host had not seen; otherwise ring on the next completion. */
-static void session_arm(struct objects *objs, struct dmesh_session *s,
-                        struct doca_comch_connection *connection,
-                        const uint8_t *payload, uint32_t len)
-{
-    struct dmesh_session_arm_flow flows[DMESH_SESSION_MAX_FLOWS];
-    uint64_t epoch;
-    uint32_t count;
-    bool ring = false;
-    if (dmesh_session_arm_decode(payload, len, &epoch, flows, &count) != 0) {
-        session_fail(objs, s);
-        return;
-    }
-    for (uint32_t i = 0; i < count; ++i) {
-        struct dmesh_conn *conn = dmesh_flow_get(objs, connection, flows[i].flow_id,
-                                                 flows[i].generation);
-        if (conn != NULL && DMESH_FLOW_USES_PUSH(conn->flow.mode) &&
-            conn->push_seq >= flows[i].expected_seq)
-            ring = true;
-    }
-    s->armed_epoch = epoch;
-    s->armed = !ring;
-    if (ring)
-        s->doorbell_pending_epoch = epoch;
-}
-
 static void server_message_recv_callback(struct doca_comch_event_msg_recv *event,
                                           uint8_t *buffer, uint32_t len,
                                           struct doca_comch_connection *connection)
@@ -257,10 +230,6 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
         }
         memcpy(s->tails.desc, payload, h.payload_len);
         s->tails.desc_len = h.payload_len;
-        return;
-    }
-    if (h.type == DMESH_SESSION_ARM && s->negotiated && !objs->dispatcher) {
-        session_arm(objs, s, connection, payload, h.payload_len);
         return;
     }
     if (!s->negotiated || h.flow_id > DMESH_MAX_CONNECTIONS) {
@@ -595,46 +564,6 @@ destroy_server:
 	return result;
 }
 
-/* A host consumer on a dispatcher session is the host asking for fast-path
- * wake (dpu/comch_wake.c): flows admitted from now on publish through it, and
- * dmesh_sessions_advance tells the host with WAKE_READY. */
-static struct objects *server_objs_of(struct doca_comch_connection *connection)
-{
-    union doca_data user_data;
-    struct doca_comch_server *server = doca_comch_server_get_server_ctx(connection);
-    if (server == NULL || doca_ctx_get_user_data(doca_comch_server_as_ctx(server), &user_data) != DOCA_SUCCESS)
-        return NULL;
-    return user_data.ptr;
-}
-static void server_consumer_arrived(struct doca_comch_event_consumer *event,
-                                    struct doca_comch_connection *connection, uint32_t id)
-{
-    server_new_consumer_callback(event, connection, id);
-    struct objects *objs = server_objs_of(connection);
-    if (objs == NULL || !objs->dispatcher || !dmesh_wake_enabled())
-        return;
-    struct dmesh_session *s = session_get(objs, connection, false);
-    if (s == NULL || s->closing)
-        return;
-    /* The first consumer is the session's; later ones are host flow slots'
-     * own (flow wake), named by the OPENs of their flows. */
-    if (s->wake_consumer == 0)
-        s->wake_consumer = id;
-    else
-        dmesh_session_flow_consumer_set(s, id, true);
-}
-static void server_consumer_expired(struct doca_comch_event_consumer *event,
-                                    struct doca_comch_connection *connection, uint32_t id)
-{
-    expired_consumer_callback(event, connection, id);
-    struct objects *objs = server_objs_of(connection);
-    struct dmesh_session *s = objs ? session_get(objs, connection, false) : NULL;
-    if (s != NULL && s->wake_consumer == id)
-        s->wake_consumer = 0;
-    else if (s != NULL)
-        dmesh_session_flow_consumer_set(s, id, false);
-}
-
 doca_error_t
 start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool is_fast_path)
 {
@@ -704,8 +633,8 @@ start_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool
     /* Config the data_path related events */
 	if (is_fast_path) {
 		result = doca_comch_server_event_consumer_register(objs->cc_server,
-									server_consumer_arrived,
-									server_consumer_expired);
+									server_new_consumer_callback,
+									expired_consumer_callback);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed adding consumer event cb with error = %s", doca_error_get_name(result));
 			goto destroy_server;
@@ -790,51 +719,6 @@ init_comch_ctrl_path_server(const char *server_name, struct objects *objs, bool 
 	DOCA_LOG_INFO("Server connection established");
 
     return DOCA_SUCCESS;
-}
-
-doca_error_t
-export_dpa_comp_to_host(struct objects *objs)
-{
-	doca_error_t result;
-	struct dmesh_dpa_comp_msg dpa_comp_msg;
-	dpa_comp_msg.type = DMESH_MSG_EXPORT_DPA_COMP;
-
-	result = DMESH_DPA_CALL(doca_comch_consumer_completion_get_dpa_handle(objs->dpa_comch->consumer_comp,
-									&dpa_comp_msg.dpa_consumer_comp));
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DPA consumer completion handle - %s",
-				doca_error_get_name(result));
-		return result;
-	}
-	result = DMESH_DPA_CALL(doca_dpa_completion_get_dpa_handle(objs->dpa_comch->producer_comp,
-									&dpa_comp_msg.dpa_producer_comp));
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DPA producer completion handle - %s",
-				doca_error_get_name(result));
-		return result;
-	}
-	result = DMESH_DPA_CALL(doca_comch_producer_get_dpa_handle(objs->dpa_comch->recv.producer,
-									&dpa_comp_msg.dpa_producer));
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DPA producer handle - %s",
-				doca_error_get_name(result));
-		return result;
-	}
-	result = DMESH_DPA_CALL(doca_comch_consumer_get_dpa_handle(objs->dpa_comch->send.consumer,
-									&dpa_comp_msg.dpa_consumer));
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DPA consumer handle - %s",
-				doca_error_get_name(result));
-		return result;
-	}
-
-	DOCA_LOG_INFO("dpa_consumer_comp: 0x%lx, dpa_producer_comp: 0x%lx, dpa_producer: 0x%lx, dpa_consumer: 0x%lx",
-			dpa_comp_msg.dpa_consumer_comp,
-			dpa_comp_msg.dpa_producer_comp,
-			dpa_comp_msg.dpa_producer,
-			dpa_comp_msg.dpa_consumer);
-
-	return server_send_msg(objs, (const char *)&dpa_comp_msg, sizeof(dpa_comp_msg));
 }
 
 /*
@@ -975,6 +859,9 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
         conn->buf_arr = NULL;
     }
 
+    /* The reverse DPA thread's state of the flow, before the mmaps its copies use. */
+    dmesh_ec_conn_reset(conn);
+
     /* Remote mmaps imported from the host's metadata message. */
     if (conn->ring_mmap != NULL) {
         (void)doca_mmap_destroy(conn->ring_mmap);
@@ -991,31 +878,15 @@ dmesh_conn_teardown(struct dmesh_conn *conn)
     conn->sndbuf.buf = NULL;
     conn->rcvbuf.buf = NULL;
 
-    /* Local staging buffer + its mmap. */
-    if (conn->local_mmap != NULL) {
-        destroy_mmap_and_free_buffer(conn->local_mmap, conn->dma_buffer);
-        conn->local_mmap = NULL;
-        conn->dma_buffer = NULL;
-    }
-
-    /* Reverse (response) path resources owned by the DPU. */
-    if (conn->rcv_ring != NULL) {
-        free_dma_ring(conn->rcv_ring);
-        conn->rcv_ring = NULL;
-    }
-    if (conn->tx_staging_mmap != NULL) {
-        destroy_mmap_and_free_buffer(conn->tx_staging_mmap, conn->tx_staging);
-        conn->tx_staging_mmap = NULL;
-        conn->tx_staging = NULL;
-    }
+    /* The slot's stagings stay in the worker's pools. */
+    conn->local_mmap = NULL;
+    conn->dma_buffer = NULL;
+    conn->tx_staging_mmap = NULL;
+    conn->tx_staging = NULL;
     conn->tx_staging_len = 0;
-    conn->tx_pos = 0;
-    conn->reverse_exported = false;
+    conn->reverse_ready = false;
     conn->push_seq = 0;
     conn->push_pos = 0;
-    conn->push_len = 0;
-    conn->push_state = 0;
-    conn->push_shadow = NULL;
 
     /* Per-connection DMA engine (ctx, inventory, task pool, recv/pending rings). */
     cleanup_dma_tasks(conn);
@@ -1068,23 +939,11 @@ static doca_error_t flow_mmap_destroy(struct doca_mmap **mmap)
     return result;
 }
 
-static doca_error_t flow_local_buffer_destroy(struct doca_mmap **mmap, void **buffer)
-{
-    if (*mmap == NULL)
-        return DOCA_SUCCESS;
-    doca_error_t result = flow_mmap_destroy(mmap);
-    if (result == DOCA_SUCCESS) {
-        free(*buffer);
-        *buffer = NULL;
-    }
-    return result;
-}
-
 static bool flow_has_resources(const struct dmesh_conn *conn)
 {
     return conn->dpa_thread || conn->dpa_comch || conn->mux || conn->dma_ctx || conn->buf_arr ||
            conn->ring_mmap || conn->sndbuf.mmap || conn->rcvbuf.mmap ||
-           conn->local_mmap || conn->rcv_ring || conn->tx_staging_mmap;
+           conn->local_mmap || conn->tx_staging_mmap;
 }
 
 static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
@@ -1093,6 +952,12 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     if (getenv("DMESH_NO_TEARDOWN") != NULL && flow_has_resources(conn))
         return DOCA_ERROR_NOT_SUPPORTED;
     conn->dma_closing = true;
+    /* The reverse DPA thread finishes the flow's batches first; then the flow
+     * leaves it, before the mmaps its copies use go. */
+    result = dmesh_ec_quiesce_step(conn);
+    if (result != DOCA_SUCCESS)
+        return result;
+    dmesh_ec_conn_reset(conn);
     /* A mux flow leaves its thread with DEL; DEL_ACK follows its last copy. */
     result = conn->mux ? dmesh_dpa_mux_del_step(conn) : dmesh_doca_dpa_quiesce_step(conn);
     if (result != DOCA_SUCCESS)
@@ -1102,9 +967,6 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
         if (result != DOCA_SUCCESS)
             return result;
     }
-    /* The last flow of a session stops its producer before the flow retires:
-     * the dispatcher may disconnect the session right after. */
-    dmesh_wake_detach(conn);
     /* DMESH_DPA_REUSE=1: the pool slot keeps the comch and the started thread
      * (a retried close finds them kept and skips both). */
     if (!dmesh_doca_dpa_comch_keep(conn)) {
@@ -1125,19 +987,13 @@ static doca_error_t dmesh_flow_teardown_checked(struct dmesh_conn *conn)
     }
     if ((result = flow_mmap_destroy(&conn->ring_mmap)) != DOCA_SUCCESS ||
         (result = flow_mmap_destroy(&conn->sndbuf.mmap)) != DOCA_SUCCESS ||
-        (result = flow_mmap_destroy(&conn->rcvbuf.mmap)) != DOCA_SUCCESS ||
-        (result = flow_local_buffer_destroy(&conn->local_mmap, &conn->dma_buffer)) != DOCA_SUCCESS)
+        (result = flow_mmap_destroy(&conn->rcvbuf.mmap)) != DOCA_SUCCESS)
         return result;
-    if (conn->rcv_ring != NULL) {
-        result = flow_local_buffer_destroy(&conn->rcv_ring->mmap, &conn->rcv_ring->buffer);
-        if (result != DOCA_SUCCESS)
-            return result;
-        free(conn->rcv_ring);
-        conn->rcv_ring = NULL;
-    }
-    result = flow_local_buffer_destroy(&conn->tx_staging_mmap, &conn->tx_staging);
-    if (result != DOCA_SUCCESS)
-        return result;
+    /* The slot's stagings stay in the worker's pools. */
+    conn->local_mmap = NULL;
+    conn->dma_buffer = NULL;
+    conn->tx_staging_mmap = NULL;
+    conn->tx_staging = NULL;
     dmesh_dpa_mux_release(conn);
     dmesh_dpa_thread_pool_release(conn->objs, conn);
     conn->dpa_thread = NULL;
@@ -1172,20 +1028,6 @@ static void dmesh_flow_close_advance(struct dmesh_conn *conn)
         /* A proxy-side EOF first asks the host to stop its reverse reader. */
         conn->error_status = ECONNRESET;
         conn->error_sent = false;
-        conn->state = DMESH_CONN_ERROR;
-        return;
-    }
-    if (!conn->close_requested && session->closing && conn->reverse_exported &&
-        !DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
-        /* Lost control transport cannot prove that the host DPA stopped
-         * reading exported DPU memory. Reserve this slot until recovery. */
-        conn->quarantined = true;
-        conn->dma_closing = true;
-        /* Stop this DPU's reader as far as possible, but its completion is
-         * not evidence that the remote host reader released our exports. */
-        (void)dmesh_doca_dpa_quiesce_step(conn);
-        conn->error_status = ECONNRESET;
-        conn->error_sent = true;
         conn->state = DMESH_CONN_ERROR;
         return;
     }
@@ -1236,16 +1078,6 @@ void dmesh_sessions_advance(struct objects *objs)
                 (!objs->dispatcher || dmesh_dispatcher_accepting(objs)) &&
                 dmesh_session_send(objs, s, DMESH_SESSION_HELLO_ACK, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)
                 s->hello_pending = false;
-            if (s->wake_consumer && !s->wake_ready_sent && objs->dispatcher && !s->hello_pending &&
-                dmesh_session_send(objs, s, DMESH_SESSION_WAKE_READY, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)
-                s->wake_ready_sent = true;
-            if (s->doorbell_pending_epoch != s->doorbell_sent_epoch) {
-                uint8_t epoch[DMESH_SESSION_DOORBELL_SIZE];
-                dmesh_session_put_u64(epoch, s->doorbell_pending_epoch);
-                if (dmesh_session_send(objs, s, DMESH_SESSION_DOORBELL, 0, 0, epoch,
-                                       sizeof(epoch), 0) == DOCA_SUCCESS)
-                    s->doorbell_sent_epoch = s->doorbell_pending_epoch;
-            }
             for (unsigned i = 0; i < DMESH_MAX_CONNECTIONS; ++i)
                 if (s->close_pending[i] &&
                     dmesh_session_send(objs, s, DMESH_SESSION_CLOSED, i + 1, s->generation[i],
@@ -1381,11 +1213,15 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			goto error;
 		}
 
-		result = alloc_buffer_and_set_mmap(&conn->local_mmap, objs->dev,
-						   &conn->dma_buffer, BUFFER_SIZE,
-						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+		/* The slot's forward staging, in the worker's pool. */
+		conn->local_mmap = objs->fwd_pool_mmap;
+		conn->dma_buffer = (uint8_t *)objs->fwd_pool + (size_t)(conn - objs->conns) * BUFFER_SIZE;
+
+		/* The reverse path imports the session's TAILS page before a mux
+		 * thread takes it. */
+		result = dmesh_ec_conn_setup(conn);
 		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to allocate DMA buffer: %s", doca_error_get_name(result));
+			DOCA_LOG_ERR("Failed to set up the reverse DPA push: %s", doca_error_get_name(result));
 			goto error;
 		}
 
@@ -1414,7 +1250,6 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 	running:
 		conn->state = DMESH_CONN_RUNNING;
 		DOCA_LOG_INFO("Connection %p is running", (void *)conn->connection);
-		/* fall through to export the reverse path metadata this same tick */
 		/* fallthrough */
 
 	case DMESH_CONN_RUNNING:
@@ -1423,49 +1258,22 @@ dmesh_doca_conn_advance(struct dmesh_conn *conn)
 			conn->error_status = EIO;
 			goto error;
 		}
-		/* Reverse (DPU->host) path setup, once per connection.
-		 *
-		 * CLIENT flows (안 1): allocate rcv_ring + tx_staging and export them;
-		 * the host's DPA thread pulls responses into the host rcvbuf.
-		 *
-		 * BACKEND flows (안 2): the host runs NO DPA - the DPU pushes with
-		 * this connection's doca_dma engine straight into the host rcvbuf's
-		 * push layout (dmesh_dma_push_backend). Only a local (non-exported)
-		 * tx_staging is needed for staging + the descriptor shadow. */
-		if (!conn->reverse_exported) {
-			if (DMESH_FLOW_USES_PUSH(conn->flow.mode)) {
-				if (conn->tx_staging == NULL) {
-					result = alloc_buffer_and_set_mmap(&conn->tx_staging_mmap,
-									   objs->dev, &conn->tx_staging,
-									   BUFFER_SIZE,
-									   DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
-					if (result != DOCA_SUCCESS) {
-						DOCA_LOG_ERR("Failed to alloc backend push staging (will retry): %s",
-							     doca_error_get_name(result));
-						break;
-					}
-					conn->tx_staging_len = BUFFER_SIZE;
-					conn->push_seq = 0;
-					conn->push_pos = 0;
-					conn->push_state = 0;
-				}
-				conn->reverse_exported = true;   /* nothing to export */
-				DOCA_LOG_INFO("Push channel ready (mode %u) for %u.%u.%u.%u:%u",
-					      conn->flow.mode,
-					      conn->flow.dst_ip & 0xff, (conn->flow.dst_ip >> 8) & 0xff,
-					      (conn->flow.dst_ip >> 16) & 0xff, (conn->flow.dst_ip >> 24) & 0xff,
-					      conn->flow.dst_port);
-			} else {
-				result = export_rcv_ring_metadata(conn);
-				if (result != DOCA_SUCCESS)
-					DOCA_LOG_ERR("Failed to export reverse metadata (will retry): %s",
-						     doca_error_get_name(result));
+		/* The reverse path's staging, the slot's part of the worker's pool:
+		 * the proxy writes a flow's bytes there and the reverse DPA thread
+		 * copies them to the host (dmesh_dma_push_staged). */
+		if (!conn->reverse_ready) {
+			if (conn->tx_staging == NULL) {
+				conn->tx_staging_mmap = objs->rev_pool_mmap;
+				conn->tx_staging = (uint8_t *)objs->rev_pool + (size_t)(conn - objs->conns) * DMESH_PUSH_WINDOW;
+				conn->tx_staging_len = DMESH_PUSH_WINDOW;
+				conn->push_seq = 0;
+				conn->push_pos = 0;
 			}
+			conn->reverse_ready = true;
 		}
-        if (conn->multiplexed && conn->reverse_exported && !conn->ready_sent &&
+        if (conn->multiplexed && conn->reverse_ready && !conn->ready_sent &&
             server_send_flow_msg(conn, DMESH_SESSION_READY, NULL, 0, 0) == DOCA_SUCCESS)
             conn->ready_sent = true;
-        dmesh_dma_push_retry_desc(conn);
         if (conn->push_fin_requested && !conn->push_fin_sent)
             (void)dmesh_dma_push_fin(conn);
 		break;
@@ -1624,9 +1432,29 @@ dmesh_doca_ctrl_advance(struct objects *objs, enum dmesh_doca_init_state *out_st
 				      (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
 		}
 
+		/* Every slot's stagings, registered once: a connection's setup
+		 * registers no memory of its own. */
+		result = alloc_buffer_and_set_mmap(&objs->fwd_pool_mmap, objs->dev, &objs->fwd_pool,
+						   (size_t)DMESH_MAX_CONNECTIONS * BUFFER_SIZE,
+						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+		if (result == DOCA_SUCCESS)
+			result = alloc_buffer_and_set_mmap(&objs->rev_pool_mmap, objs->dev, &objs->rev_pool,
+							   (size_t)DMESH_MAX_CONNECTIONS * DMESH_PUSH_WINDOW,
+							   DOCA_ACCESS_FLAG_LOCAL_READ_WRITE);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to register the stagings: %s", doca_error_get_name(result));
+			goto error;
+		}
+
 		result = dmesh_dpa_mux_init(objs);
 		if (result != DOCA_SUCCESS) {
 			DOCA_LOG_ERR("Failed to start DPA mux threads: %s", doca_error_get_name(result));
+			goto error;
+		}
+
+		result = dmesh_ec_init(objs);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to start the reverse DPA thread: %s", doca_error_get_name(result));
 			goto error;
 		}
 

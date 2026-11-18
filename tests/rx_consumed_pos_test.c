@@ -1,20 +1,23 @@
-/* Execute the production shim; replace only its synchronous DPA copy. */
+/* Execute the production shim; replace only its synchronous DPA copy and the
+ * mux thread's release store. */
 #include <assert.h>
 #include "../linkerd2-proxy/linkerd/doca/src/shim.c"
 
 pthread_mutex_t dmesh_dpa_sdk_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static unsigned copies;
-static uint32_t published;
+static unsigned copies, stores;
+static uint32_t published, stored;
 static doca_error_t copy_error;
 
-/* The flow here has its own DPA thread; a mux flow's slot is not this test's. */
+/* A mux flow's release: a store, no SDK call. */
 doca_error_t dmesh_dpa_mux_rx_consumed(struct dmesh_conn *conn, uint32_t pos)
 {
-    (void)conn;
-    (void)pos;
-    assert(!"a per-flow thread's position went to a mux slot");
-    return DOCA_ERROR_UNEXPECTED;
+    assert(conn->mux);
+    assert(pthread_mutex_trylock(&dmesh_dpa_sdk_mutex) == 0);
+    pthread_mutex_unlock(&dmesh_dpa_sdk_mutex);
+    ++stores;
+    stored = pos;
+    return DOCA_SUCCESS;
 }
 
 doca_error_t doca_dpa_h2d_memcpy(struct doca_dpa *dpa,
@@ -61,7 +64,15 @@ int main(void)
         assert(held < DMESH_RX_CONSUMED_POS_BATCH);
         assert(held + 2u * 8064u < BUFFER_SIZE);
     }
-    assert(copies == 3 + 10000 / 64);
+    assert(copies == 3 + 10000 / 64 && stores == 0);
+    /* A mux flow returns staging on every change, with no DPA copy. */
+    struct dmesh_conn *mux = &objs->conns[1];
+    mux->mux = true;
+    unsigned before = copies;
+    assert(dmesh_doca_conn_update_dpu_rx_consumed_pos(objs, 1, 1024) == DOCA_SUCCESS && stores == 1 && stored == 1024);
+    assert(dmesh_doca_conn_update_dpu_rx_consumed_pos(objs, 1, 1024) == DOCA_SUCCESS && stores == 1);
+    assert(dmesh_doca_conn_update_dpu_rx_consumed_pos(objs, 1, BUFFER_SIZE + 64) == DOCA_SUCCESS && stored == 64);
+    assert(stores == 2 && copies == before && mux->rx_consumed_pos_published == 64);
     /* After the host's SHUTDOWN the pop reports end of stream only once every
      * descriptor it posted completed and its segment was popped. */
     struct dmesh_recv_seg segs[DMESH_RECV_SEG_MAX];
@@ -83,5 +94,5 @@ int main(void)
     conn->mux_received = 2;
     assert(dmesh_doca_conn_recv_pop(objs, 0, &pos, &len) == DOCA_ERROR_SHUTDOWN);
     free(objs);
-    puts("rx_consumed_pos_test: batching, SDK lock, failure retry, staging wraps and end of stream: PASS");
+    puts("rx_consumed_pos_test: batching, SDK lock, failure retry, staging wraps, mux release stores and end of stream: PASS");
 }
