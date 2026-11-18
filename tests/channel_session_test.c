@@ -20,6 +20,10 @@ static uint8_t pending[DMESH_SESSION_MAX_FRAME];
 static size_t pending_len;
 /* Idle wake: the last ARM the host sent, and the control PE notification. */
 static unsigned arms_seen, pings_seen, notify_requests, notify_clears;
+/* The session's tail table: allocated once, exported once per session. */
+static unsigned tails_allocs, tails_seen;
+static char fake_tails_mmap, fake_tails_desc[40];
+static uint32_t fake_tails[DMESH_TAILS_BYTES / 4] __attribute__((aligned(64)));
 static uint64_t arm_epoch_seen;
 static uint32_t arm_count_seen;
 static struct dmesh_session_arm_flow arm_flows_seen[DMESH_SESSION_MAX_FLOWS];
@@ -79,6 +83,11 @@ doca_error_t dmesh_comch_client_send(struct dmesh_comch_client *objs, const char
         break;
     case DMESH_SESSION_HELLO:
         reply(DMESH_SESSION_HELLO_ACK, 0, 0, 0);
+        break;
+    case DMESH_SESSION_TAILS:
+        assert(h.flow_id == 0 && h.generation == 0 && h.payload_len == sizeof(fake_tails_desc));
+        assert(memcmp(payload, fake_tails_desc, sizeof(fake_tails_desc)) == 0);
+        ++tails_seen;
         break;
     case DMESH_SESSION_PING:
         assert(h.flow_id == 0 && h.generation == 0 && h.payload_len == 0);
@@ -182,8 +191,28 @@ doca_error_t alloc_dma_ring(struct dma_ring **out, struct doca_dev *dev, size_t 
     ++ring_allocs;
     return DOCA_SUCCESS;
 }
+doca_error_t alloc_buffer_and_set_mmap(struct doca_mmap **mmap, struct doca_dev *dev,
+                                       void **buffer, size_t size, uint32_t access)
+{
+    (void)dev; (void)access;
+    assert(size == sizeof(fake_tails));
+    ++tails_allocs;
+    *mmap = (struct doca_mmap *)&fake_tails_mmap;
+    *buffer = fake_tails;
+    return DOCA_SUCCESS;
+}
+doca_error_t doca_mmap_export_pci(struct doca_mmap *mmap, const struct doca_dev *dev,
+                                  const void **desc, size_t *len)
+{
+    (void)dev;
+    assert(mmap == (struct doca_mmap *)&fake_tails_mmap);
+    *desc = fake_tails_desc;
+    *len = sizeof(fake_tails_desc);
+    return DOCA_SUCCESS;
+}
 doca_error_t destroy_mmap_and_free_buffer(struct doca_mmap *mmap, void *buffer)
 {
+    if (mmap == (struct doca_mmap *)&fake_tails_mmap) { assert(buffer == fake_tails); return DOCA_SUCCESS; }
     assert(mmap && !buffer);
     doca_error_t result = cleanup_result(FAIL_FORWARD_RING);
     if (result == DOCA_SUCCESS) ++ring_frees;
@@ -481,6 +510,7 @@ int main(void)
     pthread_mutex_init(&dev.session_lock, NULL);
     assert(channel_session_open(&dev, "unit-session") == 0);
     assert(client_creates == 1 && dev.hello_ready);
+    assert(tails_allocs == 1 && tails_seen == 1 && dev.tails == fake_tails);
     test_backend_requests(&dev);
     struct dmesh_comch_client *control = dev.control;
     struct channel_mem tx = {.buf = calloc(1, 8192), .bytes = 8192};
@@ -493,6 +523,8 @@ int main(void)
     cfg.flow_id = 2; cfg.rx_offset = CHANNEL_WINDOW;
     assert(channel_conn_open(&dev, &cfg, &b) == 0);
     assert(client_creates == 1 && opens == 2 && a->ready && b->ready);
+    /* Each flow publishes its tail in its own slot of the session's table. */
+    assert(a->tail == &dev.tails[0] && b->tail == &dev.tails[1] && dev.tails[1] == 0);
     test_idle_wake(&dev, a, b);
 
     /* One session progress delivers replies for all flows; status checks must

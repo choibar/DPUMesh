@@ -106,6 +106,11 @@ struct channel_dev {
 	struct channel_flow_wake *flow_wake[33];
 	int flow_wake_on;
 	uint32_t news;
+	/* Tail table (TAILS): slot id - 1 holds the low 32 bits of flow id's
+	 * forward producer_tail, so the DPA thread serving this session reads
+	 * sixteen flows' tails in one cache line. Exported with every session. */
+	struct doca_mmap *tails_mmap;
+	volatile uint32_t *tails;
     struct doca_dev *reverse_dev;       /* base PF or optional SF */
     struct doca_dpa *reverse_dpa;       /* base context or SF extension */
     struct doca_dev *base_dev;
@@ -141,6 +146,7 @@ struct channel_conn {
     struct dmesh_export_rcv_ring_msg reverse_metadata;
     bool reverse_ready;
 	doca_dpa_dev_mmap_t tx_dpa;
+	volatile uint32_t *tail;            /* this flow's slot of dev->tails */
 	volatile struct dmesh_push_desc *descs;
 	volatile struct dmesh_push_cursor *cursor;
 	size_t data_size;
@@ -814,6 +820,27 @@ uint32_t channel_dev_take_news(struct channel_dev *dev)
 	return __atomic_exchange_n(&dev->news, 0, __ATOMIC_ACQUIRE);
 }
 
+/* The session's tail table: allocated with the first session, cleared and
+ * exported with every one. Sent right after HELLO_ACK, so before any OPEN. */
+static int tails_send_locked(struct channel_dev *dev)
+{
+	const void *desc;
+	size_t len;
+	doca_error_t result;
+	if (!dev->tails) {
+		void *buf = NULL;
+		result = alloc_buffer_and_set_mmap(&dev->tails_mmap, dev->dev, &buf, DMESH_TAILS_BYTES,
+						   DOCA_ACCESS_FLAG_PCI_READ_WRITE);
+		if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
+		dev->tails = buf;
+	}
+	memset((void *)dev->tails, 0, DMESH_TAILS_BYTES);
+	result = doca_mmap_export_pci(dev->tails_mmap, dev->dev, &desc, &len);
+	if (result != DOCA_SUCCESS) { errno = error_number(result); return -1; }
+	if (len == 0 || len > DMESH_SESSION_TAILS_MAX) { errno = EMSGSIZE; return -1; }
+	return session_send_locked(dev, DMESH_SESSION_TAILS, 0, 0, desc, len);
+}
+
 int channel_session_open(struct channel_dev *dev, const char *server)
 {
 	if (!dev || !server || !*server) { errno = EINVAL; return -1; }
@@ -829,6 +856,8 @@ int channel_session_open(struct channel_dev *dev, const char *server)
 	if (result != DOCA_SUCCESS) errno = error_number(result);
 	else if (session_send_locked(dev, DMESH_SESSION_HELLO, 0, 0, NULL, 0) == 0)
 		rc = session_wait_locked(dev, NULL, 0);
+	if (rc == 0)
+		rc = tails_send_locked(dev);
 	if (rc == 0) {
 		wake_open_locked(dev);
 		rc = flow_wakes_open_locked(dev);
@@ -1060,6 +1089,8 @@ void channel_dev_close(struct channel_dev *dev)
 		return;
 
 	if (channel_session_close(dev) != 0) return;
+	if (dev->tails_mmap != NULL)
+		(void)destroy_mmap_and_free_buffer(dev->tails_mmap, (void *)dev->tails);
     /* An extended context owns SF resources and retires before its base. */
     if (dev->reverse_dpa != NULL && dev->reverse_dpa != dev->base_dpa)
         (void)doca_dpa_destroy(dev->reverse_dpa);
@@ -1547,6 +1578,9 @@ static int conn_open(struct channel_dev *dev, const struct channel_conn_config *
 	conn->data_size = CHANNEL_WINDOW - DMESH_PUSH_DATA_OFF;
 	conn->expected = 1;
 	conn->tx_dpa = cfg->tx->dpa;
+	/* The ring starts at 0; the id's last flow is closed, so no DPA reads it. */
+	conn->tail = &dev->tails[conn->flow_id - 1];
+	*conn->tail = 0;
 
 	pthread_mutex_lock(&dev->session_lock);
 	struct dmesh_export_metadata_msg metadata;
@@ -1953,6 +1987,7 @@ uint64_t channel_conn_post(struct channel_conn *conn, uint64_t addr, uint32_t by
 	desc->addr = addr;
 	desc->size = bytes;
 	commit_dma_desc(ring);
+	__atomic_store_n(conn->tail, (uint32_t)ring->head, __ATOMIC_RELEASE);
 	return ring->head;
 }
 
