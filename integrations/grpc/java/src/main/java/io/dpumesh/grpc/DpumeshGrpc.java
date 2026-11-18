@@ -22,12 +22,25 @@ public final class DpumeshGrpc {
     return "1".equals(System.getenv("DPUMESH_ENABLE"));
   }
 
-  /** A server builder for this process's DPUMESH_SERVICE target. */
+  /** A server builder for this process's target: DPUMESH_SERVICE, or DPUMESH_PORT on the Pod IP. */
   public static NettyServerBuilder serverBuilder() {
-    return NettyServerBuilder.forAddress(new DpumeshAddress(System.getenv("DPUMESH_SERVICE")))
+    return NettyServerBuilder.forAddress(new DpumeshAddress(servedTarget()))
         .channelType(DpumeshServerChannel.class)
         .bossEventLoopGroup(group())
         .workerEventLoopGroup(group());
+  }
+
+  // The server channel's label only: the native library serves the target it
+  // finds when it opens the channel.
+  private static String servedTarget() {
+    String service = System.getenv("DPUMESH_SERVICE");
+    if (service != null && !service.isEmpty()) return service;
+    String port = System.getenv("DPUMESH_PORT");
+    if (port == null || port.isEmpty()) {
+      throw new IllegalStateException(
+          "a DPUMesh server needs DPUMESH_PORT or a DPUMESH_SERVICE \"<host>:<port>\" target");
+    }
+    return ":" + port;
   }
 
   /** A plaintext channel builder for a {@code "<host>:<port>"} service address. */
