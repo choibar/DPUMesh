@@ -567,7 +567,7 @@ func runServer(ctx context.Context, tcp string) error {
 func main() {
 	mode := flag.String("mode", "client", "client or server")
 	c := config{}
-	flag.IntVar(&c.connections, "connections", 1, "number of gRPC/native connections (1..4)")
+	flag.IntVar(&c.connections, "connections", 1, "number of gRPC/native connections (1..16)")
 	flag.IntVar(&c.concurrency, "concurrency", 64, "total concurrent RPC loops, divided across connections")
 	flag.DurationVar(&c.warmup, "warmup", 3*time.Second, "warmup before measurement")
 	flag.DurationVar(&c.duration, "duration", 10*time.Second, "measurement duration")
@@ -579,9 +579,9 @@ func main() {
 	ip := os.Getenv("DPUMESH_SERVICE_IP")
 	port, err := strconv.Atoi(os.Getenv("DPUMESH_SERVICE_PORT"))
 	// Only the native client dials an address; the server serves DPUMESH_SERVICE.
-	if *mode == "client" && c.tcp == "" && (err != nil || ip == "" || port < 1 || port > 65535) || c.connections < 1 || c.connections > 4 ||
+	if *mode == "client" && c.tcp == "" && (err != nil || ip == "" || port < 1 || port > 65535) || c.connections < 1 || c.connections > 16 ||
 		c.concurrency < c.connections || c.warmup < 0 || c.duration <= 0 || c.rpcTimeout <= 0 || *timeout <= 0 {
-		log.Fatal("set DPUMESH_SERVICE_IP/PORT for the client, connections 1..4, concurrency >= connections, and valid durations")
+		log.Fatal("set DPUMESH_SERVICE_IP/PORT for the client, connections 1..16, concurrency >= connections, and valid durations")
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

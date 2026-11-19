@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <openssl/rand.h>
 #include "session_protocol.h"
 
 #include "common.h"
@@ -216,7 +217,39 @@ static void server_message_recv_callback(struct doca_comch_event_msg_recv *event
     if (s->closing)
         return;
     if (h.type == DMESH_SESSION_HELLO) {
+        if (dmesh_dispatcher_registration_required(objs) && !s->negotiated) {
+            if (!s->registration_challenged) {
+                if (RAND_bytes(s->registration_nonce, sizeof(s->registration_nonce)) != 1) {
+                    session_fail(objs, s);
+                    return;
+                }
+                s->registration_challenged = true;
+                s->hello_deadline_ms = session_now_ms() + 15000;
+            }
+            s->challenge_pending = true;
+            return;
+        }
         s->negotiated = true;
+        s->hello_pending = true;
+        return;
+    }
+    if (h.type == DMESH_SESSION_REG_ASSERTION) {
+        int error = dmesh_dispatcher_register(objs, s, payload, h.payload_len);
+        if (error == EAGAIN && !s->negotiated) {
+            memcpy(s->registration_assertion, payload, sizeof(s->registration_assertion));
+            s->registration_pending = true;
+            s->registration_retry_ms = session_now_ms() + 100;
+            s->challenge_pending = false;
+            return;
+        }
+        if (error) {
+            DOCA_LOG_WARN("Refusing unverified Pod registration: %d", error);
+            session_fail(objs, s);
+            return;
+        }
+        s->negotiated = true;
+        s->registration_pending = false;
+        s->challenge_pending = false;
         s->hello_pending = true;
         return;
     }
@@ -1074,6 +1107,24 @@ void dmesh_sessions_advance(struct objects *objs)
         if ((!s->negotiated || s->hello_pending) && !s->closing && now >= s->hello_deadline_ms)
             session_fail(objs, s);
         if (!s->closing) {
+            if (s->registration_pending && now >= s->registration_retry_ms) {
+                int error = dmesh_dispatcher_register(objs, s, s->registration_assertion,
+                                                       sizeof(s->registration_assertion));
+                s->registration_retry_ms = now + 100;
+                if (!error) {
+                    s->registration_pending = false;
+                    s->negotiated = true;
+                    s->hello_pending = true;
+                } else if (error != EAGAIN) {
+                    DOCA_LOG_WARN("Refusing pending Pod registration: %d", error);
+                    session_fail(objs, s);
+                    continue;
+                }
+            }
+            if (s->challenge_pending &&
+                dmesh_session_send(objs, s, DMESH_SESSION_REG_CHALLENGE, 0, 0,
+                                   s->registration_nonce, sizeof(s->registration_nonce), 0) == DOCA_SUCCESS)
+                s->challenge_pending = false;
             if (s->hello_pending &&
                 (!objs->dispatcher || dmesh_dispatcher_accepting(objs)) &&
                 dmesh_session_send(objs, s, DMESH_SESSION_HELLO_ACK, 0, 0, NULL, 0, 0) == DOCA_SUCCESS)

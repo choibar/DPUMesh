@@ -14,6 +14,7 @@
 #define DMESH_SESSION_VERSION 10u
 #define DMESH_SESSION_HEADER_SIZE 24u
 #define DMESH_SESSION_MAX_PAYLOAD 2048u
+#define DMESH_SESSION_REG_ASSERTION_SIZE 1469u
 #define DMESH_SESSION_MAX_FRAME (DMESH_SESSION_HEADER_SIZE + DMESH_SESSION_MAX_PAYLOAD)
 #define DMESH_SESSION_MAX_FLOWS 32u
 #define DMESH_SESSION_MAX_WORKERS 128u
@@ -62,6 +63,11 @@ enum dmesh_session_message_type {
      * The same page holds each flow slot's sync event word, which the
      * reverse DPA thread writes (DMESH_EC_SE_OFF). */
     DMESH_SESSION_TAILS = 23,
+    /* Optional trusted registration handshake before HELLO_ACK. Keep upstream
+     * message IDs intact; hosts without this extension are refused only when
+     * registration is required. */
+    DMESH_SESSION_REG_CHALLENGE = 24,
+    DMESH_SESSION_REG_ASSERTION = 25,
 };
 
 struct dmesh_session_header {
@@ -103,6 +109,9 @@ static inline int dmesh_session_header_valid(const struct dmesh_session_header *
                h->payload_len <= DMESH_SESSION_TAILS_MAX;
     if (h->type == DMESH_SESSION_PING)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 && h->status == 0;
+    if (h->type == DMESH_SESSION_REG_CHALLENGE || h->type == DMESH_SESSION_REG_ASSERTION)
+        return h->flow_id == 0 && h->generation == 0 && h->status == 0 &&
+            h->payload_len == (h->type == DMESH_SESSION_REG_CHALLENGE ? 32u : DMESH_SESSION_REG_ASSERTION_SIZE);
     if (h->type == DMESH_SESSION_HELLO || h->type == DMESH_SESSION_HELLO_ACK)
         return h->flow_id == 0 && h->generation == 0 && h->payload_len == 0 &&
                (h->type == DMESH_SESSION_HELLO_ACK || h->status == 0);

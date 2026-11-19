@@ -82,8 +82,9 @@ mkdir -p "${DEVICE_BUILD_DIR}"
 	-hostcc-options="${HOST_CC_FLAGS}" \
 	--devicecc-options="${DEVICE_CC_FLAGS}" \
 	--app-name="${DPA_APP_NAME}" \
-	-device-libs="-L${DOCA_LIB_DIR} -ldoca_dpa_dev -ldoca_dpa_dev_comm" \
+	-device-libs="-L${DOCA_LIB_DIR} -ldoca_dpa_dev -ldoca_dpa_dev_comm -ldoca_dpa_dev_verbs" \
 	-flto \
 	-I${DOCA_INCLUDE} \
 	-I"${PROJECT_SRC_DIR}/" \
 	-I"${PROJECT_SRC_DIR}/common" \
+	-I"${PROJECT_SRC_DIR}/peer" \

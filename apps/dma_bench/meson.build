@@ -30,7 +30,7 @@ transport_build = transport / 'build'
 
 inc_dirs = include_directories('/opt/mellanox/doca/include/',
                                '../../src/transport/common', '../../src/transport/dpu',
-                               '../../src/transport/host')
+                               '../../src/transport/host', '../../src/transport/peer')
 
 deps = [
   dependency('threads'),
@@ -39,6 +39,13 @@ deps = [
   dependency('doca-dma'),
   dependency('doca-dpa'),
   dependency('libflexio'),
+  dependency('doca-rdma'),
+  dependency('doca-verbs'),
+  dependency('libibverbs'),
+  dependency('librdmacm'),
+  dependency('libcrypto'),
+  dependency('libssl'),
+  cc.find_library('dl'),
 ]
 
 side = get_option('side')
@@ -49,13 +56,13 @@ dpu_side = side == 'dpu'
 message('building the ' + side + ' side (dpumesh_' + side + ')')
 
 if dpu_side
-  foreach a : ['libdmesh_dpu.a', 'libdmesh_common.a', 'libdmesh_host.a', 'device/dpa_kernel.a']
+  foreach a : ['libdmesh_dpu.a', 'libdmesh_common.a', 'libdmesh_host.a', 'peer/libdmesh_peer.a', 'device/dpa_kernel.a']
     if not fs.exists(transport_build / a)
       error(transport_build / a + ' not found — run `ninja -C src/transport/build` first')
     endif
   endforeach
   transport_link_args = ['-Wl,--whole-archive', transport_build / 'libdmesh_dpu.a',
-                         transport_build / 'libdmesh_common.a', '-Wl,--no-whole-archive',
+                         transport_build / 'libdmesh_common.a', transport_build / 'peer/libdmesh_peer.a', '-Wl,--no-whole-archive',
                          transport_build / 'libdmesh_host.a']
   dpa_program_lib = cc.find_library('dpa_kernel', dirs : transport_build / 'device', static : true)
 

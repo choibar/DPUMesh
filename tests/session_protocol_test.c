@@ -53,7 +53,25 @@ struct message_case {
 
 static void test_message_shapes(void)
 {
+    assert(DMESH_SESSION_VERSION == 10);
+    assert(DMESH_SESSION_SHUTDOWN == 22);
+    assert(DMESH_SESSION_TAILS == 23);
+    assert(DMESH_SESSION_REG_CHALLENGE == 24);
+    assert(DMESH_SESSION_REG_ASSERTION == 25);
     static const struct message_case cases[] = {
+        {DMESH_SESSION_REG_CHALLENGE, 0, 0, 0, 32, 1},
+        {DMESH_SESSION_REG_CHALLENGE, 1, 0, 0, 32, 0},
+        {DMESH_SESSION_REG_CHALLENGE, 0, 1, 0, 32, 0},
+        {DMESH_SESSION_REG_CHALLENGE, 0, 0, EIO, 32, 0},
+        {DMESH_SESSION_REG_CHALLENGE, 0, 0, 0, 31, 0},
+        {DMESH_SESSION_REG_ASSERTION, 0, 0, 0, 1469, 1},
+        {DMESH_SESSION_REG_ASSERTION, 0, 0, 0, 1468, 0},
+        {DMESH_SESSION_REG_ASSERTION, 0, 0, 0, 1470, 0},
+        {DMESH_SESSION_REG_ASSERTION, 1, 0, 0, 1469, 0},
+        {DMESH_SESSION_REG_ASSERTION, 0, 1, 0, 1469, 0},
+        {DMESH_SESSION_REG_ASSERTION, 0, 0, EIO, 1469, 0},
+        {22, 0, 0, 0, 1469, 0}, /* old registration ID is now SHUTDOWN */
+        {25, 1, 1, 0, 8, 0},   /* registration cannot masquerade as SHUTDOWN */
         {DMESH_SESSION_LISTEN,         0, 1, 0,      8, 1},
         {DMESH_SESSION_LISTEN,         1, 1, 0,      8, 0},
         {DMESH_SESSION_LISTEN_ACK,     0, 1, EADDRINUSE, 0, 1},
@@ -124,8 +142,8 @@ static void test_message_shapes(void)
         {0,                           1, 1, 0,      0, 0},
         {UINT16_MAX,                  1, 1, 0,      0, 0},
     };
-    uint8_t frame[DMESH_SESSION_HEADER_SIZE + 1024];
-    uint8_t body[1024];
+    uint8_t frame[DMESH_SESSION_MAX_FRAME];
+    uint8_t body[DMESH_SESSION_MAX_PAYLOAD];
     struct dmesh_session_header h;
     const uint8_t *payload;
     memset(body, 0x5a, sizeof(body));

@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Supply the reverse-DPA fence on both Host and DPU test builds. */
+#define DMESH_EC_EXTERN
 #include "src/transport/common/object.h"
 #include "src/transport/common/session_protocol.h"
 
@@ -62,13 +64,28 @@ doca_error_t doca_comch_server_disconnect(struct doca_comch_server *server,
     return disconnect_result;
 }
 
+static bool inject_registration;
+static int registration_result;
+static int register_for_test(struct objects *o, struct dmesh_session *s,
+                              const void *payload, size_t length)
+{
+    if (!inject_registration)
+        return dmesh_dispatcher_register(o, s, payload, length);
+    assert(length == DMESH_SESSION_REG_ASSERTION_SIZE);
+    assert(((const uint8_t *)payload)[0] == 0x42);
+    return registration_result;
+}
+
+#define dmesh_dispatcher_register register_for_test
 #include "../src/transport/dpu/comch_server.c"
+#undef dmesh_dispatcher_register
 
 
 static char cleanup_order[64];
 static unsigned cleanup_count, release_count, mmap_calls;
 static char failed_phase;
 static unsigned failed_mmap, quiesce_pending;
+static unsigned reverse_pending, reverse_resets;
 
 static doca_error_t cleanup_phase(char phase)
 {
@@ -76,6 +93,23 @@ static doca_error_t cleanup_phase(char phase)
     cleanup_order[cleanup_count++] = phase;
     cleanup_order[cleanup_count] = 0;
     return failed_phase == phase ? DOCA_ERROR_IO_FAILED : DOCA_SUCCESS;
+}
+
+doca_error_t dmesh_ec_quiesce_step(struct dmesh_conn *conn)
+{
+    assert(conn->dma_closing);
+    doca_error_t result = cleanup_phase('E');
+    if (result == DOCA_SUCCESS && reverse_pending != 0) {
+        --reverse_pending;
+        return DOCA_ERROR_AGAIN;
+    }
+    return result;
+}
+
+void dmesh_ec_conn_reset(struct dmesh_conn *conn)
+{
+    assert(conn->dma_closing && reverse_pending == 0);
+    ++reverse_resets;
 }
 
 doca_error_t dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn)
@@ -161,6 +195,7 @@ static void reset_cleanup(void)
     cleanup_order[0] = 0;
     failed_phase = 0;
     failed_mmap = quiesce_pending = 0;
+    reverse_pending = reverse_resets = 0;
 }
 
 static void deliver(struct doca_comch_connection *peer, uint16_t type,
@@ -473,7 +508,7 @@ static void checked_close_test(void)
     conn->pending_metadata = calloc(1, sizeof(*conn->pending_metadata));
     assert(conn->dma_buffer && conn->pending_metadata);
 
-    const char phases[] = "QDMTB";
+    const char phases[] = "EQDMTB";
     for (unsigned i = 0; i < sizeof(phases) - 1; ++i) {
         reset_cleanup();
         failed_phase = phases[i];
@@ -487,6 +522,15 @@ static void checked_close_test(void)
         assert(memcmp(cleanup_order, phases, i + 1) == 0);
         assert(sibling->state == DMESH_CONN_RUNNING && !s->closing);
     }
+    /* Reverse copies must finish before any other resource can retire. */
+    reset_cleanup();
+    reverse_pending = 2;
+    conn->state = DMESH_CONN_CLOSING;
+    dmesh_flow_close_advance(conn);
+    dmesh_flow_close_advance(conn);
+    assert(conn->state == DMESH_CONN_CLOSING && strcmp(cleanup_order, "EE") == 0);
+    assert(conn->ring_mmap && conn->dpa_thread && release_count == 0);
+    assert(reverse_resets == 0 && mmap_calls == 0);
     /* A DPA kernel that has not stopped yet keeps the flow closing; each
      * pass rechecks it and nothing past the fence runs. */
     reset_cleanup();
@@ -494,7 +538,7 @@ static void checked_close_test(void)
     conn->state = DMESH_CONN_CLOSING;
     dmesh_flow_close_advance(conn);
     dmesh_flow_close_advance(conn);
-    assert(conn->state == DMESH_CONN_CLOSING && strcmp(cleanup_order, "QQ") == 0);
+    assert(conn->state == DMESH_CONN_CLOSING && strcmp(cleanup_order, "EQEQ") == 0);
     assert(conn->ring_mmap && conn->dpa_thread && release_count == 0);
     /* An mmap failure preserves its remaining mappings and pool reservation;
      * a retry skips already destroyed mappings and frees once. */
@@ -562,12 +606,71 @@ static void checked_close_test(void)
     callback_objects = NULL;
 }
 
+static void pending_registration_test(void)
+{
+    unsigned char peer_storage;
+    struct doca_comch_connection *peer = (void *)&peer_storage;
+    struct objects *objs = calloc(1, sizeof(*objs));
+    assert(objs);
+    callback_objects = objs;
+    objs->cc_server = (void *)&server_storage;
+    inject_registration = true;
+    registration_result = EAGAIN; /* Valid seal, signed Pod update not here yet. */
+    struct dmesh_session *s = session_get(objs, peer, true);
+    s->registration_challenged = true;
+    s->hello_deadline_ms = session_now_ms() + 15000;
+    uint8_t assertion[DMESH_SESSION_REG_ASSERTION_SIZE] = {0x42};
+    unsigned before = response_attempts;
+    deliver(peer, DMESH_SESSION_REG_ASSERTION, 0, 0, assertion, sizeof(assertion));
+    assert(s->registration_pending && !s->negotiated && !s->closing);
+    s->registration_retry_ms = 0;
+    dmesh_sessions_advance(objs);
+    assert(!s->negotiated && !live_flows(objs) && response_attempts == before);
+
+    registration_result = 0;
+    s->registration_retry_ms = 0;
+    dmesh_sessions_advance(objs);
+    assert(s->negotiated && !s->registration_pending);
+    assert(response_attempts == before + 1);
+    assert(attempted_response.type == DMESH_SESSION_HELLO_ACK);
+
+    /* Registration must complete before the upstream TAILS setup proceeds. */
+    const uint8_t tails[] = {1, 2, 3, 4};
+    deliver(peer, DMESH_SESSION_TAILS, 0, 0, tails, sizeof(tails));
+    assert(!s->closing && s->tails.desc_len == sizeof(tails));
+    assert(memcmp(s->tails.desc, tails, sizeof(tails)) == 0);
+
+    /* Waiting for topology never permits an expired/invalid assertion. */
+    s->negotiated = s->hello_pending = false;
+    registration_result = EAGAIN;
+    deliver(peer, DMESH_SESSION_REG_ASSERTION, 0, 0, assertion, sizeof(assertion));
+    registration_result = EACCES;
+    s->registration_retry_ms = 0;
+    dmesh_sessions_advance(objs);
+    assert(!s->negotiated && !live_flows(objs));
+
+    /* The original HELLO deadline also bounds the pending state. */
+    memset(objs->sessions, 0, sizeof(objs->sessions));
+    s = session_get(objs, peer, true);
+    s->registration_challenged = true;
+    registration_result = EAGAIN;
+    deliver(peer, DMESH_SESSION_REG_ASSERTION, 0, 0, assertion, sizeof(assertion));
+    s->hello_deadline_ms = 0;
+    before = response_attempts;
+    dmesh_sessions_advance(objs);
+    assert(!s->negotiated && response_attempts == before && !live_flows(objs));
+    inject_registration = false;
+    callback_objects = NULL;
+    free(objs);
+}
+
 int main(void)
 {
     receive_test();
     checked_close_test();
     reader_fence_test();
     physical_disconnect_test();
+    pending_registration_test();
     puts("session_server_test: PASS");
     return 0;
 }

@@ -35,6 +35,7 @@ deps += dependency('doca-comch')
 deps += dependency('doca-dma')
 deps += dependency('doca-dpa')
 deps += dependency('libflexio')
+deps += dependency('libcrypto')
 
 # DPA management (common/dpa.c, and comch_msgq.c on top of it) references the
 # dpacc host stub; the host library's Makefile compiles part of the DPA-free
@@ -66,6 +67,7 @@ host_srcs = files(
 # with dmesh_dpu.
 channel_srcs = files(
   'host/channel.c',
+  'host/registration_client.c',
   'host/host_stubs.c',
 )
 
@@ -79,6 +81,7 @@ doca_lib_dir = dependency('doca-dpa').get_variable(pkgconfig : 'libdir')
 # Kernel and argument-layout changes must rebuild the archive at build time,
 # not only during meson setup/reconfigure.
 subdir('device')
+subdir('peer')
 
 dmesh_common = static_library('dmesh_common', common_srcs,
   dependencies : deps,

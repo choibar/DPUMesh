@@ -24,6 +24,7 @@
 #include "dpa_common.h"
 #include "ring.h"
 #include "session_protocol.h"
+#include "registration_client.h"
 
 /*
  * DPUMesh transport, host end. Each channel owns one serialized Comch control
@@ -55,6 +56,9 @@ _Static_assert(CHANNEL_MODE_BACKEND == DMESH_FLOW_MODE_BACKEND, "backend mode");
 #define CHANNEL_KEEPALIVE_MS 1000          /* PING a session that sent nothing for this long */
 
 struct channel_dev {
+    struct dmesh_registration_client registration;
+    int registration_pending, assertion_pending;
+    uint8_t registration_nonce[32];
 	struct doca_dev *dev;               /* Comch / forward device */
 	/* Lock covers every control PE call, send, callback and flow-map change.
 	 * Callbacks only change flow control state: they never acquire slot locks.
@@ -210,6 +214,16 @@ static void session_message(void *owner, const uint8_t *data, size_t len)
 		dev->session_error = EPROTO;
 		return;
 	}
+    if (h.type == DMESH_SESSION_REG_CHALLENGE) {
+        if (dev->hello_ready || dev->registration.state || dev->registration_pending) {
+            if (memcmp(dev->registration_nonce, payload, 32))
+                dev->session_error = EPROTO;
+            return;
+        }
+        memcpy(dev->registration_nonce, payload, 32);
+        dev->registration_pending = 1;
+        return;
+    }
 	if (h.type == DMESH_SESSION_HELLO_ACK && h.flow_id == 0 && h.generation == 0) {
 		if (h.status) dev->session_error = h.status;
 		else dev->hello_ready = 1;
@@ -303,6 +317,22 @@ static int session_progress_locked(struct channel_dev *dev)
 {
 	if (!dev->control) { errno = ENOTCONN; return -1; }
 	(void)doca_pe_progress(dev->control->pe);
+    if (dev->registration_pending) {
+        int error = dmesh_registration_client_begin(&dev->registration, dev->registration_nonce);
+        dev->registration_pending = 0;
+        if (error)
+            dev->session_error = error;
+        else
+            dev->assertion_pending = 1;
+    }
+    if (dev->assertion_pending && !dev->session_error) {
+        int ready = dmesh_registration_client_progress(&dev->registration);
+        if (ready < 0)
+            dev->session_error = -ready;
+        else if (ready && !session_send_locked(dev, DMESH_SESSION_REG_ASSERTION, 0, 0,
+                   &dev->registration.assertion, sizeof(dev->registration.assertion)))
+            dev->assertion_pending = 0;
+    }
     backend_flush_rejections(dev);
 	if (dev->control->peer_gone && !dev->session_error)
 		dev->session_error = ECONNRESET;
@@ -331,7 +361,9 @@ static int session_send_locked(struct channel_dev *dev, uint16_t type,
  * sibling's data path, and no carrier slot lock is taken while progressing. */
 static int session_wait_locked(struct channel_dev *dev, struct channel_conn *conn, int closing)
 {
-	uint64_t deadline = channel_now_ms() + CHANNEL_REPLY_MS;
+	/* Registration may wait for a signed topology update within HELLO's
+	 * 15-second bound; READY/CLOSED retain the upstream reply timeout. */
+	uint64_t deadline = channel_now_ms() + (conn ? CHANNEL_REPLY_MS : 15000);
 	const struct timespec pause = { .tv_nsec = 10000 };
 	for (;;) {
 		if (session_progress_locked(dev) != 0) return -1;
@@ -671,6 +703,8 @@ int channel_session_close(struct channel_dev *dev)
 	}
 	free(control);
 	dev->control = NULL;
+    dmesh_registration_client_close(&dev->registration);
+    dev->hello_ready = dev->registration_pending = dev->assertion_pending = 0;
 	pthread_mutex_unlock(&dev->session_lock);
 	return 0;
 }
