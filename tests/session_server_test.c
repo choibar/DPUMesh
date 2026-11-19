@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Supply the reverse-DPA fence on both Host and DPU test builds. */
+#define DMESH_EC_EXTERN
 #include "src/transport/common/object.h"
 #include "src/transport/common/session_protocol.h"
 
@@ -83,6 +85,7 @@ static char cleanup_order[64];
 static unsigned cleanup_count, release_count, mmap_calls;
 static char failed_phase;
 static unsigned failed_mmap, quiesce_pending;
+static unsigned reverse_pending, reverse_resets;
 
 static doca_error_t cleanup_phase(char phase)
 {
@@ -90,6 +93,23 @@ static doca_error_t cleanup_phase(char phase)
     cleanup_order[cleanup_count++] = phase;
     cleanup_order[cleanup_count] = 0;
     return failed_phase == phase ? DOCA_ERROR_IO_FAILED : DOCA_SUCCESS;
+}
+
+doca_error_t dmesh_ec_quiesce_step(struct dmesh_conn *conn)
+{
+    assert(conn->dma_closing);
+    doca_error_t result = cleanup_phase('E');
+    if (result == DOCA_SUCCESS && reverse_pending != 0) {
+        --reverse_pending;
+        return DOCA_ERROR_AGAIN;
+    }
+    return result;
+}
+
+void dmesh_ec_conn_reset(struct dmesh_conn *conn)
+{
+    assert(conn->dma_closing && reverse_pending == 0);
+    ++reverse_resets;
 }
 
 doca_error_t dmesh_doca_dpa_quiesce_step(struct dmesh_conn *conn)
@@ -175,6 +195,7 @@ static void reset_cleanup(void)
     cleanup_order[0] = 0;
     failed_phase = 0;
     failed_mmap = quiesce_pending = 0;
+    reverse_pending = reverse_resets = 0;
 }
 
 static void deliver(struct doca_comch_connection *peer, uint16_t type,
@@ -487,7 +508,7 @@ static void checked_close_test(void)
     conn->pending_metadata = calloc(1, sizeof(*conn->pending_metadata));
     assert(conn->dma_buffer && conn->pending_metadata);
 
-    const char phases[] = "QDMTB";
+    const char phases[] = "EQDMTB";
     for (unsigned i = 0; i < sizeof(phases) - 1; ++i) {
         reset_cleanup();
         failed_phase = phases[i];
@@ -501,6 +522,15 @@ static void checked_close_test(void)
         assert(memcmp(cleanup_order, phases, i + 1) == 0);
         assert(sibling->state == DMESH_CONN_RUNNING && !s->closing);
     }
+    /* Reverse copies must finish before any other resource can retire. */
+    reset_cleanup();
+    reverse_pending = 2;
+    conn->state = DMESH_CONN_CLOSING;
+    dmesh_flow_close_advance(conn);
+    dmesh_flow_close_advance(conn);
+    assert(conn->state == DMESH_CONN_CLOSING && strcmp(cleanup_order, "EE") == 0);
+    assert(conn->ring_mmap && conn->dpa_thread && release_count == 0);
+    assert(reverse_resets == 0 && mmap_calls == 0);
     /* A DPA kernel that has not stopped yet keeps the flow closing; each
      * pass rechecks it and nothing past the fence runs. */
     reset_cleanup();
@@ -508,7 +538,7 @@ static void checked_close_test(void)
     conn->state = DMESH_CONN_CLOSING;
     dmesh_flow_close_advance(conn);
     dmesh_flow_close_advance(conn);
-    assert(conn->state == DMESH_CONN_CLOSING && strcmp(cleanup_order, "QQ") == 0);
+    assert(conn->state == DMESH_CONN_CLOSING && strcmp(cleanup_order, "EQEQ") == 0);
     assert(conn->ring_mmap && conn->dpa_thread && release_count == 0);
     /* An mmap failure preserves its remaining mappings and pool reservation;
      * a retry skips already destroyed mappings and frees once. */

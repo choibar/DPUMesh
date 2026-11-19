@@ -3,7 +3,7 @@
 This fixture keeps DPUMesh's native Comch session/flow dispatcher and Linkerd
 `DMESH_SHARDED=1` execution path. It adds the jukebox peer transport beneath
 Linkerd's connector. Each worker keeps its own current-thread Tokio runtime. With `DMESH_SHARDED=1`,
-tracing subscribers and datapath metrics default to worker scope; the fixture
+tracing subscribers and datapath metrics default to private scope; the fixture
 explicitly selects shared scope. See the proxy README for scope configuration.
 
 The path is:
@@ -193,11 +193,12 @@ in `bench-results/native-rdma-migration-20261030/report.txt` (local artifacts).
 The native release build retains `target-cpu=native`; absolute RPS and atomic
 helper sample shares are not directly interchangeable with prior jukebox runs.
 
-With `DMESH_SHARDED=1`, `DPUMESH_L7_TRACE_SCOPE=worker` (the default) creates a
+With `DMESH_SHARDED=1`, `DPUMESH_L7_TRACE_SCOPE=private` (the default) creates a
 fresh tracing registry, EnvFilter and reload layer per worker. Use
 `DPUMESH_L7_TRACE_SCOPE=shared` to select the original global subscriber for a
 same-binary A/B. Restart both DPU runtimes when changing scope. Non-sharded
-mode defaults to `shared`; explicitly selecting `worker` requires sharded mode.
+mode defaults to `shared`; explicitly selecting `private` requires sharded mode.
+The former `worker` setting is rejected.
 The outer dmesh span is constructed under its worker's dispatcher before the
 thread starts, and the thread keeps that dispatcher through runtime teardown.
 
